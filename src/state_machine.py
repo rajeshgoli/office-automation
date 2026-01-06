@@ -81,14 +81,24 @@ class StateMachine:
 
     @property
     def is_present(self) -> bool:
-        """Check if any presence signal is active."""
-        # Mac active with external monitor
-        mac_presence = self.sensors.mac_active and self.sensors.external_monitor
+        """Check if any presence signal is active.
 
-        # Recent motion (within timeout)
+        For AWAY→PRESENT transitions, we require physical presence (motion or door).
+        Mac activity alone is not enough - it just indicates the computer is on.
+        """
+        # Recent motion (within timeout) - this is physical presence
         motion_age = time.time() - self.sensors.motion_last_seen
         motion_presence = self.sensors.motion_detected or (motion_age < self.config.motion_timeout_seconds)
 
+        # Mac active with external monitor - this is supporting evidence only
+        mac_presence = self.sensors.mac_active and self.sensors.external_monitor
+
+        # Physical presence (motion) is required for AWAY→PRESENT
+        # Mac presence alone can't trigger return from AWAY
+        if self.state == OccupancyState.AWAY:
+            return motion_presence  # Only motion can bring us back from AWAY
+
+        # When PRESENT, either signal keeps us present
         return mac_presence or motion_presence
 
     @property
@@ -249,6 +259,13 @@ class StateMachine:
         self.sensors.door_last_changed = time.time()
         self.sensors.last_updated = time.time()
         logger.debug(f"Door: {'open' if is_open else 'closed'}")
+
+        # Door opening while AWAY = someone entering (immediate PRESENT)
+        if is_open and self.state == OccupancyState.AWAY:
+            logger.info("Door opened while AWAY - transitioning to PRESENT")
+            old_state = self.state
+            self.state = OccupancyState.PRESENT
+            await self._notify_state_change(old_state, self.state)
 
         # Door just closed (was open, now closed) - start departure verification
         if was_open is True and is_open is False:
