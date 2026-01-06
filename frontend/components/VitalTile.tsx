@@ -1,20 +1,25 @@
 
 import React from 'react';
-import { DeviceStatus } from '../types';
+import { DeviceStatus, ERVSpeed } from '../types';
 
 interface VitalTileProps {
   label: string;
   value: string | number;
   unit?: string;
   icon?: string;
-  status?: DeviceStatus;
+  status?: DeviceStatus | ERVSpeed;
   attention?: boolean;
 }
 
 const VitalTile: React.FC<VitalTileProps> = ({ label, value, unit, icon, status, attention }) => {
   const getStatusColor = () => {
     if (attention) return 'border-orange-500/50 bg-orange-500/5';
+    // Check DeviceStatus active states
     if (status === DeviceStatus.OPEN || status === DeviceStatus.ON || status === DeviceStatus.FULL) {
+      return 'border-zinc-700 bg-zinc-800/50';
+    }
+    // Check ERVSpeed active states (anything not OFF)
+    if (status && Object.values(ERVSpeed).includes(status as ERVSpeed) && status !== ERVSpeed.OFF) {
       return 'border-zinc-700 bg-zinc-800/50';
     }
     return 'border-zinc-800/50 bg-zinc-900/30';

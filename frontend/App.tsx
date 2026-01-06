@@ -4,6 +4,7 @@ import {
   OfficeState,
   OccupancyState,
   DeviceStatus,
+  ERVSpeed,
   ActivityEvent,
   ClimateDataPoint,
   Threshold
@@ -11,7 +12,7 @@ import {
 import { STATUS_CONFIG } from './constants';
 import VitalTile from './components/VitalTile';
 import CO2Chart from './components/CO2Chart';
-import { fetchStatus, ApiStatus, toFahrenheit, StatusWebSocket, setERVSpeed, setHVACMode, ERVSpeed, HVACMode } from './api';
+import { fetchStatus, ApiStatus, toFahrenheit, StatusWebSocket, setERVSpeed, setHVACMode, ERVSpeed as ApiERVSpeed, HVACMode } from './api';
 
 // Default state when no data available
 const DEFAULT_STATE: OfficeState = {
@@ -24,11 +25,23 @@ const DEFAULT_STATE: OfficeState = {
   window: DeviceStatus.CLOSED,
   hvacMode: DeviceStatus.OFF,
   hvacTarget: 70,
-  ventMode: DeviceStatus.OFF,
+  ventMode: ERVSpeed.OFF,
   occupancy: OccupancyState.AWAY,
   lastUpdated: new Date(),
   isSystemError: true
 };
+
+// Map API ERV speed to display speed
+function mapERVSpeed(apiSpeed: string | undefined, running: boolean): ERVSpeed {
+  if (!running) return ERVSpeed.OFF;
+  switch (apiSpeed) {
+    case 'quiet': return ERVSpeed.QUIET;
+    case 'medium': return ERVSpeed.ELEVATED;
+    case 'turbo': return ERVSpeed.PURGE;
+    case 'off': return ERVSpeed.OFF;
+    default: return ERVSpeed.AUTO; // Running but speed unknown (automation)
+  }
+}
 
 // Convert API response to OfficeState
 function apiToState(api: ApiStatus): OfficeState {
@@ -44,7 +57,7 @@ function apiToState(api: ApiStatus): OfficeState {
               api.hvac?.mode === 'cool' ? DeviceStatus.COOL :
               api.hvac?.mode === 'off' ? DeviceStatus.OFF : DeviceStatus.OFF,
     hvacTarget: api.hvac?.setpoint_c ? toFahrenheit(api.hvac.setpoint_c) : 70,
-    ventMode: api.erv.running ? DeviceStatus.ON : DeviceStatus.OFF,
+    ventMode: mapERVSpeed(api.erv.speed, api.erv.running),
     occupancy: api.is_present ? OccupancyState.PRESENT : OccupancyState.AWAY,
     lastUpdated: api.air_quality.last_update ? new Date(api.air_quality.last_update) : new Date(),
     isSystemError: false
@@ -123,7 +136,7 @@ const App: React.FC = () => {
                 addEvent('state', `${newState.occupancy === OccupancyState.PRESENT ? 'Arrived' : 'Away'} - CO2 ${newState.co2} ppm`, newState.co2);
               }
               if (prev.ventMode !== newState.ventMode) {
-                addEvent('erv', `ERV ${newState.ventMode === DeviceStatus.ON ? 'ON' : 'OFF'}`, newState.co2);
+                addEvent('erv', `ERV ${newState.ventMode}`, newState.co2);
               }
               if (prev.door !== newState.door) {
                 addEvent('door', `Door ${newState.door === DeviceStatus.OPEN ? 'opened' : 'closed'}`);
@@ -184,7 +197,7 @@ const App: React.FC = () => {
           addEvent('state', `${newState.occupancy === OccupancyState.PRESENT ? 'Arrived' : 'Away'} - CO2 ${newState.co2} ppm`, newState.co2);
         }
         if (prev.ventMode !== newState.ventMode && !initialLoadRef.current) {
-          addEvent('erv', `ERV ${newState.ventMode === DeviceStatus.ON ? 'ON' : 'OFF'}`, newState.co2);
+          addEvent('erv', `ERV ${newState.ventMode}`, newState.co2);
         }
         lastOccupancyRef.current = newState.occupancy;
         return newState;
@@ -222,7 +235,7 @@ const App: React.FC = () => {
       if (state.co2 > Threshold.ELEVATED) return STATUS_CONFIG.PRESENT_ELEVATED;
       return STATUS_CONFIG.PRESENT_QUIET;
     } else {
-      if (state.ventMode !== DeviceStatus.OFF) return STATUS_CONFIG.AWAY_CLEARING;
+      if (state.ventMode !== ERVSpeed.OFF) return STATUS_CONFIG.AWAY_CLEARING;
       return STATUS_CONFIG.AWAY_CLEAR;
     }
   }, [state]);
@@ -230,7 +243,7 @@ const App: React.FC = () => {
   const currentStatus = getPrimaryStatus();
 
   // Control button handlers
-  const handleERVControl = useCallback(async (speed: ERVSpeed) => {
+  const handleERVControl = useCallback(async (speed: ApiERVSpeed) => {
     setControlLoading(`erv-${speed}`);
     try {
       const result = await setERVSpeed(speed);
@@ -299,8 +312,8 @@ const App: React.FC = () => {
             <span className="text-sm uppercase tracking-widest text-zinc-600">Humidity</span>
           </div>
           <div className="flex flex-col items-center">
-            <span className="text-4xl font-bold text-zinc-200">{state.ventMode === DeviceStatus.ON ? '🌀' : '❄️'}</span>
-            <span className="text-sm uppercase tracking-widest text-zinc-600">{state.ventMode === DeviceStatus.ON ? 'Vent' : 'Cool'}</span>
+            <span className="text-4xl font-bold text-zinc-200">{state.ventMode !== ERVSpeed.OFF ? '🌀' : '❄️'}</span>
+            <span className="text-sm uppercase tracking-widest text-zinc-600">{state.ventMode !== ERVSpeed.OFF ? state.ventMode : 'Cool'}</span>
           </div>
         </div>
         <div className="absolute bottom-8 text-zinc-800 font-mono">

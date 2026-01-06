@@ -14,6 +14,14 @@ export enum DeviceStatus {
   COOL = 'COOL'
 }
 
+export enum ERVSpeed {
+  OFF = 'OFF',
+  QUIET = 'QUIET',
+  ELEVATED = 'ELEVATED',
+  PURGE = 'PURGE',
+  AUTO = 'AUTO'
+}
+
 export interface ActivityEvent {
   id: string;
   timestamp: Date;
@@ -39,7 +47,7 @@ export interface OfficeState {
   window: DeviceStatus;
   hvacMode: DeviceStatus;
   hvacTarget: number;
-  ventMode: DeviceStatus;
+  ventMode: ERVSpeed;
   occupancy: OccupancyState;
   lastUpdated: Date;
   isSystemError: boolean;
