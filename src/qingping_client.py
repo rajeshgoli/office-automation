@@ -98,15 +98,26 @@ class QingpingMQTTClient:
 
     def _on_message(self, client, userdata, msg):
         try:
-            payload = json.loads(msg.payload.decode())
+            raw = msg.payload.decode()
+            logger.info(f"Qingping MQTT raw ({len(raw)} bytes): {raw[:200]}...")
+            payload = json.loads(raw)
             logger.debug(f"Received MQTT message: {payload}")
 
-            # Parse sensor data (type 17 is sensor report)
-            msg_type = payload.get("type")
+            # Parse sensor data - handle both formats:
+            # Format 1 (cloud): {"type": 17, "sensor_data": {...}}
+            # Format 2 (local): {"sensorData": [{"co2": {"value": ...}, ...}]}
 
-            if msg_type == 17:  # Sensor data report
+            sensor_data = None
+
+            # Try Format 2 first (local MQTT - camelCase array)
+            if "sensorData" in payload and isinstance(payload["sensorData"], list):
+                if payload["sensorData"]:
+                    sensor_data = payload["sensorData"][0]
+            # Fall back to Format 1 (cloud - snake_case object)
+            elif payload.get("type") == 17:
                 sensor_data = payload.get("sensor_data", {})
 
+            if sensor_data:
                 reading = QingpingReading(
                     device_name=f"Qingping Air Monitor",
                     mac_hint=payload.get("mac", self.device_mac),
@@ -116,7 +127,7 @@ class QingpingMQTTClient:
                     pm25=sensor_data.get("pm25", {}).get("value"),
                     pm10=sensor_data.get("pm10", {}).get("value"),
                     tvoc=sensor_data.get("tvoc", {}).get("value"),
-                    timestamp=datetime.fromtimestamp(payload.get("timestamp", 0)),
+                    timestamp=datetime.now(),
                     raw_data=msg.payload.decode(),
                 )
 
@@ -126,7 +137,7 @@ class QingpingMQTTClient:
                 if self._reading_callback:
                     self._reading_callback(reading)
             else:
-                logger.debug(f"Ignoring message type {msg_type}")
+                logger.debug(f"Ignoring message without sensor data: {list(payload.keys())}")
 
         except Exception as e:
             logger.error(f"Error parsing MQTT message: {e}")

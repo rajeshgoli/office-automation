@@ -1,13 +1,17 @@
 """
 Office Climate Automation State Machine
 
-Implements PRESENT/AWAY state logic from vision.md:
+Implements PRESENT/AWAY state logic:
 - PRESENT: Quiet mode - ERV off unless CO2 > 2000 ppm
 - AWAY: Ventilation mode - ERV full blast until CO2 < 500 ppm
 
 Presence detection:
   is_present = (mac_active AND external_monitor) OR motion_detected_recently
-  is_away = (door_close_sequence OR motion_timeout) AND NOT is_present
+
+State transitions:
+  AWAY → PRESENT: Any presence signal (immediate)
+  PRESENT → AWAY: REQUIRES door open→close sequence + no presence signals
+                  (motion timeout alone is not sufficient - can't leave without door)
 """
 
 import asyncio
@@ -101,9 +105,12 @@ class StateMachine:
 
     @property
     def should_be_away(self) -> bool:
-        """Check if departure conditions are met."""
-        departure_signal = self.door_just_closed or self.motion_timed_out
-        return departure_signal and not self.is_present
+        """Check if departure conditions are met.
+
+        REQUIRES door open→close sequence. Motion timeout alone is NOT sufficient
+        since user cannot leave the office without using the door.
+        """
+        return self.door_just_closed and not self.is_present
 
     @property
     def safety_interlock_active(self) -> bool:
