@@ -79,8 +79,9 @@ class Orchestrator:
         # WebSocket connections
         self._ws_clients: Set[web.WebSocketResponse] = set()
 
-        # Track if ERV is currently running
+        # Track if ERV is currently running and at what speed
         self._erv_running: bool = False
+        self._erv_speed: str = "off"  # "off", "quiet", "medium", "turbo"
 
         # Track tVOC-triggered ventilation (separate from CO2-based logic)
         self._tvoc_ventilation_active: bool = False
@@ -231,6 +232,7 @@ class Orchestrator:
                 logger.info("ACTION: ERV OFF (window/door open)")
                 self.erv.turn_off()
                 self._erv_running = False
+                self._erv_speed = "off"
                 if self._tvoc_ventilation_active:
                     self._tvoc_ventilation_active = False
                     self.db.log_climate_action("erv", "off", co2_ppm=co2, reason="safety_interlock")
@@ -244,13 +246,15 @@ class Orchestrator:
                     logger.info("ACTION: ERV OFF (manual override)")
                     self.erv.turn_off()
                     self._erv_running = False
+                    self._erv_speed = "off"
             else:
                 speed_map = {"quiet": FanSpeed.QUIET, "medium": FanSpeed.MEDIUM, "turbo": FanSpeed.TURBO}
                 fan_speed = speed_map.get(target_speed, FanSpeed.QUIET)
-                if not self._erv_running:
+                if not self._erv_running or self._erv_speed != target_speed:
                     logger.info(f"ACTION: ERV {target_speed.upper()} (manual override)")
                     self.erv.turn_on(fan_speed)
                     self._erv_running = True
+                    self._erv_speed = target_speed
             return  # Skip automation logic when manual override is active
 
         # Determine what's triggering ventilation
@@ -263,29 +267,30 @@ class Orchestrator:
             # tVOC triggers MEDIUM, CO2 critical triggers QUIET
             # tVOC takes precedence (MEDIUM is louder but handles VOCs)
             if tvoc_triggered:
-                if not self._erv_running or not self._tvoc_ventilation_active:
+                if not self._erv_running or self._erv_speed != "medium":
                     logger.info(f"ACTION: ERV MEDIUM (tVOC high: {tvoc}ppb)")
                     self.erv.turn_on(FanSpeed.MEDIUM)
                     self._erv_running = True
+                    self._erv_speed = "medium"
                     if not self._tvoc_ventilation_active:
                         self._tvoc_ventilation_active = True
                         self.db.log_climate_action("erv", "medium", co2_ppm=co2, reason=f"tvoc_high_{tvoc}ppb")
             elif co2_critical:
-                if not self._erv_running:
+                if not self._erv_running or self._erv_speed != "quiet":
                     logger.info(f"ACTION: ERV QUIET (CO2 critical: {co2}ppm)")
                     self.erv.turn_on(FanSpeed.QUIET)
                     self._erv_running = True
-                elif self._tvoc_ventilation_active:
-                    # tVOC cleared, but CO2 still critical - downgrade to QUIET
-                    logger.info(f"ACTION: ERV QUIET (tVOC OK, CO2 still critical: {co2}ppm)")
-                    self.erv.turn_on(FanSpeed.QUIET)
-                    self._tvoc_ventilation_active = False
-                    self.db.log_climate_action("erv", "quiet", co2_ppm=co2, reason="tvoc_cleared_co2_critical")
+                    self._erv_speed = "quiet"
+                    if self._tvoc_ventilation_active:
+                        # tVOC cleared, but CO2 still critical - downgrade to QUIET
+                        self._tvoc_ventilation_active = False
+                        self.db.log_climate_action("erv", "quiet", co2_ppm=co2, reason="tvoc_cleared_co2_critical")
             else:
                 if self._erv_running:
                     logger.info("ACTION: ERV OFF (present, air quality OK)")
                     self.erv.turn_off()
                     self._erv_running = False
+                    self._erv_speed = "off"
                     if self._tvoc_ventilation_active:
                         self._tvoc_ventilation_active = False
                         self.db.log_climate_action("erv", "off", co2_ppm=co2, reason="tvoc_cleared")
@@ -295,16 +300,18 @@ class Orchestrator:
             # CO2 refresh uses TURBO, tVOC-only uses MEDIUM
             if co2_needs_refresh:
                 # TURBO handles both CO2 and tVOC
-                if not self._erv_running:
+                if not self._erv_running or self._erv_speed != "turbo":
                     logger.info(f"ACTION: ERV TURBO (away mode, CO2={co2}ppm)")
                     self.erv.turn_on(FanSpeed.TURBO)
                     self._erv_running = True
+                    self._erv_speed = "turbo"
             elif tvoc_triggered:
                 # CO2 is good but tVOC needs clearing
-                if not self._erv_running or not self._tvoc_ventilation_active:
+                if not self._erv_running or self._erv_speed != "medium":
                     logger.info(f"ACTION: ERV MEDIUM (away, tVOC high: {tvoc}ppb, CO2 OK)")
                     self.erv.turn_on(FanSpeed.MEDIUM)
                     self._erv_running = True
+                    self._erv_speed = "medium"
                     if not self._tvoc_ventilation_active:
                         self._tvoc_ventilation_active = True
                         self.db.log_climate_action("erv", "medium", co2_ppm=co2, reason=f"tvoc_high_{tvoc}ppb_away")
@@ -314,6 +321,7 @@ class Orchestrator:
                     logger.info(f"ACTION: ERV OFF ({reason}: CO2={co2}ppm)")
                     self.erv.turn_off()
                     self._erv_running = False
+                    self._erv_speed = "off"
                     if self._tvoc_ventilation_active:
                         self._tvoc_ventilation_active = False
                         self.db.log_climate_action("erv", "off", co2_ppm=co2, reason=reason)
@@ -632,7 +640,7 @@ class Orchestrator:
         sm_status["erv"] = {
             "running": self._erv_running,
             "tvoc_ventilation": self._tvoc_ventilation_active,
-            "speed": self._manual_erv_speed if self._manual_erv_override else ("off" if not self._erv_running else "auto"),
+            "speed": self._erv_speed,
         }
 
         # Add HVAC status

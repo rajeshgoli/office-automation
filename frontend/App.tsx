@@ -32,14 +32,13 @@ const DEFAULT_STATE: OfficeState = {
 };
 
 // Map API ERV speed to display speed
-function mapERVSpeed(apiSpeed: string | undefined, running: boolean): ERVSpeed {
-  if (!running) return ERVSpeed.OFF;
+function mapERVSpeed(apiSpeed: string | undefined): ERVSpeed {
   switch (apiSpeed) {
     case 'quiet': return ERVSpeed.QUIET;
     case 'medium': return ERVSpeed.ELEVATED;
     case 'turbo': return ERVSpeed.PURGE;
     case 'off': return ERVSpeed.OFF;
-    default: return ERVSpeed.AUTO; // Running but speed unknown (automation)
+    default: return ERVSpeed.OFF;
   }
 }
 
@@ -57,7 +56,7 @@ function apiToState(api: ApiStatus): OfficeState {
               api.hvac?.mode === 'cool' ? DeviceStatus.COOL :
               api.hvac?.mode === 'off' ? DeviceStatus.OFF : DeviceStatus.OFF,
     hvacTarget: api.hvac?.setpoint_c ? toFahrenheit(api.hvac.setpoint_c) : 70,
-    ventMode: mapERVSpeed(api.erv.speed, api.erv.running),
+    ventMode: mapERVSpeed(api.erv.speed),
     occupancy: api.is_present ? OccupancyState.PRESENT : OccupancyState.AWAY,
     lastUpdated: api.air_quality.last_update ? new Date(api.air_quality.last_update) : new Date(),
     isSystemError: false

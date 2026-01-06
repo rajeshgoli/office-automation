@@ -18,8 +18,7 @@ export enum ERVSpeed {
   OFF = 'OFF',
   QUIET = 'QUIET',
   ELEVATED = 'ELEVATED',
-  PURGE = 'PURGE',
-  AUTO = 'AUTO'
+  PURGE = 'PURGE'
 }
 
 export interface ActivityEvent {
