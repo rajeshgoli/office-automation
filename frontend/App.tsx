@@ -19,6 +19,7 @@ const DEFAULT_STATE: OfficeState = {
   temperature: 0,
   tempTrend: 'stable',
   humidity: 0,
+  tvoc: 0,
   door: DeviceStatus.CLOSED,
   window: DeviceStatus.CLOSED,
   hvacMode: DeviceStatus.OFF,
@@ -35,7 +36,8 @@ function apiToState(api: ApiStatus): OfficeState {
     co2: api.air_quality.co2_ppm ?? api.sensors.co2_ppm ?? 0,
     temperature: api.air_quality.temp_c ? toFahrenheit(api.air_quality.temp_c) : 0,
     tempTrend: 'stable',
-    humidity: api.air_quality.humidity ?? 0,
+    humidity: api.air_quality.humidity ? Math.round(api.air_quality.humidity * 10) / 10 : 0,
+    tvoc: api.air_quality.tvoc ?? 0,
     door: api.sensors.door_open ? DeviceStatus.OPEN : DeviceStatus.CLOSED,
     window: api.sensors.window_open ? DeviceStatus.OPEN : DeviceStatus.CLOSED,
     hvacMode: api.hvac?.mode === 'heat' ? DeviceStatus.HEAT :
@@ -314,6 +316,12 @@ const App: React.FC = () => {
           value={state.humidity || '---'}
           unit="%"
           icon="💧"
+        />
+        <VitalTile
+          label="tVOC"
+          value={state.tvoc || '---'}
+          unit="ppb"
+          icon="🌫️"
         />
         <VitalTile
           label="Door"

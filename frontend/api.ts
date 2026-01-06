@@ -24,6 +24,7 @@ export interface ApiStatus {
     temp_c: number | null;
     humidity: number | null;
     pm25: number | null;
+    tvoc: number | null;
     last_update: string | null;
   };
   erv: {

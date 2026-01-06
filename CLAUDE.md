@@ -15,13 +15,15 @@ Office Climate Automation system for a backyard shed office. The system coordina
 **Working:**
 - YoLink sensors (door, window, motion) via Cloud MQTT
 - ERV control via Tuya local API (tinytuya)
-- Qingping Air Monitor bound to local MQTT (Mosquitto)
-- State machine (PRESENT/AWAY) with all inputs
-- Orchestrator wired up and ready to run
+- Qingping Air Monitor via local MQTT - CO2, temp, humidity, tVOC
+- State machine (PRESENT/AWAY) with door-event requirement for departure
+- SQLite database for persistence and historical analysis
+- React dashboard with live data (WebSocket + polling fallback)
+- macOS occupancy detector sending presence to orchestrator
 
 **Pending:**
-- First Qingping sensor data via MQTT (device uploads every 15 min)
 - Mitsubishi Kumo not wired into orchestrator (client exists in `src/kumo_client.py`)
+- tVOC-based ventilation (Issue #1: >250 ppb triggers ERV 3/2)
 
 ## Hardware Devices
 
@@ -70,32 +72,42 @@ office-automate/
 ├── config.yaml            # Credentials and device config
 ├── requirements.txt       # Python dependencies
 ├── occupancy_detector.py  # macOS presence detection
-├── run.py                 # Main entry point
+├── run.py                 # Main entry point (--port arg supported)
 ├── roadmap.md             # Progress tracking (update as you work!)
+├── data/                  # SQLite database (gitignored)
+│   └── office_climate.db
+├── frontend/              # React + Vite dashboard
+│   ├── App.tsx
+│   ├── api.ts             # API client + WebSocket
+│   └── ...
 └── src/
     ├── config.py          # Config loader
+    ├── database.py        # SQLite persistence + analysis
     ├── yolink_client.py   # YoLink cloud API (HTTP + MQTT)
     ├── qingping_client.py # Qingping MQTT client (local broker)
     ├── erv_client.py      # ERV control via Tuya local
     ├── kumo_client.py     # Mitsubishi Kumo Cloud (NOT WIRED YET)
     ├── state_machine.py   # PRESENT/AWAY state logic
-    └── orchestrator.py    # Main coordinator
+    └── orchestrator.py    # Main coordinator + HTTP/WS server
 ```
 
 ## Running
 
 ```bash
-# Activate venv
+# Terminal 1: Backend
 source venv/bin/activate
+brew services start mosquitto  # Required for Qingping
+python run.py --port 9001
 
-# Start Mosquitto (required for Qingping)
-brew services start mosquitto
+# Terminal 2: Frontend
+cd frontend
+VITE_API_PORT=9001 npm run dev -- --port 9002
 
-# Run the orchestrator
-python run.py
+# Terminal 3: Mac occupancy detector
+python3 occupancy_detector.py --watch --url http://localhost:9001
 
 # Check status
-curl http://localhost:8080/status
+curl http://localhost:9001/status
 ```
 
 ## Device Details
@@ -121,11 +133,11 @@ curl http://localhost:8080/status
 
 ## Next Steps for Future Agent
 
-1. **Verify Qingping data** - Run `mosquitto_sub -h 127.0.0.1 -t "qingping/#" -v` and wait for data
-2. **Test automation** - Start orchestrator, leave office, verify ERV turns on
-3. **Wire Mitsubishi** - Add kumo_client to orchestrator for HVAC control
-4. **Reduce upload interval** - Consider changing to 10 min in developer portal
-5. **Deploy to Pi** - Move orchestrator to always-on Raspberry Pi
+1. **Issue #1: tVOC ventilation** - tVOC > 250 ppb triggers ERV at 3/2 speed
+2. **Wire Mitsubishi** - Add kumo_client to orchestrator for HVAC control
+3. **Test automation** - Leave office, verify ERV turns on when CO2 > 500
+4. **Deploy to Pi** - Move orchestrator to always-on Raspberry Pi
+5. **Query database** - Use `sqlite3 data/office_climate.db` for historical analysis
 
 ## Deployment
 

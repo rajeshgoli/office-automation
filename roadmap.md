@@ -326,3 +326,37 @@ Implement the core rules from vision.md.
   - Wire Mitsubishi Kumo client (HVAC control)
   - Persist CO2 history to file for restart recovery
   - Add events endpoint (`GET /events`) for historical event log
+
+**2026-01-05** (Session 4)
+- **State Machine Bug Fixed**
+  - PRESENT→AWAY now requires door open→close event
+  - Motion timeout alone no longer triggers departure
+  - "Can't leave without using the door"
+- **Qingping MQTT Parser Fixed**
+  - Supports local format (`sensorData` array, camelCase)
+  - Was expecting cloud format (`type: 17`, `sensor_data` object)
+  - Now receiving live CO2, temp, humidity data
+- **SQLite Database Added** (`src/database.py`)
+  - `sensor_readings` - CO2, temp, humidity, tVOC, PM2.5 history
+  - `occupancy_log` - State changes with timestamps
+  - `device_events` - Door, window, motion events
+  - `climate_actions` - ERV/HVAC control actions
+  - Restores last Qingping reading on startup (survives restarts)
+  - Analysis helpers: `get_daily_co2_stats()`, `get_occupancy_patterns()`
+- **Dashboard Fixes**
+  - HVAC status from API (was hardcoded COOL 70°, now shows HEAT 72°)
+  - Fixed spurious "Arrived" events on page load/reconnect
+  - Added tVOC tile
+  - Fixed humidity decimal precision (1 decimal place)
+- **GitHub Issue #1 Filed**
+  - tVOC > 250 ppb should trigger ERV at 3/2 speed
+  - For clearing volatile chemicals (food odors)
+- **Files Changed**:
+  - `src/state_machine.py` - Door event required for departure
+  - `src/qingping_client.py` - Local MQTT format support
+  - `src/database.py` - New SQLite persistence layer
+  - `src/orchestrator.py` - Database integration, HVAC status in API
+  - `frontend/App.tsx` - HVAC from API, event deduplication, tVOC tile
+  - `frontend/api.ts` - HVAC and tVOC types
+  - `frontend/types.ts` - tVOC field
+  - `.gitignore` - Ignore data/ directory

@@ -264,6 +264,7 @@ class Orchestrator:
             "temp_c": reading.temp_c if reading else None,
             "humidity": reading.humidity if reading else None,
             "pm25": reading.pm25 if reading else None,
+            "tvoc": reading.tvoc if reading else None,
             "last_update": reading.timestamp.isoformat() if reading and reading.timestamp else None,
         }
 
