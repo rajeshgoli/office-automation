@@ -51,7 +51,7 @@ GET http://localhost:8080/status
   "safety_interlock": false,
   "erv_should_run": false,
   "sensors": {
-    "mac_active": true,
+    "mac_last_active": 1704567890.123,
     "external_monitor": true,
     "motion_detected": false,
     "door_open": false,

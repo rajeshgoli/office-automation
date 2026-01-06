@@ -43,7 +43,8 @@ class QingpingReading:
     co2_ppm: Optional[int] = None
     pm25: Optional[int] = None
     pm10: Optional[int] = None
-    tvoc: Optional[int] = None
+    tvoc: Optional[int] = None  # tVOC index (0-500 scale from Sensirion SGP40)
+    noise_db: Optional[int] = None  # Noise level in dB
     timestamp: Optional[datetime] = None
     raw_data: Optional[str] = None
 
@@ -55,7 +56,9 @@ class QingpingMQTTClient:
     Connects to a local MQTT broker that receives data from Qingping devices
     configured via the developer portal's "Private Access" feature.
 
-    Topic format: qingping/{mac}/up for device data
+    Topic format:
+    - qingping/{mac}/up - device publishes sensor data
+    - qingping/{mac}/down - send configuration commands to device
     """
 
     def __init__(
@@ -65,6 +68,7 @@ class QingpingMQTTClient:
         mqtt_port: int = 1883,
         mqtt_user: Optional[str] = None,
         mqtt_pass: Optional[str] = None,
+        report_interval: int = 60,
     ):
         if not HAS_PAHO:
             raise ImportError("paho-mqtt is required. Install with: pip install paho-mqtt")
@@ -74,11 +78,13 @@ class QingpingMQTTClient:
         self.mqtt_port = mqtt_port
         self.mqtt_user = mqtt_user
         self.mqtt_pass = mqtt_pass
+        self.report_interval = report_interval
 
         self._client: Optional[mqtt.Client] = None
         self._latest_reading: Optional[QingpingReading] = None
         self._reading_callback: Optional[Callable[[QingpingReading], None]] = None
         self._connected = False
+        self._interval_configured = False
 
     def _on_connect(self, client, userdata, flags, rc, properties=None):
         if rc == 0:
@@ -118,6 +124,12 @@ class QingpingMQTTClient:
                 sensor_data = payload.get("sensor_data", {})
 
             if sensor_data:
+                # tVOC is reported as "tvoc_index" (Sensirion SGP40 VOC index 0-500)
+                # or "tvoc" in some firmware versions
+                tvoc_val = sensor_data.get("tvoc_index", {}).get("value")
+                if tvoc_val is None:
+                    tvoc_val = sensor_data.get("tvoc", {}).get("value")
+
                 reading = QingpingReading(
                     device_name=f"Qingping Air Monitor",
                     mac_hint=payload.get("mac", self.device_mac),
@@ -126,13 +138,14 @@ class QingpingMQTTClient:
                     co2_ppm=sensor_data.get("co2", {}).get("value"),
                     pm25=sensor_data.get("pm25", {}).get("value"),
                     pm10=sensor_data.get("pm10", {}).get("value"),
-                    tvoc=sensor_data.get("tvoc", {}).get("value"),
+                    tvoc=tvoc_val,
+                    noise_db=sensor_data.get("noise", {}).get("value"),
                     timestamp=datetime.now(),
                     raw_data=msg.payload.decode(),
                 )
 
                 self._latest_reading = reading
-                logger.info(f"Qingping: {reading.temp_c}°C, {reading.humidity}%, CO2={reading.co2_ppm}ppm")
+                logger.info(f"Qingping: {reading.temp_c}°C, {reading.humidity}%, CO2={reading.co2_ppm}ppm, tVOC={reading.tvoc}, noise={reading.noise_db}dB")
 
                 if self._reading_callback:
                     self._reading_callback(reading)
@@ -161,6 +174,52 @@ class QingpingMQTTClient:
             self._client.loop_stop()
             self._client.disconnect()
             self._connected = False
+
+    def configure_interval(self, interval_seconds: int = None):
+        """
+        Configure the device's reporting interval.
+
+        Sends a configuration message to qingping/{mac}/down to change how
+        often the device reports sensor data. The device must be connected
+        to the MQTT broker for this to work.
+
+        Args:
+            interval_seconds: Report interval in seconds (default: use self.report_interval)
+                            Minimum recommended: 15 seconds
+        """
+        if not self._connected or not self._client:
+            logger.warning("Cannot configure interval: not connected to MQTT")
+            return False
+
+        interval = interval_seconds or self.report_interval
+        topic = f"qingping/{self.device_mac}/down"
+
+        # Configuration message format for Qingping devices
+        config_msg = {
+            "id": 1,
+            "need_ack": 1,
+            "type": "17",
+            "setting": {
+                "report_interval": interval,
+                "collect_interval": interval,
+                "co2_sampling_interval": interval,
+                "pm_sampling_interval": interval,
+            }
+        }
+
+        try:
+            payload = json.dumps(config_msg)
+            result = self._client.publish(topic, payload)
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                logger.info(f"Configured Qingping interval to {interval}s via {topic}")
+                self._interval_configured = True
+                return True
+            else:
+                logger.error(f"Failed to publish interval config: rc={result.rc}")
+                return False
+        except Exception as e:
+            logger.error(f"Error configuring interval: {e}")
+            return False
 
     def set_callback(self, callback: Callable[[QingpingReading], None]):
         """Set a callback function to be called when new readings arrive."""

@@ -15,14 +15,15 @@ Office Climate Automation system for a backyard shed office. The system coordina
 **Working:**
 - YoLink sensors (door, window, motion) via Cloud MQTT
 - ERV control via Tuya local API (tinytuya)
-- Qingping Air Monitor via local MQTT - CO2, temp, humidity, tVOC
+- Qingping Air Monitor via local MQTT - CO2, temp, humidity, tVOC index, noise dB
 - State machine (PRESENT/AWAY) with robust presence detection
 - SQLite database for persistence and historical analysis
 - React dashboard with live data (WebSocket + polling fallback)
 - Dashboard quick controls for manual ERV/HVAC override
 - macOS occupancy detector (keyboard/mouse activity)
 - HVAC coordination (suspends heating when ERV venting)
-- tVOC-triggered ventilation (>250 ppb triggers ERV)
+- HVAC status polling (syncs dashboard with manual remote/app changes)
+- tVOC-triggered ventilation (VOC index >250 triggers ERV)
 
 **Pending:**
 - Deploy to Raspberry Pi for always-on operation
@@ -58,28 +59,40 @@ Office Climate Automation system for a backyard shed office. The system coordina
 ```
 
 ### Two-State System
-- **PRESENT**: Quiet mode - ERV off unless CO2 > 2000 ppm or tVOC > 250 ppb
+- **PRESENT**: Quiet mode - ERV off unless CO2 > 2000 ppm or tVOC index > 250
 - **AWAY**: Ventilation mode - ERV PURGE until CO2 < 500 ppm
 
 ### Presence Detection Logic
 
+**Architecture:**
+- Mac occupancy detector sends **raw timestamps** of last keyboard/mouse activity
+- State machine uses timestamp comparisons - NO idle threshold needed!
+- Door event timestamp is the source of truth for presence/departure
+
 **AWAY → PRESENT triggers:**
-- Mac keyboard/mouse activity (strongest signal)
-- Motion detected while door is closed
+- Mac keyboard/mouse activity AFTER last door event (strongest signal)
+- Motion detected AFTER last door event while door is closed
 
 **NOT triggers for PRESENT:**
 - Door opening alone (might just grab something)
-- External monitor connected (just means Mac is there)
+- External monitor connected alone (just means Mac is there)
 
 **PRESENT → AWAY triggers:**
-- Door closes + 10s no activity (departure verification)
+- Door closes + 10s verification with no activity
+
+**Timestamp-based detection:**
+- `mac_presence = external_monitor AND (mac_last_active > door_last_changed)`
+- Only activity AFTER last door event counts as presence
+- Pre-departure activity (walking to door) automatically ignored
+- Watching a movie (no keyboard): door hasn't closed → still PRESENT
+- Walk away: door closes → departure verification → AWAY
 
 ### ERV Speed Modes
 | Mode | Fan Speed | Trigger |
 |------|-----------|---------|
 | **OFF** | 0/0 | Default when present, air quality OK |
 | **QUIET** | 1/1 | CO2 > 2000 ppm while present |
-| **ELEVATED** | 3/2 | tVOC > 250 ppb (positive pressure) |
+| **ELEVATED** | 3/2 | tVOC index > 250 (positive pressure) |
 | **PURGE** | 8/8 | Away mode CO2 refresh |
 
 ### Safety Interlocks
@@ -87,14 +100,17 @@ Office Climate Automation system for a backyard shed office. The system coordina
 - ANY presence signal → immediate PRESENT transition
 
 ### Key Thresholds
-| Parameter | Value |
-|-----------|-------|
-| CO2 critical (ERV on while present) | 2000 ppm |
-| CO2 refresh target (away mode) | 500 ppm |
-| tVOC threshold (triggers ELEVATED) | 250 ppb |
-| Motion timeout | 60 seconds |
-| Departure verification | 10 seconds |
-| Manual override timeout | 30 minutes |
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| CO2 critical (ERV on while present) | 2000 ppm | Turn ON threshold |
+| CO2 critical hysteresis | 200 ppm | Turn OFF at (2000-200) = 1800 ppm |
+| CO2 refresh target (away mode) | 500 ppm | |
+| tVOC index threshold (triggers ELEVATED) | 250 | |
+| Motion timeout | 60 seconds | |
+| Departure verification | 10 seconds | |
+| Manual override timeout | 30 minutes | |
+
+**Hysteresis explained:** ERV turns ON when CO2 ≥ 2000 ppm, but stays ON until CO2 < 1800 ppm. This prevents rapid on/off cycling when CO2 hovers around the threshold.
 
 ## Code Structure
 
@@ -123,15 +139,38 @@ office-automate/
     └── orchestrator.py    # Main coordinator + HTTP/WS server
 ```
 
+## Database
+
+**Location:** `data/office_climate.db` (SQLite)
+
+**Tables:**
+- `sensor_readings` - CO2, temp, humidity, tVOC, PM2.5, noise history
+  - Columns: `timestamp`, `co2_ppm`, `temp_c`, `humidity`, `pm25`, `pm10`, `tvoc`, `noise_db`, `source`
+- `occupancy_log` - State changes (PRESENT/AWAY) with timestamps
+- `device_events` - Door, window, motion events
+- `climate_actions` - ERV/HVAC control actions with reasons
+
+**Important:** All timestamps are stored in **local time (PST)**, not UTC. This was changed in Session 6 to simplify debugging and analysis.
+
+**Querying Examples:**
+```bash
+# Recent door events (timestamps already in PST)
+sqlite3 data/office_climate.db "SELECT timestamp, event FROM device_events WHERE device_type='door' ORDER BY timestamp DESC LIMIT 10"
+
+# CO2 trend (last 24 hours)
+sqlite3 data/office_climate.db "SELECT timestamp, co2_ppm FROM sensor_readings WHERE timestamp > datetime('now', '-24 hours') ORDER BY timestamp"
+```
+
 ## API Endpoints
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/status` | Current system status (JSON) |
 | GET | `/ws` | WebSocket for real-time updates |
-| POST | `/occupancy` | Mac keyboard/mouse activity |
+| POST | `/occupancy` | Mac keyboard/mouse activity `{"last_active_timestamp": 1704567890.123, "external_monitor": true}` |
 | POST | `/erv` | Manual ERV control `{"speed": "off\|quiet\|medium\|turbo"}` |
 | POST | `/hvac` | Manual HVAC control `{"mode": "off\|heat", "setpoint_f": 70}` |
+| POST | `/qingping/interval` | Configure sensor report interval `{"interval": 60}` (seconds, min 15) |
 
 ## Running
 
@@ -167,8 +206,12 @@ curl -X POST http://localhost:9001/erv -H "Content-Type: application/json" -d '{
 ### Qingping (Local MQTT)
 - MAC: `582D3470765F`
 - Broker: Mosquitto on `127.0.0.1:1883`
-- Topic: `qingping/582D3470765F/up`
-- Upload interval: 15 minutes (set in developer.qingping.co)
+- Topic (receive): `qingping/582D3470765F/up`
+- Topic (configure): `qingping/582D3470765F/down`
+- Report interval: 30s (configurable in config.yaml, min 15s)
+- Sensors: CO2 (ppm), temp (°C), humidity (%), PM2.5, PM10, tVOC index (SGP40 0-500 scale), noise (dB)
+- All sensor data saved to database for historical analysis
+- Configured automatically on startup, or via POST `/qingping/interval`
 
 ### YoLink (Cloud)
 - Using Cloud API (not local hub)
@@ -176,9 +219,13 @@ curl -X POST http://localhost:9001/erv -H "Content-Type: application/json" -d '{
 - Credentials: in config.yaml (uaid, secret_key)
 
 ### Mitsubishi Kumo
-- Control via pykumo library
+- Control via Kumo Cloud API (custom client)
 - Suspends heating when ERV is venting (don't heat cold outside air)
 - Resumes when ERV stops or user returns
+- Status polling: Syncs dashboard with manual changes (remote/app)
+  - Default: 300s (5 min) - configurable via `mitsubishi.poll_interval_seconds`
+  - Updates local state and broadcasts to dashboard via WebSocket
+  - Note: Cloud API polling only - no push notifications available
 
 ## Deployment
 

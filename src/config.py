@@ -29,6 +29,7 @@ class QingpingConfig:
     device_mac: str
     mqtt_broker: str = "127.0.0.1"
     mqtt_port: int = 1883
+    report_interval: int = 60  # Seconds between sensor reports (min: 15)
 
 
 @dataclass
@@ -46,11 +47,13 @@ class MitsubishiConfig:
     device_serial: Optional[str] = None
     type: str = "kumo"  # "kumo" or "esphome"
     ip: Optional[str] = None
+    poll_interval_seconds: int = 300  # How often to poll device status (5 min default)
 
 
 @dataclass
 class ThresholdsConfig:
     co2_critical_ppm: int = 2000
+    co2_critical_hysteresis_ppm: int = 200  # Turn off when CO2 < (critical - hysteresis)
     co2_refresh_target_ppm: int = 500
     tvoc_threshold_ppb: int = 250  # tVOC > this triggers ERV at MEDIUM (3/2)
     hvac_min_temp_f: int = 68  # Don't heat above this when away + ERV running

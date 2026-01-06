@@ -5,13 +5,15 @@ Implements PRESENT/AWAY state logic:
 - PRESENT: Quiet mode - ERV off unless CO2 > 2000 ppm
 - AWAY: Ventilation mode - ERV full blast until CO2 < 500 ppm
 
-Presence detection:
-  is_present = (mac_active AND external_monitor) OR motion_detected_recently
+Presence detection (timestamp-based):
+  mac_presence = external_monitor AND (mac_last_active > door_last_changed)
+  motion_presence = motion_recent AND door_closed AND (motion_last_seen > door_last_changed)
+  is_present = mac_presence OR motion_presence
 
 State transitions:
   AWAY → PRESENT: Any presence signal (immediate)
-  PRESENT → AWAY: REQUIRES door open→close sequence + no presence signals
-                  (motion timeout alone is not sufficient - can't leave without door)
+  PRESENT → AWAY: Door close + 10s verification with no activity
+                  (Only door close can trigger departure - can't leave without door)
 """
 
 import asyncio
@@ -33,7 +35,7 @@ class OccupancyState(Enum):
 class SensorState:
     """Current state of all sensors."""
     # macOS occupancy
-    mac_active: bool = False
+    mac_last_active: float = 0  # timestamp of last keyboard/mouse activity
     external_monitor: bool = False
 
     # YoLink sensors
@@ -84,23 +86,33 @@ class StateMachine:
         """Check if any presence signal is active.
 
         Presence signals (can trigger AWAY→PRESENT):
-        - Mac keyboard/mouse activity (strongest signal - you're at the computer)
-        - Motion detected while door is closed (you're inside)
+        - Mac keyboard/mouse activity AFTER last door event (strongest signal)
+        - Motion detected AFTER last door event while door is closed
+
+        Key: Only activity AFTER the door last changed counts as presence.
+        Activity before door close was the user walking TO the door (departure).
 
         Note: Door opening alone doesn't trigger PRESENT (might just be grabbing something)
         External monitor connected just means the Mac is at the desk, not that you're there.
         """
-        # Mac keyboard/mouse activity (idle < threshold) = actively using computer
-        # This is the strongest presence signal
-        mac_active = self.sensors.mac_active  # True if recent keyboard/mouse activity
+        # Mac activity only counts if:
+        # 1. External monitor connected (Mac is in the room)
+        # 2. Activity happened AFTER last door event (not pre-departure)
+        # No idle threshold needed - door close + verification timer handles departure
+        mac_presence = (self.sensors.external_monitor and
+                       self.sensors.mac_last_active > self.sensors.door_last_changed)
 
         # Recent motion while door is closed = inside the room
         motion_age = time.time() - self.sensors.motion_last_seen
         motion_recent = self.sensors.motion_detected or (motion_age < self.config.motion_timeout_seconds)
-        # Motion only counts if door is closed (otherwise might be outside reaching in)
-        motion_inside = motion_recent and not self.sensors.door_open
+        # Motion only counts if:
+        # 1. Door is closed (not outside reaching in)
+        # 2. Motion happened AFTER door last changed (not pre-departure walking to door)
+        motion_inside = (motion_recent and
+                        not self.sensors.door_open and
+                        self.sensors.motion_last_seen > self.sensors.door_last_changed)
 
-        return mac_active or motion_inside
+        return mac_presence or motion_inside
 
     @property
     def door_just_closed(self) -> bool:
@@ -177,12 +189,11 @@ class StateMachine:
                 logger.info("Departure verified: no activity detected → AWAY")
                 old_state = self.state
                 self.state = OccupancyState.AWAY
-                # Reset all presence signals so only NEW activity triggers return
-                # - Motion: reset timestamp so stale motion doesn't trigger PRESENT
-                # - Mac: reset so only fresh keyboard/mouse activity triggers PRESENT
+                # Reset motion signals so only NEW activity triggers return
+                # Motion: reset timestamp so stale motion doesn't trigger PRESENT
+                # Mac: timestamp comparison with door_last_changed handles this automatically
                 self.sensors.motion_last_seen = 0
                 self.sensors.motion_detected = False
-                self.sensors.mac_active = False
                 await self._notify_state_change(old_state, self.state)
         except asyncio.CancelledError:
             pass  # Timer was cancelled due to activity
@@ -229,15 +240,21 @@ class StateMachine:
 
     # --- Sensor update methods ---
 
-    async def update_mac_occupancy(self, active: bool, external_monitor: bool):
-        """Update macOS occupancy status."""
-        self.sensors.mac_active = active
-        self.sensors.external_monitor = external_monitor
-        self.sensors.last_updated = time.time()
-        logger.debug(f"Mac occupancy: active={active}, monitor={external_monitor}")
+    async def update_mac_occupancy(self, last_active_timestamp: float, external_monitor: bool):
+        """Update macOS occupancy status.
 
-        # Cancel departure verification if mac shows activity
-        if active and self._verifying_departure:
+        Args:
+            last_active_timestamp: Timestamp of last keyboard/mouse activity (Unix time)
+            external_monitor: Whether external monitor is connected
+        """
+        self.sensors.external_monitor = external_monitor
+        self.sensors.mac_last_active = last_active_timestamp
+        self.sensors.last_updated = time.time()
+
+        logger.debug(f"Mac occupancy: last_active={last_active_timestamp:.1f}, monitor={external_monitor}")
+
+        # Cancel departure verification if mac shows activity after door event
+        if last_active_timestamp > self.sensors.door_last_changed and self._verifying_departure:
             self._cancel_departure_verification("mac activity")
 
         await self.evaluate()
@@ -297,7 +314,7 @@ class StateMachine:
             "erv_should_run": self.erv_should_run,
             "verifying_departure": self._verifying_departure,
             "sensors": {
-                "mac_active": self.sensors.mac_active,
+                "mac_last_active": self.sensors.mac_last_active,
                 "external_monitor": self.sensors.external_monitor,
                 "motion_detected": self.sensors.motion_detected,
                 "door_open": self.sensors.door_open,

@@ -56,11 +56,21 @@ AWAY (ventilation mode):
 
 ### Presence Detection Logic
 ```
-is_present = (
-    (mac_active AND external_monitor_connected)
-    OR motion_detected_recently
+mac_presence = (
+    external_monitor_connected AND
+    mac_last_active > door_last_changed
 )
+
+motion_presence = (
+    motion_recent AND
+    door_closed AND
+    motion_last_seen > door_last_changed
+)
+
+is_present = mac_presence OR motion_presence
 ```
+
+**Key insight:** Door event timestamp is the source of truth. Only activity AFTER the last door event counts as presence, automatically filtering out pre-departure activity.
 
 ### Departure Detection Logic
 ```
@@ -94,10 +104,12 @@ TO PRESENT:
 ### Rule 1: Present Mode — Quiet Priority
 ```
 IF is_present:
-    IF CO2 > 2000 ppm:
+    IF CO2 >= 2000 ppm:
         → ERV ON (necessary evil - air quality critical)
+    ELSE IF ERV is running AND CO2 < 1800 ppm:
+        → ERV OFF (hysteresis: 200 ppm band prevents cycling)
     ELSE:
-        → ERV OFF (preserve quiet)
+        → Maintain current state (in hysteresis band 1800-2000 ppm)
 ```
 
 ### Rule 2: Away Mode — Aggressive Refresh
@@ -147,15 +159,15 @@ ALWAYS:
 │  Priority: QUIET                │                  │
 └─────────────────────────────────┘                  │
         │                                            │
-        │ door_close OR motion_timeout               │
-        │ AND NOT (mac_active + monitor)             │
+        │ door_close + 10s verification              │
+        │ (no activity after door close)             │
         ▼                                            │
 ┌─────────────────────────────────┐                  │
 │            AWAY                 │                  │
 │  ─────────────────────────────  │                  │
 │  ERV: FULL if CO2 > 500         │──────────────────┘
 │  HVAC: Maintain or setback      │   ANY presence signal
-│  Priority: AIR QUALITY          │   (motion, mac+monitor, door open)
+│  Priority: AIR QUALITY          │   (activity after door event)
 └─────────────────────────────────┘
 ```
 
@@ -177,7 +189,8 @@ ALWAYS:
 | Parameter | Default | Notes |
 |-----------|---------|-------|
 | `motion_timeout_seconds` | 60 | Time before motion absence triggers away |
-| `co2_critical_threshold` | 2000 ppm | ERV activates even when present |
+| `co2_critical_threshold` | 2000 ppm | ERV activates even when present (turn ON) |
+| `co2_critical_hysteresis` | 200 ppm | Turn OFF at 1800 ppm (prevents cycling) |
 | `co2_refresh_target` | 500 ppm | Target for away-mode ventilation |
 | `mac_poll_interval` | 5 seconds | How often to check mac/monitor state |
 | `erv_shutoff_delay` | 0 seconds | Immediate on presence detection |

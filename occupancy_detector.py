@@ -2,9 +2,12 @@
 """
 macOS Occupancy Detector
 
-Detects presence based on:
-1. External monitor connected
-2. Mac is active (not idle beyond threshold)
+Sends raw occupancy data to orchestrator:
+1. Timestamp of last keyboard/mouse activity
+2. External monitor connection status
+
+The orchestrator state machine decides what "active" means based on
+timestamp comparisons with door events - no policy decisions here!
 
 Usage:
     python occupancy_detector.py              # Single check
@@ -113,8 +116,7 @@ def get_display_info() -> tuple[int, list[str]]:
 
 def send_to_orchestrator(
     state: OccupancyState,
-    orchestrator_url: str,
-    idle_threshold: float = 300
+    orchestrator_url: str
 ) -> bool:
     """
     Send occupancy state to the orchestrator via HTTP POST.
@@ -122,14 +124,16 @@ def send_to_orchestrator(
     Args:
         state: Current occupancy state
         orchestrator_url: Base URL of the orchestrator (e.g., http://localhost:8080)
-        idle_threshold: Seconds of idle time before considered inactive
 
     Returns:
         True if successful, False otherwise
     """
     url = f"{orchestrator_url.rstrip('/')}/occupancy"
+    # Send timestamp of last activity, not a boolean
+    # Let the orchestrator/state machine decide what "active" means
+    last_active_timestamp = time.time() - state.idle_seconds
     payload = json.dumps({
-        "active": state.idle_seconds < idle_threshold,  # active if not idle
+        "last_active_timestamp": last_active_timestamp,
         "external_monitor": state.external_monitor_connected
     }).encode("utf-8")
 
@@ -151,12 +155,12 @@ def send_to_orchestrator(
         return False
 
 
-def check_occupancy(idle_threshold_seconds: float = 300) -> OccupancyState:
+def check_occupancy(idle_threshold_seconds: float = 30) -> OccupancyState:
     """
     Check current occupancy state.
 
     Args:
-        idle_threshold_seconds: Seconds of idle time before considered inactive (default 5 min)
+        idle_threshold_seconds: Seconds of idle time before considered inactive (default 30s)
 
     Returns:
         OccupancyState with all detection details
@@ -180,31 +184,36 @@ def check_occupancy(idle_threshold_seconds: float = 300) -> OccupancyState:
 
 def watch_occupancy(
     poll_interval: float = 5.0,
-    idle_threshold: float = 300,
+    idle_threshold: float = 30,
     on_change: Optional[Callable[[OccupancyState, OccupancyState], None]] = None,
     output_json: bool = False,
-    orchestrator_url: Optional[str] = None
+    orchestrator_url: Optional[str] = None,
+    heartbeat_interval: float = 60.0
 ):
     """
     Continuously monitor occupancy state.
 
     Args:
         poll_interval: Seconds between checks
-        idle_threshold: Seconds before considered idle
+        idle_threshold: Seconds before considered idle (for local console display only)
         on_change: Callback when state changes (old_state, new_state)
         output_json: Output state as JSON on each change
-        orchestrator_url: URL to POST state changes to (e.g., http://localhost:8080)
+        orchestrator_url: URL to POST state changes to (sends raw timestamp, not boolean)
+        heartbeat_interval: Seconds between heartbeat sends (even if no change)
     """
     last_state: Optional[OccupancyState] = None
+    last_send_time: float = 0
 
     print(f"Watching occupancy (poll: {poll_interval}s, idle threshold: {idle_threshold}s)")
     if orchestrator_url:
         print(f"Sending state to: {orchestrator_url}/occupancy")
+        print(f"Heartbeat every {heartbeat_interval}s")
     print("Press Ctrl+C to stop\n")
 
     try:
         while True:
             state = check_occupancy(idle_threshold)
+            now = time.time()
 
             # Detect state change
             state_changed = (
@@ -212,7 +221,11 @@ def watch_occupancy(
                 last_state.is_present != state.is_present
             )
 
-            if state_changed:
+            # Send on change OR heartbeat interval
+            heartbeat_due = (now - last_send_time) >= heartbeat_interval
+            should_send = state_changed or heartbeat_due
+
+            if should_send:
                 if output_json:
                     print(json.dumps({
                         "timestamp": time.time(),
@@ -229,15 +242,18 @@ def watch_occupancy(
 
                 # Send to orchestrator
                 if orchestrator_url:
-                    if send_to_orchestrator(state, orchestrator_url, idle_threshold):
-                        print(f"  → Sent to orchestrator")
+                    if send_to_orchestrator(state, orchestrator_url):
+                        last_send_time = now
+                        reason = "change" if state_changed else "heartbeat"
+                        print(f"  → Sent to orchestrator ({reason})")
                     else:
                         print(f"  → Failed to send to orchestrator", file=sys.stderr)
 
                 if on_change and last_state is not None:
                     on_change(last_state, state)
 
-                last_state = state
+                if state_changed:
+                    last_state = state
 
             time.sleep(poll_interval)
 
@@ -253,8 +269,8 @@ def main():
                         help="Output as JSON")
     parser.add_argument("--poll", "-p", type=float, default=5.0,
                         help="Poll interval in seconds (default: 5)")
-    parser.add_argument("--idle-threshold", "-i", type=float, default=300,
-                        help="Idle threshold in seconds (default: 300)")
+    parser.add_argument("--idle-threshold", "-i", type=float, default=30,
+                        help="Idle threshold in seconds (default: 30)")
     parser.add_argument("--url", "-u", type=str, default="http://localhost:8080",
                         help="Orchestrator URL (default: http://localhost:8080)")
     parser.add_argument("--no-send", action="store_true",

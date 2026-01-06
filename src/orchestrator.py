@@ -103,6 +103,9 @@ class Orchestrator:
         self._manual_hvac_override_at: Optional[datetime] = None
         self._manual_override_timeout: int = 30 * 60  # 30 minutes default
 
+        # Background task for HVAC polling
+        self._hvac_poll_task: Optional[asyncio.Task] = None
+
         # Database for persistence and analysis
         self.db = Database()
 
@@ -168,6 +171,7 @@ class Orchestrator:
             pm25=reading.pm25,
             pm10=reading.pm10,
             tvoc=reading.tvoc,
+            noise_db=reading.noise_db,
         )
 
         # Update state machine with CO2 reading
@@ -260,7 +264,10 @@ class Orchestrator:
 
         # Determine what's triggering ventilation
         tvoc_triggered = tvoc is not None and tvoc > tvoc_threshold
-        co2_critical = co2 is not None and co2 >= self.config.thresholds.co2_critical_ppm
+        co2_critical_on = co2 is not None and co2 >= self.config.thresholds.co2_critical_ppm
+        co2_critical_off = co2 is not None and co2 < (
+            self.config.thresholds.co2_critical_ppm - self.config.thresholds.co2_critical_hysteresis_ppm
+        )
         co2_needs_refresh = co2 is not None and co2 > self.config.thresholds.co2_refresh_target_ppm
 
         if state == OccupancyState.PRESENT:
@@ -276,7 +283,8 @@ class Orchestrator:
                     if not self._tvoc_ventilation_active:
                         self._tvoc_ventilation_active = True
                         self.db.log_climate_action("erv", "medium", co2_ppm=co2, reason=f"tvoc_high_{tvoc}ppb")
-            elif co2_critical:
+            elif co2_critical_on:
+                # CO2 >= 2000 - turn on QUIET
                 if not self._erv_running or self._erv_speed != "quiet":
                     logger.info(f"ACTION: ERV QUIET (CO2 critical: {co2}ppm)")
                     self.erv.turn_on(FanSpeed.QUIET)
@@ -286,7 +294,20 @@ class Orchestrator:
                         # tVOC cleared, but CO2 still critical - downgrade to QUIET
                         self._tvoc_ventilation_active = False
                         self.db.log_climate_action("erv", "quiet", co2_ppm=co2, reason="tvoc_cleared_co2_critical")
+                    else:
+                        # CO2 critical while present
+                        self.db.log_climate_action("erv", "quiet", co2_ppm=co2, reason=f"present_co2_critical_{co2}ppm")
+            elif self._erv_running and self._erv_speed == "quiet":
+                # Running QUIET mode, check hysteresis before turning off
+                # Turn off only if CO2 < (critical - hysteresis)
+                if co2_critical_off:
+                    logger.info(f"ACTION: ERV OFF (CO2 dropped to {co2}ppm, below {self.config.thresholds.co2_critical_ppm - self.config.thresholds.co2_critical_hysteresis_ppm}ppm)")
+                    self.erv.turn_off()
+                    self._erv_running = False
+                    self._erv_speed = "off"
+                # else: stay in hysteresis band (1800-2000), keep running
             else:
+                # Not running in QUIET mode, safe to turn off if running
                 if self._erv_running:
                     logger.info("ACTION: ERV OFF (present, air quality OK)")
                     self.erv.turn_off()
@@ -306,6 +327,7 @@ class Orchestrator:
                     self.erv.turn_on(FanSpeed.TURBO)
                     self._erv_running = True
                     self._erv_speed = "turbo"
+                    self.db.log_climate_action("erv", "turbo", co2_ppm=co2, reason=f"away_co2_refresh_{co2}ppm")
             elif tvoc_triggered:
                 # CO2 is good but tVOC needs clearing
                 if not self._erv_running or self._erv_speed != "medium":
@@ -452,6 +474,80 @@ class Orchestrator:
         self._manual_hvac_setpoint_f = None
         self._manual_hvac_override_at = None
 
+    async def _poll_hvac_status(self):
+        """Background task to poll HVAC status periodically.
+
+        This keeps our local state in sync with the actual device,
+        even if the user changes settings via remote/app.
+        Default interval is 5 minutes to be respectful of Mitsubishi's API.
+        """
+        if not self.kumo:
+            return
+
+        poll_interval = self.config.mitsubishi.poll_interval_seconds
+
+        while True:
+            try:
+                await asyncio.sleep(poll_interval)
+
+                # Get current device status (use get_full_status for operating state)
+                status = await self.kumo.get_full_status()
+                if not status:
+                    continue
+
+                # Parse mode and power from device
+                device_power = status.get("power", 0)
+                device_mode = status.get("operationMode", "off") if device_power == 1 else "off"
+                device_sp_heat = status.get("spHeat")
+                device_sp_cool = status.get("spCool")
+
+                # Determine the active setpoint based on mode
+                if device_mode == "heat" and device_sp_heat:
+                    device_setpoint_c = device_sp_heat
+                elif device_mode == "cool" and device_sp_cool:
+                    device_setpoint_c = device_sp_cool
+                else:
+                    device_setpoint_c = None
+
+                # Check if device state differs from what we think
+                mode_changed = device_mode != self._hvac_mode
+                setpoint_changed = (device_setpoint_c is not None and
+                                    abs(device_setpoint_c - self._hvac_setpoint_c) > 0.5)
+
+                if mode_changed or setpoint_changed:
+                    old_mode = self._hvac_mode
+                    old_setpoint_f = self._hvac_setpoint_c * 9/5 + 32
+                    new_setpoint_f = device_setpoint_c * 9/5 + 32 if device_setpoint_c else old_setpoint_f
+
+                    logger.info(f"HVAC state sync: mode {old_mode}→{device_mode}, "
+                                f"setpoint {old_setpoint_f:.0f}°F→{new_setpoint_f:.0f}°F "
+                                f"(detected external change)")
+
+                    # Update our local state
+                    self._hvac_mode = device_mode
+                    if device_setpoint_c:
+                        self._hvac_setpoint_c = device_setpoint_c
+
+                    # Update last_mode if device is on
+                    if device_mode != "off":
+                        self._hvac_last_mode = device_mode
+
+                    # If we thought HVAC was suspended but it's actually on,
+                    # clear the suspended flag
+                    if self._hvac_suspended and device_mode != "off":
+                        logger.info("Clearing HVAC suspended flag (device is on)")
+                        self._hvac_suspended = False
+
+                    # Broadcast updated status to dashboard
+                    await self._broadcast_status()
+
+            except asyncio.CancelledError:
+                logger.info("HVAC polling task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error polling HVAC status: {e}")
+                # Continue polling despite errors
+
     def _on_state_change(self, old_state: OccupancyState, new_state: OccupancyState):
         """Handle occupancy state changes."""
         logger.info(f"=== STATE CHANGE: {old_state.value} → {new_state.value} ===")
@@ -486,9 +582,9 @@ class Orchestrator:
         except RuntimeError:
             pass  # No event loop running
 
-    async def update_mac_occupancy(self, active: bool, external_monitor: bool):
+    async def update_mac_occupancy(self, last_active_timestamp: float, external_monitor: bool):
         """Update from macOS occupancy detector."""
-        await self.state_machine.update_mac_occupancy(active, external_monitor)
+        await self.state_machine.update_mac_occupancy(last_active_timestamp, external_monitor)
 
     # --- HTTP Server ---
 
@@ -496,11 +592,11 @@ class Orchestrator:
         """Handle POST /occupancy from macOS detector."""
         try:
             data = await request.json()
-            active = data.get("active", False)
+            last_active_timestamp = data.get("last_active_timestamp", 0.0)
             external_monitor = data.get("external_monitor", False)
 
-            logger.info(f"Mac occupancy update: active={active}, monitor={external_monitor}")
-            await self.update_mac_occupancy(active, external_monitor)
+            logger.info(f"Mac occupancy update: last_active={last_active_timestamp}, monitor={external_monitor}")
+            await self.update_mac_occupancy(last_active_timestamp, external_monitor)
 
             # Broadcast to WebSocket clients
             await self._broadcast_status()
@@ -683,6 +779,7 @@ class Orchestrator:
             "humidity": reading.humidity if reading else None,
             "pm25": reading.pm25 if reading else None,
             "tvoc": reading.tvoc if reading else None,
+            "noise_db": reading.noise_db if reading else None,
             "last_update": reading.timestamp.isoformat() if reading and reading.timestamp else None,
             "report_interval": self.qingping.report_interval,
             "interval_configured": self.qingping._interval_configured,
@@ -826,10 +923,11 @@ class Orchestrator:
         if self.kumo:
             logger.info("Connecting to Kumo Cloud...")
             try:
-                status = await self.kumo.get_device_status()
+                status = await self.kumo.get_full_status()
                 # Parse current mode and setpoint from status
                 if status:
-                    mode = status.get("operationMode", "off")
+                    power = status.get("power", 0)
+                    mode = status.get("operationMode", "off") if power == 1 else "off"
                     self._hvac_mode = mode
                     self._hvac_last_mode = mode if mode != "off" else "heat"
                     # Get setpoint based on mode
@@ -871,6 +969,7 @@ class Orchestrator:
                     pm25=cached.get("pm25"),
                     pm10=cached.get("pm10"),
                     tvoc=cached.get("tvoc"),
+                    noise_db=cached.get("noise_db"),
                     timestamp=datetime.fromisoformat(cached["timestamp"]) if cached.get("timestamp") else None,
                 )
                 self.qingping._latest_reading = reading
@@ -892,10 +991,24 @@ class Orchestrator:
         # Map devices
         self._setup_yolink_handlers()
 
+        # Start HVAC polling task
+        if self.kumo:
+            self._hvac_poll_task = asyncio.create_task(self._poll_hvac_status())
+            interval = self.config.mitsubishi.poll_interval_seconds
+            logger.info(f"Started HVAC status polling ({interval}s interval)")
+
         logger.info("Orchestrator running. Waiting for events...")
 
     async def stop(self):
         """Stop the orchestrator."""
+        # Stop HVAC polling task
+        if self._hvac_poll_task:
+            self._hvac_poll_task.cancel()
+            try:
+                await self._hvac_poll_task
+            except asyncio.CancelledError:
+                pass
+
         # Turn off ERV before stopping
         if self._erv_running:
             logger.info("Turning off ERV before shutdown...")

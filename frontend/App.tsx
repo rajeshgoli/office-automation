@@ -21,6 +21,7 @@ const DEFAULT_STATE: OfficeState = {
   tempTrend: 'stable',
   humidity: 0,
   tvoc: 0,
+  noise: 0,
   door: DeviceStatus.CLOSED,
   window: DeviceStatus.CLOSED,
   hvacMode: DeviceStatus.OFF,
@@ -50,6 +51,7 @@ function apiToState(api: ApiStatus): OfficeState {
     tempTrend: 'stable',
     humidity: api.air_quality.humidity ? Math.round(api.air_quality.humidity * 10) / 10 : 0,
     tvoc: api.air_quality.tvoc ?? 0,
+    noise: api.air_quality.noise_db ?? 0,
     door: api.sensors.door_open ? DeviceStatus.OPEN : DeviceStatus.CLOSED,
     window: api.sensors.window_open ? DeviceStatus.OPEN : DeviceStatus.CLOSED,
     hvacMode: api.hvac?.mode === 'heat' ? DeviceStatus.HEAT :
@@ -367,7 +369,7 @@ const App: React.FC = () => {
       </section>
 
       {/* Vitals Grid */}
-      <section className="grid grid-cols-2 md:grid-cols-3 gap-4">
+      <section className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <VitalTile
           label="Temperature"
           value={state.temperature || '---'}
@@ -383,8 +385,14 @@ const App: React.FC = () => {
         <VitalTile
           label="tVOC"
           value={state.tvoc || '---'}
-          unit="ppb"
+          unit=""
           icon="🌫️"
+        />
+        <VitalTile
+          label="Noise"
+          value={state.noise || '---'}
+          unit="dB"
+          icon="🔊"
         />
         <VitalTile
           label="Door"

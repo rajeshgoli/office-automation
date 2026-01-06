@@ -42,6 +42,7 @@ export interface OfficeState {
   tempTrend: 'up' | 'down' | 'stable';
   humidity: number;
   tvoc: number;
+  noise: number;
   door: DeviceStatus;
   window: DeviceStatus;
   hvacMode: DeviceStatus;

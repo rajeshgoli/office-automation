@@ -138,7 +138,11 @@ class KumoClient:
             return await resp.json()
 
     async def get_device_status(self, device_serial: Optional[str] = None) -> Dict[str, Any]:
-        """Get status of a specific device."""
+        """Get status of a specific device.
+
+        NOTE: This endpoint only returns device metadata (firmware, WiFi, etc.),
+        NOT the current operating state. Use get_full_status() for operating state.
+        """
         serial = device_serial or self.device_serial
         if not serial:
             raise ValueError("No device serial specified")
@@ -153,6 +157,34 @@ class KumoClient:
             if resp.status != 200:
                 raise Exception(f"Failed to get device status: {resp.status}")
             return await resp.json()
+
+    async def get_full_status(self, device_serial: Optional[str] = None) -> Dict[str, Any]:
+        """Get full operating status including mode, setpoints, power state.
+
+        This queries the zones endpoint which has the complete device state,
+        unlike get_device_status() which only has metadata.
+        """
+        serial = device_serial or self.device_serial
+        if not serial:
+            raise ValueError("No device serial specified")
+
+        # Get all sites
+        sites = await self.get_sites()
+        if not sites:
+            raise Exception("No sites found")
+
+        # Search all zones in all sites for our device
+        for site in sites:
+            site_id = site.get("id")
+            zones = await self.get_zones(site_id)
+
+            for zone in zones:
+                adapter = zone.get("adapter", {})
+                if adapter.get("deviceSerial") == serial:
+                    # Return the adapter object which has all the state
+                    return adapter
+
+        raise Exception(f"Device {serial} not found in any zone")
 
     async def send_command(
         self,

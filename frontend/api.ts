@@ -26,6 +26,7 @@ export interface ApiStatus {
     humidity: number | null;
     pm25: number | null;
     tvoc: number | null;
+    noise_db: number | null;
     last_update: string | null;
   };
   erv: {

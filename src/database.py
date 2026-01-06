@@ -108,15 +108,16 @@ class Database:
         pm25: Optional[int] = None,
         pm10: Optional[int] = None,
         tvoc: Optional[int] = None,
+        noise_db: Optional[int] = None,
         source: str = "qingping"
     ):
         """Log a sensor reading."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._connection() as conn:
             conn.execute("""
-                INSERT INTO sensor_readings (timestamp, co2_ppm, temp_c, humidity, pm25, pm10, tvoc, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (now, co2_ppm, temp_c, humidity, pm25, pm10, tvoc, source))
+                INSERT INTO sensor_readings (timestamp, co2_ppm, temp_c, humidity, pm25, pm10, tvoc, noise_db, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (now, co2_ppm, temp_c, humidity, pm25, pm10, tvoc, noise_db, source))
 
     def get_latest_sensor_reading(self) -> Optional[Dict[str, Any]]:
         """Get the most recent sensor reading."""

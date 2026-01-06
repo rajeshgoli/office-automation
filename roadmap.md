@@ -18,10 +18,11 @@ A living document tracking progress and next steps.
 
 ## In Progress
 
-### Qingping Data Collection
+### Qingping Data Collection ✅ Complete
 - Device bound to local MQTT broker (Mosquitto on Mac)
-- Upload interval: 15 minutes
-- Waiting for first sensor data to confirm end-to-end flow
+- Upload interval: **Configurable** (default 60s, set in `config.yaml`)
+- Configured automatically on startup via MQTT `qingping/{MAC}/down` topic
+- API endpoint: POST `/qingping/interval` for runtime changes
 
 ---
 
@@ -242,6 +243,11 @@ Implement the core rules from vision.md.
 - [ ] Calendar integration for meeting awareness
 - [ ] Seasonal threshold adjustments
 - [x] Dashboard / visualization ✅ (Session 3)
+- [ ] **Kumo Cloud WebSocket/Push Notifications** - Replace polling with real-time updates
+  - Current: Polling every 5 minutes (wasteful, delayed updates)
+  - Better: Investigate if Kumo Cloud API supports WebSockets or push notifications
+  - Would eliminate API rate limit concerns and provide instant dashboard sync
+  - Alternative: If Kumo doesn't support it, consider ESPHome route (fully local)
 
 ---
 
@@ -418,3 +424,109 @@ Implement the core rules from vision.md.
   - `frontend/api.ts` - ERV/HVAC control functions, manual_override types
   - `frontend/types.ts` - ERVSpeed enum (OFF, QUIET, ELEVATED, PURGE)
   - `frontend/components/VitalTile.tsx` - Support ERVSpeed status
+
+**2026-01-06** (Session 7)
+- **GitHub Issue #6 Implemented** - Reduce Qingping polling interval
+  - Research: Qingping devices accept config via MQTT `qingping/{MAC}/down` topic
+  - Added `configure_interval()` method to `QingpingMQTTClient`
+  - Config format: `{"type": "17", "setting": {"report_interval": N, ...}}`
+  - New config option: `qingping.report_interval` (default: 60s)
+  - Auto-configures device on startup
+  - POST `/qingping/interval` endpoint for runtime changes
+  - Status API shows `interval_configured` and `report_interval`
+- **Note**: Device may need reset to apply new interval
+- **Files Changed**:
+  - `src/qingping_client.py` - `configure_interval()`, `report_interval` param
+  - `src/config.py` - Added `report_interval` to QingpingConfig
+  - `src/orchestrator.py` - Interval config on startup, `/qingping/interval` endpoint
+  - `config.yaml` - Added `report_interval: 60`
+  - `CLAUDE.md` - Updated API docs and Qingping section
+
+**2026-01-06** (Session 8)
+- **Fixed tVOC Reading** - Qingping sends `tvoc_index` not `tvoc`
+  - Sensirion SGP40 VOC index (0-500 scale), not ppb
+  - Updated parser to check `tvoc_index` first, fallback to `tvoc`
+  - Dashboard now shows actual tVOC values
+- **Added Noise Level** - New sensor reading from Qingping
+  - `noise_db` field added to `QingpingReading` dataclass
+  - Exposed in API at `air_quality.noise_db`
+  - New "Noise" tile on dashboard with 🔊 icon
+- **Report Interval** - Changed default from 60s to 30s
+  - More responsive dashboard updates
+  - No harm on USB-powered device
+- **Dashboard Layout** - Changed vitals grid from 3 to 4 columns on desktop
+- **Files Changed**:
+  - `src/qingping_client.py` - Fixed `tvoc_index` field, added `noise_db`
+  - `src/orchestrator.py` - Added `noise_db` to API
+  - `frontend/api.ts` - Added `noise_db` type
+  - `frontend/types.ts` - Added `noise` to OfficeState
+  - `frontend/App.tsx` - Added noise tile, 4-column grid
+  - `config.yaml` - `report_interval: 30`
+  - `CLAUDE.md` - Updated Qingping sensor docs
+
+**2026-01-06** (Session 9)
+- **HVAC Status Polling** - Fixed dashboard showing incorrect HVAC state
+  - Problem: Dashboard showed "off" when heater was actually running
+  - Root cause: Orchestrator only checked HVAC status once at startup
+  - Solution: Added background task to poll Kumo Cloud API periodically
+  - Default poll interval: 300s (5 minutes) - configurable to respect API limits
+  - Detects manual changes via remote/app and syncs local state
+  - Broadcasts updates to dashboard via WebSocket
+  - Config: `mitsubishi.poll_interval_seconds` (optional, defaults to 300)
+- **Files Changed**:
+  - `src/config.py` - Added `poll_interval_seconds` to MitsubishiConfig (default 300)
+  - `src/orchestrator.py` - Added `_poll_hvac_status()` background task, graceful shutdown
+  - `CLAUDE.md` - Documented HVAC polling feature
+- **Note**: User needs to restart orchestrator for changes to take effect
+
+**2026-01-06** (Session 10)
+- **Timestamp-Based Presence Detection** - Simplified architecture, removed idle threshold
+  - **Problem**: occupancy_detector was making policy decisions (30s idle = inactive)
+  - **Solution**: Send raw timestamps, let state machine decide everything
+  - **Key insight**: Door event timestamp IS the threshold - no arbitrary idle time needed!
+  - **occupancy_detector.py changes**:
+    - Now sends `{"last_active_timestamp": 1704567890.123, "external_monitor": true}`
+    - Removed `idle_threshold` parameter from `send_to_orchestrator()`
+    - Idle threshold kept only for local console display (informational)
+  - **state_machine.py changes**:
+    - Removed `mac_active` boolean from `SensorState`
+    - Removed `mac_idle_threshold_seconds` from `StateConfig`
+    - Simplified `is_present` logic: `mac_presence = external_monitor AND (mac_last_active > door_last_changed)`
+    - No idle computations - just timestamp comparisons
+  - **Why this works**:
+    - Watching movie (no keyboard): door hasn't closed → `mac_last_active > door_last_changed` → PRESENT
+    - Walk away: door closes → 10s verification → AWAY
+    - Return: keyboard activity → `mac_last_active > door_last_changed` → PRESENT
+    - External monitor check prevents false presence when Mac taken elsewhere
+  - **orchestrator.py changes**:
+    - Updated `/occupancy` endpoint to receive `last_active_timestamp`
+    - Passes timestamp to state machine instead of boolean
+  - **Removed everywhere**:
+    - `mac_idle_threshold_seconds` config option
+    - `mac_active` boolean state
+    - All idle time computations in state machine
+- **Files Changed**:
+  - `occupancy_detector.py` - Send timestamp instead of boolean active
+  - `src/state_machine.py` - Removed mac_active, simplified is_present logic
+  - `src/orchestrator.py` - Accept timestamp from POST /occupancy
+  - `src/config.py` - Removed mac_idle_threshold_seconds
+  - `CLAUDE.md` - Updated architecture docs, removed idle threshold from thresholds table
+- **CO2 Hysteresis Added** - Fixed rapid ERV on/off cycling at threshold
+  - **Problem**: ERV oscillates when CO2 hovers around 2000 ppm
+    - Turns ON at 2001 ppm, brings CO2 down to 2000 ppm, turns OFF
+    - CO2 rises to 2001 ppm again, turns ON, repeat...
+  - **Solution**: Different thresholds for ON vs OFF (hysteresis band)
+    - Turn ON: CO2 ≥ 2000 ppm
+    - Turn OFF: CO2 < 1800 ppm (200 ppm hysteresis)
+    - In the 1800-2000 ppm band, ERV maintains current state
+  - **Implementation**:
+    - Added `co2_critical_hysteresis_ppm: int = 200` to ThresholdsConfig
+    - Changed `_evaluate_erv_state()` PRESENT mode logic:
+      - `co2_critical_on` checks CO2 ≥ 2000 (turn ON)
+      - `co2_critical_off` checks CO2 < 1800 (turn OFF)
+      - When running in QUIET mode, only turn OFF if below 1800 ppm
+    - Prevents rapid cycling, extends ERV runtime to ensure proper ventilation
+  - **Files Changed**:
+    - `src/config.py` - Added co2_critical_hysteresis_ppm
+    - `src/orchestrator.py` - Hysteresis logic in _evaluate_erv_state()
+    - `CLAUDE.md` - Documented hysteresis in Key Thresholds table
