@@ -387,3 +387,34 @@ Implement the core rules from vision.md.
   - `src/config.py` - Added HVAC threshold configs
   - `src/orchestrator.py` - Kumo client integration, `_evaluate_hvac_state()` method
   - `frontend/api.ts` - Dynamic hostname for mobile access
+
+**2026-01-06** (Session 6)
+- **GitHub Issue #5 Implemented** - Dashboard Quick Controls
+  - POST `/erv` endpoint: `{"speed": "off|quiet|medium|turbo"}`
+  - POST `/hvac` endpoint: `{"mode": "off|heat", "setpoint_f": 70}`
+  - Manual override tracking with 30-minute auto-expiry
+  - Dashboard "Quick Controls" section with ERV (4 buttons) + HVAC (2 buttons)
+  - Visual feedback: amber highlight for active override, countdown timer
+  - All manual actions logged to `climate_actions` table
+- **ERV Speed Display** - Shows actual speed instead of just ON/OFF
+  - Dashboard shows: OFF, QUIET, ELEVATED, PURGE
+  - Maps to: off, 1/1, 3/2, 8/8 fan speeds
+  - Backend tracks `_erv_speed` during automation
+- **Presence Detection Overhaul** - Fixed false PRESENT issues
+  - Problem: Mac "active" (monitor connected) kept triggering PRESENT after leaving
+  - Solution: Door is now source of truth for departure
+  - **AWAY → PRESENT triggers:**
+    - Mac keyboard/mouse activity (strongest signal)
+    - Motion detected while door is closed
+  - **NOT triggers:**
+    - Door opening alone (might just grab something)
+    - External monitor connected (just means Mac is there)
+  - **PRESENT → AWAY:** Door closes + 10s no activity
+  - On departure verification: reset mac_active, motion_last_seen
+- **Files Changed**:
+  - `src/orchestrator.py` - Manual override endpoints, ERV speed tracking
+  - `src/state_machine.py` - Presence detection logic overhaul
+  - `frontend/App.tsx` - Quick controls UI, ERV speed display
+  - `frontend/api.ts` - ERV/HVAC control functions, manual_override types
+  - `frontend/types.ts` - ERVSpeed enum (OFF, QUIET, ELEVATED, PURGE)
+  - `frontend/components/VitalTile.tsx` - Support ERVSpeed status

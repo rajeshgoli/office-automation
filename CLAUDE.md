@@ -10,60 +10,91 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Office Climate Automation system for a backyard shed office. The system coordinates multiple smart devices to maintain air quality silently during occupancy and aggressively ventilate when away.
 
-## Current Status (2026-01-05)
+## Current Status (2026-01-06)
 
 **Working:**
 - YoLink sensors (door, window, motion) via Cloud MQTT
 - ERV control via Tuya local API (tinytuya)
 - Qingping Air Monitor via local MQTT - CO2, temp, humidity, tVOC
-- State machine (PRESENT/AWAY) with door-event requirement for departure
+- State machine (PRESENT/AWAY) with robust presence detection
 - SQLite database for persistence and historical analysis
 - React dashboard with live data (WebSocket + polling fallback)
-- macOS occupancy detector sending presence to orchestrator
+- Dashboard quick controls for manual ERV/HVAC override
+- macOS occupancy detector (keyboard/mouse activity)
+- HVAC coordination (suspends heating when ERV venting)
+- tVOC-triggered ventilation (>250 ppb triggers ERV)
 
 **Pending:**
-- Mitsubishi Kumo not wired into orchestrator (client exists in `src/kumo_client.py`)
-- tVOC-based ventilation (Issue #1: >250 ppb triggers ERV 3/2)
+- Deploy to Raspberry Pi for always-on operation
 
 ## Hardware Devices
 
 | Device | Control Method | Status |
 |--------|---------------|--------|
 | **ERV (Pioneer Airlink)** | Tuya local (`192.168.5.119`) | Working |
-| **Qingping Air Monitor** | Local MQTT (`127.0.0.1:1883`) | Configured, waiting for data |
+| **Qingping Air Monitor** | Local MQTT (`127.0.0.1:1883`) | Working |
 | **YoLink Sensors** | Cloud MQTT (`api.yosmart.com:8003`) | Working |
-| **Mitsubishi Split AC** | pykumo (Kumo Cloud) | Client exists, not wired |
-| **Mac + External Monitor** | HTTP POST to orchestrator | Working |
+| **Mitsubishi Split AC** | pykumo (Kumo Cloud) | Working |
+| **Mac Keyboard/Mouse** | HTTP POST to orchestrator | Working |
 
 ## Core Architecture
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
 │  Mac Occupancy  │────▶│                 │     │  Qingping MQTT  │
-│   (HTTP POST)   │     │                 │◀────│  (CO2/Temp/RH)  │
+│  (kbd/mouse)    │     │                 │◀────│  (CO2/Temp/RH)  │
 └─────────────────┘     │                 │     └─────────────────┘
                         │   Orchestrator  │              │
 ┌─────────────────┐     │                 │     ┌────────▼────────┐
 │  YoLink Sensors │────▶│   State Machine │────▶│   ERV Control   │
 │ (Door/Window/   │     │  (PRESENT/AWAY) │     │  (Tuya Local)   │
 │   Motion)       │     │                 │     └─────────────────┘
-└─────────────────┘     └─────────────────┘
+└─────────────────┘     └────────┬────────┘
+                                 │
+                        ┌────────▼────────┐
+                        │  HVAC Control   │
+                        │  (Kumo Cloud)   │
+                        └─────────────────┘
 ```
 
 ### Two-State System
-- **PRESENT**: Quiet mode - ERV off unless CO2 > 2000 ppm
-- **AWAY**: Ventilation mode - ERV TURBO until CO2 < 500 ppm
+- **PRESENT**: Quiet mode - ERV off unless CO2 > 2000 ppm or tVOC > 250 ppb
+- **AWAY**: Ventilation mode - ERV PURGE until CO2 < 500 ppm
+
+### Presence Detection Logic
+
+**AWAY → PRESENT triggers:**
+- Mac keyboard/mouse activity (strongest signal)
+- Motion detected while door is closed
+
+**NOT triggers for PRESENT:**
+- Door opening alone (might just grab something)
+- External monitor connected (just means Mac is there)
+
+**PRESENT → AWAY triggers:**
+- Door closes + 10s no activity (departure verification)
+
+### ERV Speed Modes
+| Mode | Fan Speed | Trigger |
+|------|-----------|---------|
+| **OFF** | 0/0 | Default when present, air quality OK |
+| **QUIET** | 1/1 | CO2 > 2000 ppm while present |
+| **ELEVATED** | 3/2 | tVOC > 250 ppb (positive pressure) |
+| **PURGE** | 8/8 | Away mode CO2 refresh |
 
 ### Safety Interlocks
 - Window OR door open → ERV OFF
-- ANY presence signal → immediate ERV shutoff
+- ANY presence signal → immediate PRESENT transition
 
 ### Key Thresholds
 | Parameter | Value |
 |-----------|-------|
 | CO2 critical (ERV on while present) | 2000 ppm |
 | CO2 refresh target (away mode) | 500 ppm |
+| tVOC threshold (triggers ELEVATED) | 250 ppb |
 | Motion timeout | 60 seconds |
+| Departure verification | 10 seconds |
+| Manual override timeout | 30 minutes |
 
 ## Code Structure
 
@@ -71,14 +102,15 @@ Office Climate Automation system for a backyard shed office. The system coordina
 office-automate/
 ├── config.yaml            # Credentials and device config
 ├── requirements.txt       # Python dependencies
-├── occupancy_detector.py  # macOS presence detection
+├── occupancy_detector.py  # macOS presence detection (keyboard/mouse)
 ├── run.py                 # Main entry point (--port arg supported)
 ├── roadmap.md             # Progress tracking (update as you work!)
 ├── data/                  # SQLite database (gitignored)
 │   └── office_climate.db
 ├── frontend/              # React + Vite dashboard
-│   ├── App.tsx
+│   ├── App.tsx            # Main dashboard with quick controls
 │   ├── api.ts             # API client + WebSocket
+│   ├── types.ts           # TypeScript types (ERVSpeed, etc.)
 │   └── ...
 └── src/
     ├── config.py          # Config loader
@@ -86,10 +118,20 @@ office-automate/
     ├── yolink_client.py   # YoLink cloud API (HTTP + MQTT)
     ├── qingping_client.py # Qingping MQTT client (local broker)
     ├── erv_client.py      # ERV control via Tuya local
-    ├── kumo_client.py     # Mitsubishi Kumo Cloud (NOT WIRED YET)
+    ├── kumo_client.py     # Mitsubishi Kumo Cloud
     ├── state_machine.py   # PRESENT/AWAY state logic
     └── orchestrator.py    # Main coordinator + HTTP/WS server
 ```
+
+## API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/status` | Current system status (JSON) |
+| GET | `/ws` | WebSocket for real-time updates |
+| POST | `/occupancy` | Mac keyboard/mouse activity |
+| POST | `/erv` | Manual ERV control `{"speed": "off\|quiet\|medium\|turbo"}` |
+| POST | `/hvac` | Manual HVAC control `{"mode": "off\|heat", "setpoint_f": 70}` |
 
 ## Running
 
@@ -108,6 +150,9 @@ python3 occupancy_detector.py --watch --url http://localhost:9001
 
 # Check status
 curl http://localhost:9001/status
+
+# Manual ERV control
+curl -X POST http://localhost:9001/erv -H "Content-Type: application/json" -d '{"speed":"turbo"}'
 ```
 
 ## Device Details
@@ -124,20 +169,16 @@ curl http://localhost:9001/status
 - Broker: Mosquitto on `127.0.0.1:1883`
 - Topic: `qingping/582D3470765F/up`
 - Upload interval: 15 minutes (set in developer.qingping.co)
-- JSON format: `{"type":17,"sensor_data":{"co2":{"value":800},"temperature":{"value":22},...}}`
 
 ### YoLink (Cloud)
 - Using Cloud API (not local hub)
 - MQTT broker: `api.yosmart.com:8003`
 - Credentials: in config.yaml (uaid, secret_key)
 
-## Next Steps for Future Agent
-
-1. **Issue #1: tVOC ventilation** - tVOC > 250 ppb triggers ERV at 3/2 speed
-2. **Wire Mitsubishi** - Add kumo_client to orchestrator for HVAC control
-3. **Test automation** - Leave office, verify ERV turns on when CO2 > 500
-4. **Deploy to Pi** - Move orchestrator to always-on Raspberry Pi
-5. **Query database** - Use `sqlite3 data/office_climate.db` for historical analysis
+### Mitsubishi Kumo
+- Control via pykumo library
+- Suspends heating when ERV is venting (don't heat cold outside air)
+- Resumes when ERV stops or user returns
 
 ## Deployment
 
