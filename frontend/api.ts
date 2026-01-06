@@ -3,8 +3,9 @@
  */
 
 const API_PORT = import.meta.env.VITE_API_PORT || '8080';
-const API_BASE = `http://localhost:${API_PORT}`;
-const WS_URL = `ws://localhost:${API_PORT}/ws`;
+const API_HOST = import.meta.env.VITE_API_HOST || window.location.hostname;
+const API_BASE = `http://${API_HOST}:${API_PORT}`;
+const WS_URL = `ws://${API_HOST}:${API_PORT}/ws`;
 
 export interface ApiStatus {
   state: string;
@@ -29,10 +30,20 @@ export interface ApiStatus {
   };
   erv: {
     running: boolean;
+    speed?: string;
   };
   hvac: {
     mode: string;
     setpoint_c: number;
+  };
+  manual_override?: {
+    erv: boolean;
+    erv_speed: string | null;
+    erv_expires_in: number | null;
+    hvac: boolean;
+    hvac_mode: string | null;
+    hvac_setpoint_f: number | null;
+    hvac_expires_in: number | null;
   };
 }
 
@@ -71,6 +82,34 @@ export async function fetchEvents(limit: number = 50): Promise<ApiEvent[]> {
  */
 export function toFahrenheit(celsius: number): number {
   return Math.round(celsius * 9 / 5 + 32);
+}
+
+export type ERVSpeed = 'off' | 'quiet' | 'medium' | 'turbo';
+
+/**
+ * Set ERV speed manually
+ */
+export async function setERVSpeed(speed: ERVSpeed): Promise<{ ok: boolean; error?: string }> {
+  const response = await fetch(`${API_BASE}/erv`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ speed }),
+  });
+  return response.json();
+}
+
+export type HVACMode = 'off' | 'heat';
+
+/**
+ * Set HVAC mode manually
+ */
+export async function setHVACMode(mode: HVACMode, setpoint_f: number = 70): Promise<{ ok: boolean; error?: string }> {
+  const response = await fetch(`${API_BASE}/hvac`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode, setpoint_f }),
+  });
+  return response.json();
 }
 
 /**

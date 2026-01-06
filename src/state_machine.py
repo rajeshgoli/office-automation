@@ -56,6 +56,7 @@ class SensorState:
 class StateConfig:
     """Configuration for state machine thresholds."""
     motion_timeout_seconds: int = 60
+    departure_verification_seconds: int = 10  # Time to wait after door close before confirming departure
     co2_critical_ppm: int = 2000
     co2_refresh_target_ppm: int = 500
 
@@ -75,6 +76,8 @@ class StateMachine:
         self.sensors = SensorState()
         self._callbacks: list[Callable[[OccupancyState, OccupancyState], Any]] = []
         self._last_door_state: Optional[bool] = None
+        self._departure_verification_task: Optional[asyncio.Task] = None
+        self._verifying_departure: bool = False
 
     @property
     def is_present(self) -> bool:
@@ -144,8 +147,56 @@ class StateMachine:
             except Exception as e:
                 logger.error(f"State change callback error: {e}")
 
+    def _cancel_departure_verification(self, reason: str = "activity detected"):
+        """Cancel any pending departure verification."""
+        if self._departure_verification_task and not self._departure_verification_task.done():
+            logger.info(f"Departure verification cancelled: {reason}")
+            self._departure_verification_task.cancel()
+            self._departure_verification_task = None
+            self._verifying_departure = False
+
+    async def _departure_verification_timer(self):
+        """Wait for verification period, then transition to AWAY if no activity."""
+        try:
+            logger.info(f"Departure verification started ({self.config.departure_verification_seconds}s)")
+            await asyncio.sleep(self.config.departure_verification_seconds)
+
+            # Timer expired without activity - confirm departure
+            if self.state == OccupancyState.PRESENT:
+                logger.info("Departure verified: no activity detected → AWAY")
+                old_state = self.state
+                self.state = OccupancyState.AWAY
+                # Reset motion timestamp to prevent stale motion from triggering false PRESENT
+                # (motion sensor may send "clear" event after we've departed)
+                self.sensors.motion_last_seen = 0
+                self.sensors.motion_detected = False
+                await self._notify_state_change(old_state, self.state)
+        except asyncio.CancelledError:
+            pass  # Timer was cancelled due to activity
+        finally:
+            self._verifying_departure = False
+            self._departure_verification_task = None
+
+    def _start_departure_verification(self):
+        """Start departure verification timer after door closes."""
+        if self.state != OccupancyState.PRESENT:
+            return  # Only verify departure if currently present
+
+        # Cancel any existing verification
+        self._cancel_departure_verification("new door event")
+
+        # Start new verification timer
+        self._verifying_departure = True
+        self._departure_verification_task = asyncio.create_task(
+            self._departure_verification_timer()
+        )
+
     async def evaluate(self) -> OccupancyState:
-        """Evaluate current state and transition if needed."""
+        """Evaluate current state and transition if needed.
+
+        Note: PRESENT → AWAY transitions are now handled by the departure
+        verification timer, not by this method.
+        """
         old_state = self.state
 
         if self.state == OccupancyState.AWAY:
@@ -153,12 +204,6 @@ class StateMachine:
             if self.is_present:
                 self.state = OccupancyState.PRESENT
                 logger.info("State: AWAY → PRESENT")
-
-        elif self.state == OccupancyState.PRESENT:
-            # Transition to AWAY on departure + no presence
-            if self.should_be_away:
-                self.state = OccupancyState.AWAY
-                logger.info("State: PRESENT → AWAY")
 
         # Track door state for open→close detection
         self._last_door_state = self.sensors.door_open
@@ -177,6 +222,11 @@ class StateMachine:
         self.sensors.external_monitor = external_monitor
         self.sensors.last_updated = time.time()
         logger.debug(f"Mac occupancy: active={active}, monitor={external_monitor}")
+
+        # Cancel departure verification if mac shows activity
+        if active and self._verifying_departure:
+            self._cancel_departure_verification("mac activity")
+
         await self.evaluate()
 
     async def update_motion(self, detected: bool):
@@ -184,16 +234,27 @@ class StateMachine:
         self.sensors.motion_detected = detected
         if detected:
             self.sensors.motion_last_seen = time.time()
+            # Cancel departure verification on motion
+            if self._verifying_departure:
+                self._cancel_departure_verification("motion detected")
         self.sensors.last_updated = time.time()
         logger.debug(f"Motion: {detected}")
         await self.evaluate()
 
     async def update_door(self, is_open: bool):
         """Update door sensor status."""
+        was_open = self._last_door_state
+
         self.sensors.door_open = is_open
         self.sensors.door_last_changed = time.time()
         self.sensors.last_updated = time.time()
         logger.debug(f"Door: {'open' if is_open else 'closed'}")
+
+        # Door just closed (was open, now closed) - start departure verification
+        if was_open is True and is_open is False:
+            logger.info("Door closed - starting departure verification")
+            self._start_departure_verification()
+
         await self.evaluate()
 
     async def update_window(self, is_open: bool):
@@ -217,6 +278,7 @@ class StateMachine:
             "is_present": self.is_present,
             "safety_interlock": self.safety_interlock_active,
             "erv_should_run": self.erv_should_run,
+            "verifying_departure": self._verifying_departure,
             "sensors": {
                 "mac_active": self.sensors.mac_active,
                 "external_monitor": self.sensors.external_monitor,

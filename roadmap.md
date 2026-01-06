@@ -224,7 +224,7 @@ Implement the core rules from vision.md.
 
 - [x] **Rule 1**: Present mode - quiet priority (ERV off unless CO2 > 2000)
 - [x] **Rule 2**: Away mode - aggressive refresh (ERV on until CO2 < 500)
-- [ ] **Rule 3**: HVAC control based on Qingping readings (Mitsubishi client exists but not wired)
+- [x] **Rule 3**: HVAC coordination - suspend heating when ERV venting (GH #2)
 - [x] **Rule 4**: Safety interlocks (window/door open = systems off)
 - [x] **Rule 5**: tVOC ventilation - ERV MEDIUM (3/2) when tVOC > 250 ppb (GH #1)
 
@@ -374,3 +374,16 @@ Implement the core rules from vision.md.
 - **Files Changed**:
   - `src/config.py` - Added `tvoc_threshold_ppb` to ThresholdsConfig
   - `src/orchestrator.py` - tVOC evaluation logic in `_evaluate_erv_state()`
+- **GitHub Issue #2 Implemented** - HVAC coordination with ERV
+  - Wired Kumo client into orchestrator
+  - Added HVAC config: `hvac_min_temp_f` (68), `hvac_critical_temp_f` (55), occupancy hours (7AM-10PM)
+  - When AWAY + ERV running + temp > 68°F: suspend HVAC (don't heat vented air)
+  - Resume HVAC when: return to PRESENT, or ERV stops within occupancy hours
+  - Critical temp protection: always heat if < 55°F
+  - Logs all HVAC actions to `climate_actions` table
+  - Status API includes `hvac.suspended` boolean
+- **Frontend Fix** - API now uses `window.location.hostname` for mobile access
+- **Files Changed**:
+  - `src/config.py` - Added HVAC threshold configs
+  - `src/orchestrator.py` - Kumo client integration, `_evaluate_hvac_state()` method
+  - `frontend/api.ts` - Dynamic hostname for mobile access

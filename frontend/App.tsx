@@ -11,7 +11,7 @@ import {
 import { STATUS_CONFIG } from './constants';
 import VitalTile from './components/VitalTile';
 import CO2Chart from './components/CO2Chart';
-import { fetchStatus, ApiStatus, toFahrenheit, StatusWebSocket } from './api';
+import { fetchStatus, ApiStatus, toFahrenheit, StatusWebSocket, setERVSpeed, setHVACMode, ERVSpeed, HVACMode } from './api';
 
 // Default state when no data available
 const DEFAULT_STATE: OfficeState = {
@@ -59,6 +59,16 @@ const App: React.FC = () => {
   const [isAmbient, setIsAmbient] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [apiConnected, setApiConnected] = useState(false);
+  const [manualOverride, setManualOverride] = useState<{
+    erv: boolean;
+    erv_speed: string | null;
+    erv_expires_in: number | null;
+    hvac: boolean;
+    hvac_mode: string | null;
+    hvac_setpoint_f: number | null;
+    hvac_expires_in: number | null;
+  } | null>(null);
+  const [controlLoading, setControlLoading] = useState<string | null>(null);
 
   const wsRef = useRef<StatusWebSocket | null>(null);
   const historyRef = useRef<ClimateDataPoint[]>([]);
@@ -101,6 +111,10 @@ const App: React.FC = () => {
         const status = await fetchStatus();
         if (mounted) {
           const newState = apiToState(status);
+          // Update manual override state
+          if (status.manual_override) {
+            setManualOverride(status.manual_override);
+          }
           setState(prev => {
             // Only log events after initial load (avoid spurious "Arrived" on page load)
             if (!initialLoadRef.current) {
@@ -160,6 +174,10 @@ const App: React.FC = () => {
     ws.onConnection(setWsConnected);
     ws.onStatus((status) => {
       const newState = apiToState(status);
+      // Update manual override state
+      if (status.manual_override) {
+        setManualOverride(status.manual_override);
+      }
       setState(prev => {
         // Only log real changes (compare against last known occupancy, not stale state)
         if (lastOccupancyRef.current !== null && lastOccupancyRef.current !== newState.occupancy) {
@@ -210,6 +228,39 @@ const App: React.FC = () => {
   }, [state]);
 
   const currentStatus = getPrimaryStatus();
+
+  // Control button handlers
+  const handleERVControl = useCallback(async (speed: ERVSpeed) => {
+    setControlLoading(`erv-${speed}`);
+    try {
+      const result = await setERVSpeed(speed);
+      if (!result.ok) {
+        console.error('ERV control failed:', result.error);
+      } else {
+        addEvent('erv', `Manual: ERV ${speed.toUpperCase()}`, state.co2);
+      }
+    } catch (e) {
+      console.error('ERV control error:', e);
+    } finally {
+      setControlLoading(null);
+    }
+  }, [addEvent, state.co2]);
+
+  const handleHVACControl = useCallback(async (mode: HVACMode, setpoint_f: number = 70) => {
+    setControlLoading(`hvac-${mode}`);
+    try {
+      const result = await setHVACMode(mode, setpoint_f);
+      if (!result.ok) {
+        console.error('HVAC control failed:', result.error);
+      } else {
+        addEvent('hvac', `Manual: HVAC ${mode === 'off' ? 'OFF' : `HEAT ${setpoint_f}°F`}`);
+      }
+    } catch (e) {
+      console.error('HVAC control error:', e);
+    } finally {
+      setControlLoading(null);
+    }
+  }, [addEvent]);
 
   const getCo2Color = (ppm: number) => {
     if (ppm < Threshold.NORMAL) return 'text-emerald-400';
@@ -349,6 +400,93 @@ const App: React.FC = () => {
           icon="🌀"
           status={state.ventMode}
         />
+      </section>
+
+      {/* Quick Controls */}
+      <section className="bg-zinc-900/30 border border-zinc-800/50 rounded-3xl p-6">
+        <div className="flex justify-between items-center mb-4">
+          <h2 className="text-xs font-bold uppercase tracking-widest text-zinc-500">Quick Controls</h2>
+          {(manualOverride?.erv || manualOverride?.hvac) && (
+            <span className="text-[10px] font-bold uppercase text-amber-500 bg-amber-500/10 px-2 py-1 rounded animate-pulse">
+              Manual Override Active
+            </span>
+          )}
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          {/* ERV Controls */}
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-bold text-zinc-400 uppercase tracking-wide">🌀 Ventilation</span>
+              {manualOverride?.erv && manualOverride.erv_expires_in && (
+                <span className="text-[10px] text-zinc-500">
+                  Expires in {Math.round(manualOverride.erv_expires_in / 60)}m
+                </span>
+              )}
+            </div>
+            <div className="grid grid-cols-4 gap-2">
+              {(['off', 'quiet', 'medium', 'turbo'] as const).map((speed) => (
+                <button
+                  key={speed}
+                  onClick={() => handleERVControl(speed)}
+                  disabled={controlLoading !== null}
+                  className={`px-3 py-2 text-xs font-bold uppercase rounded-lg transition-all
+                    ${manualOverride?.erv && manualOverride.erv_speed === speed
+                      ? 'bg-amber-500 text-black ring-2 ring-amber-400'
+                      : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200'
+                    }
+                    ${controlLoading === `erv-${speed}` ? 'opacity-50 cursor-wait' : ''}
+                    disabled:opacity-50 disabled:cursor-not-allowed
+                  `}
+                >
+                  {controlLoading === `erv-${speed}` ? '...' : speed}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* HVAC Controls */}
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-bold text-zinc-400 uppercase tracking-wide">🔥 Heating</span>
+              {manualOverride?.hvac && manualOverride.hvac_expires_in && (
+                <span className="text-[10px] text-zinc-500">
+                  Expires in {Math.round(manualOverride.hvac_expires_in / 60)}m
+                </span>
+              )}
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={() => handleHVACControl('off')}
+                disabled={controlLoading !== null}
+                className={`px-3 py-2 text-xs font-bold uppercase rounded-lg transition-all
+                  ${manualOverride?.hvac && manualOverride.hvac_mode === 'off'
+                    ? 'bg-amber-500 text-black ring-2 ring-amber-400'
+                    : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200'
+                  }
+                  ${controlLoading === 'hvac-off' ? 'opacity-50 cursor-wait' : ''}
+                  disabled:opacity-50 disabled:cursor-not-allowed
+                `}
+              >
+                {controlLoading === 'hvac-off' ? '...' : 'Heat Off'}
+              </button>
+              <button
+                onClick={() => handleHVACControl('heat', 70)}
+                disabled={controlLoading !== null}
+                className={`px-3 py-2 text-xs font-bold uppercase rounded-lg transition-all
+                  ${manualOverride?.hvac && manualOverride.hvac_mode === 'heat'
+                    ? 'bg-amber-500 text-black ring-2 ring-amber-400'
+                    : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200'
+                  }
+                  ${controlLoading === 'hvac-heat' ? 'opacity-50 cursor-wait' : ''}
+                  disabled:opacity-50 disabled:cursor-not-allowed
+                `}
+              >
+                {controlLoading === 'hvac-heat' ? '...' : 'Heat 70°F'}
+              </button>
+            </div>
+          </div>
+        </div>
       </section>
 
       {/* CO2 Timeline */}

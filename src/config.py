@@ -53,6 +53,10 @@ class ThresholdsConfig:
     co2_critical_ppm: int = 2000
     co2_refresh_target_ppm: int = 500
     tvoc_threshold_ppb: int = 250  # tVOC > this triggers ERV at MEDIUM (3/2)
+    hvac_min_temp_f: int = 68  # Don't heat above this when away + ERV running
+    hvac_critical_temp_f: int = 55  # Always heat below this (pipe freeze protection)
+    expected_occupancy_start: str = "07:00"  # When to allow pre-conditioning
+    expected_occupancy_end: str = "22:00"  # After this, no heating unless critical
     motion_timeout_seconds: int = 60
     mac_poll_interval_seconds: int = 5
 
