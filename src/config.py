@@ -52,6 +52,7 @@ class MitsubishiConfig:
 class ThresholdsConfig:
     co2_critical_ppm: int = 2000
     co2_refresh_target_ppm: int = 500
+    tvoc_threshold_ppb: int = 250  # tVOC > this triggers ERV at MEDIUM (3/2)
     motion_timeout_seconds: int = 60
     mac_poll_interval_seconds: int = 5
 

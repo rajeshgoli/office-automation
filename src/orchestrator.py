@@ -71,6 +71,9 @@ class Orchestrator:
         # Track if ERV is currently running
         self._erv_running: bool = False
 
+        # Track tVOC-triggered ventilation (separate from CO2-based logic)
+        self._tvoc_ventilation_active: bool = False
+
         # HVAC status (will be updated by Kumo integration)
         self._hvac_mode: str = "heat"  # heat, cool, off, auto
         self._hvac_setpoint_c: float = 22.0  # Celsius
@@ -156,10 +159,24 @@ class Orchestrator:
             pass  # No event loop running
 
     def _evaluate_erv_state(self):
-        """Evaluate whether ERV should be on or off based on current state."""
+        """Evaluate whether ERV should be on or off based on current state.
+
+        Priority:
+        1. Safety interlock (window/door open) = ERV OFF
+        2. tVOC > threshold = ERV MEDIUM (both PRESENT and AWAY)
+        3. CO2 logic (PRESENT: critical only, AWAY: until target)
+
+        When multiple triggers are active:
+        - PRESENT: tVOC uses MEDIUM (louder than QUIET for CO2)
+        - AWAY: TURBO handles both tVOC and CO2
+        """
         state = self.state_machine.state
-        should_run = self.state_machine.erv_should_run
         co2 = self.state_machine.sensors.co2_ppm
+
+        # Get tVOC reading
+        reading = self.qingping.latest_reading
+        tvoc = reading.tvoc if reading else None
+        tvoc_threshold = self.config.thresholds.tvoc_threshold_ppb
 
         # Safety: window/door open = ERV off
         if self.state_machine.sensors.window_open or self.state_machine.sensors.door_open:
@@ -167,33 +184,75 @@ class Orchestrator:
                 logger.info("ACTION: ERV OFF (window/door open)")
                 self.erv.turn_off()
                 self._erv_running = False
+                if self._tvoc_ventilation_active:
+                    self._tvoc_ventilation_active = False
+                    self.db.log_climate_action("erv", "off", co2_ppm=co2, reason="safety_interlock")
             return
 
+        # Determine what's triggering ventilation
+        tvoc_triggered = tvoc is not None and tvoc > tvoc_threshold
+        co2_critical = co2 is not None and co2 >= self.config.thresholds.co2_critical_ppm
+        co2_needs_refresh = co2 is not None and co2 > self.config.thresholds.co2_refresh_target_ppm
+
         if state == OccupancyState.PRESENT:
-            # Only run ERV if CO2 is critical (>2000 ppm)
-            if co2 and co2 >= self.config.thresholds.co2_critical_ppm:
+            # PRESENT mode: prioritize quiet operation
+            # tVOC triggers MEDIUM, CO2 critical triggers QUIET
+            # tVOC takes precedence (MEDIUM is louder but handles VOCs)
+            if tvoc_triggered:
+                if not self._erv_running or not self._tvoc_ventilation_active:
+                    logger.info(f"ACTION: ERV MEDIUM (tVOC high: {tvoc}ppb)")
+                    self.erv.turn_on(FanSpeed.MEDIUM)
+                    self._erv_running = True
+                    if not self._tvoc_ventilation_active:
+                        self._tvoc_ventilation_active = True
+                        self.db.log_climate_action("erv", "medium", co2_ppm=co2, reason=f"tvoc_high_{tvoc}ppb")
+            elif co2_critical:
                 if not self._erv_running:
                     logger.info(f"ACTION: ERV QUIET (CO2 critical: {co2}ppm)")
                     self.erv.turn_on(FanSpeed.QUIET)
                     self._erv_running = True
+                elif self._tvoc_ventilation_active:
+                    # tVOC cleared, but CO2 still critical - downgrade to QUIET
+                    logger.info(f"ACTION: ERV QUIET (tVOC OK, CO2 still critical: {co2}ppm)")
+                    self.erv.turn_on(FanSpeed.QUIET)
+                    self._tvoc_ventilation_active = False
+                    self.db.log_climate_action("erv", "quiet", co2_ppm=co2, reason="tvoc_cleared_co2_critical")
             else:
                 if self._erv_running:
-                    logger.info("ACTION: ERV OFF (present, CO2 OK)")
+                    logger.info("ACTION: ERV OFF (present, air quality OK)")
                     self.erv.turn_off()
                     self._erv_running = False
+                    if self._tvoc_ventilation_active:
+                        self._tvoc_ventilation_active = False
+                        self.db.log_climate_action("erv", "off", co2_ppm=co2, reason="tvoc_cleared")
 
         elif state == OccupancyState.AWAY:
-            # Run ERV until CO2 reaches target
-            if should_run:
+            # AWAY mode: aggressive ventilation
+            # CO2 refresh uses TURBO, tVOC-only uses MEDIUM
+            if co2_needs_refresh:
+                # TURBO handles both CO2 and tVOC
                 if not self._erv_running:
                     logger.info(f"ACTION: ERV TURBO (away mode, CO2={co2}ppm)")
                     self.erv.turn_on(FanSpeed.TURBO)
                     self._erv_running = True
+            elif tvoc_triggered:
+                # CO2 is good but tVOC needs clearing
+                if not self._erv_running or not self._tvoc_ventilation_active:
+                    logger.info(f"ACTION: ERV MEDIUM (away, tVOC high: {tvoc}ppb, CO2 OK)")
+                    self.erv.turn_on(FanSpeed.MEDIUM)
+                    self._erv_running = True
+                    if not self._tvoc_ventilation_active:
+                        self._tvoc_ventilation_active = True
+                        self.db.log_climate_action("erv", "medium", co2_ppm=co2, reason=f"tvoc_high_{tvoc}ppb_away")
             else:
                 if self._erv_running:
-                    logger.info(f"ACTION: ERV OFF (CO2 target reached: {co2}ppm)")
+                    reason = "co2_target_reached" if not self._tvoc_ventilation_active else "tvoc_cleared_away"
+                    logger.info(f"ACTION: ERV OFF ({reason}: CO2={co2}ppm)")
                     self.erv.turn_off()
                     self._erv_running = False
+                    if self._tvoc_ventilation_active:
+                        self._tvoc_ventilation_active = False
+                        self.db.log_climate_action("erv", "off", co2_ppm=co2, reason=reason)
 
     def _on_state_change(self, old_state: OccupancyState, new_state: OccupancyState):
         """Handle occupancy state changes."""
@@ -271,6 +330,7 @@ class Orchestrator:
         # Add ERV status
         sm_status["erv"] = {
             "running": self._erv_running,
+            "tvoc_ventilation": self._tvoc_ventilation_active,
         }
 
         # Add HVAC status

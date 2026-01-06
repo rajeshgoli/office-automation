@@ -226,6 +226,7 @@ Implement the core rules from vision.md.
 - [x] **Rule 2**: Away mode - aggressive refresh (ERV on until CO2 < 500)
 - [ ] **Rule 3**: HVAC control based on Qingping readings (Mitsubishi client exists but not wired)
 - [x] **Rule 4**: Safety interlocks (window/door open = systems off)
+- [x] **Rule 5**: tVOC ventilation - ERV MEDIUM (3/2) when tVOC > 250 ppb (GH #1)
 
 ### Phase 5: Deployment
 - [ ] Run as background service (launchd on macOS or systemd on Linux)
@@ -360,3 +361,16 @@ Implement the core rules from vision.md.
   - `frontend/api.ts` - HVAC and tVOC types
   - `frontend/types.ts` - tVOC field
   - `.gitignore` - Ignore data/ directory
+
+**2026-01-05** (Session 5)
+- **GitHub Issue #1 Implemented** - tVOC-based ventilation control
+  - Added `tvoc_threshold_ppb` config parameter (default: 250 ppb)
+  - tVOC > threshold triggers ERV at MEDIUM (3/2) speed
+  - Works in both PRESENT and AWAY states
+  - PRESENT: tVOC triggers MEDIUM (louder than QUIET for CO2 critical)
+  - AWAY: TURBO takes precedence for CO2 refresh, MEDIUM for tVOC-only
+  - Logs tVOC-triggered actions to `climate_actions` table
+  - ERV status API now includes `tvoc_ventilation` boolean
+- **Files Changed**:
+  - `src/config.py` - Added `tvoc_threshold_ppb` to ThresholdsConfig
+  - `src/orchestrator.py` - tVOC evaluation logic in `_evaluate_erv_state()`
