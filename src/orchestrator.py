@@ -49,6 +49,7 @@ class Orchestrator:
             device_mac=config.qingping.device_mac,
             mqtt_host=config.qingping.mqtt_broker,
             mqtt_port=config.qingping.mqtt_port,
+            report_interval=config.qingping.report_interval,
         )
 
         # ERV client (Tuya local)
@@ -438,9 +439,25 @@ class Orchestrator:
                     temp_str = f"{temp_f:.1f}°F" if temp_f else "unknown"
                     logger.info(f"HVAC stays off (outside occupancy hours or was off, temp {temp_str})")
 
+    def _clear_manual_overrides(self, reason: str = "state_change"):
+        """Clear all manual overrides (called on state transitions)."""
+        if self._manual_erv_override or self._manual_hvac_override:
+            logger.info(f"Clearing manual overrides: {reason}")
+
+        self._manual_erv_override = False
+        self._manual_erv_speed = None
+        self._manual_erv_override_at = None
+        self._manual_hvac_override = False
+        self._manual_hvac_mode = None
+        self._manual_hvac_setpoint_f = None
+        self._manual_hvac_override_at = None
+
     def _on_state_change(self, old_state: OccupancyState, new_state: OccupancyState):
         """Handle occupancy state changes."""
         logger.info(f"=== STATE CHANGE: {old_state.value} → {new_state.value} ===")
+
+        # Clear manual overrides - automation takes over on state change
+        self._clear_manual_overrides(f"{old_state.value}→{new_state.value}")
 
         # Get latest CO2 reading
         reading = self.qingping.latest_reading
@@ -531,6 +548,7 @@ class Orchestrator:
                 logger.info("MANUAL: ERV OFF")
                 self.erv.turn_off()
                 self._erv_running = False
+                self._erv_speed = "off"
             else:
                 speed_map = {"quiet": FanSpeed.QUIET, "medium": FanSpeed.MEDIUM, "turbo": FanSpeed.TURBO}
                 fan_speed = speed_map[speed]
@@ -621,6 +639,38 @@ class Orchestrator:
             logger.error(f"Error handling HVAC POST: {e}")
             return web.json_response({"ok": False, "error": str(e)}, status=400)
 
+    async def _handle_qingping_interval_post(self, request: web.Request) -> web.Response:
+        """Handle POST /qingping/interval to configure reporting interval.
+
+        Body: {"interval": 60}  (seconds, minimum 15)
+        """
+        try:
+            data = await request.json()
+            interval = data.get("interval", 60)
+
+            if not isinstance(interval, int) or interval < 15:
+                return web.json_response(
+                    {"ok": False, "error": "Interval must be an integer >= 15 seconds"},
+                    status=400
+                )
+
+            if self.qingping.configure_interval(interval):
+                logger.info(f"Qingping interval reconfigured to {interval}s via API")
+                return web.json_response({
+                    "ok": True,
+                    "interval": interval,
+                    "message": f"Device configured to report every {interval} seconds"
+                })
+            else:
+                return web.json_response(
+                    {"ok": False, "error": "Failed to send configuration to device"},
+                    status=503
+                )
+
+        except Exception as e:
+            logger.error(f"Error handling Qingping interval POST: {e}")
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
     def _get_status_dict(self) -> dict:
         """Get current status as a dictionary."""
         sm_status = self.state_machine.get_status()
@@ -634,6 +684,8 @@ class Orchestrator:
             "pm25": reading.pm25 if reading else None,
             "tvoc": reading.tvoc if reading else None,
             "last_update": reading.timestamp.isoformat() if reading and reading.timestamp else None,
+            "report_interval": self.qingping.report_interval,
+            "interval_configured": self.qingping._interval_configured,
         }
 
         # Add ERV status
@@ -735,6 +787,7 @@ class Orchestrator:
         self._app.router.add_get("/ws", self._handle_websocket)
         self._app.router.add_post("/erv", self._handle_erv_post)
         self._app.router.add_post("/hvac", self._handle_hvac_post)
+        self._app.router.add_post("/qingping/interval", self._handle_qingping_interval_post)
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -796,6 +849,14 @@ class Orchestrator:
             self.qingping.set_callback(self._on_qingping_reading)
             self.qingping.connect()
             logger.info("Qingping MQTT connected. Waiting for sensor data...")
+
+            # Configure device to report at desired interval
+            # Small delay to ensure connection is fully established
+            await asyncio.sleep(1)
+            if self.qingping.configure_interval():
+                logger.info(f"Qingping interval configured to {self.config.qingping.report_interval}s")
+            else:
+                logger.warning("Failed to configure Qingping interval (will use cloud default)")
 
             # Restore last reading from database (survives restarts)
             cached = self.db.get_latest_sensor_reading()

@@ -281,8 +281,8 @@ class StateMachine:
         logger.debug(f"Window: {'open' if is_open else 'closed'}")
         await self.evaluate()
 
-    async def update_co2(self, ppm: int):
-        """Update CO2 reading."""
+    def update_co2(self, ppm: int):
+        """Update CO2 reading (sync - no state transitions needed)."""
         self.sensors.co2_ppm = ppm
         self.sensors.last_updated = time.time()
         logger.debug(f"CO2: {ppm} ppm")

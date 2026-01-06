@@ -111,11 +111,12 @@ class Database:
         source: str = "qingping"
     ):
         """Log a sensor reading."""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._connection() as conn:
             conn.execute("""
-                INSERT INTO sensor_readings (co2_ppm, temp_c, humidity, pm25, pm10, tvoc, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (co2_ppm, temp_c, humidity, pm25, pm10, tvoc, source))
+                INSERT INTO sensor_readings (timestamp, co2_ppm, temp_c, humidity, pm25, pm10, tvoc, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (now, co2_ppm, temp_c, humidity, pm25, pm10, tvoc, source))
 
     def get_latest_sensor_reading(self) -> Optional[Dict[str, Any]]:
         """Get the most recent sensor reading."""
@@ -154,11 +155,12 @@ class Database:
         details: Optional[Dict] = None
     ):
         """Log an occupancy state change."""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._connection() as conn:
             conn.execute("""
-                INSERT INTO occupancy_log (state, trigger, co2_ppm, details)
-                VALUES (?, ?, ?, ?)
-            """, (state, trigger, co2_ppm, json.dumps(details) if details else None))
+                INSERT INTO occupancy_log (timestamp, state, trigger, co2_ppm, details)
+                VALUES (?, ?, ?, ?, ?)
+            """, (now, state, trigger, co2_ppm, json.dumps(details) if details else None))
 
     def get_occupancy_history(
         self,
@@ -186,11 +188,12 @@ class Database:
         details: Optional[Dict] = None
     ):
         """Log a device event (door, window, motion)."""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._connection() as conn:
             conn.execute("""
-                INSERT INTO device_events (device_type, device_name, event, details)
-                VALUES (?, ?, ?, ?)
-            """, (device_type, device_name, event, json.dumps(details) if details else None))
+                INSERT INTO device_events (timestamp, device_type, device_name, event, details)
+                VALUES (?, ?, ?, ?, ?)
+            """, (now, device_type, device_name, event, json.dumps(details) if details else None))
 
     def get_device_events(
         self,
@@ -228,11 +231,12 @@ class Database:
         reason: Optional[str] = None
     ):
         """Log a climate control action (ERV on/off, HVAC change)."""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._connection() as conn:
             conn.execute("""
-                INSERT INTO climate_actions (system, action, setpoint, co2_ppm, reason)
-                VALUES (?, ?, ?, ?, ?)
-            """, (system, action, setpoint, co2_ppm, reason))
+                INSERT INTO climate_actions (timestamp, system, action, setpoint, co2_ppm, reason)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (now, system, action, setpoint, co2_ppm, reason))
 
     def get_climate_actions(
         self,
