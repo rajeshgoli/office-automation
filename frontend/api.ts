@@ -29,6 +29,10 @@ export interface ApiStatus {
   erv: {
     running: boolean;
   };
+  hvac: {
+    mode: string;
+    setpoint_c: number;
+  };
 }
 
 export interface ApiEvent {

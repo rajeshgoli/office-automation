@@ -38,8 +38,10 @@ function apiToState(api: ApiStatus): OfficeState {
     humidity: api.air_quality.humidity ?? 0,
     door: api.sensors.door_open ? DeviceStatus.OPEN : DeviceStatus.CLOSED,
     window: api.sensors.window_open ? DeviceStatus.OPEN : DeviceStatus.CLOSED,
-    hvacMode: DeviceStatus.COOL, // TODO: Wire up Mitsubishi
-    hvacTarget: 70,
+    hvacMode: api.hvac?.mode === 'heat' ? DeviceStatus.HEAT :
+              api.hvac?.mode === 'cool' ? DeviceStatus.COOL :
+              api.hvac?.mode === 'off' ? DeviceStatus.OFF : DeviceStatus.OFF,
+    hvacTarget: api.hvac?.setpoint_c ? toFahrenheit(api.hvac.setpoint_c) : 70,
     ventMode: api.erv.running ? DeviceStatus.ON : DeviceStatus.OFF,
     occupancy: api.is_present ? OccupancyState.PRESENT : OccupancyState.AWAY,
     lastUpdated: api.air_quality.last_update ? new Date(api.air_quality.last_update) : new Date(),
@@ -58,6 +60,8 @@ const App: React.FC = () => {
 
   const wsRef = useRef<StatusWebSocket | null>(null);
   const historyRef = useRef<ClimateDataPoint[]>([]);
+  const initialLoadRef = useRef(true); // Track first load to skip spurious events
+  const lastOccupancyRef = useRef<OccupancyState | null>(null); // Track real occupancy changes
 
   // Update history with new CO2 reading
   const addHistoryPoint = useCallback((co2: number, occupancy: OccupancyState, venting: boolean) => {
@@ -96,19 +100,24 @@ const App: React.FC = () => {
         if (mounted) {
           const newState = apiToState(status);
           setState(prev => {
-            // Check for state changes to log
-            if (prev.occupancy !== newState.occupancy) {
-              addEvent('state', `${newState.occupancy === OccupancyState.PRESENT ? 'Arrived' : 'Away'} - CO2 ${newState.co2} ppm`, newState.co2);
+            // Only log events after initial load (avoid spurious "Arrived" on page load)
+            if (!initialLoadRef.current) {
+              // Only log occupancy if it actually changed from last known state
+              if (lastOccupancyRef.current !== null && lastOccupancyRef.current !== newState.occupancy) {
+                addEvent('state', `${newState.occupancy === OccupancyState.PRESENT ? 'Arrived' : 'Away'} - CO2 ${newState.co2} ppm`, newState.co2);
+              }
+              if (prev.ventMode !== newState.ventMode) {
+                addEvent('erv', `ERV ${newState.ventMode === DeviceStatus.ON ? 'ON' : 'OFF'}`, newState.co2);
+              }
+              if (prev.door !== newState.door) {
+                addEvent('door', `Door ${newState.door === DeviceStatus.OPEN ? 'opened' : 'closed'}`);
+              }
+              if (prev.window !== newState.window) {
+                addEvent('window', `Window ${newState.window === DeviceStatus.OPEN ? 'opened' : 'closed'}`);
+              }
             }
-            if (prev.ventMode !== newState.ventMode) {
-              addEvent('erv', `ERV ${newState.ventMode === DeviceStatus.ON ? 'ON' : 'OFF'}`, newState.co2);
-            }
-            if (prev.door !== newState.door) {
-              addEvent('door', `Door ${newState.door === DeviceStatus.OPEN ? 'opened' : 'closed'}`);
-            }
-            if (prev.window !== newState.window) {
-              addEvent('window', `Window ${newState.window === DeviceStatus.OPEN ? 'opened' : 'closed'}`);
-            }
+            initialLoadRef.current = false;
+            lastOccupancyRef.current = newState.occupancy;
             return newState;
           });
           setApiConnected(true);
@@ -150,13 +159,14 @@ const App: React.FC = () => {
     ws.onStatus((status) => {
       const newState = apiToState(status);
       setState(prev => {
-        // Check for state changes to log
-        if (prev.occupancy !== newState.occupancy) {
+        // Only log real changes (compare against last known occupancy, not stale state)
+        if (lastOccupancyRef.current !== null && lastOccupancyRef.current !== newState.occupancy) {
           addEvent('state', `${newState.occupancy === OccupancyState.PRESENT ? 'Arrived' : 'Away'} - CO2 ${newState.co2} ppm`, newState.co2);
         }
-        if (prev.ventMode !== newState.ventMode) {
+        if (prev.ventMode !== newState.ventMode && !initialLoadRef.current) {
           addEvent('erv', `ERV ${newState.ventMode === DeviceStatus.ON ? 'ON' : 'OFF'}`, newState.co2);
         }
+        lastOccupancyRef.current = newState.occupancy;
         return newState;
       });
       setApiConnected(true);

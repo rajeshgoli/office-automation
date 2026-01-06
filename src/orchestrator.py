@@ -70,6 +70,10 @@ class Orchestrator:
         # Track if ERV is currently running
         self._erv_running: bool = False
 
+        # HVAC status (will be updated by Kumo integration)
+        self._hvac_mode: str = "heat"  # heat, cool, off, auto
+        self._hvac_setpoint_c: float = 22.0  # Celsius
+
     def _setup_yolink_handlers(self):
         """Map YoLink devices to state machine inputs."""
         # Find devices by type/name
@@ -223,24 +227,7 @@ class Orchestrator:
 
     async def _handle_status_get(self, request: web.Request) -> web.Response:
         """Handle GET /status for debugging."""
-        sm_status = self.state_machine.get_status()
-
-        # Add air quality info
-        reading = self.qingping.latest_reading
-        sm_status["air_quality"] = {
-            "co2_ppm": reading.co2_ppm if reading else None,
-            "temp_c": reading.temp_c if reading else None,
-            "humidity": reading.humidity if reading else None,
-            "pm25": reading.pm25 if reading else None,
-            "last_update": reading.timestamp.isoformat() if reading and reading.timestamp else None,
-        }
-
-        # Add ERV status
-        sm_status["erv"] = {
-            "running": self._erv_running,
-        }
-
-        return web.json_response(sm_status)
+        return web.json_response(self._get_status_dict())
 
     def _get_status_dict(self) -> dict:
         """Get current status as a dictionary."""
@@ -259,6 +246,12 @@ class Orchestrator:
         # Add ERV status
         sm_status["erv"] = {
             "running": self._erv_running,
+        }
+
+        # Add HVAC status
+        sm_status["hvac"] = {
+            "mode": self._hvac_mode,
+            "setpoint_c": self._hvac_setpoint_c,
         }
 
         return sm_status
