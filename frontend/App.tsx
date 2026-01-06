@@ -403,7 +403,7 @@ const App: React.FC = () => {
         <VitalTile
           label="HVAC"
           value={`${state.hvacMode} ${state.hvacTarget}°`}
-          icon={state.hvacMode === DeviceStatus.COOL ? '❄️' : '🔥'}
+          icon={state.hvacMode === DeviceStatus.COOL ? '❄️' : state.hvacMode === DeviceStatus.HEAT ? '🔥' : '⏸️'}
           status={state.hvacMode}
         />
         <VitalTile
