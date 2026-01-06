@@ -1,0 +1,46 @@
+# Office Climate Automation Configuration
+# Copy this to config.yaml and fill in your values
+
+# YoLink Cloud API (get from YoLink App > Account > Advanced Settings > Personal Access Credentials)
+yolink:
+  uaid: "your_uaid"
+  secret_key: "your_secret_key"
+
+# Qingping Air Monitor (get from developer.qingping.co after setting up Private Access Config)
+qingping:
+  mqtt_broker: "localhost"  # or IP of your MQTT broker
+  mqtt_port: 1883
+  device_mac: "AA:BB:CC:DD:EE:FF"
+
+# Airlink ERV (Tuya-based)
+# Option 1: LocalTuya
+erv:
+  type: "tuya"  # or "shelly" for relay control
+  device_id: "your_tuya_device_id"
+  local_key: "your_tuya_local_key"
+  ip: "192.168.1.xxx"
+
+# Option 2: Shelly relay (if using relay instead of Tuya)
+# erv:
+#   type: "shelly"
+#   ip: "192.168.1.xxx"
+
+# Mitsubishi (pykumo)
+mitsubishi:
+  username: "your_kumo_email"
+  password: "your_kumo_password"
+  # If using ESPHome instead:
+  # type: "esphome"
+  # ip: "192.168.1.xxx"
+
+# Automation thresholds (from vision.md)
+thresholds:
+  co2_critical_ppm: 2000      # ERV on even when present
+  co2_refresh_target_ppm: 500  # Target for away-mode ventilation
+  motion_timeout_seconds: 60   # Time before motion absence triggers away
+  mac_poll_interval_seconds: 5 # How often to check Mac occupancy
+
+# Orchestrator network settings (for Mac occupancy detector to report to)
+orchestrator:
+  host: "0.0.0.0"
+  port: 8080

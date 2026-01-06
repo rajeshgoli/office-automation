@@ -1,0 +1,5 @@
+{
+  "name": "Office Climate Dashboard",
+  "description": "A glanceable, high-information-density real-time office environment dashboard featuring CO2 monitoring, HVAC status, and activity logging.",
+  "requestFramePermissions": []
+}

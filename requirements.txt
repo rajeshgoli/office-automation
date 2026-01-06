@@ -1,0 +1,23 @@
+# Office Climate Automation Dependencies
+
+# Async HTTP client
+aiohttp>=3.9.0
+
+# MQTT client (for YoLink, Qingping)
+aiomqtt>=2.0.0
+
+# Tuya local control (for ERV)
+tinytuya>=1.13.0
+
+# Mitsubishi Kumo Cloud (custom client)
+pyjwt>=2.8.0
+
+# Configuration
+pyyaml>=6.0
+
+# Type hints
+typing-extensions>=4.0.0
+
+# BLE scanning (for Qingping Lite)
+bleak>=0.21.0
+paho-mqtt>=2.0.0
