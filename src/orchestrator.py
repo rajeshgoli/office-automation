@@ -21,6 +21,7 @@ from .yolink_client import YoLinkClient, YoLinkDevice, DeviceType
 from .state_machine import StateMachine, StateConfig, OccupancyState
 from .qingping_client import QingpingMQTTClient, QingpingReading
 from .erv_client import ERVClient, FanSpeed
+from .database import Database
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,9 @@ class Orchestrator:
         self._hvac_mode: str = "heat"  # heat, cool, off, auto
         self._hvac_setpoint_c: float = 22.0  # Celsius
 
+        # Database for persistence and analysis
+        self.db = Database()
+
     def _setup_yolink_handlers(self):
         """Map YoLink devices to state machine inputs."""
         # Find devices by type/name
@@ -102,16 +106,19 @@ class Orchestrator:
         if device.device_id == self._door_device_id:
             is_open = state == "open"
             logger.info(f"Door: {'OPEN' if is_open else 'CLOSED'}")
+            self.db.log_device_event("door", "open" if is_open else "closed", device.name)
             await self.state_machine.update_door(is_open)
 
         elif device.device_id == self._window_device_id:
             is_open = state == "open"
             logger.info(f"Window: {'OPEN' if is_open else 'CLOSED'}")
+            self.db.log_device_event("window", "open" if is_open else "closed", device.name)
             await self.state_machine.update_window(is_open)
 
         elif device.device_id == self._motion_device_id:
             detected = state == "alert"
             logger.info(f"Motion: {'DETECTED' if detected else 'clear'}")
+            self.db.log_device_event("motion", "detected" if detected else "clear", device.name)
             await self.state_machine.update_motion(detected)
 
         # Log current status
@@ -124,6 +131,16 @@ class Orchestrator:
     def _on_qingping_reading(self, reading: QingpingReading):
         """Handle new air quality reading from Qingping."""
         logger.info(f"Air quality: CO2={reading.co2_ppm}ppm, {reading.temp_c}°C, {reading.humidity}%")
+
+        # Log to database for persistence and analysis
+        self.db.log_sensor_reading(
+            co2_ppm=reading.co2_ppm,
+            temp_c=reading.temp_c,
+            humidity=reading.humidity,
+            pm25=reading.pm25,
+            pm10=reading.pm10,
+            tvoc=reading.tvoc,
+        )
 
         # Update state machine with CO2 reading
         if reading.co2_ppm is not None:
@@ -186,6 +203,13 @@ class Orchestrator:
         reading = self.qingping.latest_reading
         co2 = reading.co2_ppm if reading else None
         logger.info(f"Current CO2: {co2}ppm" if co2 else "CO2: unknown")
+
+        # Log to database
+        self.db.log_occupancy_change(
+            state=new_state.value,
+            trigger=None,  # TODO: track what triggered the change
+            co2_ppm=co2,
+        )
 
         # Evaluate ERV state based on new occupancy
         self._evaluate_erv_state()
@@ -366,6 +390,24 @@ class Orchestrator:
             self.qingping.set_callback(self._on_qingping_reading)
             self.qingping.connect()
             logger.info("Qingping MQTT connected. Waiting for sensor data...")
+
+            # Restore last reading from database (survives restarts)
+            cached = self.db.get_latest_sensor_reading()
+            if cached and cached.get("co2_ppm"):
+                from datetime import datetime
+                reading = QingpingReading(
+                    device_name="Qingping Air Monitor (cached)",
+                    mac_hint=self.config.qingping.device_mac,
+                    co2_ppm=cached.get("co2_ppm"),
+                    temp_c=cached.get("temp_c"),
+                    humidity=cached.get("humidity"),
+                    pm25=cached.get("pm25"),
+                    pm10=cached.get("pm10"),
+                    tvoc=cached.get("tvoc"),
+                    timestamp=datetime.fromisoformat(cached["timestamp"]) if cached.get("timestamp") else None,
+                )
+                self.qingping._latest_reading = reading
+                logger.info(f"Restored cached reading: CO2={reading.co2_ppm}ppm from {cached.get('timestamp')}")
         except Exception as e:
             logger.error(f"Qingping MQTT connection failed: {e}")
             logger.warning("Continuing without CO2 monitoring...")

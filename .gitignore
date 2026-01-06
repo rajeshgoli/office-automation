@@ -37,3 +37,6 @@ Thumbs.db
 # Temp
 tmp/
 *.tmp
+
+# Database
+data/
