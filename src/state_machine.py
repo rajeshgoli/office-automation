@@ -83,23 +83,24 @@ class StateMachine:
     def is_present(self) -> bool:
         """Check if any presence signal is active.
 
-        For AWAY→PRESENT transitions, we require physical presence (motion or door).
-        Mac activity alone is not enough - it just indicates the computer is on.
+        Presence signals (can trigger AWAY→PRESENT):
+        - Mac keyboard/mouse activity (strongest signal - you're at the computer)
+        - Motion detected while door is closed (you're inside)
+
+        Note: Door opening alone doesn't trigger PRESENT (might just be grabbing something)
+        External monitor connected just means the Mac is at the desk, not that you're there.
         """
-        # Recent motion (within timeout) - this is physical presence
+        # Mac keyboard/mouse activity (idle < threshold) = actively using computer
+        # This is the strongest presence signal
+        mac_active = self.sensors.mac_active  # True if recent keyboard/mouse activity
+
+        # Recent motion while door is closed = inside the room
         motion_age = time.time() - self.sensors.motion_last_seen
-        motion_presence = self.sensors.motion_detected or (motion_age < self.config.motion_timeout_seconds)
+        motion_recent = self.sensors.motion_detected or (motion_age < self.config.motion_timeout_seconds)
+        # Motion only counts if door is closed (otherwise might be outside reaching in)
+        motion_inside = motion_recent and not self.sensors.door_open
 
-        # Mac active with external monitor - this is supporting evidence only
-        mac_presence = self.sensors.mac_active and self.sensors.external_monitor
-
-        # Physical presence (motion) is required for AWAY→PRESENT
-        # Mac presence alone can't trigger return from AWAY
-        if self.state == OccupancyState.AWAY:
-            return motion_presence  # Only motion can bring us back from AWAY
-
-        # When PRESENT, either signal keeps us present
-        return mac_presence or motion_presence
+        return mac_active or motion_inside
 
     @property
     def door_just_closed(self) -> bool:
@@ -176,10 +177,12 @@ class StateMachine:
                 logger.info("Departure verified: no activity detected → AWAY")
                 old_state = self.state
                 self.state = OccupancyState.AWAY
-                # Reset motion timestamp to prevent stale motion from triggering false PRESENT
-                # (motion sensor may send "clear" event after we've departed)
+                # Reset all presence signals so only NEW activity triggers return
+                # - Motion: reset timestamp so stale motion doesn't trigger PRESENT
+                # - Mac: reset so only fresh keyboard/mouse activity triggers PRESENT
                 self.sensors.motion_last_seen = 0
                 self.sensors.motion_detected = False
+                self.sensors.mac_active = False
                 await self._notify_state_change(old_state, self.state)
         except asyncio.CancelledError:
             pass  # Timer was cancelled due to activity
@@ -260,12 +263,9 @@ class StateMachine:
         self.sensors.last_updated = time.time()
         logger.debug(f"Door: {'open' if is_open else 'closed'}")
 
-        # Door opening while AWAY = someone entering (immediate PRESENT)
-        if is_open and self.state == OccupancyState.AWAY:
-            logger.info("Door opened while AWAY - transitioning to PRESENT")
-            old_state = self.state
-            self.state = OccupancyState.PRESENT
-            await self._notify_state_change(old_state, self.state)
+        # Door opening while AWAY doesn't immediately trigger PRESENT
+        # (might just be grabbing something from inside)
+        # We wait for: motion inside + door closed, OR mac activity
 
         # Door just closed (was open, now closed) - start departure verification
         if was_open is True and is_open is False:
