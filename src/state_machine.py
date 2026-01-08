@@ -5,15 +5,20 @@ Implements PRESENT/AWAY state logic:
 - PRESENT: Quiet mode - ERV off unless CO2 > 2000 ppm
 - AWAY: Ventilation mode - ERV full blast until CO2 < 500 ppm
 
-Presence detection (timestamp-based):
-  mac_presence = external_monitor AND (mac_last_active > door_last_changed)
-  motion_presence = motion_recent AND door_closed AND (motion_last_seen > door_last_changed)
-  is_present = mac_presence OR motion_presence
+Operating Modes:
 
-State transitions:
-  AWAY → PRESENT: Any presence signal (immediate)
-  PRESENT → AWAY: Door close + 10s verification with no activity
-                  (Only door close can trigger departure - can't leave without door)
+Normal Mode (Door recently changed or closed):
+  - AWAY → PRESENT: Mac activity OR motion AFTER door event
+  - PRESENT → AWAY: Door close + 10s verification with no activity
+  - Door events required for transitions
+
+Door Open Mode (Door open for 5+ minutes):
+  - AWAY → PRESENT: Immediately on any Mac OR motion activity
+  - PRESENT → AWAY: After 5 minutes of no activity
+  - Free transitions based on activity alone
+  - Door close exits door open mode → back to normal
+
+This handles "door open for ventilation" scenarios without false departures.
 """
 
 import asyncio
@@ -59,6 +64,8 @@ class StateConfig:
     """Configuration for state machine thresholds."""
     motion_timeout_seconds: int = 60
     departure_verification_seconds: int = 10  # Time to wait after door close before confirming departure
+    door_open_threshold_minutes: int = 5  # Door open this long → door open mode (activity-based transitions)
+    door_open_away_timeout_minutes: int = 5  # In door open mode, no activity for this long → AWAY
     co2_critical_ppm: int = 2000
     co2_refresh_target_ppm: int = 500
 
@@ -80,25 +87,51 @@ class StateMachine:
         self._last_door_state: Optional[bool] = None
         self._departure_verification_task: Optional[asyncio.Task] = None
         self._verifying_departure: bool = False
+        self._door_open_away_task: Optional[asyncio.Task] = None  # Timer for door open mode AWAY transition
+        self._last_activity_time: float = time.time()  # Track last Mac or motion activity for door open mode
+
+    @property
+    def in_door_open_mode(self) -> bool:
+        """Check if in door open mode (door open for 5+ minutes).
+
+        In door open mode:
+        - Transitions based on activity alone (not door events)
+        - AWAY → PRESENT: immediate on any activity
+        - PRESENT → AWAY: after 5 min no activity
+        """
+        if not self.sensors.door_open:
+            return False
+
+        door_open_duration_minutes = (time.time() - self.sensors.door_last_changed) / 60
+        return door_open_duration_minutes >= self.config.door_open_threshold_minutes
 
     @property
     def is_present(self) -> bool:
         """Check if any presence signal is active.
 
-        Presence signals (can trigger AWAY→PRESENT):
+        In door open mode (door open 5+ min):
+        - Any recent Mac activity OR motion = present
+        - No timestamp comparison needed
+
+        In normal mode:
         - Mac keyboard/mouse activity AFTER last door event (strongest signal)
         - Motion detected AFTER last door event while door is closed
-
-        Key: Only activity AFTER the door last changed counts as presence.
-        Activity before door close was the user walking TO the door (departure).
-
-        Note: Door opening alone doesn't trigger PRESENT (might just be grabbing something)
-        External monitor connected just means the Mac is at the desk, not that you're there.
+        - Only activity AFTER the door last changed counts as presence
         """
+        if self.in_door_open_mode:
+            # Door open mode: simple activity check
+            motion_age = time.time() - self.sensors.motion_last_seen
+            motion_recent = self.sensors.motion_detected or (motion_age < self.config.motion_timeout_seconds)
+
+            mac_recent = (self.sensors.external_monitor and
+                         self.sensors.mac_last_active > 0)
+
+            return mac_recent or motion_recent
+
+        # Normal mode: door-event-based presence
         # Mac activity only counts if:
         # 1. External monitor connected (Mac is in the room)
         # 2. Activity happened AFTER last door event (not pre-departure)
-        # No idle threshold needed - door close + verification timer handles departure
         mac_presence = (self.sensors.external_monitor and
                        self.sensors.mac_last_active > self.sensors.door_last_changed)
 
@@ -178,6 +211,13 @@ class StateMachine:
             self._departure_verification_task = None
             self._verifying_departure = False
 
+    def _cancel_door_open_away_timer(self, reason: str = "activity detected"):
+        """Cancel door open mode AWAY timer."""
+        if self._door_open_away_task and not self._door_open_away_task.done():
+            logger.debug(f"Door open mode AWAY timer cancelled: {reason}")
+            self._door_open_away_task.cancel()
+            self._door_open_away_task = None
+
     async def _departure_verification_timer(self):
         """Wait for verification period, then transition to AWAY if no activity."""
         try:
@@ -201,6 +241,24 @@ class StateMachine:
             self._verifying_departure = False
             self._departure_verification_task = None
 
+    async def _door_open_away_timer(self):
+        """In door open mode, transition to AWAY after no activity for 5 minutes."""
+        try:
+            timeout_seconds = self.config.door_open_away_timeout_minutes * 60
+            logger.info(f"Door open mode AWAY timer started ({self.config.door_open_away_timeout_minutes} min)")
+            await asyncio.sleep(timeout_seconds)
+
+            # Timer expired - no activity detected in door open mode
+            if self.state == OccupancyState.PRESENT and self.in_door_open_mode:
+                logger.info("Door open mode: no activity for 5 minutes → AWAY")
+                old_state = self.state
+                self.state = OccupancyState.AWAY
+                await self._notify_state_change(old_state, self.state)
+        except asyncio.CancelledError:
+            pass  # Timer was cancelled due to activity
+        finally:
+            self._door_open_away_task = None
+
     def _start_departure_verification(self):
         """Start departure verification timer after door closes."""
         if self.state != OccupancyState.PRESENT:
@@ -215,19 +273,45 @@ class StateMachine:
             self._departure_verification_timer()
         )
 
+    def _start_door_open_away_timer(self):
+        """Start door open mode AWAY timer (triggered by activity)."""
+        if self.state != OccupancyState.PRESENT:
+            return
+
+        # Cancel existing timer and restart
+        self._cancel_door_open_away_timer("restarting due to new activity")
+
+        # Start new timer
+        self._door_open_away_task = asyncio.create_task(
+            self._door_open_away_timer()
+        )
+
     async def evaluate(self) -> OccupancyState:
         """Evaluate current state and transition if needed.
 
-        Note: PRESENT → AWAY transitions are now handled by the departure
-        verification timer, not by this method.
+        Normal mode: PRESENT → AWAY via departure verification timer
+        Door open mode: AWAY ↔ PRESENT based on activity
         """
         old_state = self.state
 
-        if self.state == OccupancyState.AWAY:
-            # Transition to PRESENT on any presence signal
-            if self.is_present:
+        if self.in_door_open_mode:
+            # Door open mode: activity-based transitions
+            if self.state == OccupancyState.AWAY and self.is_present:
+                # Immediate PRESENT on activity
+                self.state = OccupancyState.PRESENT
+                logger.info("Door open mode: AWAY → PRESENT (activity detected)")
+                # Start timer for AWAY transition
+                self._start_door_open_away_timer()
+            elif self.state == OccupancyState.PRESENT and self.is_present:
+                # Activity detected while PRESENT - restart AWAY timer
+                self._start_door_open_away_timer()
+            # Note: PRESENT → AWAY handled by _door_open_away_timer
+        else:
+            # Normal mode: door-event-based transitions
+            if self.state == OccupancyState.AWAY and self.is_present:
                 self.state = OccupancyState.PRESENT
                 logger.info("State: AWAY → PRESENT")
+            # Note: PRESENT → AWAY handled by _departure_verification_timer
 
         # Track door state for open→close detection
         self._last_door_state = self.sensors.door_open
@@ -280,13 +364,12 @@ class StateMachine:
         self.sensors.last_updated = time.time()
         logger.debug(f"Door: {'open' if is_open else 'closed'}")
 
-        # Door opening while AWAY doesn't immediately trigger PRESENT
-        # (might just be grabbing something from inside)
-        # We wait for: motion inside + door closed, OR mac activity
-
-        # Door just closed (was open, now closed) - start departure verification
+        # Door closing exits door open mode - return to normal door-event logic
         if was_open is True and is_open is False:
-            logger.info("Door closed - starting departure verification")
+            logger.info("Door closed - exiting door open mode, starting departure verification")
+            # Cancel door open mode timer if active
+            self._cancel_door_open_away_timer("door closed")
+            # Start normal departure verification
             self._start_departure_verification()
 
         await self.evaluate()
@@ -313,6 +396,7 @@ class StateMachine:
             "safety_interlock": self.safety_interlock_active,
             "erv_should_run": self.erv_should_run,
             "verifying_departure": self._verifying_departure,
+            "in_door_open_mode": self.in_door_open_mode,
             "sensors": {
                 "mac_last_active": self.sensors.mac_last_active,
                 "external_monitor": self.sensors.external_monitor,

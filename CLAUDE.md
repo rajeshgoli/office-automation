@@ -62,6 +62,24 @@ Office Climate Automation system for a backyard shed office. The system coordina
 - **PRESENT**: Quiet mode - ERV off unless CO2 > 2000 ppm or tVOC index > 250
 - **AWAY**: Ventilation mode - ERV PURGE until CO2 < 500 ppm
 
+### Operating Modes
+
+The state machine has two operating modes that handle different door scenarios:
+
+**Normal Mode** (Door recently changed or closed):
+- Transitions require door events
+- AWAY → PRESENT: Mac OR motion activity AFTER door event
+- PRESENT → AWAY: Door close + 10s verification with no activity
+
+**Door Open Mode** (Door open for 5+ minutes):
+- Enables when door stays open (for ventilation)
+- AWAY → PRESENT: Immediately on any Mac OR motion activity
+- PRESENT → AWAY: After 5 minutes of no activity
+- Free transitions based on activity alone
+- Door close exits door open mode → back to normal
+
+This prevents false departures when leaving the door open for ventilation.
+
 ### Presence Detection Logic
 
 **Architecture:**
