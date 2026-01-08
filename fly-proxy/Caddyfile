@@ -1,0 +1,9 @@
+:8080 {
+	# Replace YOUR_WIREGUARD_IP with your Mac's WireGuard IP after step 2
+	# It will look like fdaa:0:1234:a7b:abc:0:a:2
+	reverse_proxy http://[YOUR_WIREGUARD_IP]:8080
+
+	# Enable WebSocket support
+	header_up Upgrade {>Upgrade}
+	header_up Connection {>Connection}
+}

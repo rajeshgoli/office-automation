@@ -1,0 +1,41 @@
+{
+  "name": "Office Climate",
+  "short_name": "Climate",
+  "description": "Control your office climate system - ERV, HVAC, and air quality monitoring",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#09090b",
+  "theme_color": "#09090b",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["utilities", "productivity"],
+  "shortcuts": [
+    {
+      "name": "ERV Off",
+      "short_name": "ERV Off",
+      "description": "Turn ERV off",
+      "url": "/?action=erv_off",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "ERV Quiet",
+      "short_name": "Quiet",
+      "description": "Set ERV to quiet mode",
+      "url": "/?action=erv_quiet",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}

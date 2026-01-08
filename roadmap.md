@@ -229,16 +229,36 @@ Implement the core rules from vision.md.
 - [x] **Rule 4**: Safety interlocks (window/door open = systems off)
 - [x] **Rule 5**: tVOC ventilation - ERV MEDIUM (3/2) when tVOC > 250 ppb (GH #1)
 
-### Phase 5: Deployment
-- [ ] Run as background service (launchd on macOS or systemd on Linux)
-- [ ] Logging and monitoring
-- [ ] Alerting for failures
-- [ ] Test full end-to-end flow with real Qingping data
+### Phase 5: Mobile & Remote Access ✅ Complete
+- [x] PWA manifest and iOS meta tags
+- [x] App icons generated (192x192, 512x512)
+- [x] Backend serves frontend (single port deployment)
+- [x] HTTP Basic Auth implemented (optional)
+- [x] Tested PWA installation on iOS
+- [x] Remote access solution selected (Tailscale Funnel)
+- [ ] Deploy to Mac Mini / always-on device (ready to go, just waiting on hardware)
+
+### Phase 6: Deployment
+- [ ] Set up Mac Mini (or Pi) as always-on server
+- [ ] Install dependencies (Python, Mosquitto, Tailscale)
+- [ ] Deploy orchestrator to Mac Mini
+- [ ] Run as launch agent (macOS) or systemd service (Linux)
+- [ ] Enable Tailscale Funnel for remote access
+- [ ] Add DNS CNAME for climate.rajeshgo.li
+- [ ] Update Mac occupancy detector to POST to Mac Mini
+- [ ] Test full end-to-end flow from anywhere
+- [ ] Enable authentication (HTTP Basic Auth or Google OAuth)
 
 ---
 
 ## Future / P2
 
+- [ ] **Historical Charts** - Time-series visualization for trends
+  - CO2, temperature, humidity graphs (day/week/month views)
+  - Occupancy pattern analysis (when are you typically in the office?)
+  - ERV runtime statistics (total hours, mode distribution)
+  - HVAC energy usage estimates
+  - Export data as CSV for external analysis
 - [ ] Predictive pre-conditioning based on arrival patterns
 - [ ] Calendar integration for meeting awareness
 - [ ] Seasonal threshold adjustments
@@ -530,3 +550,62 @@ Implement the core rules from vision.md.
     - `src/config.py` - Added co2_critical_hysteresis_ppm
     - `src/orchestrator.py` - Hysteresis logic in _evaluate_erv_state()
     - `CLAUDE.md` - Documented hysteresis in Key Thresholds table
+
+**2026-01-08** (Session 12)
+- **PWA Testing & Remote Access Planning**
+  - Generated PNG icons from SVG (192x192, 512x512)
+  - Tested PWA installation on iPhone via local network
+  - Explored remote access options: Cloudflare Tunnel (temp URLs, auth issues)
+  - **Decided on Tailscale Funnel** for remote access (simpler, free, stable)
+- **Backend Serves Frontend** - Simplified deployment
+  - Added static file serving to orchestrator
+  - Frontend build served from `/frontend/dist`
+  - Single port (8080) for both API and UI
+  - WebSocket support maintained
+- **Remote Access Documentation**
+  - Created `tailscale.md` - Step-by-step Tailscale Funnel setup
+  - Created `fly.md` - Fly.io alternative (deprecated in favor of Tailscale)
+  - Created `fly-proxy/` - Caddy reverse proxy config (unused)
+- **Deployment Target Decision**
+  - Mac Mini ($40 used) chosen over Raspberry Pi
+  - More reliable, more power, macOS compatibility
+  - Always-on device for production deployment
+- **Files Changed**:
+  - `src/orchestrator.py` - Added static file serving for frontend
+  - `frontend/public/icon-192.png` - Generated app icon
+  - `frontend/public/icon-512.png` - Generated app icon
+  - `tailscale.md` - Complete Tailscale setup guide
+  - `fly.md` - Fly.io setup guide (deprecated)
+  - `fly-proxy/*` - Fly.io proxy config files
+
+**2026-01-07** (Session 11)
+- **PWA Implementation** - Progressive Web App for iOS
+  - Added `manifest.json` with app metadata, icons, shortcuts
+  - iOS-specific meta tags for native feel (status bar, home screen)
+  - Created SVG icon (placeholder, needs PNG conversion)
+  - Added `viewport-fit=cover` for notch/safe area support
+- **HTTP Basic Auth** - Optional authentication for remote access
+  - Added `auth_username` and `auth_password` to OrchestratorConfig
+  - Middleware checks Authorization header, returns 401 if invalid
+  - CORS updated to allow Authorization header
+  - Disabled by default (no credentials = no auth required)
+  - Updated config.example.yaml with auth fields
+- **Cloudflare Tunnel + Access Documentation** - Comprehensive deployment guide
+  - Step-by-step Pi deployment (systemd service)
+  - Cloudflare Tunnel setup (cloudflared installation, config)
+  - **Cloudflare Access** for email-based auth (recommended over Basic Auth)
+    - One-time email codes (no passwords)
+    - Whitelist rajeshgoli@gmail.com
+    - 24-hour session persistence
+  - PWA installation instructions for iPhone
+  - Architecture diagrams for remote access flow
+- **Files Changed**:
+  - `frontend/public/manifest.json` - PWA manifest
+  - `frontend/public/icon.svg` - App icon (SVG placeholder)
+  - `frontend/public/ICONS_TODO.md` - Icon conversion instructions
+  - `frontend/index.html` - PWA meta tags, manifest link
+  - `src/config.py` - Added auth_username/auth_password to OrchestratorConfig
+  - `src/orchestrator.py` - HTTP Basic Auth middleware
+  - `config.example.yaml` - Auth configuration example
+  - `CLAUDE.md` - Authentication section, Cloudflare Tunnel deployment guide
+  - `roadmap.md` - Updated with Phase 5 (Mobile & Remote Access), historical charts in P2

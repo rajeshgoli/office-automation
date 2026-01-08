@@ -12,6 +12,8 @@ Ties together:
 import asyncio
 import json
 import logging
+import base64
+from pathlib import Path
 from typing import Optional, Set
 
 from aiohttp import web, WSMsgType
@@ -873,18 +875,94 @@ class Orchestrator:
 
         response.headers["Access-Control-Allow-Origin"] = "*"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         return response
+
+    def _basic_auth_middleware(self, username: str, password: str):
+        """Create a basic auth middleware with the given credentials."""
+        @web.middleware
+        async def middleware(request: web.Request, handler):
+            # Skip auth for WebSocket upgrade requests (browser handles auth before upgrade)
+            if request.headers.get("Upgrade") == "websocket":
+                return await handler(request)
+
+            # Get Authorization header
+            auth_header = request.headers.get("Authorization", "")
+
+            if not auth_header.startswith("Basic "):
+                # No auth provided, request it
+                return web.Response(
+                    status=401,
+                    headers={"WWW-Authenticate": 'Basic realm="Office Climate"'},
+                    text="Authentication required"
+                )
+
+            # Decode credentials
+            try:
+                encoded_credentials = auth_header[6:]  # Skip "Basic "
+                decoded = base64.b64decode(encoded_credentials).decode("utf-8")
+                provided_username, provided_password = decoded.split(":", 1)
+
+                # Verify credentials
+                if provided_username == username and provided_password == password:
+                    return await handler(request)
+                else:
+                    return web.Response(
+                        status=401,
+                        headers={"WWW-Authenticate": 'Basic realm="Office Climate"'},
+                        text="Invalid credentials"
+                    )
+            except Exception:
+                return web.Response(
+                    status=401,
+                    headers={"WWW-Authenticate": 'Basic realm="Office Climate"'},
+                    text="Invalid authorization header"
+                )
+
+        return middleware
 
     async def _start_http_server(self):
         """Start the HTTP server for macOS occupancy detector."""
-        self._app = web.Application(middlewares=[self._cors_middleware])
+        # Build middleware list
+        middlewares = [self._cors_middleware]
+
+        # Add basic auth if configured
+        if self.config.orchestrator.auth_username and self.config.orchestrator.auth_password:
+            auth_middleware = self._basic_auth_middleware(
+                self.config.orchestrator.auth_username,
+                self.config.orchestrator.auth_password
+            )
+            middlewares.append(auth_middleware)
+            logger.info("HTTP Basic Auth enabled")
+        else:
+            logger.warning("HTTP Basic Auth disabled - no credentials configured")
+
+        self._app = web.Application(middlewares=middlewares)
+
+        # API routes
         self._app.router.add_post("/occupancy", self._handle_occupancy_post)
         self._app.router.add_get("/status", self._handle_status_get)
         self._app.router.add_get("/ws", self._handle_websocket)
         self._app.router.add_post("/erv", self._handle_erv_post)
         self._app.router.add_post("/hvac", self._handle_hvac_post)
         self._app.router.add_post("/qingping/interval", self._handle_qingping_interval_post)
+
+        # Serve frontend static files
+        frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
+        if frontend_dist.exists():
+            # Serve static assets
+            self._app.router.add_static("/assets", frontend_dist / "assets", name="assets")
+
+            # Serve index.html for root and any other paths (SPA fallback)
+            async def serve_index(request):
+                return web.FileResponse(frontend_dist / "index.html")
+
+            self._app.router.add_get("/", serve_index)
+            self._app.router.add_get("/{path:.*}", serve_index)  # SPA fallback
+
+            logger.info(f"Serving frontend from {frontend_dist}")
+        else:
+            logger.warning(f"Frontend dist not found at {frontend_dist}")
 
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()

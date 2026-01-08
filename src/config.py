@@ -68,6 +68,8 @@ class ThresholdsConfig:
 class OrchestratorConfig:
     host: str = "0.0.0.0"
     port: int = 8080
+    auth_username: Optional[str] = None  # If set, enables HTTP Basic Auth
+    auth_password: Optional[str] = None
 
 
 @dataclass

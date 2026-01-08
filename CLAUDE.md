@@ -161,6 +161,30 @@ sqlite3 data/office_climate.db "SELECT timestamp, event FROM device_events WHERE
 sqlite3 data/office_climate.db "SELECT timestamp, co2_ppm FROM sensor_readings WHERE timestamp > datetime('now', '-24 hours') ORDER BY timestamp"
 ```
 
+## Authentication
+
+**Optional HTTP Basic Auth** - Protect the API for remote access.
+
+To enable authentication, add credentials to `config.yaml`:
+```yaml
+orchestrator:
+  host: "0.0.0.0"
+  port: 8080
+  auth_username: "admin"
+  auth_password: "your_secure_password"
+```
+
+When enabled:
+- All endpoints require HTTP Basic Auth
+- Browser will prompt for username/password on first access
+- Credentials are saved in browser for future requests
+- **Use only over HTTPS** (Cloudflare Tunnel provides this)
+
+When disabled (credentials not set):
+- API is open to local network
+- Suitable for development on trusted networks
+- **Do not expose to internet without auth**
+
 ## API Endpoints
 
 | Method | Endpoint | Description |
@@ -229,6 +253,219 @@ curl -X POST http://localhost:9001/erv -H "Content-Type: application/json" -d '{
 
 ## Deployment
 
-- **Development**: Run on Mac for testing
-- **Production**: Deploy orchestrator to Raspberry Pi (always-on)
-- **macOS detector**: Stays on Mac, POSTs to orchestrator
+### Local Development
+- **Backend**: Run orchestrator on Mac (`python run.py`)
+- **Frontend**: Run Vite dev server (`npm run dev`)
+- **macOS detector**: Run locally (`python3 occupancy_detector.py --watch`)
+- Access at `http://localhost:9001` (backend) and `http://localhost:9002` (frontend)
+
+### Production: Raspberry Pi + Cloudflare Tunnel
+
+**Architecture:**
+```
+┌─────────────────┐
+│   iPhone/iPad   │
+│   (anywhere)    │
+└────────┬────────┘
+         │ HTTPS
+         ▼
+┌─────────────────────────────────┐
+│  Cloudflare Tunnel + Access     │
+│  office.yourdomain.com          │
+│  (email auth: rajeshgoli@gmail) │
+└────────┬────────────────────────┘
+         │ Encrypted tunnel
+         ▼
+┌─────────────────────────────────┐
+│  Raspberry Pi (home network)    │
+│  orchestrator:8080              │
+└─────────────────────────────────┘
+         ▲
+         │ HTTP POST
+┌────────┴────────┐
+│   Mac (office)  │
+│ occupancy_detector
+└─────────────────┘
+```
+
+### Step 1: Deploy to Raspberry Pi
+
+1. **Copy project to Pi:**
+   ```bash
+   rsync -av --exclude 'data/' --exclude 'node_modules/' \
+     ~/Desktop/office-automate/ pi@raspberrypi.local:~/office-automate/
+   ```
+
+2. **Install dependencies on Pi:**
+   ```bash
+   ssh pi@raspberrypi.local
+   cd ~/office-automate
+   python3 -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+3. **Install Mosquitto MQTT broker:**
+   ```bash
+   sudo apt update
+   sudo apt install mosquitto mosquitto-clients
+   sudo systemctl enable mosquitto
+   sudo systemctl start mosquitto
+   ```
+
+4. **Copy config and enable auth (optional):**
+   ```bash
+   cp config.example.yaml config.yaml
+   nano config.yaml  # Fill in credentials
+   # Note: Cloudflare Access provides auth, so HTTP Basic Auth is optional
+   ```
+
+5. **Create systemd service:**
+   ```bash
+   sudo nano /etc/systemd/system/office-climate.service
+   ```
+
+   ```ini
+   [Unit]
+   Description=Office Climate Automation
+   After=network.target mosquitto.service
+
+   [Service]
+   Type=simple
+   User=pi
+   WorkingDirectory=/home/pi/office-automate
+   ExecStart=/home/pi/office-automate/venv/bin/python run.py
+   Restart=always
+   RestartSec=10
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable office-climate
+   sudo systemctl start office-climate
+   sudo systemctl status office-climate  # Check it's running
+   ```
+
+6. **Update Mac occupancy detector to point to Pi:**
+   ```bash
+   # On Mac, update the URL
+   python3 occupancy_detector.py --watch --url http://raspberrypi.local:8080
+   ```
+
+### Step 2: Cloudflare Tunnel Setup
+
+**Prerequisites:**
+- Domain name (can use a free subdomain from Cloudflare)
+- Free Cloudflare account
+
+**Installation:**
+
+1. **Install cloudflared on Pi:**
+   ```bash
+   # On Raspberry Pi
+   wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64
+   sudo mv cloudflared-linux-arm64 /usr/local/bin/cloudflared
+   sudo chmod +x /usr/local/bin/cloudflared
+   ```
+
+2. **Authenticate with Cloudflare:**
+   ```bash
+   cloudflared tunnel login
+   # Opens browser to authenticate - follow the prompts
+   # This creates ~/.cloudflared/cert.pem
+   ```
+
+3. **Create a tunnel:**
+   ```bash
+   cloudflared tunnel create office-climate
+   # Note the tunnel ID from the output
+   ```
+
+4. **Create config file:**
+   ```bash
+   sudo mkdir -p /etc/cloudflared
+   sudo nano /etc/cloudflared/config.yml
+   ```
+
+   ```yaml
+   tunnel: <your-tunnel-id>
+   credentials-file: /home/pi/.cloudflared/<your-tunnel-id>.json
+
+   ingress:
+     - hostname: office.yourdomain.com
+       service: http://localhost:8080
+     - service: http_status:404
+   ```
+
+5. **Create DNS record:**
+   ```bash
+   cloudflared tunnel route dns office-climate office.yourdomain.com
+   ```
+
+6. **Install as system service:**
+   ```bash
+   sudo cloudflared service install
+   sudo systemctl start cloudflared
+   sudo systemctl enable cloudflared
+   sudo systemctl status cloudflared  # Check it's running
+   ```
+
+### Step 3: Cloudflare Access (Email Authentication)
+
+**Recommended: Use Cloudflare Access instead of HTTP Basic Auth**
+
+1. **Go to Cloudflare Zero Trust dashboard:**
+   - Visit https://one.dash.cloudflare.com/
+   - Navigate to Access > Applications
+
+2. **Create a new application:**
+   - Type: Self-hosted
+   - Application name: `Office Climate`
+   - Session duration: `24 hours` (or your preference)
+   - Application domain: `office.yourdomain.com`
+
+3. **Add access policy:**
+   - Policy name: `Email Auth`
+   - Action: `Allow`
+   - Configure rules:
+     - Selector: `Emails`
+     - Value: `rajeshgoli@gmail.com`
+   - Click Save
+
+4. **Test access:**
+   - Visit https://office.yourdomain.com
+   - You'll see Cloudflare Access login page
+   - Enter `rajeshgoli@gmail.com`
+   - Check email for one-time code
+   - Enter code → you're in!
+   - Dashboard loads, you can control ERV/HVAC from anywhere
+
+**Benefits:**
+- No passwords to manage
+- Email-based authentication (one-time codes)
+- More secure than Basic Auth
+- Free tier includes 50 users
+- Session persistence (24 hours by default)
+
+**Alternative: HTTP Basic Auth**
+If you prefer not to use Cloudflare Access, enable HTTP Basic Auth in `config.yaml`:
+```yaml
+orchestrator:
+  auth_username: "admin"
+  auth_password: "your_secure_password"
+```
+
+### Step 4: Install PWA on iPhone
+
+1. Visit https://office.yourdomain.com in Safari
+2. Authenticate with Cloudflare Access (email code)
+3. Tap Share button → "Add to Home Screen"
+4. Name it "Climate" (or whatever you prefer)
+5. Tap Add
+
+Now you have a native-feeling app on your home screen that works from anywhere!
+
+**Note:** You'll need to re-authenticate every 24 hours (configurable in Cloudflare Access).
