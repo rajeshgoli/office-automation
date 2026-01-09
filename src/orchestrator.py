@@ -15,7 +15,7 @@ import logging
 import base64
 from collections import deque
 from pathlib import Path
-from typing import Optional, Set
+from typing import Optional, Set, Dict
 
 from aiohttp import web, WSMsgType
 
@@ -27,6 +27,7 @@ from .qingping_client import QingpingMQTTClient, QingpingReading
 from .erv_client import ERVClient, FanSpeed
 from .kumo_client import KumoClient, OperationMode as HVACMode
 from .database import Database
+from .oauth_service import OAuthService, UserSession
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,29 @@ class Orchestrator:
         self._spike_peak_value: Optional[int] = None
         self._spike_ventilation_active: bool = False
         self._spike_cooldown_until: Optional[datetime] = None
+
+        # OAuth service (if configured)
+        self.oauth: Optional[OAuthService] = None
+        if config.orchestrator.google_oauth:
+            oauth_config = config.orchestrator.google_oauth
+            # Determine redirect URI based on host/port
+            if config.orchestrator.host == "0.0.0.0":
+                redirect_uri = f"http://localhost:{config.orchestrator.port}/auth/callback"
+            else:
+                redirect_uri = f"http://{config.orchestrator.host}:{config.orchestrator.port}/auth/callback"
+
+            self.oauth = OAuthService(
+                client_id=oauth_config.client_id,
+                client_secret=oauth_config.client_secret,
+                allowed_emails=oauth_config.allowed_emails,
+                token_expiry_days=oauth_config.token_expiry_days,
+                redirect_uri=redirect_uri,
+                jwt_secret=oauth_config.jwt_secret
+            )
+            logger.info("OAuth service initialized")
+
+        # PKCE state storage (state -> code_verifier)
+        self._oauth_states: Dict[str, str] = {}
 
         # HVAC state tracking
         self._hvac_mode: str = "off"  # heat, cool, off, auto
@@ -955,6 +979,34 @@ class Orchestrator:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
 
+        # Authenticate WebSocket connection if OAuth is enabled
+        if self.oauth:
+            try:
+                # Expect first message to be auth message
+                msg = await ws.receive(timeout=10)
+                if msg.type != WSMsgType.TEXT:
+                    await ws.close(code=4001, message=b'Authentication required')
+                    return ws
+
+                data = json.loads(msg.data)
+                if data.get('type') != 'auth':
+                    await ws.close(code=4001, message=b'Authentication required')
+                    return ws
+
+                token = data.get('token')
+                email = self.oauth.verify_jwt(token)
+
+                if not email:
+                    await ws.close(code=4001, message=b'Invalid token')
+                    return ws
+
+                logger.debug(f"WebSocket authenticated: {email}")
+
+            except Exception as e:
+                logger.warning(f"WebSocket auth failed: {e}")
+                await ws.close(code=4001, message=b'Authentication failed')
+                return ws
+
         self._ws_clients.add(ws)
         logger.info(f"WebSocket client connected ({len(self._ws_clients)} total)")
 
@@ -1037,21 +1089,186 @@ class Orchestrator:
 
         return middleware
 
+    def _oauth_middleware(self):
+        """Create OAuth JWT middleware."""
+        @web.middleware
+        async def middleware(request: web.Request, handler):
+            # Skip auth for OAuth endpoints
+            skip_paths = ['/auth/login', '/auth/callback', '/auth/device/start', '/auth/device/poll']
+            if any(request.path.startswith(path) for path in skip_paths):
+                return await handler(request)
+
+            # Skip auth for WebSocket (will auth in handler)
+            if request.headers.get("Upgrade") == "websocket":
+                return await handler(request)
+
+            # Get Authorization header
+            auth_header = request.headers.get("Authorization", "")
+
+            if not auth_header.startswith("Bearer "):
+                return web.json_response(
+                    {"error": "Authentication required", "login_url": "/auth/login"},
+                    status=401
+                )
+
+            # Verify JWT
+            token = auth_header[7:]
+            email = self.oauth.verify_jwt(token)
+
+            if not email:
+                return web.json_response(
+                    {"error": "Invalid or expired token", "login_url": "/auth/login"},
+                    status=401
+                )
+
+            # Attach email to request for handlers
+            request['user_email'] = email
+
+            return await handler(request)
+
+        return middleware
+
+    async def _handle_auth_login(self, request: web.Request) -> web.Response:
+        """Handle GET /auth/login - Start OAuth flow."""
+        if not self.oauth:
+            return web.json_response({"error": "OAuth not configured"}, status=501)
+
+        # Generate PKCE pair
+        code_verifier, code_challenge = self.oauth.generate_pkce_pair()
+        state = secrets.token_urlsafe(32)
+
+        # Store state
+        self._oauth_states[state] = code_verifier
+
+        # Generate authorization URL
+        auth_url = self.oauth.create_authorization_url(state, code_challenge)
+
+        return web.json_response({
+            "authorization_url": auth_url,
+            "state": state
+        })
+
+    async def _handle_auth_callback(self, request: web.Request) -> web.Response:
+        """Handle GET /auth/callback - OAuth redirect."""
+        if not self.oauth:
+            return web.Response(text="OAuth not configured", status=501)
+
+        # Extract code and state
+        code = request.query.get('code')
+        state = request.query.get('state')
+        error = request.query.get('error')
+
+        if error:
+            logger.warning(f"OAuth callback error: {error}")
+            return web.Response(
+                text=f"<html><body><h1>Login Failed</h1><p>{error}</p></body></html>",
+                content_type='text/html',
+                status=400
+            )
+
+        if not code or not state:
+            return web.Response(text="Missing code or state", status=400)
+
+        # Verify state
+        code_verifier = self._oauth_states.pop(state, None)
+        if not code_verifier:
+            return web.Response(text="Invalid state", status=400)
+
+        # Exchange code for token
+        session = await self.oauth.exchange_code_for_token(code, code_verifier)
+
+        if not session:
+            return web.Response(
+                text="<html><body><h1>Login Failed</h1><p>Email not authorized</p></body></html>",
+                content_type='text/html',
+                status=403
+            )
+
+        # Generate JWT
+        jwt_token = self.oauth.generate_jwt(session.email)
+
+        # Return HTML that stores token and redirects
+        html = f"""
+        <html>
+        <head>
+            <script>
+                localStorage.setItem('auth_token', '{jwt_token}');
+                localStorage.setItem('user_email', '{session.email}');
+                window.location.href = '/';
+            </script>
+        </head>
+        <body>
+            <p>Login successful! Redirecting...</p>
+        </body>
+        </html>
+        """
+
+        return web.Response(text=html, content_type='text/html')
+
+    async def _handle_auth_logout(self, request: web.Request) -> web.Response:
+        """Handle POST /auth/logout - Logout user."""
+        if not self.oauth:
+            return web.json_response({"error": "OAuth not configured"}, status=501)
+
+        # Get token from Authorization header
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return web.json_response({"error": "No token provided"}, status=401)
+
+        token = auth_header[7:]
+        email = self.oauth.verify_jwt(token)
+
+        if email:
+            self.oauth.logout(email)
+
+        return web.json_response({"ok": True, "message": "Logged out"})
+
+    async def _handle_auth_device_start(self, request: web.Request) -> web.Response:
+        """Handle POST /auth/device/start - Start device flow."""
+        if not self.oauth:
+            return web.json_response({"error": "OAuth not configured"}, status=501)
+
+        try:
+            result = self.oauth.initiate_device_flow()
+            return web.json_response(result)
+        except Exception as e:
+            logger.error(f"Device flow start failed: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_auth_device_poll(self, request: web.Request) -> web.Response:
+        """Handle POST /auth/device/poll - Poll device flow."""
+        if not self.oauth:
+            return web.json_response({"error": "OAuth not configured"}, status=501)
+
+        data = await request.json()
+        device_code = data.get('device_code')
+
+        if not device_code:
+            return web.json_response({"error": "Missing device_code"}, status=400)
+
+        result = self.oauth.poll_device_flow(device_code)
+        return web.json_response(result)
+
     async def _start_http_server(self):
         """Start the HTTP server for macOS occupancy detector."""
         # Build middleware list
         middlewares = [self._cors_middleware]
 
-        # Add basic auth if configured
-        if self.config.orchestrator.auth_username and self.config.orchestrator.auth_password:
+        # Add auth middleware (prefer OAuth, fallback to Basic Auth)
+        if self.oauth:
+            auth_middleware = self._oauth_middleware()
+            middlewares.append(auth_middleware)
+            logger.info("OAuth JWT authentication enabled")
+        elif self.config.orchestrator.auth_username and self.config.orchestrator.auth_password:
+            # Fallback to Basic Auth (deprecated)
             auth_middleware = self._basic_auth_middleware(
                 self.config.orchestrator.auth_username,
                 self.config.orchestrator.auth_password
             )
             middlewares.append(auth_middleware)
-            logger.info("HTTP Basic Auth enabled")
+            logger.warning("Using deprecated HTTP Basic Auth - migrate to OAuth!")
         else:
-            logger.warning("HTTP Basic Auth disabled - no credentials configured")
+            logger.warning("No authentication configured - API is open!")
 
         self._app = web.Application(middlewares=middlewares)
 
@@ -1062,6 +1279,15 @@ class Orchestrator:
         self._app.router.add_post("/erv", self._handle_erv_post)
         self._app.router.add_post("/hvac", self._handle_hvac_post)
         self._app.router.add_post("/qingping/interval", self._handle_qingping_interval_post)
+
+        # OAuth routes (if enabled)
+        if self.oauth:
+            self._app.router.add_get("/auth/login", self._handle_auth_login)
+            self._app.router.add_get("/auth/callback", self._handle_auth_callback)
+            self._app.router.add_post("/auth/logout", self._handle_auth_logout)
+            self._app.router.add_post("/auth/device/start", self._handle_auth_device_start)
+            self._app.router.add_post("/auth/device/poll", self._handle_auth_device_poll)
+            logger.info("OAuth routes registered")
 
         # Serve frontend static files
         frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"

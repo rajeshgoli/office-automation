@@ -74,11 +74,22 @@ class ThresholdsConfig:
 
 
 @dataclass
+class GoogleOAuthConfig:
+    client_id: str
+    client_secret: str
+    allowed_emails: list[str]
+    token_expiry_days: int = 7
+    device_flow_enabled: bool = True
+    jwt_secret: Optional[str] = None
+
+
+@dataclass
 class OrchestratorConfig:
     host: str = "0.0.0.0"
     port: int = 8080
-    auth_username: Optional[str] = None  # If set, enables HTTP Basic Auth
-    auth_password: Optional[str] = None
+    auth_username: Optional[str] = None  # Legacy: HTTP Basic Auth (deprecated)
+    auth_password: Optional[str] = None  # Legacy: HTTP Basic Auth (deprecated)
+    google_oauth: Optional['GoogleOAuthConfig'] = None  # Google OAuth (recommended)
 
 
 @dataclass
@@ -104,11 +115,20 @@ def load_config(path: str = "config.yaml") -> Config:
     with open(config_path) as f:
         data = yaml.safe_load(f)
 
+    # Parse orchestrator config with optional Google OAuth
+    orchestrator_data = data.get("orchestrator", {})
+    google_oauth = None
+    if "google_oauth" in orchestrator_data:
+        google_oauth = GoogleOAuthConfig(**orchestrator_data["google_oauth"])
+        orchestrator_data = {k: v for k, v in orchestrator_data.items() if k != "google_oauth"}
+
+    orchestrator_config = OrchestratorConfig(**orchestrator_data, google_oauth=google_oauth)
+
     return Config(
         yolink=YoLinkConfig(**data["yolink"]),
         qingping=QingpingConfig(**data["qingping"]),
         erv=ERVConfig(**data["erv"]),
         mitsubishi=MitsubishiConfig(**data.get("mitsubishi", {})),
         thresholds=ThresholdsConfig(**data.get("thresholds", {})),
-        orchestrator=OrchestratorConfig(**data.get("orchestrator", {})),
+        orchestrator=orchestrator_config,
     )
