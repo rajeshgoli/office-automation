@@ -10,37 +10,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Office Climate Automation system for a backyard shed office. The system coordinates multiple smart devices to maintain air quality silently during occupancy and aggressively ventilate when away.
 
-## Current Status (2026-01-08)
+## Current Status (2026-01-09)
+
+**✅ Deployed to Mac Mini (Always-On Production)**
+- Mac Mini (macOS High Sierra 10.13.6) at 192.168.5.140
+- All services auto-start on boot via Launch Agents
+- MQTT broker (amqtt), Orchestrator, LocalTunnel all running
+- Remote access via LocalTunnel at https://climate.loca.lt (HTTP Basic Auth)
+- SSH enabled for remote management
 
 **Working:**
 - YoLink sensors (door, window, motion) via Cloud MQTT
 - ERV control via Tuya local API (tinytuya)
-- Qingping Air Monitor via local MQTT - CO2, temp, humidity, PM2.5, PM10, tVOC index, noise dB
+- Qingping Air Monitor via local MQTT (Mac Mini at 192.168.5.140:1883)
 - State machine (PRESENT/AWAY) with door open mode for ventilation scenarios
 - SQLite database for persistence and historical analysis (restores sensor states on startup)
 - React dashboard with live data (WebSocket + polling fallback)
 - Dashboard quick controls for manual ERV/HVAC override
-- macOS occupancy detector (keyboard/mouse activity)
+- macOS occupancy detector on work Mac (sends to Mac Mini orchestrator)
 - HVAC coordination (suspends heating when ERV venting)
 - HVAC status polling (syncs dashboard with manual remote/app changes, pauses at night)
 - tVOC-triggered ventilation (VOC index >250 triggers ERV)
 - **Adaptive tVOC spike detection** - Catches sub-threshold meal/food events (45+ point spikes above baseline)
+- **AWAY mode automatic ventilation** - ERV TURBO when AWAY with CO2 > 500 ppm
 - PWA support for iOS home screen installation
-
-**Next:**
-- Deploy to Mac Mini for always-on operation
-- Set eero DHCP reservation for Mac Mini stable IP
-- Reconfigure Qingping to use Mac Mini IP instead of localhost
+- HTTP Basic Auth for security
 
 ## Hardware Devices
 
 | Device | Control Method | Status |
 |--------|---------------|--------|
 | **ERV (Pioneer Airlink)** | Tuya local (`192.168.5.119`) | Working |
-| **Qingping Air Monitor** | Local MQTT (`127.0.0.1:1883` → **needs Mac Mini IP**) | Working |
+| **Qingping Air Monitor** | Local MQTT (`192.168.5.140:1883`) | Working |
 | **YoLink Sensors** | Cloud MQTT (`api.yosmart.com:8003`) | Working |
 | **Mitsubishi Split AC** | pykumo (Kumo Cloud) | Working |
-| **Mac Keyboard/Mouse** | HTTP POST to orchestrator | Working |
+| **Mac Keyboard/Mouse** | HTTP POST to orchestrator (`192.168.5.140:8080`) | Working |
+| **Mac Mini (bakasura4)** | SSH (`192.168.5.140`) | Production host |
 
 ## Core Architecture
 
@@ -259,7 +264,7 @@ curl -X POST http://localhost:9001/erv -H "Content-Type: application/json" -d '{
 
 ### Qingping (Local MQTT)
 - MAC: `582D3470765F`
-- Broker: Mosquitto on `127.0.0.1:1883`
+- Broker: amqtt on Mac Mini (`192.168.5.140:1883`)
 - Topic (receive): `qingping/582D3470765F/up`
 - Topic (configure): `qingping/582D3470765F/down`
 - Report interval: 30s (configurable in config.yaml, min 15s)
@@ -289,7 +294,9 @@ curl -X POST http://localhost:9001/erv -H "Content-Type: application/json" -d '{
 - **macOS detector**: Run locally (`python3 occupancy_detector.py --watch`)
 - Access at `http://localhost:9001` (backend) and `http://localhost:9002` (frontend)
 
-### Production: Mac Mini + Cloudflare Tunnel (or Tailscale Funnel)
+### Production: Mac Mini + LocalTunnel
+
+**✅ Currently Deployed**
 
 **Architecture:**
 ```
@@ -300,222 +307,232 @@ curl -X POST http://localhost:9001/erv -H "Content-Type: application/json" -d '{
          │ HTTPS
          ▼
 ┌─────────────────────────────────┐
-│  Cloudflare Tunnel + Access     │
-│  office.yourdomain.com          │
-│  (email auth: rajeshgoli@gmail) │
+│  LocalTunnel                     │
+│  https://climate.loca.lt        │
+│  (HTTP Basic Auth)               │
 └────────┬────────────────────────┘
          │ Encrypted tunnel
          ▼
 ┌─────────────────────────────────┐
-│  Raspberry Pi (home network)    │
-│  orchestrator:8080              │
+│  Mac Mini (192.168.5.140)       │
+│  bakasura4.local                 │
+│  orchestrator:8080 + amqtt:1883 │
 └─────────────────────────────────┘
          ▲
          │ HTTP POST
 ┌────────┴────────┐
-│   Mac (office)  │
+│ Work Mac (MBP)  │
 │ occupancy_detector
 └─────────────────┘
 ```
 
-### Step 1: Deploy to Mac Mini
+### Setup Instructions (Already Deployed)
 
-1. **Set eero DHCP Reservation** (CRITICAL - do this first!)
-   - Open eero app → Devices → Find Mac Mini
-   - Reserve IP address (e.g., `192.168.5.200`)
-   - This ensures Qingping and occupancy detector can reliably connect
+**Mac Mini Setup:**
 
-2. **Copy project to Mac Mini:**
+1. **✅ Set eero DHCP Reservation:**
+   - Mac Mini (bakasura4) reserved at `192.168.5.140`
+
+2. **✅ Install Python dependencies:**
    ```bash
-   rsync -av --exclude 'data/' --exclude 'node_modules/' \
-     ~/Desktop/office-automate/ macmini.local:~/office-automate/
-   ```
-
-3. **Install dependencies on Mac Mini:**
-   ```bash
-   ssh macmini.local
    cd ~/office-automate
    python3 -m venv venv
    source venv/bin/activate
    pip install -r requirements.txt
+   pip install --user amqtt  # MQTT broker (Homebrew too new for High Sierra)
    ```
 
-4. **Install Mosquitto MQTT broker:**
+3. **✅ Install Node.js for LocalTunnel:**
    ```bash
-   brew install mosquitto
-   brew services start mosquitto
+   # Node.js v14.21.3 (last version for High Sierra)
+   wget https://nodejs.org/dist/v14.21.3/node-v14.21.3-darwin-x64.tar.gz
+   tar -xzf node-v14.21.3-darwin-x64.tar.gz
+   sudo mv node-v14.21.3-darwin-x64 /usr/local/node
+   sudo ln -s /usr/local/node/bin/node /usr/local/bin/node
+   sudo ln -s /usr/local/node/bin/npx /usr/local/bin/npx
    ```
 
-5. **Reconfigure Qingping to use Mac Mini IP:**
-   ```bash
-   # Get Mac Mini's IP
-   ifconfig | grep "inet " | grep -v 127.0.0.1
-   # Example output: 192.168.5.200
+4. **✅ Reconfigure Qingping to use Mac Mini IP:**
+   - Via Qingping developer portal: Set MQTT broker to `192.168.5.140:1883`
 
-   # Update Qingping via app or device config to point to Mac Mini IP
-   # MQTT Broker: 192.168.5.200
-   # Port: 1883
+5. **✅ Enable SSH:**
+   ```bash
+   sudo systemsetup -setremotelogin on
+   # Set up SSH key from work Mac for passwordless login
    ```
 
-6. **Copy config and enable auth (optional):**
+6. **✅ Prevent Mac Mini sleep:**
    ```bash
-   cp config.example.yaml config.yaml
-   nano config.yaml  # Fill in credentials
-   # Note: Cloudflare Access provides auth, so HTTP Basic Auth is optional
+   sudo pmset -c sleep 0
+   sudo pmset -c disksleep 0
+   sudo pmset -c displaysleep 10
    ```
 
-7. **Create Launch Agent (macOS):**
+7. **✅ Create Launch Agents (auto-start on boot):**
+
+   **MQTT Broker (amqtt):**
    ```bash
-   # Create plist file
-   cat > ~/Library/LaunchAgents/com.office-automate.plist << 'EOF'
+   cat > ~/Library/LaunchAgents/com.office-automate.mqtt.plist << 'EOF'
    <?xml version="1.0" encoding="UTF-8"?>
    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
    <plist version="1.0">
    <dict>
      <key>Label</key>
-     <string>com.office-automate</string>
+     <string>com.office-automate.mqtt</string>
      <key>ProgramArguments</key>
      <array>
-       <string>/Users/YOUR_USERNAME/office-automate/venv/bin/python</string>
-       <string>/Users/YOUR_USERNAME/office-automate/run.py</string>
+       <string>/Users/rajesh/Library/Python/3.10/bin/amqtt</string>
      </array>
-     <key>WorkingDirectory</key>
-     <string>/Users/YOUR_USERNAME/office-automate</string>
      <key>RunAtLoad</key>
      <true/>
      <key>KeepAlive</key>
      <true/>
-     <key>StandardOutPath</key>
-     <string>/tmp/office-automate.log</string>
-     <key>StandardErrorPath</key>
-     <string>/tmp/office-automate.error.log</string>
    </dict>
    </plist>
    EOF
 
-   # Load and start
-   launchctl load ~/Library/LaunchAgents/com.office-automate.plist
-   launchctl start com.office-automate
-   launchctl list | grep office-automate  # Check it's running
+   launchctl load ~/Library/LaunchAgents/com.office-automate.mqtt.plist
    ```
 
-8. **Update Mac occupancy detector to point to Mac Mini:**
+   **Orchestrator:**
    ```bash
-   # On work Mac, update the URL to Mac Mini's IP
-   python3 occupancy_detector.py --watch --url http://192.168.5.200:8080
+   cat > ~/Library/LaunchAgents/com.office-automate.orchestrator.plist << 'EOF'
+   <?xml version="1.0" encoding="UTF-8"?>
+   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+   <plist version="1.0">
+   <dict>
+     <key>Label</key>
+     <string>com.office-automate.orchestrator</string>
+     <key>ProgramArguments</key>
+     <array>
+       <string>/Users/rajesh/office-automate/venv/bin/python</string>
+       <string>/Users/rajesh/office-automate/run.py</string>
+     </array>
+     <key>WorkingDirectory</key>
+     <string>/Users/rajesh/office-automate</string>
+     <key>RunAtLoad</key>
+     <true/>
+     <key>KeepAlive</key>
+     <true/>
+   </dict>
+   </plist>
+   EOF
+
+   launchctl load ~/Library/LaunchAgents/com.office-automate.orchestrator.plist
    ```
 
-### Step 2: Cloudflare Tunnel Setup
-
-**Prerequisites:**
-- Domain name (can use a free subdomain from Cloudflare)
-- Free Cloudflare account
-
-**Installation:**
-
-1. **Install cloudflared on Pi:**
+   **LocalTunnel:**
    ```bash
-   # On Raspberry Pi
-   wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64
-   sudo mv cloudflared-linux-arm64 /usr/local/bin/cloudflared
-   sudo chmod +x /usr/local/bin/cloudflared
+   cat > ~/Library/LaunchAgents/com.office-automate.localtunnel.plist << 'EOF'
+   <?xml version="1.0" encoding="UTF-8"?>
+   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+   <plist version="1.0">
+   <dict>
+     <key>Label</key>
+     <string>com.office-automate.localtunnel</string>
+     <key>ProgramArguments</key>
+     <array>
+       <string>/usr/local/bin/npx</string>
+       <string>localtunnel</string>
+       <string>--port</string>
+       <string>8080</string>
+       <string>--subdomain</string>
+       <string>climate</string>
+     </array>
+     <key>RunAtLoad</key>
+     <true/>
+     <key>KeepAlive</key>
+     <true/>
+   </dict>
+   </plist>
+   EOF
+
+   launchctl load ~/Library/LaunchAgents/com.office-automate.localtunnel.plist
    ```
 
-2. **Authenticate with Cloudflare:**
-   ```bash
-   cloudflared tunnel login
-   # Opens browser to authenticate - follow the prompts
-   # This creates ~/.cloudflared/cert.pem
-   ```
-
-3. **Create a tunnel:**
-   ```bash
-   cloudflared tunnel create office-climate
-   # Note the tunnel ID from the output
-   ```
-
-4. **Create config file:**
-   ```bash
-   sudo mkdir -p /etc/cloudflared
-   sudo nano /etc/cloudflared/config.yml
-   ```
-
+8. **✅ Configure HTTP Basic Auth in config.yaml:**
    ```yaml
-   tunnel: <your-tunnel-id>
-   credentials-file: /home/pi/.cloudflared/<your-tunnel-id>.json
-
-   ingress:
-     - hostname: office.yourdomain.com
-       service: http://localhost:8080
-     - service: http_status:404
+   orchestrator:
+     host: "0.0.0.0"
+     port: 8080
+     auth_username: "rajesh"
+     auth_password: "your_password"
    ```
 
-5. **Create DNS record:**
+**Work Mac Setup:**
+
+9. **✅ Create occupancy detector Launch Agent:**
    ```bash
-   cloudflared tunnel route dns office-climate office.yourdomain.com
+   cat > ~/Library/LaunchAgents/com.office-automate.occupancy.plist << 'EOF'
+   <?xml version="1.0" encoding="UTF-8"?>
+   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+   <plist version="1.0">
+   <dict>
+     <key>Label</key>
+     <string>com.office-automate.occupancy</string>
+     <key>ProgramArguments</key>
+     <array>
+       <string>/opt/homebrew/bin/python3</string>
+       <string>/Users/rajesh/Desktop/office-automate/occupancy_detector.py</string>
+       <string>--watch</string>
+       <string>--url</string>
+       <string>http://192.168.5.140:8080</string>
+       <string>--auth-username</string>
+       <string>rajesh</string>
+       <string>--auth-password</string>
+       <string>your_password</string>
+     </array>
+     <key>RunAtLoad</key>
+     <true/>
+     <key>KeepAlive</key>
+     <true/>
+   </dict>
+   </plist>
+   EOF
+
+   launchctl load ~/Library/LaunchAgents/com.office-automate.occupancy.plist
    ```
 
-6. **Install as system service:**
-   ```bash
-   sudo cloudflared service install
-   sudo systemctl start cloudflared
-   sudo systemctl enable cloudflared
-   sudo systemctl status cloudflared  # Check it's running
-   ```
+### Usage & Remote Access
 
-### Step 3: Cloudflare Access (Email Authentication)
+**Local Network Access:**
+- Dashboard: `http://192.168.5.140:8080`
+- Direct access from any device on home network
 
-**Recommended: Use Cloudflare Access instead of HTTP Basic Auth**
+**Remote Access (via LocalTunnel):**
+- URL: `https://climate.loca.lt`
+- First access: Enter tunnel password (get from Mac Mini: `curl https://loca.lt/mytunnelpassword`)
+- After IP whitelisting: HTTP Basic Auth (username: `rajesh`, password in config.yaml)
+- **Note:** LocalTunnel subdomain is first-come-first-served. If lost, check logs: `ssh rajesh@192.168.5.140 "tail /tmp/localtunnel.log"`
 
-1. **Go to Cloudflare Zero Trust dashboard:**
-   - Visit https://one.dash.cloudflare.com/
-   - Navigate to Access > Applications
+**Install PWA on iPhone:**
+1. Visit `https://climate.loca.lt` in Safari
+2. Enter LocalTunnel password (one-time per IP)
+3. Login with HTTP Basic Auth
+4. Tap Share button → "Add to Home Screen"
+5. Name it "Climate"
 
-2. **Create a new application:**
-   - Type: Self-hosted
-   - Application name: `Office Climate`
-   - Session duration: `24 hours` (or your preference)
-   - Application domain: `office.yourdomain.com`
+**Remote Management:**
+```bash
+# SSH into Mac Mini
+ssh rajesh@192.168.5.140
 
-3. **Add access policy:**
-   - Policy name: `Email Auth`
-   - Action: `Allow`
-   - Configure rules:
-     - Selector: `Emails`
-     - Value: `rajeshgoli@gmail.com`
-   - Click Save
+# Check services status
+launchctl list | grep office-automate
 
-4. **Test access:**
-   - Visit https://office.yourdomain.com
-   - You'll see Cloudflare Access login page
-   - Enter `rajeshgoli@gmail.com`
-   - Check email for one-time code
-   - Enter code → you're in!
-   - Dashboard loads, you can control ERV/HVAC from anywhere
+# View logs
+tail -f /tmp/office-automate.error.log
+tail -f /tmp/mqtt.log
+tail -f /tmp/localtunnel.log
 
-**Benefits:**
-- No passwords to manage
-- Email-based authentication (one-time codes)
-- More secure than Basic Auth
-- Free tier includes 50 users
-- Session persistence (24 hours by default)
+# Restart services
+launchctl unload ~/Library/LaunchAgents/com.office-automate.orchestrator.plist
+launchctl load ~/Library/LaunchAgents/com.office-automate.orchestrator.plist
 
-**Alternative: HTTP Basic Auth**
-If you prefer not to use Cloudflare Access, enable HTTP Basic Auth in `config.yaml`:
-```yaml
-orchestrator:
-  auth_username: "admin"
-  auth_password: "your_secure_password"
+# Deploy code updates from work Mac
+scp ~/Desktop/office-automate/src/orchestrator.py rajesh@192.168.5.140:~/office-automate/src/
+ssh rajesh@192.168.5.140 "launchctl unload ~/Library/LaunchAgents/com.office-automate.orchestrator.plist && launchctl load ~/Library/LaunchAgents/com.office-automate.orchestrator.plist"
+
+# Database queries
+ssh rajesh@192.168.5.140 "sqlite3 ~/office-automate/data/office_climate.db 'SELECT * FROM occupancy_log ORDER BY timestamp DESC LIMIT 10'"
 ```
-
-### Step 4: Install PWA on iPhone
-
-1. Visit https://office.yourdomain.com in Safari
-2. Authenticate with Cloudflare Access (email code)
-3. Tap Share button → "Add to Home Screen"
-4. Name it "Climate" (or whatever you prefer)
-5. Tap Add
-
-Now you have a native-feeling app on your home screen that works from anywhere!
-
-**Note:** You'll need to re-authenticate every 24 hours (configurable in Cloudflare Access).
