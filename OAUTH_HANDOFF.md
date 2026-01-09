@@ -1,8 +1,8 @@
 # Google OAuth Implementation - Session Handoff
 
 **Date**: 2026-01-09
-**Commit**: a728dbd
-**Status**: Backend Complete ✅ | Frontend Pending ⏳
+**Commits**: a728dbd (backend) → 72dcc48 (frontend/detector) → 88645f6 (docs)
+**Status**: ✅ COMPLETE - Ready for Testing
 
 ---
 
@@ -50,9 +50,9 @@
 
 ---
 
-## What Remains To Do ⏳
+## Implementation Summary
 
-### 3. Frontend Implementation (Pending)
+### 3. Frontend Implementation (✅ Complete - Commit 72dcc48)
 
 #### A. Token Management (`frontend/api.ts`)
 **Add after line 15:**
@@ -233,9 +233,9 @@ if (!authenticated) {
 </div>
 ```
 
-### 4. Occupancy Detector Update (Pending)
+### 4. Occupancy Detector Update (✅ Complete - Commit 72dcc48)
 
-**File**: `occupancy_detector.py`
+**File**: `occupancy_detector.py` - All changes implemented
 
 **Add import** (after line 26):
 ```python
@@ -352,15 +352,20 @@ send_to_orchestrator(
 
 ## Testing Checklist
 
-### Backend Only (Current State)
-- [x] OAuth service initializes without errors
-- [x] JWT middleware registered
-- [x] OAuth endpoints available
-- [x] WebSocket auth logic present
-- [x] Device flow client ready
+### Implementation Status
+- [x] Backend OAuth service (commit a728dbd)
+- [x] Frontend authentication (commit 72dcc48)
+- [x] Occupancy detector OAuth (commit 72dcc48)
+- [x] All code pushed to origin/main
 
-### After Frontend Implementation
-- [ ] Visit http://localhost:8080 shows login screen
+### 🧪 Ready for Local Testing (Requires Google OAuth Setup)
+
+**Prerequisites:**
+1. Set up Google Cloud Console OAuth credentials (see below)
+2. Update config.yaml with client_id and client_secret
+
+**Frontend Testing:**
+- [ ] Visit http://localhost:5173 shows login screen
 - [ ] Click "Sign in with Google" redirects to Google
 - [ ] Approve access with rajeshgoli+kumo@gmail.com
 - [ ] Redirected back, JWT stored in localStorage
@@ -369,7 +374,7 @@ send_to_orchestrator(
 - [ ] Manual controls (ERV, HVAC) work
 - [ ] Logout clears token and shows login
 
-### After Detector Update
+**Detector Testing:**
 - [ ] Run: `python3 occupancy_detector.py --url http://localhost:8080 --reauth`
 - [ ] See device code and verification URL
 - [ ] Visit URL on phone, enter code
@@ -377,11 +382,11 @@ send_to_orchestrator(
 - [ ] Detector shows "Authorization successful"
 - [ ] Token saved to `~/.office-automate/auth_token.json`
 - [ ] Run again without `--reauth`, uses saved token
-- [ ] POST `/occupancy` succeeds
+- [ ] POST `/occupancy` succeeds (no more 401 errors)
 
 ---
 
-## Deployment Steps (After Frontend Complete)
+## Deployment Steps (After Local Testing)
 
 ### 1. Frontend Build
 ```bash
@@ -492,34 +497,35 @@ If OAuth causes issues:
 
 ---
 
-## Next Session Tasks
+## Next Steps
 
-1. **Implement frontend changes** (token management, Login component, API updates)
-2. **Update occupancy detector** (OAuth device flow integration)
-3. **Test end-to-end flow** (browser + detector)
-4. **Deploy to Mac Mini** (build frontend, update configs)
-5. **Update CLAUDE.md** (document OAuth, remove Basic Auth as primary)
+1. ✅ ~~Implement frontend changes~~ (COMPLETE - commit 72dcc48)
+2. ✅ ~~Update occupancy detector~~ (COMPLETE - commit 72dcc48)
+3. ⏳ **Set up Google Cloud Console** (OAuth credentials - see section above)
+4. ⏳ **Test end-to-end flow** (browser + detector - requires OAuth setup)
+5. ⏳ **Deploy to Mac Mini** (build frontend, update configs)
+6. ⏳ **Update CLAUDE.md** (document OAuth as primary auth)
 
 ---
 
 ## Key Files Reference
 
-**Backend (Complete):**
+**Backend (✅ Complete - commit a728dbd):**
 - `src/oauth_service.py` - Core OAuth logic
 - `src/orchestrator.py` - OAuth endpoints (lines 1103-1222), JWT middleware (lines 1064-1101), WebSocket auth (lines 982-1008)
 - `src/config.py` - GoogleOAuthConfig (lines 77-83)
 - `oauth_device_client.py` - Device flow client
 
-**Frontend (Pending):**
-- `frontend/api.ts` - Add token management, update API calls
-- `frontend/Login.tsx` - NEW FILE - Login screen
-- `frontend/App.tsx` - Auth state, logout button
+**Frontend (✅ Complete - commit 72dcc48):**
+- `frontend/api.ts` - Token management, Bearer auth headers, 401 handling
+- `frontend/Login.tsx` - NEW FILE - Login screen with Google OAuth
+- `frontend/App.tsx` - Auth state, user email display, logout button
 
-**Detector (Pending):**
-- `occupancy_detector.py` - OAuth integration
+**Detector (✅ Complete - commit 72dcc48):**
+- `occupancy_detector.py` - OAuth device flow integration, --reauth flag
 
-**Config:**
-- `config.yaml` - Update OAuth credentials (lines 47-54)
+**Config (⏳ Needs OAuth Credentials):**
+- `config.yaml` - Add Google OAuth client_id and client_secret
 
 ---
 
@@ -533,6 +539,12 @@ If OAuth causes issues:
 
 ---
 
-**Commit**: a728dbd
+**Commits**:
+- a728dbd - Backend OAuth implementation
+- 72dcc48 - Frontend & detector OAuth integration
+- 88645f6 - Documentation updates
+
 **Branch**: main
-**Status**: Backend pushed to origin ✅
+**Status**: ✅ All code complete and pushed to origin
+
+**Next**: Set up Google OAuth credentials → Test locally → Deploy to Mac Mini

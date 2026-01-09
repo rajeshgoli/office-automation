@@ -16,7 +16,7 @@ Office Climate Automation system for a backyard shed office. The system coordina
 - Mac Mini (macOS High Sierra 10.13.6) at 192.168.5.140
 - All services auto-start on boot via Launch Agents
 - MQTT broker (amqtt), Orchestrator, LocalTunnel all running
-- Remote access via LocalTunnel at https://climate.loca.lt (HTTP Basic Auth)
+- Remote access via LocalTunnel at https://climate.loca.lt
 - SSH enabled for remote management
 
 **Working:**
@@ -34,7 +34,7 @@ Office Climate Automation system for a backyard shed office. The system coordina
 - **Adaptive tVOC spike detection** - Catches sub-threshold meal/food events (45+ point spikes above baseline)
 - **AWAY mode automatic ventilation** - ERV TURBO when AWAY with CO2 > 500 ppm
 - PWA support for iOS home screen installation
-- HTTP Basic Auth for security
+- **Google OAuth 2.0 authentication** - Secure JWT-based auth for dashboard and API (ready for testing)
 
 ## Hardware Devices
 
@@ -147,27 +147,31 @@ This prevents false departures when leaving the door open for ventilation.
 
 ```
 office-automate/
-├── config.yaml            # Credentials and device config
+├── config.yaml            # Credentials and device config (includes OAuth)
 ├── requirements.txt       # Python dependencies
-├── occupancy_detector.py  # macOS presence detection (keyboard/mouse)
+├── occupancy_detector.py  # macOS presence detection (OAuth device flow)
+├── oauth_device_client.py # OAuth device flow client (for detector)
 ├── run.py                 # Main entry point (--port arg supported)
 ├── roadmap.md             # Progress tracking (update as you work!)
+├── OAUTH_HANDOFF.md       # OAuth implementation documentation
 ├── data/                  # SQLite database (gitignored)
 │   └── office_climate.db
 ├── frontend/              # React + Vite dashboard
-│   ├── App.tsx            # Main dashboard with quick controls
-│   ├── api.ts             # API client + WebSocket
+│   ├── App.tsx            # Main dashboard with auth state + quick controls
+│   ├── Login.tsx          # OAuth login screen
+│   ├── api.ts             # API client + WebSocket + token management
 │   ├── types.ts           # TypeScript types (ERVSpeed, etc.)
 │   └── ...
 └── src/
-    ├── config.py          # Config loader
+    ├── config.py          # Config loader (includes GoogleOAuthConfig)
     ├── database.py        # SQLite persistence + analysis
+    ├── oauth_service.py   # OAuth 2.0 service (JWT tokens, device flow)
     ├── yolink_client.py   # YoLink cloud API (HTTP + MQTT)
     ├── qingping_client.py # Qingping MQTT client (local broker)
     ├── erv_client.py      # ERV control via Tuya local
     ├── kumo_client.py     # Mitsubishi Kumo Cloud
     ├── state_machine.py   # PRESENT/AWAY state logic
-    └── orchestrator.py    # Main coordinator + HTTP/WS server
+    └── orchestrator.py    # Main coordinator + HTTP/WS server + OAuth endpoints
 ```
 
 ## Database
@@ -198,34 +202,77 @@ sqlite3 data/office_climate.db "SELECT timestamp, co2_ppm FROM sensor_readings W
 
 ## Authentication
 
-**Optional HTTP Basic Auth** - Protect the API for remote access.
+**Google OAuth 2.0 (Primary)** - Secure JWT-based authentication for dashboard and API access.
 
-To enable authentication, add credentials to `config.yaml`:
+### Setup Google OAuth
+
+1. **Google Cloud Console** (https://console.cloud.google.com):
+   - Create project: "Office Climate Automation"
+   - Enable "Google+ API" or "Google Identity Services"
+   - Create OAuth 2.0 Client ID (Web application)
+   - Add authorized redirect URIs:
+     - `http://localhost:8080/auth/callback` (development)
+     - `http://192.168.5.140:8080/auth/callback` (local network)
+     - `https://climate.loca.lt/auth/callback` (remote access)
+
+2. **Update config.yaml**:
 ```yaml
 orchestrator:
-  host: "0.0.0.0"
-  port: 8080
+  google_oauth:
+    client_id: "YOUR_CLIENT_ID.apps.googleusercontent.com"
+    client_secret: "YOUR_CLIENT_SECRET"
+    allowed_emails:
+      - "rajeshgoli+kumo@gmail.com"
+```
+
+### OAuth Features
+
+**Authorization Code Flow (Browser/Dashboard):**
+- Login screen with "Sign in with Google" button
+- PKCE for secure authorization without exposing client secret
+- JWT tokens (7-day expiry) stored in localStorage
+- User email display and logout button in dashboard
+
+**Device Flow (Occupancy Detector):**
+- Headless authentication for background services
+- Shows device code and verification URL
+- Automatic token refresh
+- Token stored in `~/.office-automate/auth_token.json`
+
+**API Security:**
+- All endpoints require `Authorization: Bearer <JWT>` header
+- WebSocket requires auth token as first message
+- Email allowlist enforcement (only authorized emails can access)
+- Automatic 401 handling and token refresh
+
+### HTTP Basic Auth (Fallback)
+
+OAuth is optional. If not configured, the system falls back to HTTP Basic Auth:
+
+```yaml
+orchestrator:
   auth_username: "admin"
   auth_password: "your_secure_password"
 ```
 
-When enabled:
-- All endpoints require HTTP Basic Auth
-- Browser will prompt for username/password on first access
-- Credentials are saved in browser for future requests
-- **Use only over HTTPS** (Cloudflare Tunnel provides this)
-
-When disabled (credentials not set):
-- API is open to local network
-- Suitable for development on trusted networks
-- **Do not expose to internet without auth**
+**Note:** Basic Auth is deprecated. Use OAuth for production deployments.
 
 ## API Endpoints
 
+### OAuth Endpoints
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/auth/login` | Initiate OAuth flow, returns Google authorization URL |
+| GET | `/auth/callback` | OAuth callback, exchanges code for JWT token |
+| POST | `/auth/logout` | Invalidate user session |
+| POST | `/auth/device/start` | Start device flow (for occupancy detector) |
+| POST | `/auth/device/poll` | Poll device authorization status |
+
+### System Endpoints (Require Authentication)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/status` | Current system status (JSON) |
-| GET | `/ws` | WebSocket for real-time updates |
+| GET | `/ws` | WebSocket for real-time updates (auth token required) |
 | POST | `/occupancy` | Mac keyboard/mouse activity `{"last_active_timestamp": 1704567890.123, "external_monitor": true}` |
 | POST | `/erv` | Manual ERV control `{"speed": "off\|quiet\|medium\|turbo"}` |
 | POST | `/hvac` | Manual HVAC control `{"mode": "off\|heat", "setpoint_f": 70}` |
@@ -243,14 +290,20 @@ python run.py --port 9001
 cd frontend
 VITE_API_PORT=9001 npm run dev -- --port 9002
 
-# Terminal 3: Mac occupancy detector
-python3 occupancy_detector.py --watch --url http://localhost:9001
+# Terminal 3: Mac occupancy detector (OAuth)
+python3 occupancy_detector.py --watch --url http://localhost:9001 --reauth
+# First run: Follow device code flow to authenticate
+# Subsequent runs: Omit --reauth flag, uses saved token
 
-# Check status
-curl http://localhost:9001/status
+# Check status (with OAuth)
+TOKEN="your_jwt_token_here"
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9001/status
 
-# Manual ERV control
-curl -X POST http://localhost:9001/erv -H "Content-Type: application/json" -d '{"speed":"turbo"}'
+# Manual ERV control (with OAuth)
+curl -X POST http://localhost:9001/erv \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"speed":"turbo"}'
 ```
 
 ## Device Details
