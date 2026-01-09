@@ -10,20 +10,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Office Climate Automation system for a backyard shed office. The system coordinates multiple smart devices to maintain air quality silently during occupancy and aggressively ventilate when away.
 
-## Current Status (2026-01-06)
+## Current Status (2026-01-08)
 
 **Working:**
 - YoLink sensors (door, window, motion) via Cloud MQTT
 - ERV control via Tuya local API (tinytuya)
-- Qingping Air Monitor via local MQTT - CO2, temp, humidity, tVOC index, noise dB
-- State machine (PRESENT/AWAY) with robust presence detection
-- SQLite database for persistence and historical analysis
+- Qingping Air Monitor via local MQTT - CO2, temp, humidity, PM2.5, PM10, tVOC index, noise dB
+- State machine (PRESENT/AWAY) with door open mode for ventilation scenarios
+- SQLite database for persistence and historical analysis (restores sensor states on startup)
 - React dashboard with live data (WebSocket + polling fallback)
 - Dashboard quick controls for manual ERV/HVAC override
 - macOS occupancy detector (keyboard/mouse activity)
 - HVAC coordination (suspends heating when ERV venting)
-- HVAC status polling (syncs dashboard with manual remote/app changes)
+- HVAC status polling (syncs dashboard with manual remote/app changes, pauses at night)
 - tVOC-triggered ventilation (VOC index >250 triggers ERV)
+- PWA support for iOS home screen installation
 
 **Pending:**
 - Deploy to Raspberry Pi for always-on operation
@@ -126,7 +127,11 @@ This prevents false departures when leaving the door open for ventilation.
 | tVOC index threshold (triggers ELEVATED) | 250 | |
 | Motion timeout | 60 seconds | |
 | Departure verification | 10 seconds | |
+| Door open mode threshold | 5 minutes | Door open this long → activity-based transitions |
+| Door open mode away timeout | 5 minutes | No activity for this long → AWAY |
 | Manual override timeout | 30 minutes | |
+| HVAC polling interval | 10 minutes | Sync dashboard with manual changes |
+| HVAC night pause | 11 PM - 6 AM | Skip polling during sleep hours |
 
 **Hysteresis explained:** ERV turns ON when CO2 ≥ 2000 ppm, but stays ON until CO2 < 1800 ppm. This prevents rapid on/off cycling when CO2 hovers around the threshold.
 
@@ -169,6 +174,10 @@ office-automate/
 - `climate_actions` - ERV/HVAC control actions with reasons
 
 **Important:** All timestamps are stored in **local time (PST)**, not UTC. This was changed in Session 6 to simplify debugging and analysis.
+
+**State Restoration:** On startup, the orchestrator restores last known sensor states from the database:
+- Qingping: Latest CO2/temp/humidity reading (prevents showing 0 until first MQTT update)
+- YoLink: Latest door/window/motion states (YoLink API doesn't support state queries with UAC)
 
 **Querying Examples:**
 ```bash

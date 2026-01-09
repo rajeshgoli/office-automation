@@ -578,6 +578,43 @@ Implement the core rules from vision.md.
   - `fly.md` - Fly.io setup guide (deprecated)
   - `fly-proxy/*` - Fly.io proxy config files
 
+**2026-01-08** (Session 13)
+- **State Machine Door Open Mode** - Fixed false presence bug
+  - **Problem**: Leaving door open and exiting → system thinks user is still present
+  - **Solution**: Door open mode (activity-based transitions)
+  - **Normal mode** (door recently changed/closed):
+    - AWAY → PRESENT: Mac/motion activity AFTER door event
+    - PRESENT → AWAY: Door close + 10s verification with no activity
+  - **Door open mode** (door open 5+ minutes):
+    - AWAY → PRESENT: Immediate on any Mac/motion activity
+    - PRESENT → AWAY: After 5 min no activity
+    - Door close exits mode → back to normal
+  - Handles "door open for ventilation" without false departures
+- **YoLink Sensor State Restoration** - Fixed window showing closed after restart
+  - **Problem**: YoLink API doesn't support state queries with UAC ("Token is invalid")
+  - **Solution**: Restore last known states from database on startup
+  - Added `Database.get_latest_device_state()` method
+  - Restores door/window/motion states from device_events table
+  - Matches Qingping approach (cache restoration)
+- **UI Improvements**
+  - Open Air status now shows presence: "PRESENT · OPEN AIR" / "AWAY · OPEN AIR"
+  - Changed from grey to cyan 🌬️ (positive vibe, not error state)
+  - Added PM2.5 and PM10 tiles to vitals grid (µg/m³ units)
+  - Backend now includes PM10 in air_quality response
+- **HVAC Polling Optimization**
+  - Reduced default interval from 5 min → 10 min (fewer API calls)
+  - Added night pause (11 PM - 6 AM) - no polling during sleep hours
+  - Respects Mitsubishi API while maintaining sync
+- **Files Changed**:
+  - `src/state_machine.py` - Door open mode implementation (renamed from greedy mode)
+  - `src/database.py` - Added get_latest_device_state() method
+  - `src/orchestrator.py` - YoLink state restoration, PM10 in API, HVAC night pause
+  - `src/config.py` - HVAC poll interval changed to 600s default
+  - `frontend/constants.tsx` - OPEN_AIR_PRESENT and OPEN_AIR_AWAY statuses
+  - `frontend/App.tsx` - PM2.5/PM10 tiles, open air shows presence
+  - `frontend/types.ts` - Added pm25/pm10 to OfficeState
+  - `CLAUDE.md` - Updated Operating Modes section
+
 **2026-01-07** (Session 11)
 - **PWA Implementation** - Progressive Web App for iOS
   - Added `manifest.json` with app metadata, icons, shortcuts
