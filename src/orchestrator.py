@@ -1069,33 +1069,25 @@ class Orchestrator:
         # Map devices first (needed to identify which device is which)
         self._setup_yolink_handlers()
 
-        # Query current state of all devices
-        logger.info("Querying YoLink device states...")
-        try:
-            await self.yolink.refresh_all_states()
-            logger.info("YoLink device states refreshed successfully")
+        # Restore YoLink sensor states from database (survives restarts)
+        logger.info("Restoring YoLink sensor states from database...")
+        door_state = self.db.get_latest_device_state("door")
+        if door_state:
+            is_open = door_state == "open"
+            logger.info(f"Restored door state: {'OPEN' if is_open else 'CLOSED'}")
+            await self.state_machine.update_door(is_open)
 
-            # Apply initial states to state machine
-            for device in self.yolink.devices.values():
-                state = device.state.get("state")
-                if not state:
-                    continue
+        window_state = self.db.get_latest_device_state("window")
+        if window_state:
+            is_open = window_state == "open"
+            logger.info(f"Restored window state: {'OPEN' if is_open else 'CLOSED'}")
+            await self.state_machine.update_window(is_open)
 
-                if device.device_id == self._door_device_id:
-                    is_open = state == "open"
-                    logger.info(f"Initial door state: {'OPEN' if is_open else 'CLOSED'}")
-                    await self.state_machine.update_door(is_open)
-                elif device.device_id == self._window_device_id:
-                    is_open = state == "open"
-                    logger.info(f"Initial window state: {'OPEN' if is_open else 'CLOSED'}")
-                    await self.state_machine.update_window(is_open)
-                elif device.device_id == self._motion_device_id:
-                    detected = state == "alert"
-                    logger.info(f"Initial motion state: {'DETECTED' if detected else 'clear'}")
-                    await self.state_machine.update_motion(detected)
-
-        except Exception as e:
-            logger.warning(f"Failed to query YoLink states (will rely on MQTT events): {e}")
+        motion_state = self.db.get_latest_device_state("motion")
+        if motion_state:
+            detected = motion_state == "detected"
+            logger.info(f"Restored motion state: {'DETECTED' if detected else 'clear'}")
+            await self.state_machine.update_motion(detected)
 
         # Start HVAC polling task
         if self.kumo:

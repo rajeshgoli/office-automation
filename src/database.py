@@ -221,6 +221,21 @@ class Database:
                 """, (since.isoformat(), limit)).fetchall()
             return [dict(row) for row in rows]
 
+    def get_latest_device_state(self, device_type: str) -> Optional[str]:
+        """Get the most recent event state for a device type (door, window, motion).
+
+        Returns:
+            Event state string (e.g., "open", "closed", "detected", "clear") or None if no events found.
+        """
+        with self._connection() as conn:
+            row = conn.execute("""
+                SELECT event FROM device_events
+                WHERE device_type = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (device_type,)).fetchone()
+            return row["event"] if row else None
+
     # --- Climate actions ---
 
     def log_climate_action(
