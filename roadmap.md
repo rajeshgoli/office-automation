@@ -615,6 +615,35 @@ Implement the core rules from vision.md.
   - `frontend/types.ts` - Added pm25/pm10 to OfficeState
   - `CLAUDE.md` - Updated Operating Modes section
 
+**2026-01-08** (Session 14)
+- **Adaptive tVOC Spike Detection** - Catches sub-threshold meal/food events
+  - **Problem**: Breakfast/meal tVOC spikes (65-80 points above baseline) fall below 250 threshold
+  - **Solution**: Three-phase detection (detect spike → track peak → trigger on decline)
+  - **Implementation**:
+    - Sliding window history buffer (15 readings, ~7.5 min)
+    - Spike detection: tVOC rises 45+ points above 5-reading baseline
+    - Peak tracking: Monitor highest value during spike
+    - Decline trigger: 2 consecutive drops from peak
+    - Ventilation: Run MEDIUM (3/2) until tVOC < 40 (nighttime baseline)
+    - Cooldown: 2-hour window prevents re-triggering same event
+  - **Configuration** (tuned to actual data):
+    - `tvoc_spike_baseline_delta: 45` (observed 65-80 point spikes)
+    - `tvoc_spike_min_trigger: 60` (baseline is 30-40)
+    - `tvoc_spike_min_peak: 90` (typical peaks 100-117)
+    - `tvoc_spike_target: 40` (clear to nighttime baseline)
+  - **Dashboard Integration**:
+    - New ERV status fields: `spike_ventilation`, `spike_peak`, `spike_cooldown_until`
+    - Logs to database: `spike_decline_peak_NNN` reason codes
+  - **State Management**:
+    - Clears spike state on PRESENT → AWAY transition
+    - Complements (doesn't replace) existing tVOC >250 logic
+    - Priority: Spike ventilation > tVOC >250 > CO2 critical
+- **Files Changed**:
+  - `src/config.py` - Added 7 spike detection config parameters
+  - `src/orchestrator.py` - Spike detection methods, integration in `_evaluate_erv_state()`
+  - `config.yaml` - User-facing spike thresholds (gitignored)
+  - `CLAUDE.md` - Updated Current Status, ERV Speed Modes
+
 **2026-01-07** (Session 11)
 - **PWA Implementation** - Progressive Web App for iOS
   - Added `manifest.json` with app metadata, icons, shortcuts

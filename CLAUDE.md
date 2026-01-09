@@ -24,17 +24,20 @@ Office Climate Automation system for a backyard shed office. The system coordina
 - HVAC coordination (suspends heating when ERV venting)
 - HVAC status polling (syncs dashboard with manual remote/app changes, pauses at night)
 - tVOC-triggered ventilation (VOC index >250 triggers ERV)
+- **Adaptive tVOC spike detection** - Catches sub-threshold meal/food events (45+ point spikes above baseline)
 - PWA support for iOS home screen installation
 
-**Pending:**
-- Deploy to Raspberry Pi for always-on operation
+**Next:**
+- Deploy to Mac Mini for always-on operation
+- Set eero DHCP reservation for Mac Mini stable IP
+- Reconfigure Qingping to use Mac Mini IP instead of localhost
 
 ## Hardware Devices
 
 | Device | Control Method | Status |
 |--------|---------------|--------|
 | **ERV (Pioneer Airlink)** | Tuya local (`192.168.5.119`) | Working |
-| **Qingping Air Monitor** | Local MQTT (`127.0.0.1:1883`) | Working |
+| **Qingping Air Monitor** | Local MQTT (`127.0.0.1:1883` → **needs Mac Mini IP**) | Working |
 | **YoLink Sensors** | Cloud MQTT (`api.yosmart.com:8003`) | Working |
 | **Mitsubishi Split AC** | pykumo (Kumo Cloud) | Working |
 | **Mac Keyboard/Mouse** | HTTP POST to orchestrator | Working |
@@ -111,7 +114,7 @@ This prevents false departures when leaving the door open for ventilation.
 |------|-----------|---------|
 | **OFF** | 0/0 | Default when present, air quality OK |
 | **QUIET** | 1/1 | CO2 > 2000 ppm while present |
-| **ELEVATED** | 3/2 | tVOC index > 250 (positive pressure) |
+| **ELEVATED** | 3/2 | tVOC index > 250 OR adaptive spike detected (positive pressure) |
 | **PURGE** | 8/8 | Away mode CO2 refresh |
 
 ### Safety Interlocks
@@ -286,7 +289,7 @@ curl -X POST http://localhost:9001/erv -H "Content-Type: application/json" -d '{
 - **macOS detector**: Run locally (`python3 occupancy_detector.py --watch`)
 - Access at `http://localhost:9001` (backend) and `http://localhost:9002` (frontend)
 
-### Production: Raspberry Pi + Cloudflare Tunnel
+### Production: Mac Mini + Cloudflare Tunnel (or Tailscale Funnel)
 
 **Architecture:**
 ```
@@ -315,71 +318,91 @@ curl -X POST http://localhost:9001/erv -H "Content-Type: application/json" -d '{
 └─────────────────┘
 ```
 
-### Step 1: Deploy to Raspberry Pi
+### Step 1: Deploy to Mac Mini
 
-1. **Copy project to Pi:**
+1. **Set eero DHCP Reservation** (CRITICAL - do this first!)
+   - Open eero app → Devices → Find Mac Mini
+   - Reserve IP address (e.g., `192.168.5.200`)
+   - This ensures Qingping and occupancy detector can reliably connect
+
+2. **Copy project to Mac Mini:**
    ```bash
    rsync -av --exclude 'data/' --exclude 'node_modules/' \
-     ~/Desktop/office-automate/ pi@raspberrypi.local:~/office-automate/
+     ~/Desktop/office-automate/ macmini.local:~/office-automate/
    ```
 
-2. **Install dependencies on Pi:**
+3. **Install dependencies on Mac Mini:**
    ```bash
-   ssh pi@raspberrypi.local
+   ssh macmini.local
    cd ~/office-automate
    python3 -m venv venv
    source venv/bin/activate
    pip install -r requirements.txt
    ```
 
-3. **Install Mosquitto MQTT broker:**
+4. **Install Mosquitto MQTT broker:**
    ```bash
-   sudo apt update
-   sudo apt install mosquitto mosquitto-clients
-   sudo systemctl enable mosquitto
-   sudo systemctl start mosquitto
+   brew install mosquitto
+   brew services start mosquitto
    ```
 
-4. **Copy config and enable auth (optional):**
+5. **Reconfigure Qingping to use Mac Mini IP:**
+   ```bash
+   # Get Mac Mini's IP
+   ifconfig | grep "inet " | grep -v 127.0.0.1
+   # Example output: 192.168.5.200
+
+   # Update Qingping via app or device config to point to Mac Mini IP
+   # MQTT Broker: 192.168.5.200
+   # Port: 1883
+   ```
+
+6. **Copy config and enable auth (optional):**
    ```bash
    cp config.example.yaml config.yaml
    nano config.yaml  # Fill in credentials
    # Note: Cloudflare Access provides auth, so HTTP Basic Auth is optional
    ```
 
-5. **Create systemd service:**
+7. **Create Launch Agent (macOS):**
    ```bash
-   sudo nano /etc/systemd/system/office-climate.service
+   # Create plist file
+   cat > ~/Library/LaunchAgents/com.office-automate.plist << 'EOF'
+   <?xml version="1.0" encoding="UTF-8"?>
+   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+   <plist version="1.0">
+   <dict>
+     <key>Label</key>
+     <string>com.office-automate</string>
+     <key>ProgramArguments</key>
+     <array>
+       <string>/Users/YOUR_USERNAME/office-automate/venv/bin/python</string>
+       <string>/Users/YOUR_USERNAME/office-automate/run.py</string>
+     </array>
+     <key>WorkingDirectory</key>
+     <string>/Users/YOUR_USERNAME/office-automate</string>
+     <key>RunAtLoad</key>
+     <true/>
+     <key>KeepAlive</key>
+     <true/>
+     <key>StandardOutPath</key>
+     <string>/tmp/office-automate.log</string>
+     <key>StandardErrorPath</key>
+     <string>/tmp/office-automate.error.log</string>
+   </dict>
+   </plist>
+   EOF
+
+   # Load and start
+   launchctl load ~/Library/LaunchAgents/com.office-automate.plist
+   launchctl start com.office-automate
+   launchctl list | grep office-automate  # Check it's running
    ```
 
-   ```ini
-   [Unit]
-   Description=Office Climate Automation
-   After=network.target mosquitto.service
-
-   [Service]
-   Type=simple
-   User=pi
-   WorkingDirectory=/home/pi/office-automate
-   ExecStart=/home/pi/office-automate/venv/bin/python run.py
-   Restart=always
-   RestartSec=10
-
-   [Install]
-   WantedBy=multi-user.target
-   ```
-
+8. **Update Mac occupancy detector to point to Mac Mini:**
    ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl enable office-climate
-   sudo systemctl start office-climate
-   sudo systemctl status office-climate  # Check it's running
-   ```
-
-6. **Update Mac occupancy detector to point to Pi:**
-   ```bash
-   # On Mac, update the URL
-   python3 occupancy_detector.py --watch --url http://raspberrypi.local:8080
+   # On work Mac, update the URL to Mac Mini's IP
+   python3 occupancy_detector.py --watch --url http://192.168.5.200:8080
    ```
 
 ### Step 2: Cloudflare Tunnel Setup
