@@ -269,10 +269,10 @@ class Orchestrator:
         self._check_manual_override_expiry()
 
         state = self.state_machine.state
-        co2 = self.state_machine.sensors.co2_ppm
 
-        # Get tVOC reading
+        # Get CO2 and tVOC readings from Qingping
         reading = self.qingping.latest_reading
+        co2 = reading.co2_ppm if reading else None
         tvoc = reading.tvoc if reading else None
         tvoc_threshold = self.config.thresholds.tvoc_threshold_ppb
 

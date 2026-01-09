@@ -4,8 +4,15 @@
 
 const API_PORT = import.meta.env.VITE_API_PORT || '8080';
 const API_HOST = import.meta.env.VITE_API_HOST || window.location.hostname;
-const API_BASE = `http://${API_HOST}:${API_PORT}`;
-const WS_URL = `ws://${API_HOST}:${API_PORT}/ws`;
+
+// Use current protocol and only add port if on localhost
+const isLocalhost = API_HOST === 'localhost' || API_HOST === '127.0.0.1';
+const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
+const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+const portSuffix = isLocalhost ? `:${API_PORT}` : '';
+
+const API_BASE = `${protocol}//${API_HOST}${portSuffix}`;
+const WS_URL = `${wsProtocol}//${API_HOST}${portSuffix}/ws`;
 
 export interface ApiStatus {
   state: string;

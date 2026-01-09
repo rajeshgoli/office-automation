@@ -116,7 +116,9 @@ def get_display_info() -> tuple[int, list[str]]:
 
 def send_to_orchestrator(
     state: OccupancyState,
-    orchestrator_url: str
+    orchestrator_url: str,
+    auth_username: Optional[str] = None,
+    auth_password: Optional[str] = None
 ) -> bool:
     """
     Send occupancy state to the orchestrator via HTTP POST.
@@ -124,6 +126,8 @@ def send_to_orchestrator(
     Args:
         state: Current occupancy state
         orchestrator_url: Base URL of the orchestrator (e.g., http://localhost:8080)
+        auth_username: Optional HTTP Basic Auth username
+        auth_password: Optional HTTP Basic Auth password
 
     Returns:
         True if successful, False otherwise
@@ -138,6 +142,14 @@ def send_to_orchestrator(
     }).encode("utf-8")
 
     try:
+        # Set up authentication if credentials provided
+        if auth_username and auth_password:
+            password_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+            password_mgr.add_password(None, orchestrator_url, auth_username, auth_password)
+            auth_handler = urllib.request.HTTPBasicAuthHandler(password_mgr)
+            opener = urllib.request.build_opener(auth_handler)
+            urllib.request.install_opener(opener)
+
         req = urllib.request.Request(
             url,
             data=payload,
@@ -188,7 +200,9 @@ def watch_occupancy(
     on_change: Optional[Callable[[OccupancyState, OccupancyState], None]] = None,
     output_json: bool = False,
     orchestrator_url: Optional[str] = None,
-    heartbeat_interval: float = 60.0
+    heartbeat_interval: float = 60.0,
+    auth_username: Optional[str] = None,
+    auth_password: Optional[str] = None
 ):
     """
     Continuously monitor occupancy state.
@@ -242,7 +256,7 @@ def watch_occupancy(
 
                 # Send to orchestrator
                 if orchestrator_url:
-                    if send_to_orchestrator(state, orchestrator_url):
+                    if send_to_orchestrator(state, orchestrator_url, auth_username, auth_password):
                         last_send_time = now
                         reason = "change" if state_changed else "heartbeat"
                         print(f"  → Sent to orchestrator ({reason})")
@@ -275,6 +289,10 @@ def main():
                         help="Orchestrator URL (default: http://localhost:8080)")
     parser.add_argument("--no-send", action="store_true",
                         help="Don't send state changes to orchestrator")
+    parser.add_argument("--auth-username", type=str,
+                        help="HTTP Basic Auth username")
+    parser.add_argument("--auth-password", type=str,
+                        help="HTTP Basic Auth password")
 
     args = parser.parse_args()
 
@@ -285,7 +303,9 @@ def main():
             poll_interval=args.poll,
             idle_threshold=args.idle_threshold,
             output_json=args.json,
-            orchestrator_url=orchestrator_url
+            orchestrator_url=orchestrator_url,
+            auth_username=args.auth_username,
+            auth_password=args.auth_password
         )
     else:
         state = check_occupancy(args.idle_threshold)
