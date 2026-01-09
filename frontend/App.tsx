@@ -12,7 +12,8 @@ import {
 import { STATUS_CONFIG } from './constants';
 import VitalTile from './components/VitalTile';
 import CO2Chart from './components/CO2Chart';
-import { fetchStatus, ApiStatus, toFahrenheit, StatusWebSocket, setERVSpeed, setHVACMode, ERVSpeed as ApiERVSpeed, HVACMode } from './api';
+import { fetchStatus, ApiStatus, toFahrenheit, StatusWebSocket, setERVSpeed, setHVACMode, ERVSpeed as ApiERVSpeed, HVACMode, isAuthenticated, logout, getUserEmail } from './api';
+import Login from './Login';
 
 // Default state when no data available
 const DEFAULT_STATE: OfficeState = {
@@ -87,6 +88,8 @@ const App: React.FC = () => {
     hvac_expires_in: number | null;
   } | null>(null);
   const [controlLoading, setControlLoading] = useState<string | null>(null);
+  const [authenticated, setAuthenticated] = useState(isAuthenticated());
+  const [userEmail, setUserEmail] = useState(getUserEmail());
 
   const wsRef = useRef<StatusWebSocket | null>(null);
   const historyRef = useRef<ClimateDataPoint[]>([]);
@@ -118,6 +121,13 @@ const App: React.FC = () => {
     };
     setEvents(prev => [...prev.slice(-19), event]); // Keep last 20 events
   }, []);
+
+  // Handle logout
+  const handleLogout = async () => {
+    await logout();
+    setAuthenticated(false);
+    setUserEmail(null);
+  };
 
   // Fetch initial status
   useEffect(() => {
@@ -253,6 +263,11 @@ const App: React.FC = () => {
 
   const currentStatus = getPrimaryStatus();
 
+  // Show login screen if not authenticated
+  if (!authenticated) {
+    return <Login />;
+  }
+
   // Control button handlers
   const handleERVControl = useCallback(async (speed: ApiERVSpeed) => {
     setControlLoading(`erv-${speed}`);
@@ -340,6 +355,15 @@ const App: React.FC = () => {
       <header className="flex justify-between items-center mb-2">
         <h1 className="text-lg font-bold tracking-tighter text-zinc-400 uppercase">Office Climate</h1>
         <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
+            <span className="text-sm text-zinc-400">{userEmail}</span>
+            <button
+              onClick={handleLogout}
+              className="text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-300 px-3 py-1 rounded transition-colors"
+            >
+              Logout
+            </button>
+          </div>
           <button
             onClick={() => setIsAmbient(true)}
             className="text-[10px] border border-zinc-800 px-2 py-1 rounded text-zinc-600 hover:text-zinc-400 transition-colors uppercase font-bold"

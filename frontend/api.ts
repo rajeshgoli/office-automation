@@ -14,6 +14,50 @@ const portSuffix = isLocalhost ? `:${API_PORT}` : '';
 const API_BASE = `${protocol}//${API_HOST}${portSuffix}`;
 const WS_URL = `${wsProtocol}//${API_HOST}${portSuffix}/ws`;
 
+const TOKEN_KEY = 'auth_token';
+const EMAIL_KEY = 'user_email';
+
+export function getAuthToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+export function setAuthToken(token: string, email: string) {
+  localStorage.setItem(TOKEN_KEY, token);
+  localStorage.setItem(EMAIL_KEY, email);
+}
+
+export function clearAuthToken() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(EMAIL_KEY);
+}
+
+export function getUserEmail(): string | null {
+  return localStorage.getItem(EMAIL_KEY);
+}
+
+export function isAuthenticated(): boolean {
+  return getAuthToken() !== null;
+}
+
+export async function startLogin(): Promise<{ authorization_url: string }> {
+  const response = await fetch(`${API_BASE}/auth/login`);
+  if (!response.ok) {
+    throw new Error('Failed to initiate login');
+  }
+  return response.json();
+}
+
+export async function logout(): Promise<void> {
+  const token = getAuthToken();
+  if (token) {
+    await fetch(`${API_BASE}/auth/logout`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+  }
+  clearAuthToken();
+}
+
 export interface ApiStatus {
   state: string;
   is_present: boolean;
@@ -67,10 +111,25 @@ export interface ApiEvent {
  * Fetch current status from orchestrator
  */
 export async function fetchStatus(): Promise<ApiStatus> {
-  const response = await fetch(`${API_BASE}/status`);
+  const token = getAuthToken();
+  const headers: HeadersInit = {};
+
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  const response = await fetch(`${API_BASE}/status`, { headers });
+
+  if (response.status === 401) {
+    clearAuthToken();
+    window.location.reload();
+    throw new Error('Authentication required');
+  }
+
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
   }
+
   return response.json();
 }
 
@@ -98,11 +157,25 @@ export type ERVSpeed = 'off' | 'quiet' | 'medium' | 'turbo';
  * Set ERV speed manually
  */
 export async function setERVSpeed(speed: ERVSpeed): Promise<{ ok: boolean; error?: string }> {
+  const token = getAuthToken();
+  const headers: HeadersInit = { 'Content-Type': 'application/json' };
+
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
   const response = await fetch(`${API_BASE}/erv`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({ speed }),
   });
+
+  if (response.status === 401) {
+    clearAuthToken();
+    window.location.reload();
+    throw new Error('Authentication required');
+  }
+
   return response.json();
 }
 
@@ -112,11 +185,25 @@ export type HVACMode = 'off' | 'heat';
  * Set HVAC mode manually
  */
 export async function setHVACMode(mode: HVACMode, setpoint_f: number = 70): Promise<{ ok: boolean; error?: string }> {
+  const token = getAuthToken();
+  const headers: HeadersInit = { 'Content-Type': 'application/json' };
+
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
   const response = await fetch(`${API_BASE}/hvac`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({ mode, setpoint_f }),
   });
+
+  if (response.status === 401) {
+    clearAuthToken();
+    window.location.reload();
+    throw new Error('Authentication required');
+  }
+
   return response.json();
 }
 
@@ -139,6 +226,11 @@ export class StatusWebSocket {
 
       this.ws.onopen = () => {
         console.log('WebSocket connected');
+        // Send auth message first
+        const token = getAuthToken();
+        if (token) {
+          this.ws!.send(JSON.stringify({ type: 'auth', token }));
+        }
         this.onConnectionCallback?.(true);
         if (this.reconnectTimer) {
           clearTimeout(this.reconnectTimer);

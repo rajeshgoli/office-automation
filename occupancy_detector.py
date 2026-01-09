@@ -24,6 +24,8 @@ import urllib.request
 import urllib.error
 from dataclasses import dataclass
 from typing import Optional, Callable
+from pathlib import Path
+from oauth_device_client import OAuthDeviceClient
 
 
 @dataclass
@@ -117,6 +119,8 @@ def get_display_info() -> tuple[int, list[str]]:
 def send_to_orchestrator(
     state: OccupancyState,
     orchestrator_url: str,
+    oauth_client: Optional[OAuthDeviceClient] = None,
+    # Legacy Basic Auth (deprecated)
     auth_username: Optional[str] = None,
     auth_password: Optional[str] = None
 ) -> bool:
@@ -141,24 +145,39 @@ def send_to_orchestrator(
         "external_monitor": state.external_monitor_connected
     }).encode("utf-8")
 
+    headers = {"Content-Type": "application/json"}
+
     try:
-        # Set up authentication if credentials provided
-        if auth_username and auth_password:
+        # OAuth authentication (preferred)
+        if oauth_client:
+            token = oauth_client.get_access_token()
+            if not token:
+                print("Failed to get access token", file=sys.stderr)
+                return False
+            headers["Authorization"] = f"Bearer {token}"
+
+        # Legacy Basic Auth (deprecated)
+        elif auth_username and auth_password:
             password_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
             password_mgr.add_password(None, orchestrator_url, auth_username, auth_password)
             auth_handler = urllib.request.HTTPBasicAuthHandler(password_mgr)
             opener = urllib.request.build_opener(auth_handler)
             urllib.request.install_opener(opener)
 
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+
         with urllib.request.urlopen(req, timeout=5) as response:
             result = json.loads(response.read().decode("utf-8"))
             return result.get("ok", False)
+
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            print("Authentication failed - token may be expired", file=sys.stderr)
+            if oauth_client:
+                print("Run with --reauth to re-authenticate", file=sys.stderr)
+        else:
+            print(f"HTTP error {e.code}: {e.reason}", file=sys.stderr)
+        return False
     except urllib.error.URLError as e:
         print(f"Error sending to orchestrator: {e}", file=sys.stderr)
         return False
@@ -201,6 +220,7 @@ def watch_occupancy(
     output_json: bool = False,
     orchestrator_url: Optional[str] = None,
     heartbeat_interval: float = 60.0,
+    oauth_client: Optional[OAuthDeviceClient] = None,
     auth_username: Optional[str] = None,
     auth_password: Optional[str] = None
 ):
@@ -256,7 +276,7 @@ def watch_occupancy(
 
                 # Send to orchestrator
                 if orchestrator_url:
-                    if send_to_orchestrator(state, orchestrator_url, auth_username, auth_password):
+                    if send_to_orchestrator(state, orchestrator_url, oauth_client, auth_username, auth_password):
                         last_send_time = now
                         reason = "change" if state_changed else "heartbeat"
                         print(f"  → Sent to orchestrator ({reason})")
@@ -289,14 +309,30 @@ def main():
                         help="Orchestrator URL (default: http://localhost:8080)")
     parser.add_argument("--no-send", action="store_true",
                         help="Don't send state changes to orchestrator")
+    parser.add_argument("--auth-token-file", type=str,
+                        help="OAuth token file path")
+    parser.add_argument("--reauth", action="store_true",
+                        help="Force re-authentication")
     parser.add_argument("--auth-username", type=str,
-                        help="HTTP Basic Auth username")
+                        help="HTTP Basic Auth username (deprecated)")
     parser.add_argument("--auth-password", type=str,
-                        help="HTTP Basic Auth password")
+                        help="HTTP Basic Auth password (deprecated)")
 
     args = parser.parse_args()
 
     orchestrator_url = None if args.no_send else args.url
+
+    # Set up OAuth client
+    oauth_client = None
+    if orchestrator_url:
+        token_file = Path(args.auth_token_file) if args.auth_token_file else None
+        oauth_client = OAuthDeviceClient(orchestrator_url, token_file)
+
+        # Load existing token or authenticate
+        if args.reauth or not oauth_client.load_token():
+            if not oauth_client.authenticate():
+                print("Authentication failed", file=sys.stderr)
+                sys.exit(1)
 
     if args.watch:
         watch_occupancy(
@@ -304,6 +340,7 @@ def main():
             idle_threshold=args.idle_threshold,
             output_json=args.json,
             orchestrator_url=orchestrator_url,
+            oauth_client=oauth_client,
             auth_username=args.auth_username,
             auth_password=args.auth_password
         )
