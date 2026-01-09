@@ -63,6 +63,15 @@ class ThresholdsConfig:
     motion_timeout_seconds: int = 60
     mac_poll_interval_seconds: int = 5
 
+    # Adaptive tVOC spike detection
+    tvoc_spike_detection_enabled: bool = True
+    tvoc_spike_baseline_delta: int = 45      # Points above baseline to detect spike
+    tvoc_spike_min_trigger: int = 60         # Ignore very low readings
+    tvoc_spike_min_peak: int = 90            # Only ventilate if peak > 90
+    tvoc_spike_target: int = 40              # Clear to this baseline
+    tvoc_spike_cooldown_hours: int = 2       # Hours between detections
+    tvoc_spike_history_size: int = 15        # Readings in sliding window
+
 
 @dataclass
 class OrchestratorConfig:

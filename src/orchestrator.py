@@ -13,12 +13,13 @@ import asyncio
 import json
 import logging
 import base64
+from collections import deque
 from pathlib import Path
 from typing import Optional, Set
 
 from aiohttp import web, WSMsgType
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from .config import load_config, Config
 from .yolink_client import YoLinkClient, YoLinkDevice, DeviceType
 from .state_machine import StateMachine, StateConfig, OccupancyState
@@ -88,6 +89,15 @@ class Orchestrator:
 
         # Track tVOC-triggered ventilation (separate from CO2-based logic)
         self._tvoc_ventilation_active: bool = False
+
+        # Adaptive tVOC spike detection state
+        self._tvoc_history: deque[tuple[datetime, int]] = deque(
+            maxlen=self.config.thresholds.tvoc_spike_history_size
+        )
+        self._spike_detected: bool = False
+        self._spike_peak_value: Optional[int] = None
+        self._spike_ventilation_active: bool = False
+        self._spike_cooldown_until: Optional[datetime] = None
 
         # HVAC state tracking
         self._hvac_mode: str = "off"  # heat, cool, off, auto
@@ -176,6 +186,11 @@ class Orchestrator:
             noise_db=reading.noise_db,
         )
 
+        # Update tVOC history for spike detection
+        if reading.tvoc is not None:
+            now = datetime.now()
+            self._tvoc_history.append((now, reading.tvoc))
+
         # Update state machine with CO2 reading
         if reading.co2_ppm is not None:
             self.state_machine.update_co2(reading.co2_ppm)
@@ -208,6 +223,34 @@ class Orchestrator:
                 self._manual_hvac_mode = None
                 self._manual_hvac_setpoint_f = None
                 self._manual_hvac_override_at = None
+
+    def _detect_tvoc_spike(self, current_tvoc: int) -> bool:
+        """Detect if tVOC is spiking above baseline."""
+        if not self.config.thresholds.tvoc_spike_detection_enabled:
+            return False
+
+        if len(self._tvoc_history) < 5:
+            return False  # Need baseline
+
+        # Calculate 5-reading baseline (exclude current)
+        baseline_readings = list(self._tvoc_history)[:-1][-5:]
+        baseline_avg = sum(r[1] for r in baseline_readings) / len(baseline_readings)
+
+        # Spike = significant increase above baseline
+        delta = current_tvoc - baseline_avg
+        return (current_tvoc > self.config.thresholds.tvoc_spike_min_trigger and
+                delta >= self.config.thresholds.tvoc_spike_baseline_delta)
+
+    def _detect_tvoc_decline(self) -> bool:
+        """Detect if tVOC is declining (2 consecutive drops)."""
+        if len(self._tvoc_history) < 3:
+            return False
+
+        recent_three = [r[1] for r in list(self._tvoc_history)[-3:]]
+        current = recent_three[2]
+
+        # Declining = current < both previous readings
+        return current < recent_three[1] and current < recent_three[0]
 
     def _evaluate_erv_state(self):
         """Evaluate whether ERV should be on or off based on current state.
@@ -264,6 +307,50 @@ class Orchestrator:
                     self._erv_speed = target_speed
             return  # Skip automation logic when manual override is active
 
+        # === ADAPTIVE SPIKE DETECTION ===
+        if (self.config.thresholds.tvoc_spike_detection_enabled and
+            tvoc is not None and
+            state == OccupancyState.PRESENT):
+
+            # Check cooldown
+            in_cooldown = (self._spike_cooldown_until and
+                          datetime.now() < self._spike_cooldown_until)
+
+            if not in_cooldown:
+                # Phase 1: Detect spike start
+                if not self._spike_detected and self._detect_tvoc_spike(tvoc):
+                    self._spike_detected = True
+                    self._spike_peak_value = tvoc
+                    logger.info(f"tVOC spike detected: {tvoc} (baseline breach)")
+
+                # Phase 2: Track peak
+                if self._spike_detected and tvoc > self._spike_peak_value:
+                    self._spike_peak_value = tvoc
+
+                # Phase 3: Detect decline and trigger ventilation
+                if (self._spike_detected and
+                    self._spike_peak_value > self.config.thresholds.tvoc_spike_min_peak and
+                    self._detect_tvoc_decline() and
+                    not self._spike_ventilation_active):
+
+                    logger.info(f"tVOC decline detected: peak={self._spike_peak_value}, "
+                               f"current={tvoc}, triggering MEDIUM ventilation")
+                    self._spike_ventilation_active = True
+                    self.db.log_climate_action("erv", "medium", co2_ppm=co2,
+                                               reason=f"spike_decline_peak_{self._spike_peak_value}")
+
+            # Phase 4: Clear when target reached
+            if (self._spike_ventilation_active and
+                tvoc < self.config.thresholds.tvoc_spike_target):
+                logger.info(f"tVOC cleared to {tvoc}, ending spike ventilation")
+                self._spike_detected = False
+                self._spike_peak_value = None
+                self._spike_ventilation_active = False
+                # 2-hour cooldown
+                self._spike_cooldown_until = datetime.now() + timedelta(
+                    hours=self.config.thresholds.tvoc_spike_cooldown_hours
+                )
+
         # Determine what's triggering ventilation
         tvoc_triggered = tvoc is not None and tvoc > tvoc_threshold
         co2_critical_on = co2 is not None and co2 >= self.config.thresholds.co2_critical_ppm
@@ -274,9 +361,16 @@ class Orchestrator:
 
         if state == OccupancyState.PRESENT:
             # PRESENT mode: prioritize quiet operation
-            # tVOC triggers MEDIUM, CO2 critical triggers QUIET
-            # tVOC takes precedence (MEDIUM is louder but handles VOCs)
-            if tvoc_triggered:
+            # Spike ventilation > tVOC >250 > CO2 critical
+            # Both spike and tVOC >250 use MEDIUM (positive pressure for VOC flush)
+            if self._spike_ventilation_active:
+                # Spike-based ventilation (adaptive, catches sub-threshold spikes)
+                if not self._erv_running or self._erv_speed != "medium":
+                    logger.info(f"ACTION: ERV MEDIUM (spike ventilation: tVOC={tvoc})")
+                    self.erv.turn_on(FanSpeed.MEDIUM)
+                    self._erv_running = True
+                    self._erv_speed = "medium"
+            elif tvoc_triggered:
                 if not self._erv_running or self._erv_speed != "medium":
                     logger.info(f"ACTION: ERV MEDIUM (tVOC high: {tvoc}ppb)")
                     self.erv.turn_on(FanSpeed.MEDIUM)
@@ -570,6 +664,15 @@ class Orchestrator:
         co2 = reading.co2_ppm if reading else None
         logger.info(f"Current CO2: {co2}ppm" if co2 else "CO2: unknown")
 
+        # Clear spike detection state on departure
+        if new_state == OccupancyState.AWAY:
+            if self._spike_detected or self._spike_ventilation_active:
+                logger.info("Clearing spike state: user departed")
+                self._spike_detected = False
+                self._spike_peak_value = None
+                self._spike_ventilation_active = False
+                # Keep cooldown to prevent re-trigger on immediate return
+
         # Log to database
         self.db.log_occupancy_change(
             state=new_state.value,
@@ -801,6 +904,10 @@ class Orchestrator:
             "running": self._erv_running,
             "tvoc_ventilation": self._tvoc_ventilation_active,
             "speed": self._erv_speed,
+            "spike_ventilation": self._spike_ventilation_active,
+            "spike_peak": self._spike_peak_value,
+            "spike_cooldown_until": (self._spike_cooldown_until.isoformat()
+                                    if self._spike_cooldown_until else None),
         }
 
         # Add HVAC status
