@@ -481,7 +481,8 @@ class Orchestrator:
 
         This keeps our local state in sync with the actual device,
         even if the user changes settings via remote/app.
-        Default interval is 5 minutes to be respectful of Mitsubishi's API.
+        Default interval is 10 minutes to be respectful of Mitsubishi's API.
+        Pauses during night hours (11 PM - 6 AM) to avoid unnecessary API calls.
         """
         if not self.kumo:
             return
@@ -491,6 +492,13 @@ class Orchestrator:
         while True:
             try:
                 await asyncio.sleep(poll_interval)
+
+                # Pause polling during night hours (11 PM - 6 AM)
+                from datetime import datetime
+                current_hour = datetime.now().hour
+                if current_hour >= 23 or current_hour < 6:
+                    logger.debug("HVAC polling paused (night hours: 11 PM - 6 AM)")
+                    continue
 
                 # Get current device status (use get_full_status for operating state)
                 status = await self.kumo.get_full_status()
@@ -780,6 +788,7 @@ class Orchestrator:
             "temp_c": reading.temp_c if reading else None,
             "humidity": reading.humidity if reading else None,
             "pm25": reading.pm25 if reading else None,
+            "pm10": reading.pm10 if reading else None,
             "tvoc": reading.tvoc if reading else None,
             "noise_db": reading.noise_db if reading else None,
             "last_update": reading.timestamp.isoformat() if reading and reading.timestamp else None,

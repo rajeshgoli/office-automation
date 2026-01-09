@@ -22,6 +22,8 @@ const DEFAULT_STATE: OfficeState = {
   humidity: 0,
   tvoc: 0,
   noise: 0,
+  pm25: 0,
+  pm10: 0,
   door: DeviceStatus.CLOSED,
   window: DeviceStatus.CLOSED,
   hvacMode: DeviceStatus.OFF,
@@ -52,6 +54,8 @@ function apiToState(api: ApiStatus): OfficeState {
     humidity: api.air_quality.humidity ? Math.round(api.air_quality.humidity * 10) / 10 : 0,
     tvoc: api.air_quality.tvoc ?? 0,
     noise: api.air_quality.noise_db ?? 0,
+    pm25: api.air_quality.pm25 ?? 0,
+    pm10: api.air_quality.pm10 ?? 0,
     door: api.sensors.door_open ? DeviceStatus.OPEN : DeviceStatus.CLOSED,
     window: api.sensors.window_open ? DeviceStatus.OPEN : DeviceStatus.CLOSED,
     hvacMode: api.hvac?.mode === 'heat' ? DeviceStatus.HEAT :
@@ -229,7 +233,13 @@ const App: React.FC = () => {
 
   const getPrimaryStatus = useCallback(() => {
     if (state.isSystemError) return STATUS_CONFIG.ERROR;
-    if (state.window === DeviceStatus.OPEN || state.door === DeviceStatus.OPEN) return STATUS_CONFIG.OPEN_AIR;
+
+    // Open air shows presence status too
+    if (state.window === DeviceStatus.OPEN || state.door === DeviceStatus.OPEN) {
+      return state.occupancy === OccupancyState.PRESENT
+        ? STATUS_CONFIG.OPEN_AIR_PRESENT
+        : STATUS_CONFIG.OPEN_AIR_AWAY;
+    }
 
     if (state.occupancy === OccupancyState.PRESENT) {
       if (state.co2 > Threshold.CRITICAL) return STATUS_CONFIG.PRESENT_VENTING;
@@ -393,6 +403,18 @@ const App: React.FC = () => {
           value={state.noise || '---'}
           unit="dB"
           icon="🔊"
+        />
+        <VitalTile
+          label="PM2.5"
+          value={state.pm25 ?? '---'}
+          unit="µg/m³"
+          icon="💨"
+        />
+        <VitalTile
+          label="PM10"
+          value={state.pm10 ?? '---'}
+          unit="µg/m³"
+          icon="💨"
         />
         <VitalTile
           label="Door"

@@ -43,6 +43,8 @@ export interface OfficeState {
   humidity: number;
   tvoc: number;
   noise: number;
+  pm25: number;
+  pm10: number;
   door: DeviceStatus;
   window: DeviceStatus;
   hvacMode: DeviceStatus;

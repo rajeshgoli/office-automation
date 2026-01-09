@@ -37,12 +37,19 @@ export const STATUS_CONFIG = {
     border: 'border-blue-400/30',
     icon: '🔵'
   },
-  OPEN_AIR: {
-    label: 'OPEN AIR',
-    color: 'bg-gray-400',
-    text: 'text-gray-400',
-    border: 'border-gray-400/30',
-    icon: '⚪'
+  OPEN_AIR_PRESENT: {
+    label: 'PRESENT · OPEN AIR',
+    color: 'bg-cyan-500',
+    text: 'text-cyan-500',
+    border: 'border-cyan-500/30',
+    icon: '🌬️'
+  },
+  OPEN_AIR_AWAY: {
+    label: 'AWAY · OPEN AIR',
+    color: 'bg-cyan-400',
+    text: 'text-cyan-400',
+    border: 'border-cyan-400/30',
+    icon: '🌬️'
   },
   ERROR: {
     label: 'CHECK SYSTEM',

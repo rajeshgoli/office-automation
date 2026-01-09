@@ -47,7 +47,7 @@ class MitsubishiConfig:
     device_serial: Optional[str] = None
     type: str = "kumo"  # "kumo" or "esphome"
     ip: Optional[str] = None
-    poll_interval_seconds: int = 300  # How often to poll device status (5 min default)
+    poll_interval_seconds: int = 600  # How often to poll device status (10 min default)
 
 
 @dataclass
