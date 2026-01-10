@@ -40,3 +40,4 @@ tmp/
 
 # Database
 data/
+client_secret.json
