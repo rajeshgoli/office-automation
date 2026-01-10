@@ -124,7 +124,8 @@ class Orchestrator:
                 allowed_emails=oauth_config.allowed_emails,
                 token_expiry_days=oauth_config.token_expiry_days,
                 redirect_uri=redirect_uri,
-                jwt_secret=oauth_config.jwt_secret
+                jwt_secret=oauth_config.jwt_secret,
+                trusted_networks=oauth_config.trusted_networks
             )
             logger.info("OAuth service initialized")
 
@@ -1273,7 +1274,7 @@ class Orchestrator:
 
     def _is_trusted_network(self, request: web.Request) -> bool:
         """Check if request is from a trusted network."""
-        if not self.oauth or not self.oauth.config.trusted_networks:
+        if not self.oauth or not self.oauth.trusted_networks:
             return False
 
         # Get client IP (handle X-Forwarded-For for proxies)
@@ -1288,7 +1289,7 @@ class Orchestrator:
 
         try:
             client_addr = ipaddress.ip_address(client_ip)
-            for network_str in self.oauth.config.trusted_networks:
+            for network_str in self.oauth.trusted_networks:
                 network = ipaddress.ip_network(network_str, strict=False)
                 if client_addr in network:
                     logger.info(f"Request from trusted network: {client_ip} in {network_str}")

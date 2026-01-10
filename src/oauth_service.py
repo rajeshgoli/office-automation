@@ -47,13 +47,15 @@ class OAuthService:
         allowed_emails: list[str],
         token_expiry_days: int = 7,
         redirect_uri: Optional[str] = None,
-        jwt_secret: Optional[str] = None
+        jwt_secret: Optional[str] = None,
+        trusted_networks: Optional[list[str]] = None
     ):
         self.client_id = client_id
         self.client_secret = client_secret
         self.allowed_emails = [e.lower() for e in allowed_emails]
         self.token_expiry_days = token_expiry_days
         self.redirect_uri = redirect_uri
+        self.trusted_networks = trusted_networks or []
 
         # JWT secret for signing tokens
         self.jwt_secret = jwt_secret or secrets.token_urlsafe(32)
