@@ -133,6 +133,9 @@ const App: React.FC = () => {
 
   // Fetch initial status
   useEffect(() => {
+    // Skip if not authenticated
+    if (!authenticated) return;
+
     let mounted = true;
     let pollInterval: number | null = null;
 
@@ -194,10 +197,13 @@ const App: React.FC = () => {
       mounted = false;
       if (pollInterval) clearInterval(pollInterval);
     };
-  }, [addHistoryPoint, addEvent]);
+  }, [authenticated, addHistoryPoint, addEvent]);
 
   // WebSocket connection
   useEffect(() => {
+    // Skip if not authenticated
+    if (!authenticated) return;
+
     const ws = new StatusWebSocket();
     wsRef.current = ws;
 
@@ -233,7 +239,7 @@ const App: React.FC = () => {
     return () => {
       ws.disconnect();
     };
-  }, [addHistoryPoint, addEvent]);
+  }, [authenticated, addHistoryPoint, addEvent]);
 
   // Clock update
   useEffect(() => {

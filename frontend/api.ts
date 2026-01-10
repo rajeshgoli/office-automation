@@ -122,7 +122,6 @@ export async function fetchStatus(): Promise<ApiStatus> {
 
   if (response.status === 401) {
     clearAuthToken();
-    window.location.reload();
     throw new Error('Authentication required');
   }
 
@@ -172,7 +171,6 @@ export async function setERVSpeed(speed: ERVSpeed): Promise<{ ok: boolean; error
 
   if (response.status === 401) {
     clearAuthToken();
-    window.location.reload();
     throw new Error('Authentication required');
   }
 
@@ -200,7 +198,6 @@ export async function setHVACMode(mode: HVACMode, setpoint_f: number = 70): Prom
 
   if (response.status === 401) {
     clearAuthToken();
-    window.location.reload();
     throw new Error('Authentication required');
   }
 
