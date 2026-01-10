@@ -100,6 +100,13 @@ class Orchestrator:
         self._spike_ventilation_active: bool = False
         self._spike_cooldown_until: Optional[datetime] = None
 
+        # CO2 plateau detection state (AWAY mode optimization)
+        self._co2_history: deque[tuple[datetime, int]] = deque(
+            maxlen=self.config.thresholds.co2_history_size
+        )
+        self._outdoor_co2_baseline: Optional[int] = None  # Learned outdoor CO2 level
+        self._plateau_detected: bool = False
+
         # OAuth service (if configured)
         self.oauth: Optional[OAuthService] = None
         if config.orchestrator.google_oauth:
@@ -215,6 +222,11 @@ class Orchestrator:
             now = datetime.now()
             self._tvoc_history.append((now, reading.tvoc))
 
+        # Update CO2 history for plateau detection
+        if reading.co2_ppm is not None:
+            now = datetime.now()
+            self._co2_history.append((now, reading.co2_ppm))
+
         # Update state machine with CO2 reading
         if reading.co2_ppm is not None:
             self.state_machine.update_co2(reading.co2_ppm)
@@ -275,6 +287,106 @@ class Orchestrator:
 
         # Declining = current < both previous readings
         return current < recent_three[1] and current < recent_three[0]
+
+    def _calculate_co2_rate_of_change(self) -> Optional[float]:
+        """Calculate CO2 rate of change in ppm/min over the history window.
+
+        Returns:
+            Rate of change in ppm/min (negative = falling, positive = rising)
+            None if insufficient data
+        """
+        if len(self._co2_history) < 2:
+            return None
+
+        # Get oldest and newest readings
+        oldest_time, oldest_co2 = self._co2_history[0]
+        newest_time, newest_co2 = self._co2_history[-1]
+
+        # Calculate time difference in minutes
+        time_delta = (newest_time - oldest_time).total_seconds() / 60.0
+
+        if time_delta == 0:
+            return None
+
+        # Calculate rate (negative = falling, positive = rising)
+        co2_delta = newest_co2 - oldest_co2
+        rate = co2_delta / time_delta
+
+        return rate
+
+    def _detect_co2_plateau(self) -> bool:
+        """Detect if CO2 has plateaued (equilibrium with outdoor air).
+
+        Plateau = rate of change < threshold for sustained period.
+
+        Returns:
+            True if plateau detected, False otherwise
+        """
+        if not self.config.thresholds.co2_plateau_enabled:
+            return False
+
+        # Need enough data to calculate rate over window
+        min_readings = max(20, int(self.config.thresholds.co2_plateau_window_minutes * 2))
+        if len(self._co2_history) < min_readings:
+            return False
+
+        # Safety: Don't declare plateau if CO2 is still high
+        current_co2 = self._co2_history[-1][1]
+        if current_co2 > self.config.thresholds.co2_plateau_min_co2:
+            return False
+
+        # Calculate rate of change
+        rate = self._calculate_co2_rate_of_change()
+        if rate is None:
+            return False
+
+        # Plateau = very slow rate (absolute value)
+        rate_threshold = self.config.thresholds.co2_plateau_rate_threshold
+        is_plateau = abs(rate) < rate_threshold
+
+        if is_plateau:
+            # Remember this as outdoor baseline
+            self._outdoor_co2_baseline = current_co2
+            logger.info(f"CO2 plateau detected at {current_co2}ppm (rate: {rate:.2f} ppm/min, "
+                       f"outdoor baseline learned)")
+
+        return is_plateau
+
+    def _get_adaptive_erv_speed_for_away(self, co2: int) -> Optional[str]:
+        """Determine adaptive ERV speed for AWAY mode based on CO2 rate of change.
+
+        Returns:
+            "turbo", "medium", "quiet", "off", or None if insufficient data
+        """
+        if not self.config.thresholds.co2_adaptive_speed_enabled:
+            return None  # Fall back to default TURBO logic
+
+        # Check for plateau first
+        if self._detect_co2_plateau():
+            logger.info(f"CO2 plateau detected at {co2}ppm, stopping ERV (outdoor baseline: {self._outdoor_co2_baseline}ppm)")
+            self._plateau_detected = True
+            return "off"
+
+        # Calculate rate of change
+        rate = self._calculate_co2_rate_of_change()
+        if rate is None:
+            return None  # Not enough data, use default
+
+        # Rate is negative when falling (ventilation working)
+        # We want absolute value for thresholds
+        abs_rate = abs(rate)
+
+        # Adaptive speed based on how fast CO2 is falling
+        if abs_rate > self.config.thresholds.co2_rate_turbo_threshold:
+            return "turbo"  # Falling fast, keep TURBO
+        elif abs_rate > self.config.thresholds.co2_rate_medium_threshold:
+            return "medium"  # Slowing down, step to MEDIUM
+        elif abs_rate > self.config.thresholds.co2_rate_quiet_threshold:
+            return "quiet"  # Very slow, step to QUIET
+        else:
+            # Rate < 0.5 ppm/min - approaching plateau
+            # But give it a few more minutes before declaring plateau
+            return "quiet"
 
     def _evaluate_erv_state(self):
         """Evaluate whether ERV should be on or off based on current state.
@@ -438,16 +550,44 @@ class Orchestrator:
                         self.db.log_climate_action("erv", "off", co2_ppm=co2, reason="tvoc_cleared")
 
         elif state == OccupancyState.AWAY:
-            # AWAY mode: aggressive ventilation
-            # CO2 refresh uses TURBO, tVOC-only uses MEDIUM
+            # AWAY mode: aggressive ventilation with adaptive speed control
+            # Priority: CO2 refresh > tVOC clearing
+            # CO2 refresh uses adaptive speed (TURBO -> MEDIUM -> QUIET -> OFF based on rate)
             if co2_needs_refresh:
-                # TURBO handles both CO2 and tVOC
-                if not self._erv_running or self._erv_speed != "turbo":
-                    logger.info(f"ACTION: ERV TURBO (away mode, CO2={co2}ppm)")
-                    self.erv.turn_on(FanSpeed.TURBO)
-                    self._erv_running = True
-                    self._erv_speed = "turbo"
-                    self.db.log_climate_action("erv", "turbo", co2_ppm=co2, reason=f"away_co2_refresh_{co2}ppm")
+                # Try adaptive speed control first
+                adaptive_speed = self._get_adaptive_erv_speed_for_away(co2)
+
+                if adaptive_speed == "off":
+                    # Plateau detected - outdoor baseline reached
+                    if self._erv_running:
+                        logger.info(f"ACTION: ERV OFF (CO2 plateau at {co2}ppm, outdoor baseline: {self._outdoor_co2_baseline}ppm)")
+                        self.erv.turn_off()
+                        self._erv_running = False
+                        self._erv_speed = "off"
+                        self.db.log_climate_action("erv", "off", co2_ppm=co2, reason=f"co2_plateau_{co2}ppm")
+                        self._plateau_detected = True
+                elif adaptive_speed:
+                    # Use adaptive speed (turbo/medium/quiet based on rate)
+                    speed_map = {"quiet": FanSpeed.QUIET, "medium": FanSpeed.MEDIUM, "turbo": FanSpeed.TURBO}
+                    fan_speed = speed_map[adaptive_speed]
+
+                    if not self._erv_running or self._erv_speed != adaptive_speed:
+                        rate = self._calculate_co2_rate_of_change()
+                        rate_str = f"{rate:.2f}" if rate else "N/A"
+                        logger.info(f"ACTION: ERV {adaptive_speed.upper()} (away, adaptive: CO2={co2}ppm, rate={rate_str} ppm/min)")
+                        self.erv.turn_on(fan_speed)
+                        self._erv_running = True
+                        self._erv_speed = adaptive_speed
+                        self.db.log_climate_action("erv", adaptive_speed, co2_ppm=co2,
+                                                   reason=f"away_adaptive_{adaptive_speed}_{co2}ppm")
+                else:
+                    # Fall back to default TURBO if adaptive disabled or insufficient data
+                    if not self._erv_running or self._erv_speed != "turbo":
+                        logger.info(f"ACTION: ERV TURBO (away mode, CO2={co2}ppm)")
+                        self.erv.turn_on(FanSpeed.TURBO)
+                        self._erv_running = True
+                        self._erv_speed = "turbo"
+                        self.db.log_climate_action("erv", "turbo", co2_ppm=co2, reason=f"away_co2_refresh_{co2}ppm")
             elif tvoc_triggered:
                 # CO2 is good but tVOC needs clearing
                 if not self._erv_running or self._erv_speed != "medium":
@@ -459,6 +599,7 @@ class Orchestrator:
                         self._tvoc_ventilation_active = True
                         self.db.log_climate_action("erv", "medium", co2_ppm=co2, reason=f"tvoc_high_{tvoc}ppb_away")
             else:
+                # CO2 below target and no tVOC issue
                 if self._erv_running:
                     reason = "co2_target_reached" if not self._tvoc_ventilation_active else "tvoc_cleared_away"
                     logger.info(f"ACTION: ERV OFF ({reason}: CO2={co2}ppm)")
@@ -696,6 +837,12 @@ class Orchestrator:
                 self._spike_peak_value = None
                 self._spike_ventilation_active = False
                 # Keep cooldown to prevent re-trigger on immediate return
+
+        # Clear plateau detection state on arrival (start fresh CO2 refresh cycle)
+        if new_state == OccupancyState.PRESENT and self._plateau_detected:
+            logger.info("Clearing plateau state: user returned")
+            self._plateau_detected = False
+            # Keep outdoor baseline for reference
 
         # Log to database
         self.db.log_occupancy_change(

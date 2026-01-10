@@ -253,6 +253,32 @@ Implement the core rules from vision.md.
 
 ## Future / P2
 
+### Demo "Wow Features" 🎬
+- [ ] **Real-Time Animated Charts + Timeline** - Visual storytelling of your day
+  - Live trending charts: CO2, tVOC, temp over last 24 hours
+  - Animated state machine timeline showing PRESENT/AWAY transitions
+  - "Rewind the day" scrubber to see exactly when events happened
+  - Correlation view: Overlay occupancy, CO2, and ERV actions on single chart
+  - Real-time updates as data flows in
+  - Demo value: Makes the invisible (air quality) visible and cinematic
+- [ ] **Weekly AI Report with Predictions** - System "understands" your patterns
+  - Personalized weekly summary: hours occupied, average CO2, air quality score
+  - Pattern detection: "You arrive 23 minutes earlier on Mondays"
+  - Smart suggestions: "Consider pre-cooling the office at 8:30am?"
+  - Predictive insights based on historical data
+  - Energy savings tracking (kWh saved vs always-on)
+  - Demo value: Shows intelligence, not just reactive automation
+- [ ] **Office Replay Time Machine** - Animated playback of your workday
+  - Cinematic timeline animation showing:
+    - Your arrival (door opens → motion detected)
+    - CO2 rising (color-coded: green → yellow → red)
+    - ERV kicking in (animated fan icon)
+    - CO2 dropping back to safe levels
+    - Your departure (door closes → AWAY mode → PURGE cycle)
+  - Select any day from history to replay
+  - Demo value: Tells a compelling story of how the system works
+
+### Other Future Enhancements
 - [ ] **Historical Charts** - Time-series visualization for trends
   - CO2, temperature, humidity graphs (day/week/month views)
   - Occupancy pattern analysis (when are you typically in the office?)

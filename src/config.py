@@ -72,6 +72,20 @@ class ThresholdsConfig:
     tvoc_spike_cooldown_hours: int = 2       # Hours between detections
     tvoc_spike_history_size: int = 15        # Readings in sliding window
 
+    # CO2 plateau detection (AWAY mode optimization)
+    co2_plateau_enabled: bool = True
+    co2_plateau_rate_threshold: float = 0.5  # ppm/min - slower than this = plateau
+    co2_plateau_window_minutes: int = 10     # sustained slow rate for this long
+    co2_plateau_min_co2: int = 600           # don't declare plateau above this (safety, allows winter ~490ppm + margin)
+    co2_history_size: int = 40               # CO2 readings in sliding window (20 min at 30s intervals)
+
+    # Adaptive ERV speed control (AWAY mode)
+    co2_adaptive_speed_enabled: bool = True
+    co2_rate_turbo_threshold: float = 8.0    # > 8 ppm/min → TURBO (8/8)
+    co2_rate_medium_threshold: float = 2.0   # 2-8 ppm/min → MEDIUM (3/2)
+    co2_rate_quiet_threshold: float = 0.5    # 0.5-2 ppm/min → QUIET (1/1)
+                                              # < 0.5 ppm/min for 10 min → OFF (plateau)
+
 
 @dataclass
 class GoogleOAuthConfig:

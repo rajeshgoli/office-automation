@@ -32,7 +32,8 @@ Office Climate Automation system for a backyard shed office. The system coordina
 - HVAC status polling (syncs dashboard with manual remote/app changes, pauses at night)
 - tVOC-triggered ventilation (VOC index >250 triggers ERV)
 - **Adaptive tVOC spike detection** - Catches sub-threshold meal/food events (45+ point spikes above baseline)
-- **AWAY mode automatic ventilation** - ERV TURBO when AWAY with CO2 > 500 ppm
+- **Adaptive AWAY mode ventilation** - Speed adjusts based on CO2 fall rate (TURBO → MEDIUM → QUIET → OFF)
+- **CO2 plateau detection** - Learns outdoor baseline (~490 ppm winter) and stops ERV when equilibrium reached
 - PWA support for iOS home screen installation
 - **Google OAuth 2.0 authentication** - Secure JWT-based auth for dashboard and API (ready for testing)
 
@@ -69,7 +70,7 @@ Office Climate Automation system for a backyard shed office. The system coordina
 
 ### Two-State System
 - **PRESENT**: Quiet mode - ERV off unless CO2 > 2000 ppm or tVOC index > 250
-- **AWAY**: Ventilation mode - ERV PURGE until CO2 < 500 ppm
+- **AWAY**: Adaptive ventilation mode - ERV speed adjusts based on CO2 fall rate, stops at outdoor baseline plateau
 
 ### Operating Modes
 
@@ -115,12 +116,23 @@ This prevents false departures when leaving the door open for ventilation.
 - Walk away: door closes → departure verification → AWAY
 
 ### ERV Speed Modes
+
+**PRESENT Mode:**
 | Mode | Fan Speed | Trigger |
 |------|-----------|---------|
-| **OFF** | 0/0 | Default when present, air quality OK |
-| **QUIET** | 1/1 | CO2 > 2000 ppm while present |
+| **OFF** | 0/0 | Default when air quality OK |
+| **QUIET** | 1/1 | CO2 > 2000 ppm (hysteresis: off at 1800 ppm) |
 | **ELEVATED** | 3/2 | tVOC index > 250 OR adaptive spike detected (positive pressure) |
-| **PURGE** | 8/8 | Away mode CO2 refresh |
+
+**AWAY Mode (Adaptive Speed Control):**
+| Mode | Fan Speed | CO2 Fall Rate | Notes |
+|------|-----------|---------------|-------|
+| **PURGE** | 8/8 | > 8 ppm/min | Fast CO2 drop, aggressive ventilation |
+| **ELEVATED** | 3/2 | 2-8 ppm/min | Moderate drop, stepping down |
+| **QUIET** | 1/1 | 0.5-2 ppm/min | Slow drop, approaching equilibrium |
+| **OFF** | 0/0 | < 0.5 ppm/min for 10 min | Plateau detected, outdoor baseline reached |
+
+**Outdoor Baseline Detection:** System learns outdoor CO2 level (e.g., ~490 ppm in winter) and stops ventilating when equilibrium is reached, preventing infinite runtime.
 
 ### Safety Interlocks
 - Window OR door open → ERV OFF
@@ -131,8 +143,14 @@ This prevents false departures when leaving the door open for ventilation.
 |-----------|-------|-------|
 | CO2 critical (ERV on while present) | 2000 ppm | Turn ON threshold |
 | CO2 critical hysteresis | 200 ppm | Turn OFF at (2000-200) = 1800 ppm |
-| CO2 refresh target (away mode) | 500 ppm | |
+| CO2 refresh target (away mode) | 500 ppm | Start target (adaptive control takes over) |
 | tVOC index threshold (triggers ELEVATED) | 250 | |
+| **CO2 plateau rate threshold** | **0.5 ppm/min** | Slower than this = outdoor baseline reached |
+| **CO2 plateau window** | **10 minutes** | Sustained slow rate duration |
+| **CO2 plateau min safety** | **600 ppm** | Don't plateau above this (safety margin for winter ~490 ppm) |
+| **Adaptive TURBO threshold** | **> 8 ppm/min** | CO2 falling fast |
+| **Adaptive MEDIUM threshold** | **2-8 ppm/min** | CO2 falling moderately |
+| **Adaptive QUIET threshold** | **0.5-2 ppm/min** | CO2 falling slowly |
 | Motion timeout | 60 seconds | |
 | Departure verification | 10 seconds | |
 | Door open mode threshold | 5 minutes | Door open this long → activity-based transitions |
@@ -142,6 +160,8 @@ This prevents false departures when leaving the door open for ventilation.
 | HVAC night pause | 11 PM - 6 AM | Skip polling during sleep hours |
 
 **Hysteresis explained:** ERV turns ON when CO2 ≥ 2000 ppm, but stays ON until CO2 < 1800 ppm. This prevents rapid on/off cycling when CO2 hovers around the threshold.
+
+**Plateau detection explained:** When AWAY, the system tracks CO2 fall rate. When the rate drops below 0.5 ppm/min for 10 consecutive minutes, it means outdoor air equilibrium has been reached (e.g., ~490 ppm in winter). The ERV stops to save energy instead of running indefinitely trying to reach an impossible target.
 
 ## Code Structure
 
