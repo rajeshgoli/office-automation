@@ -144,6 +144,31 @@ export async function fetchEvents(limit: number = 50): Promise<ApiEvent[]> {
 }
 
 /**
+ * Fetch historical data from orchestrator
+ */
+export async function fetchHistory(hours: number = 24): Promise<any> {
+  const token = getAuthToken();
+  const headers: HeadersInit = {};
+
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  const response = await fetch(`${API_BASE}/history?hours=${hours}`, { headers });
+
+  if (response.status === 401) {
+    clearAuthToken();
+    throw new Error('Authentication required');
+  }
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+  }
+
+  return response.json();
+}
+
+/**
  * Convert Celsius to Fahrenheit
  */
 export function toFahrenheit(celsius: number): number {

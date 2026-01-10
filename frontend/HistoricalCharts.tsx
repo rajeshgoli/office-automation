@@ -11,6 +11,7 @@ import {
   ReferenceLine,
 } from 'recharts';
 import { format, parseISO } from 'date-fns';
+import { fetchHistory } from './api';
 
 interface SensorReading {
   timestamp: string;
@@ -26,15 +27,6 @@ interface HistoricalData {
   device_events: any[];
   climate_actions: any[];
 }
-
-const fetchHistory = async (hours: number = 24): Promise<HistoricalData> => {
-  const apiPort = import.meta.env.VITE_API_PORT || window.location.port || '8080';
-  const response = await fetch(
-    `http://${window.location.hostname}:${apiPort}/history?hours=${hours}`
-  );
-  const data = await response.json();
-  return data;
-};
 
 const HistoricalCharts: React.FC = () => {
   const [data, setData] = useState<HistoricalData | null>(null);
