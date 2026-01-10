@@ -104,7 +104,8 @@ class OAuthService:
     async def exchange_code_for_token(
         self,
         code: str,
-        code_verifier: str
+        code_verifier: str,
+        redirect_uri: Optional[str] = None
     ) -> Optional[UserSession]:
         """Exchange authorization code for tokens."""
         flow = Flow.from_client_config(
@@ -117,7 +118,7 @@ class OAuthService:
                 }
             },
             scopes=["openid", "email", "profile"],
-            redirect_uri=self.redirect_uri
+            redirect_uri=redirect_uri or self.redirect_uri
         )
 
         try:

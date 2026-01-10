@@ -1350,15 +1350,33 @@ class Orchestrator:
         if not self.oauth:
             return web.json_response({"error": "OAuth not configured"}, status=501)
 
+        # Determine redirect URI based on request host
+        # LocalTunnel: climate.loca.lt -> https://climate.loca.lt/auth/callback
+        # Local: localhost/IP -> http://localhost:8080/auth/callback
+        host = request.host
+        if 'loca.lt' in host:
+            redirect_uri = f"https://{host}/auth/callback"
+        else:
+            redirect_uri = f"http://localhost:{self.config.orchestrator.port}/auth/callback"
+
+        # Temporarily update OAuth redirect_uri for this request
+        original_redirect_uri = self.oauth.redirect_uri
+        self.oauth.redirect_uri = redirect_uri
+
         # Generate PKCE pair
         code_verifier, code_challenge = self.oauth.generate_pkce_pair()
         state = secrets.token_urlsafe(32)
 
-        # Store state
+        # Store state and redirect_uri for callback
         self._oauth_states[state] = code_verifier
+        self._oauth_redirect_uris = getattr(self, '_oauth_redirect_uris', {})
+        self._oauth_redirect_uris[state] = redirect_uri
 
         # Generate authorization URL
         auth_url = self.oauth.create_authorization_url(state, code_challenge)
+
+        # Restore original redirect_uri
+        self.oauth.redirect_uri = original_redirect_uri
 
         return web.json_response({
             "authorization_url": auth_url,
@@ -1386,13 +1404,15 @@ class Orchestrator:
         if not code or not state:
             return web.Response(text="Missing code or state", status=400)
 
-        # Verify state
+        # Verify state and retrieve redirect_uri
         code_verifier = self._oauth_states.pop(state, None)
+        redirect_uri = getattr(self, '_oauth_redirect_uris', {}).pop(state, None)
+
         if not code_verifier:
             return web.Response(text="Invalid state", status=400)
 
-        # Exchange code for token
-        session = await self.oauth.exchange_code_for_token(code, code_verifier)
+        # Exchange code for token (use stored redirect_uri for this state)
+        session = await self.oauth.exchange_code_for_token(code, code_verifier, redirect_uri)
 
         if not session:
             return web.Response(
