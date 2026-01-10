@@ -1051,6 +1051,40 @@ class Orchestrator:
             logger.error(f"Error handling Qingping interval POST: {e}")
             return web.json_response({"ok": False, "error": str(e)}, status=400)
 
+    async def _handle_history_get(self, request: web.Request) -> web.Response:
+        """Handle GET /history for historical data.
+
+        Query params:
+        - hours: Number of hours of history (default: 24, max: 168)
+        - limit: Max number of records (default: 1000, max: 10000)
+        """
+        try:
+            hours = int(request.query.get("hours", "24"))
+            limit = int(request.query.get("limit", "1000"))
+
+            # Validate params
+            hours = min(max(1, hours), 168)  # 1 hour to 1 week
+            limit = min(max(10, limit), 10000)
+
+            # Get historical data from database
+            sensor_readings = self.db.get_sensor_readings(hours=hours, limit=limit)
+            occupancy_history = self.db.get_occupancy_history(hours=hours, limit=limit)
+            device_events = self.db.get_device_events(hours=hours, limit=limit)
+            climate_actions = self.db.get_climate_actions(hours=hours, limit=limit)
+
+            return web.json_response({
+                "ok": True,
+                "hours": hours,
+                "sensor_readings": sensor_readings,
+                "occupancy_history": occupancy_history,
+                "device_events": device_events,
+                "climate_actions": climate_actions,
+            })
+
+        except Exception as e:
+            logger.error(f"Error handling history GET: {e}")
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
     def _get_status_dict(self) -> dict:
         """Get current status as a dictionary."""
         sm_status = self.state_machine.get_status()
@@ -1422,6 +1456,7 @@ class Orchestrator:
         # API routes
         self._app.router.add_post("/occupancy", self._handle_occupancy_post)
         self._app.router.add_get("/status", self._handle_status_get)
+        self._app.router.add_get("/history", self._handle_history_get)
         self._app.router.add_get("/ws", self._handle_websocket)
         self._app.router.add_post("/erv", self._handle_erv_post)
         self._app.router.add_post("/hvac", self._handle_hvac_post)

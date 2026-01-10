@@ -14,6 +14,8 @@ import VitalTile from './components/VitalTile';
 import CO2Chart from './components/CO2Chart';
 import { fetchStatus, ApiStatus, toFahrenheit, StatusWebSocket, setERVSpeed, setHVACMode, ERVSpeed as ApiERVSpeed, HVACMode, isAuthenticated, logout, getUserEmail } from './api';
 import Login from './Login';
+import HistoricalCharts from './HistoricalCharts';
+import OfficeReplay from './OfficeReplay';
 
 // Default state when no data available
 const DEFAULT_STATE: OfficeState = {
@@ -592,6 +594,12 @@ const App: React.FC = () => {
           )}
         </div>
       </section>
+
+      {/* Historical Charts */}
+      <HistoricalCharts />
+
+      {/* Office Replay */}
+      <OfficeReplay />
 
       {/* System Health Status Bar */}
       <footer className="fixed bottom-0 left-0 right-0 bg-black/80 backdrop-blur-md border-t border-zinc-800 p-3 flex justify-center items-center gap-6">
