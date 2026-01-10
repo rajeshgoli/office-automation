@@ -1314,6 +1314,10 @@ class Orchestrator:
             if request.headers.get("Upgrade") == "websocket":
                 return await handler(request)
 
+            # Skip auth for static assets and frontend HTML (allow login page to load)
+            if request.path.startswith('/assets/') or request.path in ['/', '/index.html'] or request.path.endswith('.png') or request.path.endswith('.json'):
+                return await handler(request)
+
             # Skip auth for trusted networks (local network access)
             if self._is_trusted_network(request):
                 request['user_email'] = 'trusted_network'  # Placeholder email
