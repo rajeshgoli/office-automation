@@ -86,7 +86,11 @@ class OAuthService:
                     "token_uri": "https://oauth2.googleapis.com/token",
                 }
             },
-            scopes=["openid", "email", "profile"],
+            scopes=[
+                "openid",
+                "https://www.googleapis.com/auth/userinfo.email",
+                "https://www.googleapis.com/auth/userinfo.profile"
+            ],
             redirect_uri=self.redirect_uri
         )
 
@@ -117,7 +121,11 @@ class OAuthService:
                     "token_uri": "https://oauth2.googleapis.com/token",
                 }
             },
-            scopes=["openid", "email", "profile"],
+            scopes=[
+                "openid",
+                "https://www.googleapis.com/auth/userinfo.email",
+                "https://www.googleapis.com/auth/userinfo.profile"
+            ],
             redirect_uri=redirect_uri or self.redirect_uri
         )
 
