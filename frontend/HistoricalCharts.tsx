@@ -107,15 +107,17 @@ const HistoricalCharts: React.FC = () => {
   const currentMetric = metrics[activeMetric];
 
   return (
-    <div className="bg-gray-800 rounded-lg p-6">
-      <div className="flex justify-between items-center mb-6">
-        <h2 className="text-2xl font-bold text-white">Historical Trends</h2>
-        <div className="flex gap-4">
+    <div className="bg-gray-800 rounded-lg p-4 sm:p-6">
+      {/* Header - stack on mobile, side-by-side on desktop */}
+      <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4 mb-6">
+        <h2 className="text-xl sm:text-2xl font-bold text-white">Historical Trends</h2>
+
+        <div className="flex flex-col sm:flex-row gap-3 sm:gap-4">
           {/* Time range selector */}
           <select
             value={hours}
             onChange={(e) => setHours(Number(e.target.value))}
-            className="bg-gray-700 text-white px-4 py-2 rounded-lg"
+            className="bg-gray-700 text-white px-3 py-2 rounded-lg text-sm sm:text-base"
           >
             <option value={6}>Last 6 hours</option>
             <option value={12}>Last 12 hours</option>
@@ -124,11 +126,11 @@ const HistoricalCharts: React.FC = () => {
             <option value={168}>Last week</option>
           </select>
 
-          {/* Metric selector */}
+          {/* Metric selector - full width on mobile */}
           <div className="flex gap-2">
             <button
               onClick={() => setActiveMetric('co2')}
-              className={`px-4 py-2 rounded-lg ${
+              className={`flex-1 sm:flex-none px-3 sm:px-4 py-2 rounded-lg text-sm sm:text-base ${
                 activeMetric === 'co2'
                   ? 'bg-green-600 text-white'
                   : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
@@ -138,7 +140,7 @@ const HistoricalCharts: React.FC = () => {
             </button>
             <button
               onClick={() => setActiveMetric('tvoc')}
-              className={`px-4 py-2 rounded-lg ${
+              className={`flex-1 sm:flex-none px-3 sm:px-4 py-2 rounded-lg text-sm sm:text-base ${
                 activeMetric === 'tvoc'
                   ? 'bg-purple-600 text-white'
                   : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
@@ -148,7 +150,7 @@ const HistoricalCharts: React.FC = () => {
             </button>
             <button
               onClick={() => setActiveMetric('temp')}
-              className={`px-4 py-2 rounded-lg ${
+              className={`flex-1 sm:flex-none px-3 sm:px-4 py-2 rounded-lg text-sm sm:text-base ${
                 activeMetric === 'temp'
                   ? 'bg-blue-600 text-white'
                   : 'bg-gray-700 text-gray-300 hover:bg-gray-600'

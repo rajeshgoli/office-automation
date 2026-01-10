@@ -184,8 +184,8 @@ const OfficeReplay: React.FC = () => {
   const progress = ((currentIndex + 1) / events.length) * 100;
 
   return (
-    <div className="bg-gray-800 rounded-lg p-6">
-      <h2 className="text-2xl font-bold text-white mb-6">Office Replay 🎬</h2>
+    <div className="bg-gray-800 rounded-lg p-4 sm:p-6">
+      <h2 className="text-xl sm:text-2xl font-bold text-white mb-4 sm:mb-6">Office Replay 🎬</h2>
 
       {/* Progress bar */}
       <div className="mb-6">
@@ -204,22 +204,22 @@ const OfficeReplay: React.FC = () => {
       </div>
 
       {/* Current event display */}
-      <div className="bg-gray-900 rounded-lg p-6 mb-6 min-h-[120px]">
-        <div className="flex items-center gap-4">
+      <div className="bg-gray-900 rounded-lg p-4 sm:p-6 mb-4 sm:mb-6 min-h-[100px] sm:min-h-[120px]">
+        <div className="flex items-center gap-3 sm:gap-4">
           <div
-            className={`text-4xl flex items-center justify-center w-16 h-16 rounded-full ${getEventColor(
+            className={`text-3xl sm:text-4xl flex items-center justify-center w-12 h-12 sm:w-16 sm:h-16 rounded-full flex-shrink-0 ${getEventColor(
               currentEvent.type
             )}`}
           >
             {getEventIcon(currentEvent.type)}
           </div>
-          <div className="flex-1">
-            <div className="text-xl font-bold text-white mb-2">{currentEvent.description}</div>
-            <div className="text-gray-400 text-sm">
+          <div className="flex-1 min-w-0">
+            <div className="text-base sm:text-xl font-bold text-white mb-1 sm:mb-2">{currentEvent.description}</div>
+            <div className="text-gray-400 text-xs sm:text-sm">
               {format(parseISO(currentEvent.timestamp), 'HH:mm:ss')}
             </div>
             {currentEvent.data?.co2_ppm && (
-              <div className="text-gray-400 text-sm mt-1">
+              <div className="text-gray-400 text-xs sm:text-sm mt-1">
                 CO₂: {currentEvent.data.co2_ppm} ppm
               </div>
             )}
@@ -227,37 +227,42 @@ const OfficeReplay: React.FC = () => {
         </div>
       </div>
 
-      {/* Controls */}
-      <div className="flex gap-4 items-center justify-center">
-        <button
-          onClick={handleReset}
-          className="px-4 py-2 bg-gray-700 text-white rounded-lg hover:bg-gray-600"
-        >
-          ⏮️ Reset
-        </button>
-        <button
-          onClick={handlePlayPause}
-          className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-bold"
-        >
-          {isPlaying ? '⏸️ Pause' : '▶️ Play'}
-        </button>
-        <select
-          value={speed}
-          onChange={(e) => setSpeed(Number(e.target.value))}
-          className="px-4 py-2 bg-gray-700 text-white rounded-lg"
-        >
-          <option value={0.5}>0.5x</option>
-          <option value={1}>1x</option>
-          <option value={2}>2x</option>
-          <option value={4}>4x</option>
-        </select>
+      {/* Controls - responsive layout */}
+      <div className="space-y-3">
+        {/* Main controls - centered on mobile */}
+        <div className="flex gap-2 sm:gap-4 items-center justify-center flex-wrap">
+          <button
+            onClick={handleReset}
+            className="px-3 sm:px-4 py-2 bg-gray-700 text-white rounded-lg hover:bg-gray-600 text-sm sm:text-base"
+          >
+            ⏮️ Reset
+          </button>
+          <button
+            onClick={handlePlayPause}
+            className="px-4 sm:px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-bold text-sm sm:text-base"
+          >
+            {isPlaying ? '⏸️ Pause' : '▶️ Play'}
+          </button>
+          <select
+            value={speed}
+            onChange={(e) => setSpeed(Number(e.target.value))}
+            className="px-3 sm:px-4 py-2 bg-gray-700 text-white rounded-lg text-sm sm:text-base"
+          >
+            <option value={0.5}>0.5x</option>
+            <option value={1}>1x</option>
+            <option value={2}>2x</option>
+            <option value={4}>4x</option>
+          </select>
+        </div>
+
+        {/* Range slider - full width */}
         <input
           type="range"
           min={0}
           max={events.length - 1}
           value={currentIndex}
           onChange={(e) => setCurrentIndex(Number(e.target.value))}
-          className="flex-1"
+          className="w-full"
         />
       </div>
 
