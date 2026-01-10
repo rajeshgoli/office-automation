@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import base64
+import ipaddress
 from collections import deque
 from pathlib import Path
 from typing import Optional, Set, Dict
@@ -1270,6 +1271,34 @@ class Orchestrator:
 
         return middleware
 
+    def _is_trusted_network(self, request: web.Request) -> bool:
+        """Check if request is from a trusted network."""
+        if not self.oauth or not self.oauth.config.trusted_networks:
+            return False
+
+        # Get client IP (handle X-Forwarded-For for proxies)
+        forwarded_for = request.headers.get('X-Forwarded-For')
+        if forwarded_for:
+            client_ip = forwarded_for.split(',')[0].strip()
+        else:
+            client_ip = request.remote
+
+        if not client_ip:
+            return False
+
+        try:
+            client_addr = ipaddress.ip_address(client_ip)
+            for network_str in self.oauth.config.trusted_networks:
+                network = ipaddress.ip_network(network_str, strict=False)
+                if client_addr in network:
+                    logger.info(f"Request from trusted network: {client_ip} in {network_str}")
+                    return True
+        except (ValueError, AttributeError) as e:
+            logger.warning(f"Invalid IP or network: {e}")
+            return False
+
+        return False
+
     def _oauth_middleware(self):
         """Create OAuth JWT middleware."""
         @web.middleware
@@ -1281,6 +1310,11 @@ class Orchestrator:
 
             # Skip auth for WebSocket (will auth in handler)
             if request.headers.get("Upgrade") == "websocket":
+                return await handler(request)
+
+            # Skip auth for trusted networks (local network access)
+            if self._is_trusted_network(request):
+                request['user_email'] = 'trusted_network'  # Placeholder email
                 return await handler(request)
 
             # Get Authorization header

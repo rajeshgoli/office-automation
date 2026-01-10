@@ -95,6 +95,11 @@ class GoogleOAuthConfig:
     token_expiry_days: int = 7
     device_flow_enabled: bool = True
     jwt_secret: Optional[str] = None
+    trusted_networks: list[str] = None  # CIDR networks that skip auth (e.g., ["192.168.5.0/24"])
+
+    def __post_init__(self):
+        if self.trusted_networks is None:
+            self.trusted_networks = []
 
 
 @dataclass
