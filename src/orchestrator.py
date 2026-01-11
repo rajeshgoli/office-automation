@@ -490,8 +490,12 @@ class Orchestrator:
                     hours=self.config.thresholds.tvoc_spike_cooldown_hours
                 )
 
-        # Determine what's triggering ventilation
-        tvoc_triggered = tvoc is not None and tvoc > tvoc_threshold
+        # Determine what's triggering ventilation (with hysteresis)
+        # tVOC hysteresis: ON at 250, OFF at 220 (30ppb dead band)
+        tvoc_above_threshold = tvoc is not None and tvoc >= tvoc_threshold
+        tvoc_below_hysteresis = tvoc is not None and tvoc < (tvoc_threshold - self.config.thresholds.tvoc_hysteresis_ppb)
+
+        # CO2 hysteresis: ON at 2000, OFF at 1800 (200ppm dead band)
         co2_critical_on = co2 is not None and co2 >= self.config.thresholds.co2_critical_ppm
         co2_critical_off = co2 is not None and co2 < (
             self.config.thresholds.co2_critical_ppm - self.config.thresholds.co2_critical_hysteresis_ppm
@@ -509,7 +513,7 @@ class Orchestrator:
                     self.erv.turn_on(FanSpeed.MEDIUM)
                     self._erv_running = True
                     self._erv_speed = "medium"
-            elif tvoc_triggered:
+            elif tvoc_above_threshold or (self._tvoc_ventilation_active and not tvoc_below_hysteresis):
                 if not self._erv_running or self._erv_speed != "medium":
                     logger.info(f"ACTION: ERV MEDIUM (tVOC high: {tvoc}ppb)")
                     self.erv.turn_on(FanSpeed.MEDIUM)
@@ -591,8 +595,8 @@ class Orchestrator:
                         self._erv_running = True
                         self._erv_speed = "turbo"
                         self.db.log_climate_action("erv", "turbo", co2_ppm=co2, reason=f"away_co2_refresh_{co2}ppm")
-            elif tvoc_triggered:
-                # CO2 is good but tVOC needs clearing
+            elif tvoc_above_threshold or (self._tvoc_ventilation_active and not tvoc_below_hysteresis):
+                # CO2 is good but tVOC needs clearing (with hysteresis: ON at 250, OFF at 220)
                 if not self._erv_running or self._erv_speed != "medium":
                     logger.info(f"ACTION: ERV MEDIUM (away, tVOC high: {tvoc}ppb, CO2 OK)")
                     self.erv.turn_on(FanSpeed.MEDIUM)

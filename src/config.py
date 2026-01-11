@@ -56,6 +56,7 @@ class ThresholdsConfig:
     co2_critical_hysteresis_ppm: int = 200  # Turn off when CO2 < (critical - hysteresis)
     co2_refresh_target_ppm: int = 500
     tvoc_threshold_ppb: int = 250  # tVOC > this triggers ERV at MEDIUM (3/2)
+    tvoc_hysteresis_ppb: int = 30  # Turn off MEDIUM when tVOC < (threshold - hysteresis)
     hvac_min_temp_f: int = 68  # Don't heat above this when away + ERV running
     hvac_critical_temp_f: int = 55  # Always heat below this (pipe freeze protection)
     expected_occupancy_start: str = "07:00"  # When to allow pre-conditioning
