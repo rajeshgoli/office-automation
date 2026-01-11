@@ -297,6 +297,26 @@ Implement the core rules from vision.md.
 
 ---
 
+## Known Issues / Technical Debt
+
+### HVAC Auto-Restore Race Condition
+**Problem**: System may auto-restore heater when user manually turned it off via physical remote
+- **Root cause**: Kumo Cloud API has lag (seconds to minutes) syncing physical remote changes
+- **Scenario**: User turns off heater via remote → leaves immediately → system checks API (still shows "heat") → suspends it → user returns → auto-restores
+- **Current mitigations**:
+  - Check actual device state before suspending (not stored state)
+  - Clear suspension flag when using dashboard controls
+- **Doesn't fix**: Physical remote + immediate departure (cloud API lag)
+- **Workarounds**:
+  - Wait 30+ seconds after using remote before leaving
+  - Use dashboard instead of remote (no API lag)
+  - Disable auto-restore entirely (manual control only)
+- **Status**: Acceptable race condition, not mission critical
+- **Potential fixes**:
+  - Add 30s delay before checking HVAC state (wastes energy)
+  - Move to ESPHome (fully local, no cloud lag)
+  - Disable auto-restore feature
+
 ## Open Questions
 
 1. ~~Is a hub required for YoLink sensors?~~ → **Answered**: No for cloud API, yes for local API
