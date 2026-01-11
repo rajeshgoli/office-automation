@@ -661,16 +661,29 @@ class Orchestrator:
         # PRESENT mode: restore HVAC if we suspended it (and it was actually running)
         if state == OccupancyState.PRESENT:
             if self._hvac_suspended and self._hvac_last_mode in ("heat", "cool", "auto"):
-                logger.info(f"ACTION: HVAC RESTORE (returned to present, was {self._hvac_last_mode})")
                 try:
-                    if self._hvac_last_mode == "heat":
-                        await self.kumo.set_heat(self._hvac_setpoint_c)
-                    elif self._hvac_last_mode == "cool":
-                        await self.kumo.set_cool(self._hvac_setpoint_c)
-                    self._hvac_mode = self._hvac_last_mode
-                    self.db.log_climate_action("hvac", self._hvac_last_mode,
-                                               setpoint=self._hvac_setpoint_c,
-                                               reason="present_restore")
+                    # Check ACTUAL current state before restoring (in case user turned it off)
+                    status = await self.kumo.get_full_status()
+                    if status:
+                        device_power = status.get("power", 0)
+                        device_mode = status.get("operationMode", "off") if device_power == 1 else "off"
+
+                        # Only restore if device is currently OFF
+                        # (if user manually turned it off or on, respect their choice)
+                        if device_mode == "off":
+                            logger.info(f"ACTION: HVAC RESTORE (returned to present, was {self._hvac_last_mode})")
+                            if self._hvac_last_mode == "heat":
+                                await self.kumo.set_heat(self._hvac_setpoint_c)
+                            elif self._hvac_last_mode == "cool":
+                                await self.kumo.set_cool(self._hvac_setpoint_c)
+                            self._hvac_mode = self._hvac_last_mode
+                            self.db.log_climate_action("hvac", self._hvac_last_mode,
+                                                       setpoint=self._hvac_setpoint_c,
+                                                       reason="present_restore")
+                        else:
+                            # Device not off - user may have manually controlled it, respect that
+                            logger.info(f"HVAC restore skipped: device is {device_mode}, not off (respecting user control)")
+                            self._hvac_mode = device_mode
                 except Exception as e:
                     logger.error(f"Failed to restore HVAC: {e}")
             self._hvac_suspended = False  # Clear flag regardless
