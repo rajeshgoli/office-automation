@@ -1004,6 +1004,10 @@ class Orchestrator:
             self._manual_hvac_setpoint_f = setpoint_f
             self._manual_hvac_override_at = datetime.now()
 
+            # Clear suspension flag (user manually controlling, don't auto-restore later)
+            self._hvac_suspended = False
+            self._hvac_last_mode = None
+
             # Apply the change
             if mode == "off":
                 logger.info("MANUAL: HVAC OFF")
