@@ -695,16 +695,26 @@ class Orchestrator:
 
             # ERV running + temp acceptable = suspend heating
             if self._erv_running and temp_f is not None and temp_f > min_temp:
-                if not self._hvac_suspended and self._hvac_mode in ("heat", "auto"):
-                    logger.info(f"ACTION: HVAC SUSPEND (ERV running, temp {temp_f:.1f}°F > {min_temp}°F)")
+                if not self._hvac_suspended:
                     try:
-                        # Remember current mode before turning off
-                        self._hvac_last_mode = self._hvac_mode
-                        await self.kumo.turn_off()
-                        self._hvac_mode = "off"
-                        self._hvac_suspended = True
-                        self.db.log_climate_action("hvac", "off",
-                                                   reason=f"erv_running_temp_{temp_f:.0f}F")
+                        # Check ACTUAL current state before suspending (don't rely on stored state)
+                        status = await self.kumo.get_full_status()
+                        if status:
+                            device_power = status.get("power", 0)
+                            device_mode = status.get("operationMode", "off") if device_power == 1 else "off"
+
+                            # Only suspend and remember state if heater is actually ON
+                            if device_mode in ("heat", "cool", "auto"):
+                                logger.info(f"ACTION: HVAC SUSPEND (ERV running, temp {temp_f:.1f}°F > {min_temp}°F, was {device_mode})")
+                                self._hvac_last_mode = device_mode  # Save actual state
+                                await self.kumo.turn_off()
+                                self._hvac_mode = "off"
+                                self._hvac_suspended = True
+                                self.db.log_climate_action("hvac", "off",
+                                                           reason=f"erv_running_temp_{temp_f:.0f}F")
+                            else:
+                                # Heater already off, nothing to suspend
+                                logger.debug(f"HVAC already off, no suspension needed (ERV running, temp {temp_f:.1f}°F)")
                     except Exception as e:
                         logger.error(f"Failed to suspend HVAC: {e}")
                 return
