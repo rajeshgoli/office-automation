@@ -41,3 +41,7 @@ tmp/
 # Database
 data/
 client_secret.json
+
+# tinytuya generated files
+snapshot.json
+tinytuya.json

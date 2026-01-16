@@ -33,6 +33,13 @@ class QingpingConfig:
 
 
 @dataclass
+class TuyaCloudConfig:
+    access_id: str
+    access_secret: str
+    region: str = "us"
+
+
+@dataclass
 class ERVConfig:
     type: str  # "tuya" or "shelly"
     ip: str
@@ -120,6 +127,7 @@ class Config:
     mitsubishi: MitsubishiConfig
     thresholds: ThresholdsConfig
     orchestrator: OrchestratorConfig
+    tuya_cloud: Optional[TuyaCloudConfig] = None
 
 
 def load_config(path: str = "config.yaml") -> Config:
@@ -144,6 +152,11 @@ def load_config(path: str = "config.yaml") -> Config:
 
     orchestrator_config = OrchestratorConfig(**orchestrator_data, google_oauth=google_oauth)
 
+    # Parse optional Tuya Cloud config
+    tuya_cloud = None
+    if "tuya_cloud" in data:
+        tuya_cloud = TuyaCloudConfig(**data["tuya_cloud"])
+
     return Config(
         yolink=YoLinkConfig(**data["yolink"]),
         qingping=QingpingConfig(**data["qingping"]),
@@ -151,4 +164,5 @@ def load_config(path: str = "config.yaml") -> Config:
         mitsubishi=MitsubishiConfig(**data.get("mitsubishi", {})),
         thresholds=ThresholdsConfig(**data.get("thresholds", {})),
         orchestrator=orchestrator_config,
+        tuya_cloud=tuya_cloud,
     )

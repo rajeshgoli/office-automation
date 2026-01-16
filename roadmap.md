@@ -299,6 +299,24 @@ Implement the core rules from vision.md.
 
 ## Known Issues / Technical Debt
 
+### ERV Tuya Local Key Broken (2026-01-14)
+**Problem**: Tuya local API returns error 914 "Check device key or version"
+- **Symptoms**: Local API fails, cloud fallback works (on/off only, no fan speed control)
+- **Investigation**:
+  - Device at 192.168.5.119, broadcasting v3.4 correctly
+  - Local key in config matches Tuya Cloud: `f@lqvVpv)ShQ^@D:`
+  - Session key negotiation fails (device sends null payload)
+  - Tried all protocol versions (3.1-3.5), same result
+- **Root cause**: Device's internal local key likely changed but hasn't synced to cloud
+  - Can happen after: firmware update, power outage, network change
+  - Mac Mini was moved to garage just before this started
+- **Impact**: Cloud fallback works but limited to ON/OFF only. Fan speed control (QUIET/MEDIUM/TURBO) unavailable until fixed.
+- **Solutions** (in order):
+  1. **Power cycle ERV** - Unplug 30 seconds, replug. Often forces key resync.
+  2. **Re-pair in Smart Life** - Remove device, re-add, get new local key from Tuya IoT Platform
+  3. **Continue with cloud** - Works but degraded (no speed control)
+- **Status**: ✅ FIXED - Power cycle on 2026-01-15 resolved the issue. Local API working.
+
 ### HVAC Auto-Restore Race Condition
 **Problem**: System may auto-restore heater when user manually turned it off via physical remote
 - **Root cause**: Kumo Cloud API has lag (seconds to minutes) syncing physical remote changes
@@ -721,3 +739,32 @@ Implement the core rules from vision.md.
   - `config.example.yaml` - Auth configuration example
   - `CLAUDE.md` - Authentication section, Cloudflare Tunnel deployment guide
   - `roadmap.md` - Updated with Phase 5 (Mobile & Remote Access), historical charts in P2
+
+**2026-01-14** (Session 15)
+- **Local Network Auth Bypass** - Skip OAuth for trusted networks
+  - Added `trusted_networks` config (CIDR format, e.g., `192.168.0.0/16`)
+  - Backend skips auth check for requests from trusted IPs
+  - Frontend checks `/status` before showing login screen
+  - Fixed React hooks error #310 (hooks must be before early returns)
+- **Mac Mini Moved to Garage** - Relocated always-on server
+  - Safely shut down and reconnected via SSH
+  - Enabled VNC/Screen Sharing via ARDAgent kickstart command
+  - Configured auto-login for Launch Agent persistence
+  - Manually started services (Launch Agents only run after GUI login)
+- **Multi-Subnet Access** - Fixed phone access (192.168.4.x subnet)
+  - Changed trusted_networks from `192.168.5.0/24` to `192.168.0.0/16`
+  - All private 192.168.x.x networks now trusted
+- **ERV Tuya Local API Broken** - Investigated error 914
+  - Local key matches cloud but device rejects authentication
+  - Session key negotiation fails (null payload response)
+  - Tried all protocol versions (3.1-3.5), same result
+  - Added cloud fallback to ERVClient (on/off only, no speed control)
+  - Root cause: Device key likely changed but not synced to cloud
+  - Fix: Power cycle ERV to force key resync
+- **Files Changed**:
+  - `frontend/App.tsx` - Trusted network check, hooks ordering fix
+  - `frontend/api.ts` - `checkTrustedNetwork()`, fixed port detection
+  - `src/orchestrator.py` - Trusted network middleware, WebSocket auth bypass
+  - `src/config.py` - Added `TuyaCloudConfig`, `trusted_networks`
+  - `src/erv_client.py` - Cloud fallback when local API fails
+  - `config.yaml` - Updated trusted_networks to 192.168.0.0/16

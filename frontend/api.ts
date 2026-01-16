@@ -2,14 +2,17 @@
  * API service for communicating with the orchestrator backend
  */
 
-const API_PORT = import.meta.env.VITE_API_PORT || '8080';
+// Determine API port: use env override, or URL port, or nothing (for standard ports via tunnel)
+const envPort = import.meta.env.VITE_API_PORT;
+const urlPort = window.location.port;  // Empty string for standard ports (80, 443)
+const API_PORT = envPort || urlPort || '';  // Don't default to 8080 - trust the URL
+
 const API_HOST = import.meta.env.VITE_API_HOST || window.location.hostname;
 
-// Use current protocol and only add port if on localhost
-const isLocalhost = API_HOST === 'localhost' || API_HOST === '127.0.0.1';
+// Use current protocol and port from URL (or env override)
 const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
 const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-const portSuffix = isLocalhost ? `:${API_PORT}` : '';
+const portSuffix = API_PORT ? `:${API_PORT}` : '';
 
 const API_BASE = `${protocol}//${API_HOST}${portSuffix}`;
 const WS_URL = `${wsProtocol}//${API_HOST}${portSuffix}/ws`;
@@ -37,6 +40,20 @@ export function getUserEmail(): string | null {
 
 export function isAuthenticated(): boolean {
   return getAuthToken() !== null;
+}
+
+/**
+ * Check if current connection is authenticated (via token or trusted network)
+ * Returns true if we can access the API without a token (trusted network)
+ */
+export async function checkTrustedNetwork(): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_BASE}/status`);
+    // If we get 200 without a token, we're on a trusted network
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 export async function startLogin(): Promise<{ authorization_url: string }> {

@@ -12,7 +12,7 @@ import {
 import { STATUS_CONFIG } from './constants';
 import VitalTile from './components/VitalTile';
 import CO2Chart from './components/CO2Chart';
-import { fetchStatus, ApiStatus, toFahrenheit, StatusWebSocket, setERVSpeed, setHVACMode, ERVSpeed as ApiERVSpeed, HVACMode, isAuthenticated, logout, getUserEmail } from './api';
+import { fetchStatus, ApiStatus, toFahrenheit, StatusWebSocket, setERVSpeed, setHVACMode, ERVSpeed as ApiERVSpeed, HVACMode, isAuthenticated, logout, getUserEmail, checkTrustedNetwork } from './api';
 import Login from './Login';
 import HistoricalCharts from './HistoricalCharts';
 import OfficeReplay from './OfficeReplay';
@@ -90,8 +90,9 @@ const App: React.FC = () => {
     hvac_expires_in: number | null;
   } | null>(null);
   const [controlLoading, setControlLoading] = useState<string | null>(null);
-  const [authenticated, setAuthenticated] = useState(isAuthenticated());
-  const [userEmail, setUserEmail] = useState(getUserEmail());
+  const [authenticated, setAuthenticated] = useState(false); // Start false, check on load
+  const [authChecking, setAuthChecking] = useState(true); // Always check on load
+  const [userEmail, setUserEmail] = useState<string | null>(null);
 
   const wsRef = useRef<StatusWebSocket | null>(null);
   const historyRef = useRef<ClimateDataPoint[]>([]);
@@ -130,6 +131,28 @@ const App: React.FC = () => {
     setAuthenticated(false);
     setUserEmail(null);
   };
+
+  // Check authentication on load - try trusted network first, then token
+  useEffect(() => {
+    if (!authChecking) return;
+
+    checkTrustedNetwork().then((isTrusted) => {
+      if (isTrusted) {
+        // Trusted network - no token needed
+        setAuthenticated(true);
+        setUserEmail('Local Network');
+        setAuthChecking(false);
+      } else if (isAuthenticated()) {
+        // Not trusted network, but have a token - use it
+        setAuthenticated(true);
+        setUserEmail(getUserEmail());
+        setAuthChecking(false);
+      } else {
+        // No trusted network, no token - need login
+        setAuthChecking(false);
+      }
+    });
+  }, [authChecking]);
 
   // Fetch initial status
   useEffect(() => {
@@ -269,14 +292,7 @@ const App: React.FC = () => {
     }
   }, [state]);
 
-  const currentStatus = getPrimaryStatus();
-
-  // Show login screen if not authenticated
-  if (!authenticated) {
-    return <Login />;
-  }
-
-  // Control button handlers
+  // Control button handlers (must be before early returns for hook consistency)
   const handleERVControl = useCallback(async (speed: ApiERVSpeed) => {
     setControlLoading(`erv-${speed}`);
     try {
@@ -308,6 +324,22 @@ const App: React.FC = () => {
       setControlLoading(null);
     }
   }, [addEvent]);
+
+  const currentStatus = getPrimaryStatus();
+
+  // Show loading while checking trusted network
+  if (authChecking) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-black">
+        <div className="text-zinc-500">Checking connection...</div>
+      </div>
+    );
+  }
+
+  // Show login screen if not authenticated
+  if (!authenticated) {
+    return <Login />;
+  }
 
   const getCo2Color = (ppm: number) => {
     if (ppm < Threshold.NORMAL) return 'text-emerald-400';

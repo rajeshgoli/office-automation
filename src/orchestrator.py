@@ -58,11 +58,14 @@ class Orchestrator:
             report_interval=config.qingping.report_interval,
         )
 
-        # ERV client (Tuya local)
+        # ERV client (Tuya local with cloud fallback)
         self.erv = ERVClient(
             device_id=config.erv.device_id,
             ip=config.erv.ip,
             local_key=config.erv.local_key,
+            cloud_api_key=config.tuya_cloud.access_id if config.tuya_cloud else None,
+            cloud_api_secret=config.tuya_cloud.access_secret if config.tuya_cloud else None,
+            cloud_region=config.tuya_cloud.region if config.tuya_cloud else "us",
         )
 
         # Kumo client (Mitsubishi HVAC)
@@ -1182,7 +1185,8 @@ class Orchestrator:
         await ws.prepare(request)
 
         # Authenticate WebSocket connection if OAuth is enabled
-        if self.oauth:
+        # Skip auth for trusted networks (local network access)
+        if self.oauth and not self._is_trusted_network(request):
             try:
                 # Expect first message to be auth message
                 msg = await ws.receive(timeout=10)
@@ -1208,6 +1212,8 @@ class Orchestrator:
                 logger.warning(f"WebSocket auth failed: {e}")
                 await ws.close(code=4001, message=b'Authentication failed')
                 return ws
+        elif self._is_trusted_network(request):
+            logger.debug("WebSocket from trusted network, skipping auth")
 
         self._ws_clients.add(ws)
         logger.info(f"WebSocket client connected ({len(self._ws_clients)} total)")
