@@ -93,24 +93,20 @@ class Orchestrator:
         self._erv_running: bool = False
         self._erv_speed: str = "off"  # "off", "quiet", "medium", "turbo"
 
-        # Track tVOC-triggered ventilation (separate from CO2-based logic)
-        self._tvoc_ventilation_active: bool = False
-
-        # Adaptive tVOC spike detection state
-        self._tvoc_history: deque[tuple[datetime, int]] = deque(
-            maxlen=self.config.thresholds.tvoc_spike_history_size
-        )
-        self._spike_detected: bool = False
-        self._spike_peak_value: Optional[int] = None
-        self._spike_ventilation_active: bool = False
-        self._spike_cooldown_until: Optional[datetime] = None
-
         # CO2 plateau detection state (AWAY mode optimization)
         self._co2_history: deque[tuple[datetime, int]] = deque(
             maxlen=self.config.thresholds.co2_history_size
         )
         self._outdoor_co2_baseline: Optional[int] = None  # Learned outdoor CO2 level
         self._plateau_detected: bool = False
+
+        # tVOC AWAY mode adaptive control (separate from spike detection)
+        self._tvoc_away_history: deque[tuple[datetime, int]] = deque(
+            maxlen=self.config.thresholds.tvoc_away_history_size
+        )
+        self._tvoc_away_ventilation_active: bool = False
+        self._tvoc_baseline: Optional[int] = None  # Learned baseline tVOC level
+        self._tvoc_plateau_detected: bool = False
 
         # OAuth service (if configured)
         self.oauth: Optional[OAuthService] = None
@@ -223,10 +219,10 @@ class Orchestrator:
             noise_db=reading.noise_db,
         )
 
-        # Update tVOC history for spike detection
+        # Update tVOC history for AWAY mode adaptive control
         if reading.tvoc is not None:
             now = datetime.now()
-            self._tvoc_history.append((now, reading.tvoc))
+            self._tvoc_away_history.append((now, reading.tvoc))
 
         # Update CO2 history for plateau detection
         if reading.co2_ppm is not None:
@@ -265,34 +261,6 @@ class Orchestrator:
                 self._manual_hvac_mode = None
                 self._manual_hvac_setpoint_f = None
                 self._manual_hvac_override_at = None
-
-    def _detect_tvoc_spike(self, current_tvoc: int) -> bool:
-        """Detect if tVOC is spiking above baseline."""
-        if not self.config.thresholds.tvoc_spike_detection_enabled:
-            return False
-
-        if len(self._tvoc_history) < 5:
-            return False  # Need baseline
-
-        # Calculate 5-reading baseline (exclude current)
-        baseline_readings = list(self._tvoc_history)[:-1][-5:]
-        baseline_avg = sum(r[1] for r in baseline_readings) / len(baseline_readings)
-
-        # Spike = significant increase above baseline
-        delta = current_tvoc - baseline_avg
-        return (current_tvoc > self.config.thresholds.tvoc_spike_min_trigger and
-                delta >= self.config.thresholds.tvoc_spike_baseline_delta)
-
-    def _detect_tvoc_decline(self) -> bool:
-        """Detect if tVOC is declining (2 consecutive drops)."""
-        if len(self._tvoc_history) < 3:
-            return False
-
-        recent_three = [r[1] for r in list(self._tvoc_history)[-3:]]
-        current = recent_three[2]
-
-        # Declining = current < both previous readings
-        return current < recent_three[1] and current < recent_three[0]
 
     def _calculate_co2_rate_of_change(self) -> Optional[float]:
         """Calculate CO2 rate of change in ppm/min over the history window.
@@ -394,18 +362,113 @@ class Orchestrator:
             # But give it a few more minutes before declaring plateau
             return "quiet"
 
+    def _calculate_tvoc_rate_of_change(self) -> Optional[float]:
+        """Calculate tVOC rate of change in points/min over the history window.
+
+        Returns:
+            Rate of change in points/min (negative = falling, positive = rising)
+            None if insufficient data
+        """
+        if len(self._tvoc_away_history) < 2:
+            return None
+
+        # Get oldest and newest readings
+        oldest_time, oldest_tvoc = self._tvoc_away_history[0]
+        newest_time, newest_tvoc = self._tvoc_away_history[-1]
+
+        # Calculate time difference in minutes
+        time_delta = (newest_time - oldest_time).total_seconds() / 60.0
+
+        if time_delta == 0:
+            return None
+
+        # Calculate rate (negative = falling, positive = rising)
+        tvoc_delta = newest_tvoc - oldest_tvoc
+        rate = tvoc_delta / time_delta
+
+        return rate
+
+    def _detect_tvoc_plateau(self) -> bool:
+        """Detect if tVOC has plateaued (reached baseline).
+
+        Plateau = rate of change < threshold for sustained period.
+
+        Returns:
+            True if plateau detected, False otherwise
+        """
+        if not self.config.thresholds.tvoc_away_enabled:
+            return False
+
+        # Need enough data to calculate rate over window
+        min_readings = 20
+        if len(self._tvoc_away_history) < min_readings:
+            return False
+
+        # Safety: Don't declare plateau if tVOC is still high
+        current_tvoc = self._tvoc_away_history[-1][1]
+        if current_tvoc > self.config.thresholds.tvoc_away_target + 20:  # Allow some margin
+            return False
+
+        # Calculate rate of change
+        rate = self._calculate_tvoc_rate_of_change()
+        if rate is None:
+            return False
+
+        # Plateau = very slow rate (absolute value)
+        rate_threshold = self.config.thresholds.tvoc_plateau_rate_threshold
+        is_plateau = abs(rate) < rate_threshold
+
+        if is_plateau:
+            # Remember this as baseline
+            self._tvoc_baseline = current_tvoc
+            logger.info(f"tVOC plateau detected at {current_tvoc} (rate: {rate:.2f} points/min, "
+                       f"baseline learned)")
+
+        return is_plateau
+
+    def _get_adaptive_erv_speed_for_tvoc_away(self, tvoc: int) -> Optional[str]:
+        """Determine adaptive ERV speed for AWAY mode based on tVOC rate of change.
+
+        Returns:
+            "turbo", "medium", "quiet", "off", or None if insufficient data
+        """
+        if not self.config.thresholds.tvoc_away_enabled:
+            return None
+
+        # Check for plateau first
+        if self._detect_tvoc_plateau():
+            logger.info(f"tVOC plateau detected at {tvoc}, stopping ERV (baseline: {self._tvoc_baseline})")
+            self._tvoc_plateau_detected = True
+            return "off"
+
+        # Calculate rate of change
+        rate = self._calculate_tvoc_rate_of_change()
+        if rate is None:
+            return None  # Not enough data, use default
+
+        # Rate is negative when falling (ventilation working)
+        # We want absolute value for thresholds
+        abs_rate = abs(rate)
+
+        # Adaptive speed based on how fast tVOC is falling
+        if abs_rate > self.config.thresholds.tvoc_rate_turbo_threshold:
+            return "turbo"  # Falling fast, keep TURBO
+        elif abs_rate > self.config.thresholds.tvoc_rate_medium_threshold:
+            return "medium"  # Slowing down, step to MEDIUM
+        elif abs_rate > self.config.thresholds.tvoc_rate_quiet_threshold:
+            return "quiet"  # Very slow, step to QUIET
+        else:
+            # Approaching plateau
+            return "quiet"
+
     def _evaluate_erv_state(self):
         """Evaluate whether ERV should be on or off based on current state.
 
         Priority:
         1. Safety interlock (window/door open) = ERV OFF
         2. Manual override (if active and not expired)
-        3. tVOC > threshold = ERV MEDIUM (both PRESENT and AWAY)
-        4. CO2 logic (PRESENT: critical only, AWAY: until target)
-
-        When multiple triggers are active:
-        - PRESENT: tVOC uses MEDIUM (louder than QUIET for CO2)
-        - AWAY: TURBO handles both tVOC and CO2
+        3. PRESENT: Only CO2 > 2000 triggers QUIET (tVOC IGNORED when present)
+        4. AWAY: CO2 > 500 OR tVOC > 200 triggers adaptive ventilation
         """
         # Check for expired manual overrides
         self._check_manual_override_expiry()
@@ -416,7 +479,6 @@ class Orchestrator:
         reading = self.qingping.latest_reading
         co2 = reading.co2_ppm if reading else None
         tvoc = reading.tvoc if reading else None
-        tvoc_threshold = self.config.thresholds.tvoc_threshold_ppb
 
         # Safety: window/door open = ERV off (overrides everything including manual)
         if self.state_machine.sensors.window_open or self.state_machine.sensors.door_open:
@@ -425,9 +487,8 @@ class Orchestrator:
                 self.erv.turn_off()
                 self._erv_running = False
                 self._erv_speed = "off"
-                if self._tvoc_ventilation_active:
-                    self._tvoc_ventilation_active = False
-                    self.db.log_climate_action("erv", "off", co2_ppm=co2, reason="safety_interlock")
+                self._tvoc_away_ventilation_active = False
+                self.db.log_climate_action("erv", "off", co2_ppm=co2, reason="safety_interlock")
             return
 
         # Manual override takes priority over automation
@@ -449,55 +510,6 @@ class Orchestrator:
                     self._erv_speed = target_speed
             return  # Skip automation logic when manual override is active
 
-        # === ADAPTIVE SPIKE DETECTION ===
-        if (self.config.thresholds.tvoc_spike_detection_enabled and
-            tvoc is not None and
-            state == OccupancyState.PRESENT):
-
-            # Check cooldown
-            in_cooldown = (self._spike_cooldown_until and
-                          datetime.now() < self._spike_cooldown_until)
-
-            if not in_cooldown:
-                # Phase 1: Detect spike start
-                if not self._spike_detected and self._detect_tvoc_spike(tvoc):
-                    self._spike_detected = True
-                    self._spike_peak_value = tvoc
-                    logger.info(f"tVOC spike detected: {tvoc} (baseline breach)")
-
-                # Phase 2: Track peak
-                if self._spike_detected and tvoc > self._spike_peak_value:
-                    self._spike_peak_value = tvoc
-
-                # Phase 3: Detect decline and trigger ventilation
-                if (self._spike_detected and
-                    self._spike_peak_value > self.config.thresholds.tvoc_spike_min_peak and
-                    self._detect_tvoc_decline() and
-                    not self._spike_ventilation_active):
-
-                    logger.info(f"tVOC decline detected: peak={self._spike_peak_value}, "
-                               f"current={tvoc}, triggering MEDIUM ventilation")
-                    self._spike_ventilation_active = True
-                    self.db.log_climate_action("erv", "medium", co2_ppm=co2,
-                                               reason=f"spike_decline_peak_{self._spike_peak_value}")
-
-            # Phase 4: Clear when target reached
-            if (self._spike_ventilation_active and
-                tvoc < self.config.thresholds.tvoc_spike_target):
-                logger.info(f"tVOC cleared to {tvoc}, ending spike ventilation")
-                self._spike_detected = False
-                self._spike_peak_value = None
-                self._spike_ventilation_active = False
-                # 2-hour cooldown
-                self._spike_cooldown_until = datetime.now() + timedelta(
-                    hours=self.config.thresholds.tvoc_spike_cooldown_hours
-                )
-
-        # Determine what's triggering ventilation (with hysteresis)
-        # tVOC hysteresis: ON at 250, OFF at 220 (30ppb dead band)
-        tvoc_above_threshold = tvoc is not None and tvoc >= tvoc_threshold
-        tvoc_below_hysteresis = tvoc is not None and tvoc < (tvoc_threshold - self.config.thresholds.tvoc_hysteresis_ppb)
-
         # CO2 hysteresis: ON at 2000, OFF at 1800 (200ppm dead band)
         co2_critical_on = co2 is not None and co2 >= self.config.thresholds.co2_critical_ppm
         co2_critical_off = co2 is not None and co2 < (
@@ -505,120 +517,118 @@ class Orchestrator:
         )
         co2_needs_refresh = co2 is not None and co2 > self.config.thresholds.co2_refresh_target_ppm
 
+        # tVOC AWAY mode thresholds
+        tvoc_away_threshold = self.config.thresholds.tvoc_away_threshold
+        tvoc_needs_clearing = tvoc is not None and tvoc > tvoc_away_threshold
+        tvoc_at_target = tvoc is not None and tvoc <= self.config.thresholds.tvoc_away_target
+
         if state == OccupancyState.PRESENT:
             # PRESENT mode: prioritize quiet operation
-            # Spike ventilation > tVOC >250 > CO2 critical
-            # Both spike and tVOC >250 use MEDIUM (positive pressure for VOC flush)
-            if self._spike_ventilation_active:
-                # Spike-based ventilation (adaptive, catches sub-threshold spikes)
-                if not self._erv_running or self._erv_speed != "medium":
-                    logger.info(f"ACTION: ERV MEDIUM (spike ventilation: tVOC={tvoc})")
-                    self.erv.turn_on(FanSpeed.MEDIUM)
-                    self._erv_running = True
-                    self._erv_speed = "medium"
-            elif tvoc_above_threshold or (self._tvoc_ventilation_active and not tvoc_below_hysteresis):
-                if not self._erv_running or self._erv_speed != "medium":
-                    logger.info(f"ACTION: ERV MEDIUM (tVOC high: {tvoc}ppb)")
-                    self.erv.turn_on(FanSpeed.MEDIUM)
-                    self._erv_running = True
-                    self._erv_speed = "medium"
-                    if not self._tvoc_ventilation_active:
-                        self._tvoc_ventilation_active = True
-                        self.db.log_climate_action("erv", "medium", co2_ppm=co2, reason=f"tvoc_high_{tvoc}ppb")
-            elif co2_critical_on:
+            # tVOC is IGNORED when present - only CO2 > 2000 triggers ERV
+            if co2_critical_on:
                 # CO2 >= 2000 - turn on QUIET
                 if not self._erv_running or self._erv_speed != "quiet":
                     logger.info(f"ACTION: ERV QUIET (CO2 critical: {co2}ppm)")
                     self.erv.turn_on(FanSpeed.QUIET)
                     self._erv_running = True
                     self._erv_speed = "quiet"
-                    if self._tvoc_ventilation_active:
-                        # tVOC cleared, but CO2 still critical - downgrade to QUIET
-                        self._tvoc_ventilation_active = False
-                        self.db.log_climate_action("erv", "quiet", co2_ppm=co2, reason="tvoc_cleared_co2_critical")
-                    else:
-                        # CO2 critical while present
-                        self.db.log_climate_action("erv", "quiet", co2_ppm=co2, reason=f"present_co2_critical_{co2}ppm")
+                    self.db.log_climate_action("erv", "quiet", co2_ppm=co2, reason=f"present_co2_critical_{co2}ppm")
             elif self._erv_running and self._erv_speed == "quiet":
                 # Running QUIET mode, check hysteresis before turning off
-                # Turn off only if CO2 < (critical - hysteresis)
                 if co2_critical_off:
                     logger.info(f"ACTION: ERV OFF (CO2 dropped to {co2}ppm, below {self.config.thresholds.co2_critical_ppm - self.config.thresholds.co2_critical_hysteresis_ppm}ppm)")
                     self.erv.turn_off()
                     self._erv_running = False
                     self._erv_speed = "off"
                 # else: stay in hysteresis band (1800-2000), keep running
-            else:
-                # Not running in QUIET mode, safe to turn off if running
-                if self._erv_running:
-                    logger.info("ACTION: ERV OFF (present, air quality OK)")
-                    self.erv.turn_off()
-                    self._erv_running = False
-                    self._erv_speed = "off"
-                    if self._tvoc_ventilation_active:
-                        self._tvoc_ventilation_active = False
-                        self.db.log_climate_action("erv", "off", co2_ppm=co2, reason="tvoc_cleared")
+            elif self._erv_running:
+                # Turn off if running for any other reason
+                logger.info("ACTION: ERV OFF (present, air quality OK)")
+                self.erv.turn_off()
+                self._erv_running = False
+                self._erv_speed = "off"
 
         elif state == OccupancyState.AWAY:
             # AWAY mode: aggressive ventilation with adaptive speed control
-            # Priority: CO2 refresh > tVOC clearing
-            # CO2 refresh uses adaptive speed (TURBO -> MEDIUM -> QUIET -> OFF based on rate)
+            # Both CO2 > 500 and tVOC > 200 trigger ventilation
+            # Use the more aggressive speed between CO2 and tVOC needs
+
+            # Get adaptive speeds for both CO2 and tVOC
+            co2_adaptive_speed = None
+            tvoc_adaptive_speed = None
+
             if co2_needs_refresh:
-                # Try adaptive speed control first
-                adaptive_speed = self._get_adaptive_erv_speed_for_away(co2)
+                co2_adaptive_speed = self._get_adaptive_erv_speed_for_away(co2)
 
-                if adaptive_speed == "off":
-                    # Plateau detected - outdoor baseline reached
-                    if self._erv_running:
-                        logger.info(f"ACTION: ERV OFF (CO2 plateau at {co2}ppm, outdoor baseline: {self._outdoor_co2_baseline}ppm)")
-                        self.erv.turn_off()
-                        self._erv_running = False
-                        self._erv_speed = "off"
-                        self.db.log_climate_action("erv", "off", co2_ppm=co2, reason=f"co2_plateau_{co2}ppm")
-                        self._plateau_detected = True
-                elif adaptive_speed:
-                    # Use adaptive speed (turbo/medium/quiet based on rate)
-                    speed_map = {"quiet": FanSpeed.QUIET, "medium": FanSpeed.MEDIUM, "turbo": FanSpeed.TURBO}
-                    fan_speed = speed_map[adaptive_speed]
+            if tvoc_needs_clearing or self._tvoc_away_ventilation_active:
+                # Check if tVOC has reached target
+                if tvoc_at_target and self._tvoc_away_ventilation_active:
+                    logger.info(f"tVOC cleared to {tvoc}, ending tVOC ventilation")
+                    self._tvoc_away_ventilation_active = False
+                    self._tvoc_plateau_detected = False
+                elif tvoc_needs_clearing or self._tvoc_away_ventilation_active:
+                    tvoc_adaptive_speed = self._get_adaptive_erv_speed_for_tvoc_away(tvoc)
+                    if not self._tvoc_away_ventilation_active and tvoc_needs_clearing:
+                        self._tvoc_away_ventilation_active = True
+                        logger.info(f"tVOC high ({tvoc}), starting adaptive ventilation")
 
-                    if not self._erv_running or self._erv_speed != adaptive_speed:
-                        rate = self._calculate_co2_rate_of_change()
-                        rate_str = f"{rate:.2f}" if rate else "N/A"
-                        logger.info(f"ACTION: ERV {adaptive_speed.upper()} (away, adaptive: CO2={co2}ppm, rate={rate_str} ppm/min)")
-                        self.erv.turn_on(fan_speed)
-                        self._erv_running = True
-                        self._erv_speed = adaptive_speed
-                        self.db.log_climate_action("erv", adaptive_speed, co2_ppm=co2,
-                                                   reason=f"away_adaptive_{adaptive_speed}_{co2}ppm")
-                else:
-                    # Fall back to default TURBO if adaptive disabled or insufficient data
-                    if not self._erv_running or self._erv_speed != "turbo":
-                        logger.info(f"ACTION: ERV TURBO (away mode, CO2={co2}ppm)")
-                        self.erv.turn_on(FanSpeed.TURBO)
-                        self._erv_running = True
-                        self._erv_speed = "turbo"
-                        self.db.log_climate_action("erv", "turbo", co2_ppm=co2, reason=f"away_co2_refresh_{co2}ppm")
-            elif tvoc_above_threshold or (self._tvoc_ventilation_active and not tvoc_below_hysteresis):
-                # CO2 is good but tVOC needs clearing (with hysteresis: ON at 250, OFF at 220)
-                if not self._erv_running or self._erv_speed != "medium":
-                    logger.info(f"ACTION: ERV MEDIUM (away, tVOC high: {tvoc}ppb, CO2 OK)")
-                    self.erv.turn_on(FanSpeed.MEDIUM)
-                    self._erv_running = True
-                    self._erv_speed = "medium"
-                    if not self._tvoc_ventilation_active:
-                        self._tvoc_ventilation_active = True
-                        self.db.log_climate_action("erv", "medium", co2_ppm=co2, reason=f"tvoc_high_{tvoc}ppb_away")
-            else:
-                # CO2 below target and no tVOC issue
+            # Determine final speed: pick the more aggressive one
+            # Speed priority: turbo > medium > quiet > off
+            speed_priority = {"turbo": 3, "medium": 2, "quiet": 1, "off": 0, None: -1}
+            co2_priority = speed_priority.get(co2_adaptive_speed, -1)
+            tvoc_priority = speed_priority.get(tvoc_adaptive_speed, -1)
+
+            # If both are "off" or plateau, turn off
+            if co2_adaptive_speed == "off" and (tvoc_adaptive_speed == "off" or not self._tvoc_away_ventilation_active):
                 if self._erv_running:
-                    reason = "co2_target_reached" if not self._tvoc_ventilation_active else "tvoc_cleared_away"
-                    logger.info(f"ACTION: ERV OFF ({reason}: CO2={co2}ppm)")
+                    reason = "co2_plateau" if self._plateau_detected else "targets_reached"
+                    logger.info(f"ACTION: ERV OFF ({reason}: CO2={co2}ppm, tVOC={tvoc})")
                     self.erv.turn_off()
                     self._erv_running = False
                     self._erv_speed = "off"
-                    if self._tvoc_ventilation_active:
-                        self._tvoc_ventilation_active = False
-                        self.db.log_climate_action("erv", "off", co2_ppm=co2, reason=reason)
+                    self.db.log_climate_action("erv", "off", co2_ppm=co2, reason=reason)
+            elif co2_priority >= 0 or tvoc_priority >= 0:
+                # Pick the more aggressive speed
+                if co2_priority >= tvoc_priority:
+                    target_speed = co2_adaptive_speed
+                    trigger = f"CO2={co2}ppm"
+                else:
+                    target_speed = tvoc_adaptive_speed
+                    trigger = f"tVOC={tvoc}"
+
+                if target_speed and target_speed != "off":
+                    speed_map = {"quiet": FanSpeed.QUIET, "medium": FanSpeed.MEDIUM, "turbo": FanSpeed.TURBO}
+                    fan_speed = speed_map[target_speed]
+
+                    if not self._erv_running or self._erv_speed != target_speed:
+                        co2_rate = self._calculate_co2_rate_of_change()
+                        tvoc_rate = self._calculate_tvoc_rate_of_change()
+                        rate_str = f"CO2:{co2_rate:.2f}/min" if co2_rate else ""
+                        if tvoc_rate:
+                            rate_str += f" tVOC:{tvoc_rate:.2f}/min" if rate_str else f"tVOC:{tvoc_rate:.2f}/min"
+                        logger.info(f"ACTION: ERV {target_speed.upper()} (away, adaptive: {trigger}, {rate_str})")
+                        self.erv.turn_on(fan_speed)
+                        self._erv_running = True
+                        self._erv_speed = target_speed
+                        self.db.log_climate_action("erv", target_speed, co2_ppm=co2,
+                                                   reason=f"away_adaptive_{target_speed}_{trigger}")
+            elif not co2_needs_refresh and not self._tvoc_away_ventilation_active:
+                # Nothing needs ventilation
+                if self._erv_running:
+                    logger.info(f"ACTION: ERV OFF (air quality OK: CO2={co2}ppm, tVOC={tvoc})")
+                    self.erv.turn_off()
+                    self._erv_running = False
+                    self._erv_speed = "off"
+                    self.db.log_climate_action("erv", "off", co2_ppm=co2, reason="air_quality_ok")
+            else:
+                # Fall back to TURBO if adaptive not ready yet
+                if not self._erv_running or self._erv_speed != "turbo":
+                    trigger = f"CO2={co2}ppm" if co2_needs_refresh else f"tVOC={tvoc}"
+                    logger.info(f"ACTION: ERV TURBO (away mode, {trigger})")
+                    self.erv.turn_on(FanSpeed.TURBO)
+                    self._erv_running = True
+                    self._erv_speed = "turbo"
+                    self.db.log_climate_action("erv", "turbo", co2_ppm=co2, reason=f"away_refresh_{trigger}")
 
         # After ERV state changes, evaluate HVAC coordination
         try:
@@ -849,14 +859,12 @@ class Orchestrator:
         co2 = reading.co2_ppm if reading else None
         logger.info(f"Current CO2: {co2}ppm" if co2 else "CO2: unknown")
 
-        # Clear spike detection state on departure
-        if new_state == OccupancyState.AWAY:
-            if self._spike_detected or self._spike_ventilation_active:
-                logger.info("Clearing spike state: user departed")
-                self._spike_detected = False
-                self._spike_peak_value = None
-                self._spike_ventilation_active = False
-                # Keep cooldown to prevent re-trigger on immediate return
+        # Clear tVOC AWAY ventilation state on arrival
+        if new_state == OccupancyState.PRESENT:
+            if self._tvoc_away_ventilation_active:
+                logger.info("Clearing tVOC AWAY ventilation state: user returned")
+                self._tvoc_away_ventilation_active = False
+                self._tvoc_plateau_detected = False
 
         # Clear plateau detection state on arrival (start fresh CO2 refresh cycle)
         if new_state == OccupancyState.PRESENT and self._plateau_detected:
@@ -1131,12 +1139,10 @@ class Orchestrator:
         # Add ERV status
         sm_status["erv"] = {
             "running": self._erv_running,
-            "tvoc_ventilation": self._tvoc_ventilation_active,
+            "tvoc_ventilation": self._tvoc_away_ventilation_active,  # tVOC AWAY mode ventilation
             "speed": self._erv_speed,
-            "spike_ventilation": self._spike_ventilation_active,
-            "spike_peak": self._spike_peak_value,
-            "spike_cooldown_until": (self._spike_cooldown_until.isoformat()
-                                    if self._spike_cooldown_until else None),
+            "tvoc_plateau": self._tvoc_plateau_detected,
+            "tvoc_baseline": self._tvoc_baseline,
         }
 
         # Add HVAC status

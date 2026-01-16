@@ -94,6 +94,17 @@ class ThresholdsConfig:
     co2_rate_quiet_threshold: float = 0.5    # 0.5-2 ppm/min → QUIET (1/1)
                                               # < 0.5 ppm/min for 10 min → OFF (plateau)
 
+    # tVOC AWAY mode ventilation (similar to CO2 adaptive control)
+    # NOTE: tVOC is IGNORED when PRESENT - only triggers ventilation when AWAY
+    tvoc_away_enabled: bool = True
+    tvoc_away_threshold: int = 200           # tVOC > this in AWAY triggers purge
+    tvoc_away_target: int = 40               # Stop when tVOC reaches baseline
+    tvoc_away_history_size: int = 40         # tVOC readings in sliding window
+    tvoc_plateau_rate_threshold: float = 0.3 # points/min - slower = plateau
+    tvoc_rate_turbo_threshold: float = 5.0   # > 5 points/min → TURBO
+    tvoc_rate_medium_threshold: float = 1.5  # 1.5-5 points/min → MEDIUM
+    tvoc_rate_quiet_threshold: float = 0.3   # 0.3-1.5 points/min → QUIET
+
 
 @dataclass
 class GoogleOAuthConfig:
