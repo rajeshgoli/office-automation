@@ -317,14 +317,16 @@ def main():
                         help="HTTP Basic Auth username (deprecated)")
     parser.add_argument("--auth-password", type=str,
                         help="HTTP Basic Auth password (deprecated)")
+    parser.add_argument("--no-auth", action="store_true",
+                        help="Skip authentication (for trusted networks)")
 
     args = parser.parse_args()
 
     orchestrator_url = None if args.no_send else args.url
 
-    # Set up OAuth client
+    # Set up OAuth client (only if auth is needed and Basic Auth not provided)
     oauth_client = None
-    if orchestrator_url:
+    if orchestrator_url and not args.no_auth and not (args.auth_username and args.auth_password):
         token_file = Path(args.auth_token_file) if args.auth_token_file else None
         oauth_client = OAuthDeviceClient(orchestrator_url, token_file)
 
