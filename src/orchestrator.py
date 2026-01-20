@@ -859,6 +859,12 @@ class Orchestrator:
         co2 = reading.co2_ppm if reading else None
         logger.info(f"Current CO2: {co2}ppm" if co2 else "CO2: unknown")
 
+        # Clear rate history on departure - ensures TURBO start, then adaptive takes over
+        if new_state == OccupancyState.AWAY:
+            logger.info("Clearing CO2/tVOC history for fresh adaptive calculation")
+            self._co2_history.clear()
+            self._tvoc_history.clear()
+
         # Clear tVOC AWAY ventilation state on arrival
         if new_state == OccupancyState.PRESENT:
             if self._tvoc_away_ventilation_active:
