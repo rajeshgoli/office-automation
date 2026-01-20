@@ -99,6 +99,7 @@ class Orchestrator:
         )
         self._outdoor_co2_baseline: Optional[int] = None  # Learned outdoor CO2 level
         self._plateau_detected: bool = False
+        self._away_start_time: Optional[datetime] = None  # When we entered AWAY mode
 
         # tVOC AWAY mode adaptive control (separate from spike detection)
         self._tvoc_away_history: deque[tuple[datetime, int]] = deque(
@@ -341,11 +342,13 @@ class Orchestrator:
             self._plateau_detected = True
             return "off"
 
-        # Force TURBO at high CO2 regardless of rate
-        # Only step down when CO2 is at a reasonable level
-        co2_turbo_floor = getattr(self.config.thresholds, 'co2_turbo_floor_ppm', 800)
-        if co2 > co2_turbo_floor:
-            return "turbo"  # High CO2, full blast until it drops
+        # Force TURBO for first N minutes after departure
+        # This ensures aggressive initial purge before switching to adaptive
+        turbo_duration = self.config.thresholds.co2_turbo_duration_minutes
+        if self._away_start_time:
+            minutes_away = (datetime.now() - self._away_start_time).total_seconds() / 60.0
+            if minutes_away < turbo_duration:
+                return "turbo"  # Still in initial TURBO window
 
         # Calculate rate of change
         rate = self._calculate_co2_rate_of_change()
@@ -870,9 +873,12 @@ class Orchestrator:
             logger.info("Clearing CO2/tVOC history for fresh adaptive calculation")
             self._co2_history.clear()
             self._tvoc_history.clear()
+            self._away_start_time = datetime.now()
+            logger.info(f"TURBO mode for {self.config.thresholds.co2_turbo_duration_minutes} min, then adaptive")
 
-        # Clear tVOC AWAY ventilation state on arrival
+        # Clear AWAY mode state on arrival
         if new_state == OccupancyState.PRESENT:
+            self._away_start_time = None
             if self._tvoc_away_ventilation_active:
                 logger.info("Clearing tVOC AWAY ventilation state: user returned")
                 self._tvoc_away_ventilation_active = False
