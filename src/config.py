@@ -93,6 +93,7 @@ class ThresholdsConfig:
     co2_rate_medium_threshold: float = 2.0   # 2-8 ppm/min → MEDIUM (3/2)
     co2_rate_quiet_threshold: float = 0.5    # 0.5-2 ppm/min → QUIET (1/1)
                                               # < 0.5 ppm/min for 10 min → OFF (plateau)
+    co2_turbo_floor_ppm: int = 800           # Force TURBO above this, regardless of rate
 
     # tVOC AWAY mode ventilation (similar to CO2 adaptive control)
     # NOTE: tVOC is IGNORED when PRESENT - only triggers ventilation when AWAY

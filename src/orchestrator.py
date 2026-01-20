@@ -341,6 +341,12 @@ class Orchestrator:
             self._plateau_detected = True
             return "off"
 
+        # Force TURBO at high CO2 regardless of rate
+        # Only step down when CO2 is at a reasonable level
+        co2_turbo_floor = getattr(self.config.thresholds, 'co2_turbo_floor_ppm', 800)
+        if co2 > co2_turbo_floor:
+            return "turbo"  # High CO2, full blast until it drops
+
         # Calculate rate of change
         rate = self._calculate_co2_rate_of_change()
         if rate is None:
