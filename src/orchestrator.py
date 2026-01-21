@@ -444,6 +444,13 @@ class Orchestrator:
         if not self.config.thresholds.tvoc_away_enabled:
             return None
 
+        # Force TURBO for first N minutes after departure (same as CO2)
+        turbo_duration = self.config.thresholds.co2_turbo_duration_minutes
+        if self._away_start_time:
+            minutes_away = (datetime.now() - self._away_start_time).total_seconds() / 60.0
+            if minutes_away < turbo_duration:
+                return "turbo"  # Still in initial TURBO window
+
         # Check for plateau first
         if self._detect_tvoc_plateau():
             logger.info(f"tVOC plateau detected at {tvoc}, stopping ERV (baseline: {self._tvoc_baseline})")
