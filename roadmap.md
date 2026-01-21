@@ -279,6 +279,13 @@ Implement the core rules from vision.md.
   - Demo value: Tells a compelling story of how the system works
 
 ### Other Future Enhancements
+- [ ] **Telegram Bot for Remote IP Lookup** - Get LocalTunnel password when away
+  - Problem: LocalTunnel asks for server's public IP as password
+  - Can't easily get home IP when on mobile data
+  - Solution: Telegram bot on Mac Mini that responds to `/ip` command
+  - Uses long-polling (outbound connection, no ports needed)
+  - Implementation: `python-telegram-bot` library + Launch Agent
+  - Could also add `/status`, `/erv turbo`, etc. commands later
 - [ ] **Historical Charts** - Time-series visualization for trends
   - CO2, temperature, humidity graphs (day/week/month views)
   - Occupancy pattern analysis (when are you typically in the office?)
