@@ -32,7 +32,7 @@ Office Climate Automation system for a backyard shed office. The system coordina
 - HVAC status polling (syncs dashboard with manual remote/app changes, pauses at night)
 - tVOC-triggered ventilation (VOC index >250 triggers ERV)
 - **Adaptive tVOC spike detection** - Catches sub-threshold meal/food events (45+ point spikes above baseline)
-- **Adaptive AWAY mode ventilation** - Speed adjusts based on CO2 fall rate (TURBO → MEDIUM → QUIET → OFF)
+- **Two-phase AWAY mode ventilation** - 30 min forced TURBO, then adaptive speed based on CO2 fall rate
 - **CO2 plateau detection** - Learns outdoor baseline (~490 ppm winter) and stops ERV when equilibrium reached
 - PWA support for iOS home screen installation
 - **Google OAuth 2.0 authentication** - Secure JWT-based auth for dashboard and API (ready for testing)
@@ -124,13 +124,25 @@ This prevents false departures when leaving the door open for ventilation.
 | **QUIET** | 1/1 | CO2 > 2000 ppm (hysteresis: off at 1800 ppm) |
 | **ELEVATED** | 3/2 | tVOC index > 250 OR adaptive spike detected (positive pressure) |
 
-**AWAY Mode (Adaptive Speed Control):**
+**AWAY Mode (Two-Phase Ventilation):**
+
+*Phase 1: Initial Purge (first 30 minutes)*
+| Mode | Fan Speed | Notes |
+|------|-----------|-------|
+| **TURBO** | 8/8 | Forced for first 30 min regardless of CO2 level or rate |
+
+*Phase 2: Adaptive Control (after 30 minutes)*
 | Mode | Fan Speed | CO2 Fall Rate | Notes |
 |------|-----------|---------------|-------|
-| **PURGE** | 8/8 | > 8 ppm/min | Fast CO2 drop, aggressive ventilation |
-| **ELEVATED** | 3/2 | 2-8 ppm/min | Moderate drop, stepping down |
+| **TURBO** | 8/8 | > 8 ppm/min | Fast CO2 drop, stay aggressive |
+| **MEDIUM** | 3/2 | 2-8 ppm/min | Moderate drop, stepping down |
 | **QUIET** | 1/1 | 0.5-2 ppm/min | Slow drop, approaching equilibrium |
 | **OFF** | 0/0 | < 0.5 ppm/min for 10 min | Plateau detected, outdoor baseline reached |
+
+**Why 30 minutes?** Historical data analysis showed:
+- 0-10 min: Air mixing/ramping (minimal CO2 drop)
+- 10-30 min: High-efficiency window (~10 ppm/min drop)
+- 30+ min: Diminishing returns, adaptive can optimize
 
 **Outdoor Baseline Detection:** System learns outdoor CO2 level (e.g., ~490 ppm in winter) and stops ventilating when equilibrium is reached, preventing infinite runtime.
 
@@ -148,7 +160,8 @@ This prevents false departures when leaving the door open for ventilation.
 | **CO2 plateau rate threshold** | **0.5 ppm/min** | Slower than this = outdoor baseline reached |
 | **CO2 plateau window** | **10 minutes** | Sustained slow rate duration |
 | **CO2 plateau min safety** | **600 ppm** | Don't plateau above this (safety margin for winter ~490 ppm) |
-| **Adaptive TURBO threshold** | **> 8 ppm/min** | CO2 falling fast |
+| **TURBO duration** | **30 minutes** | Force TURBO for this long after departure, then adaptive |
+| **Adaptive TURBO threshold** | **> 8 ppm/min** | CO2 falling fast (after initial 30 min) |
 | **Adaptive MEDIUM threshold** | **2-8 ppm/min** | CO2 falling moderately |
 | **Adaptive QUIET threshold** | **0.5-2 ppm/min** | CO2 falling slowly |
 | Motion timeout | 60 seconds | |
