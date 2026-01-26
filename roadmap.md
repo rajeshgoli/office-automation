@@ -244,10 +244,10 @@ Implement the core rules from vision.md.
 - [ ] Deploy orchestrator to Mac Mini
 - [ ] Run as launch agent (macOS) or systemd service (Linux)
 - [ ] Enable Tailscale Funnel for remote access
-- [ ] Add DNS CNAME for climate.rajeshgo.li
-- [ ] Update Mac occupancy detector to POST to Mac Mini
-- [ ] Test full end-to-end flow from anywhere
-- [ ] Enable authentication (HTTP Basic Auth or Google OAuth)
+- [x] ~~Add DNS CNAME for climate.rajeshgo.li~~ - Skipped (would require moving domain to Cloudflare)
+- [x] Update Mac occupancy detector to POST to Mac Mini
+- [x] Test full end-to-end flow from anywhere
+- [x] Enable authentication (Google OAuth working)
 
 ---
 
@@ -279,6 +279,12 @@ Implement the core rules from vision.md.
   - Demo value: Tells a compelling story of how the system works
 
 ### Other Future Enhancements
+- [ ] **Screen Door Sensor** - More robust AWAY detection when main door is open for ventilation
+  - Problem: When main door is open, system uses activity timeout (5 min) which can be unreliable
+  - Solution: Add contact sensor to screen door (always closed when leaving)
+  - Options: YoLink outdoor sensor (YS7706-UC, ~$20, IP65 weatherproof) or mount regular sensor on interior-facing part of frame
+  - Logic change: If main door OPEN, require screen door CLOSE for AWAY transition
+  - Screen door becomes the "airlock" sensor when ventilating
 - [ ] **Telegram Bot for Remote IP Lookup** - Get LocalTunnel password when away
   - Problem: LocalTunnel asks for server's public IP as password
   - Can't easily get home IP when on mobile data
