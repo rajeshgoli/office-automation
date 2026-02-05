@@ -310,6 +310,7 @@ orchestrator:
 | POST | `/erv` | Manual ERV control `{"speed": "off\|quiet\|medium\|turbo"}` |
 | POST | `/hvac` | Manual HVAC control `{"mode": "off\|heat", "setpoint_f": 70}` |
 | POST | `/qingping/interval` | Configure sensor report interval `{"interval": 60}` (seconds, min 15) |
+| GET | `/localtunnel/password` | Fetch LocalTunnel tunnel password from loca.lt API |
 
 ## Running
 

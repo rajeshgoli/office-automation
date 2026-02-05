@@ -1108,6 +1108,40 @@ class Orchestrator:
             logger.error(f"Error handling Qingping interval POST: {e}")
             return web.json_response({"ok": False, "error": str(e)}, status=400)
 
+    async def _fetch_localtunnel_password(self) -> str:
+        """Fetch LocalTunnel password from loca.lt API."""
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://loca.lt/mytunnelpassword",
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                response.raise_for_status()
+                return await response.text()
+
+    async def _handle_localtunnel_password(self, request: web.Request) -> web.Response:
+        """Handle GET /localtunnel/password - Fetch LocalTunnel password."""
+        try:
+            password = await self._fetch_localtunnel_password()
+            return web.json_response({
+                "password": password.strip()
+            })
+        except Exception as e:
+            logger.error(f"Failed to fetch LocalTunnel password: {e}")
+            # Check if it's a network/HTTP error
+            import aiohttp
+            if isinstance(e, (aiohttp.ClientError, aiohttp.ServerTimeoutError)):
+                return web.json_response(
+                    {"error": f"Failed to fetch password: {str(e)}"},
+                    status=503
+                )
+            else:
+                return web.json_response(
+                    {"error": str(e)},
+                    status=500
+                )
+
     async def _handle_history_get(self, request: web.Request) -> web.Response:
         """Handle GET /history for historical data.
 
@@ -1576,6 +1610,7 @@ class Orchestrator:
         self._app.router.add_post("/erv", self._handle_erv_post)
         self._app.router.add_post("/hvac", self._handle_hvac_post)
         self._app.router.add_post("/qingping/interval", self._handle_qingping_interval_post)
+        self._app.router.add_get("/localtunnel/password", self._handle_localtunnel_password)
 
         # OAuth routes (if enabled)
         if self.oauth:
