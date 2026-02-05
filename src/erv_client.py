@@ -189,6 +189,16 @@ class ERVClient:
         logger.info(f"Setting ERV speed to {speed.value}")
 
         if self._use_cloud:
+            # Try local first in case the device recovered; cloud can't set speeds.
+            if self._device:
+                try:
+                    result = self._set_speed_local(speed)
+                    if result:
+                        logger.info("Local ERV control recovered; disabling cloud fallback")
+                        self._use_cloud = False
+                        return True
+                except Exception as e:
+                    logger.warning(f"Local ERV control still unavailable: {e}")
             return self._set_speed_cloud(speed)
         else:
             result = self._set_speed_local(speed)

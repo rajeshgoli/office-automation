@@ -879,7 +879,7 @@ class Orchestrator:
         if new_state == OccupancyState.AWAY:
             logger.info("Clearing CO2/tVOC history for fresh adaptive calculation")
             self._co2_history.clear()
-            self._tvoc_history.clear()
+            self._tvoc_away_history.clear()
             self._away_start_time = datetime.now()
             logger.info(f"TURBO mode for {self.config.thresholds.co2_turbo_duration_minutes} min, then adaptive")
 
