@@ -1,86 +1,45 @@
-# Tuya Local Key Recovery (Smart Life / ERV)
+#!/usr/bin/env bash
+set -euo pipefail
 
-This is the repeatable process we used to restore ERV local control when Tuya local commands started failing (e.g., Err 914 or dashboard control not working). The fix is to extract the **current local key** from the Smart Life app and update `config.yaml`.
+if [[ -z "${APP_UID:-}" ]]; then
+  echo "APP_UID is required. Example: APP_UID=u0_a167 scripts/tuya-local-key.sh" >&2
+  exit 1
+fi
 
-## When To Run This
+if ! command -v adb >/dev/null 2>&1; then
+  echo "adb not found in PATH" >&2
+  exit 1
+fi
 
-Run this if any of the following happen:
-- Local control fails with Err 914 (“Check device key or version”).
-- Dashboard or automations can’t turn on the ERV but the Smart Life app works.
-- You re-pair/reset the ERV (local key can change).
+if ! command -v javac >/dev/null 2>&1; then
+  echo "javac not found in PATH" >&2
+  exit 1
+fi
 
-## Prereqs
+if ! command -v jar >/dev/null 2>&1; then
+  echo "jar not found in PATH" >&2
+  exit 1
+fi
 
-- Android emulator (arm64) and ADB
-- Smart Life app installed and logged in
-- Root access in emulator (`adb root`)
-- Java 17 (for Android SDK tools)
+if [[ ! -d "${HOME}/android-sdk" ]]; then
+  echo "~/android-sdk not found" >&2
+  exit 1
+fi
 
-## 1) Quick Checks (Before Installing Anything)
+SDK_ROOT="${HOME}/android-sdk"
+BUILD_TOOLS="${SDK_ROOT}/build-tools/30.0.3"
+PLATFORM_JAR="${SDK_ROOT}/platforms/android-30/android.jar"
+D8_BIN="${BUILD_TOOLS}/d8"
 
-These tools often already exist on this machine. Check first:
+if [[ ! -x "${D8_BIN}" ]]; then
+  echo "D8 not found at ${D8_BIN}. Install build-tools;30.0.3" >&2
+  exit 1
+fi
 
-```sh
-command -v adb
-command -v emulator
-test -d ~/android-sdk && echo "android-sdk present"
-```
+WORKDIR="/tmp/tuya-dump"
+mkdir -p "${WORKDIR}"
 
-If all are present, skip to **2) Install Smart Life + Login**. Otherwise continue.
-
-## 2) Emulator Setup (Apple Silicon Friendly)
-
-```sh
-# SDK setup
-export JAVA_HOME="$(brew --prefix openjdk@17)/libexec/openjdk.jdk/Contents/Home"
-~/android-sdk/cmdline-tools/latest/bin/sdkmanager \
-  "platform-tools" "emulator" "platforms;android-30" \
-  "system-images;android-30;google_apis;arm64-v8a" \
-  "build-tools;30.0.3"
-
-# Create emulator
-~/android-sdk/cmdline-tools/latest/bin/avdmanager create avd \
-  -n tuya \
-  -k "system-images;android-30;google_apis;arm64-v8a"
-
-# Start emulator
-~/android-sdk/emulator/emulator \
-  -avd tuya \
-  -no-snapshot \
-  -no-audio \
-  -gpu swiftshader_indirect
-```
-
-## 3) Install Smart Life + Login
-
-- Install Smart Life via Play Store or APKPure (arm64).
-- Log in with your account.
-- Verify the ERV device appears in the app.
-
-## 4) Extract Local Key (On-Emulator Helper)
-
-We run a small Java helper inside the emulator. It:
-- Decrypts `global_preference.xml` using Android Keystore
-- Gets the `__SECURITY_KEY__` map (MMKV encryption keys)
-- Opens encrypted MMKV and prints entries containing `localKey`
-
-### 4.1 Identify the app UID (needed for `su`)
-
-```sh
-~/android-sdk/platform-tools/adb -s emulator-5556 root
-~/android-sdk/platform-tools/adb -s emulator-5556 shell \
-  "ls -ld /data/data/com.tuya.smartlife"
-```
-
-The owner will look like `u0_a###`. Use that in the command below.
-
-### 4.2 Build + Push the helper
-
-Preferred: use the repo script (see below). If you want to do it manually, use this block.
-
-```sh
-mkdir -p /tmp/tuya-dump
-cat > /tmp/tuya-dump/DumpTuya.java <<'JAVA'
+cat > "${WORKDIR}/DumpTuya.java" <<'JAVA'
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
@@ -251,93 +210,22 @@ public class DumpTuya {
 }
 JAVA
 
-# Build -> dex -> push
-export JAVA_HOME="$(brew --prefix openjdk@17)/libexec/openjdk.jdk/Contents/Home"
-JAVAC="$(brew --prefix openjdk@17)/bin/javac"
-JAR="$(brew --prefix openjdk@17)/bin/jar"
+rm -rf "${WORKDIR}/classes" "${WORKDIR}/dex" "${WORKDIR}/dumptuya.jar" "${WORKDIR}/dumptuya.dex.jar"
+mkdir -p "${WORKDIR}/classes" "${WORKDIR}/dex"
 
-rm -rf /tmp/tuya-dump/classes /tmp/tuya-dump/dex
-mkdir -p /tmp/tuya-dump/classes /tmp/tuya-dump/dex
+javac --release 8 -classpath "${PLATFORM_JAR}" -d "${WORKDIR}/classes" "${WORKDIR}/DumpTuya.java"
+jar cf "${WORKDIR}/dumptuya.jar" -C "${WORKDIR}/classes" .
+"${D8_BIN}" --min-api 21 --output "${WORKDIR}/dex" "${WORKDIR}/dumptuya.jar"
+jar cf "${WORKDIR}/dumptuya.dex.jar" -C "${WORKDIR}/dex" classes.dex
 
-$JAVAC --release 8 -classpath ~/android-sdk/platforms/android-30/android.jar \
-  -d /tmp/tuya-dump/classes /tmp/tuya-dump/DumpTuya.java
+adb -s emulator-5556 root >/dev/null
+adb -s emulator-5556 push "${WORKDIR}/dumptuya.dex.jar" /data/local/tmp/dumptuya.dex.jar >/dev/null
 
-$JAR cf /tmp/tuya-dump/dumptuya.jar -C /tmp/tuya-dump/classes .
-~/android-sdk/build-tools/30.0.3/d8 --min-api 21 \
-  --output /tmp/tuya-dump/dex /tmp/tuya-dump/dumptuya.jar
-
-$JAR cf /tmp/tuya-dump/dumptuya.dex.jar -C /tmp/tuya-dump/dex classes.dex
-~/android-sdk/platform-tools/adb -s emulator-5556 \
-  push /tmp/tuya-dump/dumptuya.dex.jar /data/local/tmp/dumptuya.dex.jar
-```
-
-### 4.3 Run it inside the emulator
-
-Replace `<APP_UID>` with the owner you got in step 3.1.
-
-```sh
-APP_PATH=$(~/android-sdk/platform-tools/adb -s emulator-5556 shell pm path com.tuya.smartlife | head -1 | sed 's/package://')
+APP_PATH=$(adb -s emulator-5556 shell pm path com.tuya.smartlife | head -1 | sed 's/package://')
 APP_DIR=$(dirname "$APP_PATH")
 LIB_DIR="$APP_DIR/lib/arm64"
 
-~/android-sdk/platform-tools/adb -s emulator-5556 shell \
-  "su <APP_UID> sh -c 'CLASSPATH=/data/local/tmp/dumptuya.dex.jar:$APP_PATH \
+adb -s emulator-5556 shell \
+  "su ${APP_UID} sh -c 'CLASSPATH=/data/local/tmp/dumptuya.dex.jar:$APP_PATH \
   LD_LIBRARY_PATH=/system/lib64:/system_ext/lib64:/vendor/lib64:$LIB_DIR \
   /system/bin/app_process /data/local/tmp DumpTuya'"
-```
-
-You’ll see a big JSON blob. Find the ERV entry and grab its `localKey`.
-
-Example (do **not** reuse this key):
-```
-name":"ERVQ-H-F-BM" ... "localKey":"<THE_KEY_YOU_NEED>"
-```
-
-### 4.4 Cleanup
-
-```sh
-~/android-sdk/platform-tools/adb -s emulator-5556 shell rm -f /data/local/tmp/dumptuya.dex.jar
-```
-
-## 5) Update Office Automate Config + Restart
-
-Update `config.yaml`:
-```yaml
-erv:
-  type: "tuya"
-  device_id: "<your-device-id>"
-  local_key: "<new-local-key>"
-```
-
-Deploy to the server and restart:
-```sh
-scp config.yaml USER@SERVER_IP:/path/to/office-automate/config.yaml
-ssh USER@SERVER_IP 'U=$(id -u); launchctl kickstart -k gui/$U/com.office-automate.orchestrator'
-```
-
-Verify:
-```sh
-ssh USER@SERVER_IP 'tail -n 50 /tmp/office-automate.error.log'
-```
-
-You should see:
-```
-Connected to ERV via local API. Status: ...
-```
-
-## Notes
-
-- Local keys can change after re-pair or firmware changes.
-- Tuya cloud API can expire; local control will still work if the local key is correct.
-- Keep local keys private (don’t commit them to Git).
-- Store site-specific values (device ID, local key, server IP, local paths, app UID) in a private file excluded from Git.
-
-## Scripted Flow (Recommended)
-
-This repo includes a helper script to avoid copy/paste errors. It builds the dumper, pushes it to the emulator, and runs it.
-
-```sh
-APP_UID=<APP_UID> scripts/tuya-local-key.sh
-```
-
-The output will include `localKey` entries in the device list. Grab the ERV one.
