@@ -45,3 +45,6 @@ client_secret.json
 # tinytuya generated files
 snapshot.json
 tinytuya.json
+
+# Private docs
+docs/tuya-local-key-private.md
