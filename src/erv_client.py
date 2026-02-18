@@ -17,6 +17,7 @@ Fan Speed Presets (SA/EA):
 """
 
 import logging
+from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -83,6 +84,9 @@ class ERVClient:
         self._device: Optional[tinytuya.Device] = None
         self._cloud: Optional[tinytuya.Cloud] = None
         self._use_cloud = False
+        self.last_error: Optional[str] = None
+        self.last_error_at: Optional[datetime] = None
+        self.last_ok_at: Optional[datetime] = None
 
         # Set up cloud fallback if credentials provided
         if cloud_api_key and cloud_api_secret:
@@ -107,18 +111,22 @@ class ERVClient:
         if "Error" not in status:
             logger.info(f"Connected to ERV via local API. Status: {status}")
             self._use_cloud = False
+            self._record_success()
             return status
 
         # Local failed, try cloud
         logger.warning(f"Local connection failed: {status}")
+        self._record_error(f"Local connection failed: {status}")
         if self._cloud:
             logger.info("Falling back to cloud API...")
             cloud_status = self._cloud.getstatus(self.device_id)
             if cloud_status.get('success'):
                 logger.info(f"Connected to ERV via cloud API")
                 self._use_cloud = True
+                self._record_success()
                 return cloud_status
             else:
+                self._record_error(f"Cloud connection failed: {cloud_status}")
                 raise ConnectionError(f"Cloud connection also failed: {cloud_status}")
         else:
             raise ConnectionError(f"Local connection failed and no cloud credentials: {status}")
@@ -137,6 +145,7 @@ class ERVClient:
 
         status = self._device.status()
         if "Error" in status:
+            self._record_error(f"Local status failed: {status}")
             raise RuntimeError(f"Failed to get status: {status}")
 
         dps = status.get("dps", {})
@@ -153,6 +162,7 @@ class ERVClient:
                     fan_speed = preset
                     break
 
+        self._record_success()
         return ERVStatus(
             power=power,
             fan_speed=fan_speed,
@@ -168,6 +178,7 @@ class ERVClient:
 
         result = self._cloud.getstatus(self.device_id)
         if not result.get('success'):
+            self._record_error(f"Cloud status failed: {result}")
             raise RuntimeError(f"Failed to get cloud status: {result}")
 
         # Parse cloud status format
@@ -176,6 +187,7 @@ class ERVClient:
 
         power = status_dict.get('switch', False)
 
+        self._record_success()
         return ERVStatus(
             power=power,
             fan_speed=FanSpeed.OFF if not power else None,  # Cloud doesn't report speeds
@@ -199,9 +211,26 @@ class ERVClient:
                         return True
                 except Exception as e:
                     logger.warning(f"Local ERV control still unavailable: {e}")
+                    self._record_error(f"Local set_speed failed: {e}")
             return self._set_speed_cloud(speed)
         else:
-            result = self._set_speed_local(speed)
+            try:
+                result = self._set_speed_local(speed)
+            except Exception as e:
+                logger.warning(f"Local set_speed error: {e}")
+                self._record_error(f"Local set_speed error: {e}")
+                result = False
+
+            if not result:
+                # Retry local once after reconnect (handles stale sessions)
+                try:
+                    self.connect()
+                    if not self._use_cloud:
+                        result = self._set_speed_local(speed)
+                except Exception as e:
+                    logger.warning(f"Local reconnect failed: {e}")
+                    self._record_error(f"Local reconnect failed: {e}")
+
             if not result and self._cloud:
                 # Local failed, try cloud
                 logger.warning("Local set_speed failed, trying cloud...")
@@ -224,9 +253,11 @@ class ERVClient:
 
         if "Error" in str(result):
             logger.error(f"Failed to set speed: {result}")
+            self._record_error(f"Local set_speed failed: {result}")
             return False
 
         logger.info(f"ERV speed set to {speed.value}")
+        self._record_success()
         return True
 
     def _set_speed_cloud(self, speed: FanSpeed) -> bool:
@@ -250,9 +281,11 @@ class ERVClient:
 
         if result.get('success'):
             logger.info(f"ERV {'turned off' if speed == FanSpeed.OFF else 'turned on'} via cloud")
+            self._record_success()
             return True
         else:
             logger.error(f"Cloud command failed: {result}")
+            self._record_error(f"Cloud set_speed failed: {result}")
             return False
 
     def turn_on(self, speed: FanSpeed = FanSpeed.TURBO) -> bool:
@@ -262,6 +295,23 @@ class ERVClient:
     def turn_off(self) -> bool:
         """Turn off ERV."""
         return self.set_speed(FanSpeed.OFF)
+
+    def get_health(self) -> dict:
+        """Return ERV control health info."""
+        return {
+            "last_ok_at": self.last_ok_at.isoformat() if self.last_ok_at else None,
+            "last_error": self.last_error,
+            "last_error_at": self.last_error_at.isoformat() if self.last_error_at else None,
+            "using_cloud": self._use_cloud,
+        }
+
+    def _record_error(self, message: str):
+        self.last_error = message
+        self.last_error_at = datetime.now()
+
+    def _record_success(self):
+        self.last_ok_at = datetime.now()
+        self.last_error = None
 
 
 # Standalone test
