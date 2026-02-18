@@ -425,7 +425,6 @@ curl -X POST http://localhost:9001/erv \
 
 3. **✅ Reconfigure Qingping to use Mac Mini IP:**
    - Via Qingping developer portal: Set MQTT broker to `bakasura4.local:1883`
-
 4. **✅ Enable SSH:**
    ```bash
    sudo systemsetup -setremotelogin on

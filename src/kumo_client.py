@@ -328,7 +328,7 @@ async def main():
     kumo_config = config.get("mitsubishi", {})
     username = kumo_config.get("username")
     password = kumo_config.get("password")
-    device_serial = kumo_config.get("device_serial", "3334P008X100046F")
+    device_serial = kumo_config.get("device_serial")
 
     if not username or not password or username == "placeholder":
         print("Please configure mitsubishi username/password in config.yaml")
