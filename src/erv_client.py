@@ -59,6 +59,9 @@ class ERVClient:
     DP_SUPPLY_SPEED = "101"
     DP_EXHAUST_SPEED = "102"
 
+    # Delay before read-back verification to allow the device to process commands
+    VERIFY_DELAY_SECONDS = 1
+
     # Fan speed presets: (supply, exhaust)
     SPEED_PRESETS = {
         FanSpeed.OFF: (1, 1),
@@ -250,7 +253,7 @@ class ERVClient:
                 return False
 
         # Read-back verification: confirm the device actually changed state
-        time.sleep(1)
+        time.sleep(self.VERIFY_DELAY_SECONDS)
         try:
             actual = self._get_status_local()
             if speed == FanSpeed.OFF:
