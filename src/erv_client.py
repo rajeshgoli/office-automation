@@ -17,6 +17,7 @@ Fan Speed Presets (SA/EA):
 """
 
 import logging
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -57,6 +58,9 @@ class ERVClient:
     DP_MODE = "2"
     DP_SUPPLY_SPEED = "101"
     DP_EXHAUST_SPEED = "102"
+
+    # Delay before read-back verification to allow the device to process commands
+    VERIFY_DELAY_SECONDS = 1
 
     # Fan speed presets: (supply, exhaust)
     SPEED_PRESETS = {
@@ -185,7 +189,7 @@ class ERVClient:
         )
 
     def set_speed(self, speed: FanSpeed) -> bool:
-        """Set ERV fan speed."""
+        """Set ERV fan speed with reconnect retry on local failure."""
         logger.info(f"Setting ERV speed to {speed.value}")
 
         if self._use_cloud:
@@ -201,32 +205,77 @@ class ERVClient:
                     logger.warning(f"Local ERV control still unavailable: {e}")
             return self._set_speed_cloud(speed)
         else:
-            result = self._set_speed_local(speed)
+            try:
+                result = self._set_speed_local(speed)
+            except Exception as e:
+                logger.warning(f"Local set_speed error: {e}")
+                result = False
+
+            if not result:
+                # Retry once after reconnect (handles stale sessions)
+                logger.warning("Local set_speed failed, reconnecting and retrying...")
+                try:
+                    self.connect()
+                    if not self._use_cloud:
+                        result = self._set_speed_local(speed)
+                except Exception as e:
+                    logger.warning(f"Local reconnect/retry failed: {e}")
+
             if not result and self._cloud:
-                # Local failed, try cloud
-                logger.warning("Local set_speed failed, trying cloud...")
+                logger.warning("Local set_speed failed after retry, trying cloud...")
                 self._use_cloud = True
                 return self._set_speed_cloud(speed)
             return result
 
     def _set_speed_local(self, speed: FanSpeed) -> bool:
-        """Set speed via local API."""
+        """Set speed via local API with result checking and read-back verification."""
         if not self._device:
             raise RuntimeError("Not connected. Call connect() first.")
 
         if speed == FanSpeed.OFF:
             result = self._device.set_value(self.DP_POWER, False)
+            if "Error" in str(result):
+                logger.error(f"Failed to set power off: {result}")
+                return False
         else:
             supply, exhaust = self.SPEED_PRESETS[speed]
-            self._device.set_value(self.DP_POWER, True)
-            self._device.set_value(self.DP_SUPPLY_SPEED, supply)
-            result = self._device.set_value(self.DP_EXHAUST_SPEED, exhaust)
+            r1 = self._device.set_value(self.DP_POWER, True)
+            if "Error" in str(r1):
+                logger.error(f"Failed to set power on: {r1}")
+                return False
+            r2 = self._device.set_value(self.DP_SUPPLY_SPEED, supply)
+            if "Error" in str(r2):
+                logger.error(f"Failed to set supply speed: {r2}")
+                return False
+            r3 = self._device.set_value(self.DP_EXHAUST_SPEED, exhaust)
+            if "Error" in str(r3):
+                logger.error(f"Failed to set exhaust speed: {r3}")
+                return False
 
-        if "Error" in str(result):
-            logger.error(f"Failed to set speed: {result}")
+        # Read-back verification: confirm the device actually changed state
+        time.sleep(self.VERIFY_DELAY_SECONDS)
+        try:
+            actual = self._get_status_local()
+            if speed == FanSpeed.OFF:
+                if actual.power:
+                    logger.error(f"ERV verification failed: expected power OFF, got ON")
+                    return False
+            else:
+                if not actual.power:
+                    logger.error(f"ERV verification failed: expected power ON, got OFF")
+                    return False
+                expected_supply, expected_exhaust = self.SPEED_PRESETS[speed]
+                if actual.supply_speed != expected_supply or actual.exhaust_speed != expected_exhaust:
+                    logger.error(
+                        f"ERV verification failed: expected SA={expected_supply}/EA={expected_exhaust}, "
+                        f"got SA={actual.supply_speed}/EA={actual.exhaust_speed}"
+                    )
+                    return False
+        except Exception as e:
+            logger.error(f"ERV verification read-back failed: {e}")
             return False
 
-        logger.info(f"ERV speed set to {speed.value}")
+        logger.info(f"ERV speed set to {speed.value} (verified)")
         return True
 
     def _set_speed_cloud(self, speed: FanSpeed) -> bool:
