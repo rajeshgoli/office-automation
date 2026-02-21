@@ -1,3 +1,4 @@
 [submodule ".agent-os"]
 	path = .agent-os
 	url = git@github.com:rajeshgoli/agent-os.git
+	branch = main
