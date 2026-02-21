@@ -28,6 +28,7 @@ from .state_machine import StateMachine, StateConfig, OccupancyState
 from .qingping_client import QingpingMQTTClient, QingpingReading
 from .erv_client import ERVClient, FanSpeed
 from .kumo_client import KumoClient, OperationMode as HVACMode
+from .hvac_hysteresis import get_heat_band_action
 from .database import Database
 from .oauth_service import OAuthService, UserSession
 
@@ -138,6 +139,7 @@ class Orchestrator:
         self._hvac_setpoint_c: float = 22.0  # Celsius
         self._hvac_suspended: bool = False  # True when we turned off HVAC due to ERV running
         self._hvac_last_mode: str = "heat"  # Mode before we suspended it
+        self._hvac_temp_band_paused: bool = False  # True when heat was paused by 75/71 comfort band
 
         # Manual override tracking
         self._manual_erv_override: bool = False
@@ -686,6 +688,52 @@ class Orchestrator:
         temp_f = self._get_temp_f()
         min_temp = self.config.thresholds.hvac_min_temp_f
         critical_temp = self.config.thresholds.hvac_critical_temp_f
+        heat_off_temp = self.config.thresholds.hvac_heat_off_temp_f
+        heat_on_temp = self.config.thresholds.hvac_heat_on_temp_f
+        within_occupancy_hours = self._is_within_occupancy_hours()
+
+        heat_band_action = get_heat_band_action(
+            temp_f=temp_f,
+            hvac_mode=self._hvac_mode,
+            temp_band_paused=self._hvac_temp_band_paused,
+            state=state,
+            erv_running=self._erv_running,
+            min_temp_f=min_temp,
+            within_occupancy_hours=within_occupancy_hours,
+            heat_off_temp_f=heat_off_temp,
+            heat_on_temp_f=heat_on_temp,
+        )
+
+        # Temperature comfort-band hysteresis from Qingping readings:
+        # pause heat at upper bound, resume at lower bound.
+        if heat_band_action == "pause":
+            logger.info(f"ACTION: HVAC OFF (temp band: {temp_f:.1f}°F >= {heat_off_temp}°F)")
+            try:
+                await self.kumo.turn_off()
+                self._hvac_mode = "off"
+                self._hvac_temp_band_paused = True
+                self.db.log_climate_action(
+                    "hvac", "off", reason=f"temp_band_pause_{temp_f:.0f}F"
+                )
+            except Exception as e:
+                logger.error(f"Failed to pause HVAC for temp band: {e}")
+            return
+
+        if heat_band_action == "resume":
+            logger.info(f"ACTION: HVAC HEAT (temp band: {temp_f:.1f}°F <= {heat_on_temp}°F)")
+            try:
+                await self.kumo.set_heat(self._hvac_setpoint_c)
+                self._hvac_mode = "heat"
+                self._hvac_last_mode = "heat"
+                self._hvac_temp_band_paused = False
+                self.db.log_climate_action(
+                    "hvac", "heat",
+                    setpoint=self._hvac_setpoint_c,
+                    reason=f"temp_band_resume_{temp_f:.0f}F"
+                )
+            except Exception as e:
+                logger.error(f"Failed to resume HVAC for temp band: {e}")
+            return
 
         # PRESENT mode: restore HVAC if we suspended it (and it was actually running)
         if state == OccupancyState.PRESENT:
@@ -715,6 +763,7 @@ class Orchestrator:
                         await self.kumo.set_heat(self._hvac_setpoint_c)
                         self._hvac_mode = "heat"
                         self._hvac_suspended = False
+                        self._hvac_temp_band_paused = False
                         self.db.log_climate_action("hvac", "heat",
                                                    setpoint=self._hvac_setpoint_c,
                                                    reason=f"critical_temp_{temp_f:.0f}F")
@@ -750,7 +799,7 @@ class Orchestrator:
 
             # ERV stopped + we suspended HVAC + within occupancy hours = restore
             if not self._erv_running and self._hvac_suspended:
-                if self._is_within_occupancy_hours() and self._hvac_last_mode in ("heat", "cool", "auto"):
+                if within_occupancy_hours and self._hvac_last_mode in ("heat", "cool", "auto"):
                     logger.info(f"ACTION: HVAC RESTORE (ERV stopped, within occupancy hours)")
                     try:
                         if self._hvac_last_mode == "heat":
@@ -846,6 +895,11 @@ class Orchestrator:
                     # Update last_mode if device is on
                     if device_mode != "off":
                         self._hvac_last_mode = device_mode
+
+                    # If heat/cool was enabled externally, clear temp-band pause.
+                    if self._hvac_temp_band_paused and device_mode != "off":
+                        logger.info("Clearing HVAC temp-band pause (device is on)")
+                        self._hvac_temp_band_paused = False
 
                     # If we thought HVAC was suspended but it's actually on,
                     # clear the suspended flag
@@ -1043,6 +1097,7 @@ class Orchestrator:
             # Clear suspension flag (user manually controlling, don't auto-restore later)
             self._hvac_suspended = False
             self._hvac_last_mode = None
+            self._hvac_temp_band_paused = False
 
             # Apply the change
             if mode == "off":
