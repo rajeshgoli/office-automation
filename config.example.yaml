@@ -37,6 +37,8 @@ mitsubishi:
 thresholds:
   co2_critical_ppm: 2000      # ERV on even when present
   co2_refresh_target_ppm: 500  # Target for away-mode ventilation
+  hvac_heat_off_temp_f: 75     # Turn heat off at/above this Qingping temp
+  hvac_heat_on_temp_f: 71      # Turn heat back on at/below this temp (hysteresis)
   motion_timeout_seconds: 60   # Time before motion absence triggers away
   mac_poll_interval_seconds: 5 # How often to check Mac occupancy
 

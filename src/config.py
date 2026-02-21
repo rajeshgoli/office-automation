@@ -66,6 +66,8 @@ class ThresholdsConfig:
     tvoc_hysteresis_ppb: int = 30  # Turn off MEDIUM when tVOC < (threshold - hysteresis)
     hvac_min_temp_f: int = 68  # Don't heat above this when away + ERV running
     hvac_critical_temp_f: int = 55  # Always heat below this (pipe freeze protection)
+    hvac_heat_off_temp_f: int = 75  # Turn heat off when temp reaches this
+    hvac_heat_on_temp_f: int = 71  # Turn heat back on when temp drops to this
     expected_occupancy_start: str = "07:00"  # When to allow pre-conditioning
     expected_occupancy_end: str = "22:00"  # After this, no heating unless critical
     motion_timeout_seconds: int = 60
