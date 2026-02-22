@@ -2,10 +2,6 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Git Commits
-
-**Do NOT add Claude attributions to commits.** No "Generated with Claude Code" or "Co-Authored-By" lines. Single developer repo - Claude authorship is assumed.
-
 ## Project Overview
 
 Office Climate Automation system for a backyard shed office. The system coordinates multiple smart devices to maintain air quality silently during occupancy and aggressively ventilate when away.
@@ -13,7 +9,7 @@ Office Climate Automation system for a backyard shed office. The system coordina
 ## Current Status (2026-01-09)
 
 **✅ Deployed to Mac Mini (Always-On Production)**
-- Mac Mini (macOS High Sierra 10.13.6) at 192.168.5.140
+- Mac Mini (macOS High Sierra 10.13.6) — hostname `bakasura4.local` (IP in config.yaml)
 - All services auto-start on boot via Launch Agents
 - MQTT broker (amqtt), Orchestrator, LocalTunnel all running
 - Remote access via LocalTunnel at https://climate.loca.lt
@@ -22,7 +18,7 @@ Office Climate Automation system for a backyard shed office. The system coordina
 **Working:**
 - YoLink sensors (door, window, motion) via Cloud MQTT
 - ERV control via Tuya local API (tinytuya)
-- Qingping Air Monitor via local MQTT (Mac Mini at 192.168.5.140:1883)
+- Qingping Air Monitor via local MQTT (Mac Mini — broker in config.yaml)
 - State machine (PRESENT/AWAY) with door open mode for ventilation scenarios
 - SQLite database for persistence and historical analysis (restores sensor states on startup)
 - React dashboard with live data (WebSocket + polling fallback)
@@ -41,12 +37,12 @@ Office Climate Automation system for a backyard shed office. The system coordina
 
 | Device | Control Method | Status |
 |--------|---------------|--------|
-| **ERV (Pioneer Airlink)** | Tuya local (`192.168.5.119`) | Working |
-| **Qingping Air Monitor** | Local MQTT (`192.168.5.140:1883`) | Working |
+| **ERV (Pioneer Airlink)** | Tuya local (IP in config.yaml) | Working |
+| **Qingping Air Monitor** | Local MQTT (broker in config.yaml) | Working |
 | **YoLink Sensors** | Cloud MQTT (`api.yosmart.com:8003`) | Working |
 | **Mitsubishi Split AC** | pykumo (Kumo Cloud) | Working |
-| **Mac Keyboard/Mouse** | HTTP POST to orchestrator (`192.168.5.140:8080`) | Working |
-| **Mac Mini (bakasura4)** | SSH (`192.168.5.140`) | Production host |
+| **Mac Keyboard/Mouse** | HTTP POST to orchestrator (server in config.yaml) | Working |
+| **Mac Mini (bakasura4)** | SSH (`bakasura4.local`) | Production host |
 
 ## Core Architecture
 
@@ -245,7 +241,7 @@ sqlite3 data/office_climate.db "SELECT timestamp, co2_ppm FROM sensor_readings W
    - Create OAuth 2.0 Client ID (Web application)
    - Add authorized redirect URIs:
      - `http://localhost:8080/auth/callback` (development)
-     - `http://192.168.5.140:8080/auth/callback` (local network)
+     - `http://bakasura4.local:8080/auth/callback` (local network)
      - `https://climate.loca.lt/auth/callback` (remote access)
 
 2. **Update config.yaml**:
@@ -255,7 +251,7 @@ orchestrator:
     client_id: "YOUR_CLIENT_ID.apps.googleusercontent.com"
     client_secret: "YOUR_CLIENT_SECRET"
     allowed_emails:
-      - "rajeshgoli+kumo@gmail.com"
+      - "your_email@gmail.com"
 ```
 
 ### OAuth Features
@@ -343,17 +339,17 @@ curl -X POST http://localhost:9001/erv \
 ## Device Details
 
 ### ERV (Tuya Local)
-- Device ID: `ebfb18b2fc8f6dc63eqvcw`
-- IP: `192.168.5.119`
-- Local Key: in config.yaml
+- Device ID: in config.yaml (`tuya.device_id`)
+- IP: in config.yaml (`tuya.device_ip`)
+- Local Key: in config.yaml (`tuya.local_key`)
 - DPS: 1 (power), 101 (SA fan 1-8), 102 (EA fan 1-8)
 - Presets: QUIET (1/1), MEDIUM (3/2), TURBO (8/8)
 
 ### Qingping (Local MQTT)
-- MAC: `582D3470765F`
-- Broker: amqtt on Mac Mini (`192.168.5.140:1883`)
-- Topic (receive): `qingping/582D3470765F/up`
-- Topic (configure): `qingping/582D3470765F/down`
+- MAC: in config.yaml (`qingping.mac`)
+- Broker: amqtt on Mac Mini (configured in config.yaml)
+- Topic (receive): `qingping/<mac>/up`
+- Topic (configure): `qingping/<mac>/down`
 - Report interval: 30s (configurable in config.yaml, min 15s)
 - Sensors: CO2 (ppm), temp (°C), humidity (%), PM2.5, PM10, tVOC index (SGP40 0-500 scale), noise (dB)
 - All sensor data saved to database for historical analysis
@@ -401,8 +397,7 @@ curl -X POST http://localhost:9001/erv \
          │ Encrypted tunnel
          ▼
 ┌─────────────────────────────────┐
-│  Mac Mini (192.168.5.140)       │
-│  bakasura4.local                 │
+│  Mac Mini (bakasura4.local)     │
 │  orchestrator:8080 + amqtt:1883 │
 └─────────────────────────────────┘
          ▲
@@ -418,7 +413,7 @@ curl -X POST http://localhost:9001/erv \
 **Mac Mini Setup:**
 
 1. **✅ Set eero DHCP Reservation:**
-   - Mac Mini (bakasura4) reserved at `192.168.5.140`
+   - Mac Mini (bakasura4) should have a static DHCP reservation (configure IP in config.yaml)
 
 2. **✅ Install Python dependencies:**
    ```bash
@@ -440,7 +435,7 @@ curl -X POST http://localhost:9001/erv \
    ```
 
 4. **✅ Reconfigure Qingping to use Mac Mini IP:**
-   - Via Qingping developer portal: Set MQTT broker to `192.168.5.140:1883`
+   - Via Qingping developer portal: Set MQTT broker to `bakasura4.local:1883`
 
 5. **✅ Enable SSH:**
    ```bash
@@ -542,7 +537,7 @@ curl -X POST http://localhost:9001/erv \
    orchestrator:
      host: "0.0.0.0"
      port: 8080
-     auth_username: "rajesh"
+     auth_username: "admin"
      auth_password: "your_password"
    ```
 
@@ -563,9 +558,9 @@ curl -X POST http://localhost:9001/erv \
        <string>/Users/rajesh/Desktop/office-automate/occupancy_detector.py</string>
        <string>--watch</string>
        <string>--url</string>
-       <string>http://192.168.5.140:8080</string>
+       <string>http://bakasura4.local:8080</string>
        <string>--auth-username</string>
-       <string>rajesh</string>
+       <string>admin</string>
        <string>--auth-password</string>
        <string>your_password</string>
      </array>
@@ -583,14 +578,14 @@ curl -X POST http://localhost:9001/erv \
 ### Usage & Remote Access
 
 **Local Network Access:**
-- Dashboard: `http://192.168.5.140:8080`
+- Dashboard: `http://bakasura4.local:8080`
 - Direct access from any device on home network
 
 **Remote Access (via LocalTunnel):**
 - URL: `https://climate.loca.lt`
 - First access: Enter tunnel password (get from Mac Mini: `curl https://loca.lt/mytunnelpassword`)
 - After IP whitelisting: HTTP Basic Auth (username: `rajesh`, password in config.yaml)
-- **Note:** LocalTunnel subdomain is first-come-first-served. If lost, check logs: `ssh rajesh@192.168.5.140 "tail /tmp/localtunnel.log"`
+- **Note:** LocalTunnel subdomain is first-come-first-served. If lost, check logs: `ssh rajesh@bakasura4.local "tail /tmp/localtunnel.log"`
 
 **Install PWA on iPhone:**
 1. Visit `https://climate.loca.lt` in Safari
@@ -602,7 +597,7 @@ curl -X POST http://localhost:9001/erv \
 **Remote Management:**
 ```bash
 # SSH into Mac Mini
-ssh rajesh@192.168.5.140
+ssh rajesh@bakasura4.local
 
 # Check services status
 launchctl list | grep office-automate
@@ -617,9 +612,9 @@ launchctl unload ~/Library/LaunchAgents/com.office-automate.orchestrator.plist
 launchctl load ~/Library/LaunchAgents/com.office-automate.orchestrator.plist
 
 # Deploy code updates from work Mac
-scp ~/Desktop/office-automate/src/orchestrator.py rajesh@192.168.5.140:~/office-automate/src/
-ssh rajesh@192.168.5.140 "launchctl unload ~/Library/LaunchAgents/com.office-automate.orchestrator.plist && launchctl load ~/Library/LaunchAgents/com.office-automate.orchestrator.plist"
+scp ~/Desktop/office-automate/src/orchestrator.py rajesh@bakasura4.local:~/office-automate/src/
+ssh rajesh@bakasura4.local "launchctl unload ~/Library/LaunchAgents/com.office-automate.orchestrator.plist && launchctl load ~/Library/LaunchAgents/com.office-automate.orchestrator.plist"
 
 # Database queries
-ssh rajesh@192.168.5.140 "sqlite3 ~/office-automate/data/office_climate.db 'SELECT * FROM occupancy_log ORDER BY timestamp DESC LIMIT 10'"
+ssh rajesh@bakasura4.local "sqlite3 ~/office-automate/data/office_climate.db 'SELECT * FROM occupancy_log ORDER BY timestamp DESC LIMIT 10'"
 ```

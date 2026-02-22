@@ -45,3 +45,12 @@ client_secret.json
 # tinytuya generated files
 snapshot.json
 tinytuya.json
+
+# Private docs
+docs/tuya-local-key-private.md
+
+# Session logs / local-only docs
+roadmap.md
+
+# Claude settings (may contain local IPs)
+.claude/
