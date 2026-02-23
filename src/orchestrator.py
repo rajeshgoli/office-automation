@@ -110,6 +110,11 @@ class Orchestrator:
         self._tvoc_baseline: Optional[int] = None  # Learned baseline tVOC level
         self._tvoc_plateau_detected: bool = False
 
+        # AWAY stale-air periodic flush state
+        self._room_closed_since: Optional[datetime] = datetime.now()
+        self._away_stale_flush_active_until: Optional[datetime] = None
+        self._away_stale_flush_next_due_at: Optional[datetime] = None
+
         # OAuth service (if configured)
         self.oauth: Optional[OAuthService] = None
         if config.orchestrator.google_oauth:
@@ -187,12 +192,16 @@ class Orchestrator:
             logger.info(f"Door: {'OPEN' if is_open else 'CLOSED'}")
             self.db.log_device_event("door", "open" if is_open else "closed", device.name)
             await self.state_machine.update_door(is_open)
+            self._update_room_closed_tracking()
+            self._evaluate_erv_state()
 
         elif device.device_id == self._window_device_id:
             is_open = state == "open"
             logger.info(f"Window: {'OPEN' if is_open else 'CLOSED'}")
             self.db.log_device_event("window", "open" if is_open else "closed", device.name)
             await self.state_machine.update_window(is_open)
+            self._update_room_closed_tracking()
+            self._evaluate_erv_state()
 
         elif device.device_id == self._motion_device_id:
             detected = state == "alert"
@@ -264,6 +273,87 @@ class Orchestrator:
                 self._manual_hvac_mode = None
                 self._manual_hvac_setpoint_f = None
                 self._manual_hvac_override_at = None
+
+    def _room_is_closed(self) -> bool:
+        """True when both door and window are closed."""
+        return (not self.state_machine.sensors.door_open and
+                not self.state_machine.sensors.window_open)
+
+    def _update_room_closed_tracking(self, now: Optional[datetime] = None):
+        """Track continuous closed period and clear stale-flush timers on open events."""
+        now = now or datetime.now()
+        if self._room_is_closed():
+            if self._room_closed_since is None:
+                self._room_closed_since = now
+                logger.info("Room closed tracking started")
+            return
+
+        if self._room_closed_since is not None:
+            logger.info("Room opened, resetting stale-air flush schedule")
+        self._room_closed_since = None
+        self._away_stale_flush_active_until = None
+        self._away_stale_flush_next_due_at = None
+
+    def _stale_flush_speed(self) -> str:
+        """Configured stale flush speed with safe fallback."""
+        speed = self.config.thresholds.away_stale_flush_speed.lower()
+        if speed not in ("quiet", "medium", "turbo"):
+            logger.warning(
+                "Invalid away_stale_flush_speed '%s', defaulting to 'medium'",
+                self.config.thresholds.away_stale_flush_speed,
+            )
+            return "medium"
+        return speed
+
+    def _is_away_stale_flush_active(self, now: Optional[datetime] = None) -> bool:
+        """Update and return AWAY stale-air flush activity state."""
+        if not self.config.thresholds.away_stale_flush_enabled:
+            self._away_stale_flush_active_until = None
+            self._away_stale_flush_next_due_at = None
+            return False
+
+        if self.state_machine.state != OccupancyState.AWAY:
+            self._away_stale_flush_active_until = None
+            self._away_stale_flush_next_due_at = None
+            return False
+
+        now = now or datetime.now()
+
+        # Keep closed/open tracking current before making decisions.
+        self._update_room_closed_tracking(now)
+        if not self._room_is_closed():
+            return False
+
+        if self._room_closed_since is None:
+            self._room_closed_since = now
+
+        interval = timedelta(hours=max(1, self.config.thresholds.away_stale_flush_interval_hours))
+        duration = timedelta(minutes=max(1, self.config.thresholds.away_stale_flush_duration_minutes))
+
+        # Initialize schedule once we have a continuous closed timer.
+        if self._away_stale_flush_next_due_at is None:
+            first_due = self._room_closed_since + interval
+            self._away_stale_flush_next_due_at = now if now >= first_due else first_due
+
+        # End current stale-flush window when duration elapses.
+        if self._away_stale_flush_active_until and now >= self._away_stale_flush_active_until:
+            logger.info("AWAY stale-air flush completed")
+            self._away_stale_flush_active_until = None
+
+        # Start next stale flush when due. Next due is scheduled start-to-start.
+        if (self._away_stale_flush_active_until is None and
+                self._away_stale_flush_next_due_at is not None and
+                now >= self._away_stale_flush_next_due_at):
+            self._away_stale_flush_active_until = now + duration
+            self._away_stale_flush_next_due_at = now + interval
+            logger.info(
+                "AWAY stale-air flush started: %d minutes at %s (next in %d hours)",
+                self.config.thresholds.away_stale_flush_duration_minutes,
+                self._stale_flush_speed(),
+                self.config.thresholds.away_stale_flush_interval_hours,
+            )
+
+        return self._away_stale_flush_active_until is not None and now < self._away_stale_flush_active_until
 
     def _calculate_co2_rate_of_change(self) -> Optional[float]:
         """Calculate CO2 rate of change in ppm/min over the history window.
@@ -569,7 +659,11 @@ class Orchestrator:
         elif state == OccupancyState.AWAY:
             # AWAY mode: aggressive ventilation with adaptive speed control
             # Both CO2 > 500 and tVOC > 200 trigger ventilation
-            # Use the more aggressive speed between CO2 and tVOC needs
+            # Periodic stale-air flush also runs while continuously closed.
+            # Use the most aggressive speed among CO2, tVOC, and stale flush needs.
+
+            stale_flush_active = self._is_away_stale_flush_active(datetime.now())
+            stale_adaptive_speed = self._stale_flush_speed() if stale_flush_active else None
 
             # Get adaptive speeds for both CO2 and tVOC
             co2_adaptive_speed = None
@@ -595,9 +689,12 @@ class Orchestrator:
             speed_priority = {"turbo": 3, "medium": 2, "quiet": 1, "off": 0, None: -1}
             co2_priority = speed_priority.get(co2_adaptive_speed, -1)
             tvoc_priority = speed_priority.get(tvoc_adaptive_speed, -1)
+            stale_priority = speed_priority.get(stale_adaptive_speed, -1)
 
-            # If both are "off" or plateau, turn off
-            if co2_adaptive_speed == "off" and (tvoc_adaptive_speed == "off" or not self._tvoc_away_ventilation_active):
+            # If both are "off" or plateau and stale flush is not active, turn off
+            if (stale_priority < 0 and
+                    co2_adaptive_speed == "off" and
+                    (tvoc_adaptive_speed == "off" or not self._tvoc_away_ventilation_active)):
                 if self._erv_running:
                     reason = "co2_plateau" if self._plateau_detected else "targets_reached"
                     logger.info(f"ACTION: ERV OFF ({reason}: CO2={co2}ppm, tVOC={tvoc})")
@@ -605,32 +702,44 @@ class Orchestrator:
                     self._erv_running = False
                     self._erv_speed = "off"
                     self.db.log_climate_action("erv", "off", co2_ppm=co2, reason=reason)
-            elif co2_priority >= 0 or tvoc_priority >= 0:
+            elif co2_priority >= 0 or tvoc_priority >= 0 or stale_priority >= 0:
                 # Pick the more aggressive speed
-                if co2_priority >= tvoc_priority:
-                    target_speed = co2_adaptive_speed
+                candidates = [
+                    ("co2", co2_adaptive_speed, co2_priority, 3),
+                    ("tvoc", tvoc_adaptive_speed, tvoc_priority, 2),
+                    ("stale", stale_adaptive_speed, stale_priority, 1),
+                ]
+                source, target_speed, _, _ = max(candidates, key=lambda item: (item[2], item[3]))
+
+                if source == "co2":
                     trigger = f"CO2={co2}ppm"
-                else:
-                    target_speed = tvoc_adaptive_speed
+                    reason = f"away_adaptive_{target_speed}_{trigger}"
+                elif source == "tvoc":
                     trigger = f"tVOC={tvoc}"
+                    reason = f"away_adaptive_{target_speed}_{trigger}"
+                else:
+                    trigger = "stale_air_periodic_flush"
+                    reason = f"away_stale_flush_{target_speed}"
 
                 if target_speed and target_speed != "off":
                     speed_map = {"quiet": FanSpeed.QUIET, "medium": FanSpeed.MEDIUM, "turbo": FanSpeed.TURBO}
                     fan_speed = speed_map[target_speed]
 
                     if not self._erv_running or self._erv_speed != target_speed:
-                        co2_rate = self._calculate_co2_rate_of_change()
-                        tvoc_rate = self._calculate_tvoc_rate_of_change()
-                        rate_str = f"CO2:{co2_rate:.2f}/min" if co2_rate else ""
-                        if tvoc_rate:
-                            rate_str += f" tVOC:{tvoc_rate:.2f}/min" if rate_str else f"tVOC:{tvoc_rate:.2f}/min"
-                        logger.info(f"ACTION: ERV {target_speed.upper()} (away, adaptive: {trigger}, {rate_str})")
+                        if source == "stale":
+                            logger.info(f"ACTION: ERV {target_speed.upper()} (away, stale-air periodic flush)")
+                        else:
+                            co2_rate = self._calculate_co2_rate_of_change()
+                            tvoc_rate = self._calculate_tvoc_rate_of_change()
+                            rate_str = f"CO2:{co2_rate:.2f}/min" if co2_rate else ""
+                            if tvoc_rate:
+                                rate_str += f" tVOC:{tvoc_rate:.2f}/min" if rate_str else f"tVOC:{tvoc_rate:.2f}/min"
+                            logger.info(f"ACTION: ERV {target_speed.upper()} (away, adaptive: {trigger}, {rate_str})")
                         self.erv.turn_on(fan_speed)
                         self._erv_running = True
                         self._erv_speed = target_speed
-                        self.db.log_climate_action("erv", target_speed, co2_ppm=co2,
-                                                   reason=f"away_adaptive_{target_speed}_{trigger}")
-            elif not co2_needs_refresh and not self._tvoc_away_ventilation_active:
+                        self.db.log_climate_action("erv", target_speed, co2_ppm=co2, reason=reason)
+            elif not co2_needs_refresh and not self._tvoc_away_ventilation_active and stale_priority < 0:
                 # Nothing needs ventilation
                 if self._erv_running:
                     logger.info(f"ACTION: ERV OFF (air quality OK: CO2={co2}ppm, tVOC={tvoc})")
@@ -920,6 +1029,7 @@ class Orchestrator:
     def _on_state_change(self, old_state: OccupancyState, new_state: OccupancyState):
         """Handle occupancy state changes."""
         logger.info(f"=== STATE CHANGE: {old_state.value} → {new_state.value} ===")
+        now = datetime.now()
 
         # Clear manual overrides - automation takes over on state change
         self._clear_manual_overrides(f"{old_state.value}→{new_state.value}")
@@ -934,12 +1044,21 @@ class Orchestrator:
             logger.info("Clearing CO2/tVOC history for fresh adaptive calculation")
             self._co2_history.clear()
             self._tvoc_away_history.clear()
-            self._away_start_time = datetime.now()
+            self._away_start_time = now
+            self._away_stale_flush_active_until = None
+            self._away_stale_flush_next_due_at = None
+            self._update_room_closed_tracking(now)
+            if self.config.thresholds.away_stale_flush_enabled and self._room_closed_since:
+                interval = timedelta(hours=max(1, self.config.thresholds.away_stale_flush_interval_hours))
+                first_due = self._room_closed_since + interval
+                self._away_stale_flush_next_due_at = now if now >= first_due else first_due
             logger.info(f"TURBO mode for {self.config.thresholds.co2_turbo_duration_minutes} min, then adaptive")
 
         # Clear AWAY mode state on arrival
         if new_state == OccupancyState.PRESENT:
             self._away_start_time = None
+            self._away_stale_flush_active_until = None
+            self._away_stale_flush_next_due_at = None
             if self._tvoc_away_ventilation_active:
                 logger.info("Clearing tVOC AWAY ventilation state: user returned")
                 self._tvoc_away_ventilation_active = False
@@ -1257,6 +1376,23 @@ class Orchestrator:
             "speed": self._erv_speed,
             "tvoc_plateau": self._tvoc_plateau_detected,
             "tvoc_baseline": self._tvoc_baseline,
+            "away_stale_flush_enabled": self.config.thresholds.away_stale_flush_enabled,
+            "away_stale_flush_active": (
+                self._away_stale_flush_active_until is not None and
+                datetime.now() < self._away_stale_flush_active_until
+            ),
+            "away_stale_flush_active_until": (
+                self._away_stale_flush_active_until.isoformat()
+                if self._away_stale_flush_active_until else None
+            ),
+            "away_stale_flush_next_due_at": (
+                self._away_stale_flush_next_due_at.isoformat()
+                if self._away_stale_flush_next_due_at else None
+            ),
+            "room_closed_since": (
+                self._room_closed_since.isoformat()
+                if self._room_closed_since else None
+            ),
         }
 
         # Add HVAC status

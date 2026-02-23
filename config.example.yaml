@@ -41,6 +41,10 @@ thresholds:
   hvac_heat_on_temp_f: 71      # Turn heat back on at/below this temp (hysteresis)
   motion_timeout_seconds: 60   # Time before motion absence triggers away
   mac_poll_interval_seconds: 5 # How often to check Mac occupancy
+  away_stale_flush_enabled: true        # Periodic stale-air flush while away
+  away_stale_flush_interval_hours: 8    # Flush every 8 hours if room stays closed
+  away_stale_flush_duration_minutes: 30 # Run each stale flush for 30 minutes
+  away_stale_flush_speed: "medium"      # 3/2 airflow (quiet|medium|turbo)
 
 # Orchestrator network settings (for Mac occupancy detector to report to)
 orchestrator:
