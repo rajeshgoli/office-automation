@@ -111,7 +111,8 @@ class Orchestrator:
         self._tvoc_plateau_detected: bool = False
 
         # AWAY stale-air periodic flush state
-        self._room_closed_since: Optional[datetime] = datetime.now()
+        self._room_closed_since: Optional[datetime] = None
+        self._room_closed_state_known: bool = False
         self._away_stale_flush_active_until: Optional[datetime] = None
         self._away_stale_flush_next_due_at: Optional[datetime] = None
 
@@ -192,7 +193,7 @@ class Orchestrator:
             logger.info(f"Door: {'OPEN' if is_open else 'CLOSED'}")
             self.db.log_device_event("door", "open" if is_open else "closed", device.name)
             await self.state_machine.update_door(is_open)
-            self._update_room_closed_tracking()
+            self._update_room_closed_tracking(mark_state_known=True)
             self._evaluate_erv_state()
 
         elif device.device_id == self._window_device_id:
@@ -200,7 +201,7 @@ class Orchestrator:
             logger.info(f"Window: {'OPEN' if is_open else 'CLOSED'}")
             self.db.log_device_event("window", "open" if is_open else "closed", device.name)
             await self.state_machine.update_window(is_open)
-            self._update_room_closed_tracking()
+            self._update_room_closed_tracking(mark_state_known=True)
             self._evaluate_erv_state()
 
         elif device.device_id == self._motion_device_id:
@@ -276,12 +277,20 @@ class Orchestrator:
 
     def _room_is_closed(self) -> bool:
         """True when both door and window are closed."""
+        if not self._room_closed_state_known:
+            return False
         return (not self.state_machine.sensors.door_open and
                 not self.state_machine.sensors.window_open)
 
-    def _update_room_closed_tracking(self, now: Optional[datetime] = None):
+    def _update_room_closed_tracking(self, now: Optional[datetime] = None, mark_state_known: bool = False):
         """Track continuous closed period and clear stale-flush timers on open events."""
         now = now or datetime.now()
+        if mark_state_known:
+            self._room_closed_state_known = True
+
+        if not self._room_closed_state_known:
+            return
+
         if self._room_is_closed():
             if self._room_closed_since is None:
                 self._room_closed_since = now
@@ -668,9 +677,14 @@ class Orchestrator:
             # Get adaptive speeds for both CO2 and tVOC
             co2_adaptive_speed = None
             tvoc_adaptive_speed = None
+            co2_fallback_turbo = False
 
             if co2_needs_refresh:
                 co2_adaptive_speed = self._get_adaptive_erv_speed_for_away(co2)
+                # Preserve existing high-CO2 fallback behavior when adaptive speed is unavailable.
+                if co2_adaptive_speed is None:
+                    co2_adaptive_speed = "turbo"
+                    co2_fallback_turbo = True
 
             if tvoc_needs_clearing or self._tvoc_away_ventilation_active:
                 # Check if tVOC has reached target
@@ -713,7 +727,7 @@ class Orchestrator:
 
                 if source == "co2":
                     trigger = f"CO2={co2}ppm"
-                    reason = f"away_adaptive_{target_speed}_{trigger}"
+                    reason = f"away_refresh_{trigger}" if co2_fallback_turbo else f"away_adaptive_{target_speed}_{trigger}"
                 elif source == "tvoc":
                     trigger = f"tVOC={tvoc}"
                     reason = f"away_adaptive_{target_speed}_{trigger}"

@@ -143,6 +143,7 @@ def _build_orchestrator(thresholds: ThresholdsConfig) -> Orchestrator:
     orchestrator._manual_override_timeout = 30 * 60
 
     orchestrator._room_closed_since = datetime.now()
+    orchestrator._room_closed_state_known = True
     orchestrator._away_stale_flush_active_until = None
     orchestrator._away_stale_flush_next_due_at = None
 
@@ -208,6 +209,28 @@ def test_stale_flush_does_not_run_when_present():
     assert orchestrator._erv_speed == "off"
 
 
+def test_stale_flush_waits_for_known_room_state():
+    thresholds = ThresholdsConfig(
+        away_stale_flush_enabled=True,
+        away_stale_flush_interval_hours=8,
+        away_stale_flush_duration_minutes=30,
+        away_stale_flush_speed="medium",
+        tvoc_away_enabled=False,
+    )
+    orchestrator = _build_orchestrator(thresholds)
+    orchestrator.state_machine.state = OccupancyState.AWAY
+    orchestrator.qingping.latest_reading = _reading(co2_ppm=450, tvoc=20)
+    orchestrator._room_closed_state_known = False
+    orchestrator._room_closed_since = None
+    orchestrator._away_stale_flush_next_due_at = datetime.now() - timedelta(minutes=1)
+
+    orchestrator._evaluate_erv_state()
+
+    assert orchestrator._erv_running is False
+    assert orchestrator._erv_speed == "off"
+    assert orchestrator._room_closed_since is None
+
+
 def test_stale_flush_schedule_resets_when_room_opens():
     thresholds = ThresholdsConfig(away_stale_flush_enabled=True)
     orchestrator = _build_orchestrator(thresholds)
@@ -217,7 +240,7 @@ def test_stale_flush_schedule_resets_when_room_opens():
     orchestrator._away_stale_flush_next_due_at = datetime.now() + timedelta(hours=8)
 
     orchestrator.state_machine.sensors.door_open = True
-    orchestrator._update_room_closed_tracking()
+    orchestrator._update_room_closed_tracking(mark_state_known=True)
 
     assert orchestrator._room_closed_since is None
     assert orchestrator._away_stale_flush_active_until is None
@@ -240,6 +263,32 @@ def test_stale_flush_never_overrides_more_aggressive_co2_speed():
     orchestrator._away_start_time = datetime.now()  # Forces CO2 turbo window.
     orchestrator._room_closed_since = datetime.now() - timedelta(hours=9)
     orchestrator._away_stale_flush_next_due_at = datetime.now() - timedelta(minutes=1)
+
+    orchestrator._evaluate_erv_state()
+
+    assert orchestrator._erv_running is True
+    assert orchestrator._erv_speed == "turbo"
+
+
+def test_co2_fallback_turbo_beats_stale_flush_when_adaptive_unavailable():
+    thresholds = ThresholdsConfig(
+        away_stale_flush_enabled=True,
+        away_stale_flush_interval_hours=8,
+        away_stale_flush_duration_minutes=30,
+        away_stale_flush_speed="medium",
+        tvoc_away_enabled=False,
+        co2_adaptive_speed_enabled=True,
+        co2_turbo_duration_minutes=0,
+    )
+    orchestrator = _build_orchestrator(thresholds)
+    orchestrator.state_machine.state = OccupancyState.AWAY
+    orchestrator.qingping.latest_reading = _reading(co2_ppm=1200, tvoc=20)
+    orchestrator._away_start_time = None  # No forced turbo duration.
+
+    # Stale flush active and would otherwise choose MEDIUM.
+    orchestrator._room_closed_since = datetime.now() - timedelta(hours=9)
+    orchestrator._away_stale_flush_next_due_at = datetime.now() - timedelta(minutes=1)
+    orchestrator._co2_history.clear()  # Adaptive speed unavailable -> fallback path.
 
     orchestrator._evaluate_erv_state()
 
