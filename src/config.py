@@ -108,6 +108,12 @@ class ThresholdsConfig:
     tvoc_rate_medium_threshold: float = 1.5  # 1.5-5 points/min → MEDIUM
     tvoc_rate_quiet_threshold: float = 0.3   # 0.3-1.5 points/min → QUIET
 
+    # AWAY stale-air periodic flush
+    away_stale_flush_enabled: bool = True
+    away_stale_flush_interval_hours: int = 8     # Trigger every N continuous closed hours while AWAY
+    away_stale_flush_duration_minutes: int = 30  # Flush duration each cycle
+    away_stale_flush_speed: str = "medium"       # quiet, medium (3/2), turbo
+
 
 @dataclass
 class GoogleOAuthConfig:
