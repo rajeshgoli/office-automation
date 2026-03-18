@@ -219,7 +219,7 @@ export async function setERVSpeed(speed: ERVSpeed): Promise<{ ok: boolean; error
   return response.json();
 }
 
-export type HVACMode = 'off' | 'heat';
+export type HVACMode = 'off' | 'heat' | 'cool';
 
 /**
  * Set HVAC mode manually

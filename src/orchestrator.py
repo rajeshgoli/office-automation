@@ -17,7 +17,7 @@ import ipaddress
 import secrets
 from collections import deque
 from pathlib import Path
-from typing import Optional, Set, Dict
+from typing import Optional, Set, Dict, Callable, Awaitable
 
 from aiohttp import web, WSMsgType
 
@@ -28,7 +28,7 @@ from .state_machine import StateMachine, StateConfig, OccupancyState
 from .qingping_client import QingpingMQTTClient, QingpingReading
 from .erv_client import ERVClient, FanSpeed
 from .kumo_client import KumoClient, OperationMode as HVACMode
-from .hvac_hysteresis import get_heat_band_action
+from .hvac_hysteresis import get_hvac_band_action
 from .database import Database
 from .oauth_service import OAuthService, UserSession
 
@@ -143,25 +143,55 @@ class Orchestrator:
         # HVAC state tracking
         self._hvac_mode: str = "off"  # heat, cool, off, auto
         self._hvac_setpoint_c: float = 22.0  # Celsius
+        self._hvac_heat_setpoint_c: float = 22.0  # Celsius
+        self._hvac_cool_setpoint_c: float = (config.thresholds.hvac_cool_setpoint_f - 32) * 5 / 9
         self._hvac_suspended: bool = False  # True when we turned off HVAC due to ERV running
         self._hvac_last_mode: str = "heat"  # Mode before we suspended it
-        self._hvac_temp_band_paused: bool = False  # True when heat was paused by 75/71 comfort band
+        self._hvac_temp_band_paused: bool = False  # True when HVAC was paused by a temp comfort band
+        self._hvac_temp_band_mode: Optional[str] = None  # Mode paused by temp band: heat or cool
 
         # Manual override tracking
         self._manual_erv_override: bool = False
         self._manual_erv_speed: Optional[str] = None  # "off", "quiet", "medium", "turbo"
         self._manual_erv_override_at: Optional[datetime] = None
         self._manual_hvac_override: bool = False
-        self._manual_hvac_mode: Optional[str] = None  # "off", "heat"
+        self._manual_hvac_mode: Optional[str] = None  # "off", "heat", "cool"
         self._manual_hvac_setpoint_f: Optional[float] = None
         self._manual_hvac_override_at: Optional[datetime] = None
         self._manual_override_timeout: int = 30 * 60  # 30 minutes default
 
         # Background task for HVAC polling
         self._hvac_poll_task: Optional[asyncio.Task] = None
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Database for persistence and analysis
         self.db = Database()
+
+    def _schedule_task(self, task_factory: Callable[[], Awaitable[None]], *, context: str) -> None:
+        """Schedule async work on the orchestrator loop, even from callback threads."""
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        target_loop = self._main_loop or current_loop
+        if not target_loop:
+            logger.debug(f"Skipping task schedule ({context}): no event loop available")
+            return
+
+        def create_task():
+            try:
+                target_loop.create_task(task_factory())
+            except Exception as e:
+                logger.error(f"Failed to create task ({context}): {e}")
+
+        try:
+            if current_loop is target_loop:
+                create_task()
+            else:
+                target_loop.call_soon_threadsafe(create_task)
+        except Exception as e:
+            logger.error(f"Failed to schedule task ({context}): {e}")
 
     def _setup_yolink_handlers(self):
         """Map YoLink devices to state machine inputs."""
@@ -250,10 +280,7 @@ class Orchestrator:
         self._evaluate_erv_state()
 
         # Broadcast to WebSocket clients (schedule async call)
-        try:
-            asyncio.get_event_loop().create_task(self._broadcast_status())
-        except RuntimeError:
-            pass  # No event loop running
+        self._schedule_task(self._broadcast_status, context="qingping_broadcast_status")
 
     def _check_manual_override_expiry(self):
         """Check if manual overrides have expired and clear them."""
@@ -772,10 +799,7 @@ class Orchestrator:
                     self.db.log_climate_action("erv", "turbo", co2_ppm=co2, reason=f"away_refresh_{trigger}")
 
         # After ERV state changes, evaluate HVAC coordination
-        try:
-            asyncio.get_event_loop().create_task(self._evaluate_hvac_state())
-        except RuntimeError:
-            pass  # No event loop running
+        self._schedule_task(self._evaluate_hvac_state, context="erv_hvac_coordination")
 
     def _is_within_occupancy_hours(self) -> bool:
         """Check if current time is within expected occupancy hours."""
@@ -795,6 +819,49 @@ class Orchestrator:
             return reading.temp_c * 9 / 5 + 32
         return None
 
+    def _get_target_setpoint_c(self, mode: str) -> float:
+        """Return the configured/tracked setpoint for a given HVAC mode."""
+        if mode == "cool":
+            return self._hvac_cool_setpoint_c
+        return self._hvac_heat_setpoint_c
+
+    async def _apply_hvac_mode(self, mode: str, reason: str) -> None:
+        """Apply an HVAC mode using the tracked per-mode setpoints."""
+        if mode == "heat":
+            target = self._hvac_heat_setpoint_c
+            await self.kumo.set_heat(target)
+            self._hvac_setpoint_c = target
+        elif mode == "cool":
+            target = self._hvac_cool_setpoint_c
+            await self.kumo.set_cool(target)
+            self._hvac_setpoint_c = target
+        elif mode == "auto":
+            await self.kumo.set_auto(self._hvac_heat_setpoint_c, self._hvac_cool_setpoint_c)
+            target = self._hvac_setpoint_c
+        else:
+            raise ValueError(f"Unsupported HVAC mode: {mode}")
+
+        self._hvac_mode = mode
+        self._hvac_last_mode = mode
+        self.db.log_climate_action("hvac", mode, setpoint=target, reason=reason)
+
+    def _should_restore_hvac_mode(
+        self,
+        mode: str,
+        temp_f: Optional[float],
+        *,
+        heat_off_temp_f: float,
+        cool_off_temp_f: float,
+    ) -> bool:
+        """Check whether a suspended HVAC mode still needs to be restored."""
+        if temp_f is None:
+            return True
+        if mode == "heat":
+            return temp_f < heat_off_temp_f
+        if mode == "cool":
+            return temp_f > cool_off_temp_f
+        return True
+
     async def _evaluate_hvac_state(self):
         """Evaluate HVAC state based on ERV coordination rules.
 
@@ -807,72 +874,115 @@ class Orchestrator:
         if not self.kumo:
             return  # No HVAC control available
 
+        self._check_manual_override_expiry()
+        if self._manual_hvac_override:
+            return
+
         state = self.state_machine.state
         temp_f = self._get_temp_f()
         min_temp = self.config.thresholds.hvac_min_temp_f
         critical_temp = self.config.thresholds.hvac_critical_temp_f
         heat_off_temp = self.config.thresholds.hvac_heat_off_temp_f
         heat_on_temp = self.config.thresholds.hvac_heat_on_temp_f
+        cool_on_temp = self.config.thresholds.hvac_cool_on_temp_f
+        cool_off_temp = self.config.thresholds.hvac_cool_off_temp_f
         within_occupancy_hours = self._is_within_occupancy_hours()
+        safety_interlock_active = self.state_machine.safety_interlock_active
 
-        heat_band_action = get_heat_band_action(
+        hvac_band_action = get_hvac_band_action(
             temp_f=temp_f,
             hvac_mode=self._hvac_mode,
-            temp_band_paused=self._hvac_temp_band_paused,
+            temp_band_mode=self._hvac_temp_band_mode,
             state=state,
             erv_running=self._erv_running,
             min_temp_f=min_temp,
             within_occupancy_hours=within_occupancy_hours,
             heat_off_temp_f=heat_off_temp,
             heat_on_temp_f=heat_on_temp,
+            cool_on_temp_f=cool_on_temp,
+            cool_off_temp_f=cool_off_temp,
         )
 
-        # Temperature comfort-band hysteresis from Qingping readings:
-        # pause heat at upper bound, resume at lower bound.
-        if heat_band_action == "pause":
-            logger.info(f"ACTION: HVAC OFF (temp band: {temp_f:.1f}°F >= {heat_off_temp}°F)")
+        if safety_interlock_active:
+            try:
+                status = await self.kumo.get_full_status()
+                if status:
+                    device_power = status.get("power", 0)
+                    device_mode = status.get("operationMode", "off") if device_power == 1 else "off"
+                    if device_mode in ("heat", "cool", "auto"):
+                        logger.info("ACTION: HVAC OFF (safety interlock: door/window open)")
+                        self._hvac_last_mode = device_mode
+                        await self.kumo.turn_off()
+                        self._hvac_mode = "off"
+                        self._hvac_suspended = True
+                        self.db.log_climate_action("hvac", "off", reason="safety_interlock")
+            except Exception as e:
+                logger.error(f"Failed to apply HVAC safety interlock: {e}")
+            return
+
+        # Temperature comfort-band hysteresis from Qingping readings.
+        if hvac_band_action == "pause_heat":
+            logger.info(f"ACTION: HVAC OFF (heat band: {temp_f:.1f}°F >= {heat_off_temp}°F)")
             try:
                 await self.kumo.turn_off()
                 self._hvac_mode = "off"
                 self._hvac_temp_band_paused = True
+                self._hvac_temp_band_mode = "heat"
                 self.db.log_climate_action(
-                    "hvac", "off", reason=f"temp_band_pause_{temp_f:.0f}F"
+                    "hvac", "off", reason=f"heat_band_pause_{temp_f:.0f}F"
                 )
             except Exception as e:
-                logger.error(f"Failed to pause HVAC for temp band: {e}")
+                logger.error(f"Failed to pause HVAC for heat band: {e}")
             return
 
-        if heat_band_action == "resume":
+        if hvac_band_action == "resume_heat":
             logger.info(f"ACTION: HVAC HEAT (temp band: {temp_f:.1f}°F <= {heat_on_temp}°F)")
             try:
-                await self.kumo.set_heat(self._hvac_setpoint_c)
-                self._hvac_mode = "heat"
-                self._hvac_last_mode = "heat"
+                await self._apply_hvac_mode("heat", reason=f"heat_band_resume_{temp_f:.0f}F")
                 self._hvac_temp_band_paused = False
+                self._hvac_temp_band_mode = None
+            except Exception as e:
+                logger.error(f"Failed to resume HVAC for heat band: {e}")
+            return
+
+        if hvac_band_action == "stop_cool":
+            logger.info(f"ACTION: HVAC OFF (cool band: {temp_f:.1f}°F <= {cool_off_temp}°F)")
+            try:
+                await self.kumo.turn_off()
+                self._hvac_mode = "off"
+                self._hvac_temp_band_paused = True
+                self._hvac_temp_band_mode = "cool"
                 self.db.log_climate_action(
-                    "hvac", "heat",
-                    setpoint=self._hvac_setpoint_c,
-                    reason=f"temp_band_resume_{temp_f:.0f}F"
+                    "hvac", "off", reason=f"cool_band_stop_{temp_f:.0f}F"
                 )
             except Exception as e:
-                logger.error(f"Failed to resume HVAC for temp band: {e}")
+                logger.error(f"Failed to stop HVAC for cool band: {e}")
+            return
+
+        if hvac_band_action == "start_cool":
+            logger.info(f"ACTION: HVAC COOL (temp band: {temp_f:.1f}°F > {cool_on_temp}°F)")
+            try:
+                await self._apply_hvac_mode("cool", reason=f"cool_band_start_{temp_f:.0f}F")
+                self._hvac_temp_band_paused = False
+                self._hvac_temp_band_mode = None
+            except Exception as e:
+                logger.error(f"Failed to start HVAC cooling: {e}")
             return
 
         # PRESENT mode: restore HVAC if we suspended it (and it was actually running)
         if state == OccupancyState.PRESENT:
             if self._hvac_suspended and self._hvac_last_mode in ("heat", "cool", "auto"):
-                logger.info(f"ACTION: HVAC RESTORE (returned to present, was {self._hvac_last_mode})")
-                try:
-                    if self._hvac_last_mode == "heat":
-                        await self.kumo.set_heat(self._hvac_setpoint_c)
-                    elif self._hvac_last_mode == "cool":
-                        await self.kumo.set_cool(self._hvac_setpoint_c)
-                    self._hvac_mode = self._hvac_last_mode
-                    self.db.log_climate_action("hvac", self._hvac_last_mode,
-                                               setpoint=self._hvac_setpoint_c,
-                                               reason="present_restore")
-                except Exception as e:
-                    logger.error(f"Failed to restore HVAC: {e}")
+                if self._should_restore_hvac_mode(
+                    self._hvac_last_mode,
+                    temp_f,
+                    heat_off_temp_f=heat_off_temp,
+                    cool_off_temp_f=cool_off_temp,
+                ):
+                    logger.info(f"ACTION: HVAC RESTORE (returned to present, was {self._hvac_last_mode})")
+                    try:
+                        await self._apply_hvac_mode(self._hvac_last_mode, reason="present_restore")
+                    except Exception as e:
+                        logger.error(f"Failed to restore HVAC: {e}")
             self._hvac_suspended = False  # Clear flag regardless
             return
 
@@ -883,13 +993,10 @@ class Orchestrator:
                 if self._hvac_suspended or self._hvac_mode == "off":
                     logger.info(f"ACTION: HVAC HEAT (critical temp: {temp_f:.1f}°F < {critical_temp}°F)")
                     try:
-                        await self.kumo.set_heat(self._hvac_setpoint_c)
-                        self._hvac_mode = "heat"
+                        await self._apply_hvac_mode("heat", reason=f"critical_temp_{temp_f:.0f}F")
                         self._hvac_suspended = False
                         self._hvac_temp_band_paused = False
-                        self.db.log_climate_action("hvac", "heat",
-                                                   setpoint=self._hvac_setpoint_c,
-                                                   reason=f"critical_temp_{temp_f:.0f}F")
+                        self._hvac_temp_band_mode = None
                     except Exception as e:
                         logger.error(f"Failed to turn on HVAC: {e}")
                 return
@@ -903,8 +1010,15 @@ class Orchestrator:
                         if status:
                             device_power = status.get("power", 0)
                             device_mode = status.get("operationMode", "off") if device_power == 1 else "off"
+                            device_sp_heat = status.get("spHeat")
+                            device_sp_cool = status.get("spCool")
 
-                            # Only suspend and remember state if heater is actually ON
+                            if device_sp_heat is not None:
+                                self._hvac_heat_setpoint_c = device_sp_heat
+                            if device_sp_cool is not None:
+                                self._hvac_cool_setpoint_c = device_sp_cool
+
+                            # Only suspend and remember state if HVAC is actually ON
                             if device_mode in ("heat", "cool", "auto"):
                                 logger.info(f"ACTION: HVAC SUSPEND (ERV running, temp {temp_f:.1f}°F > {min_temp}°F, was {device_mode})")
                                 self._hvac_last_mode = device_mode  # Save actual state
@@ -922,18 +1036,20 @@ class Orchestrator:
 
             # ERV stopped + we suspended HVAC + within occupancy hours = restore
             if not self._erv_running and self._hvac_suspended:
-                if within_occupancy_hours and self._hvac_last_mode in ("heat", "cool", "auto"):
+                if (
+                    within_occupancy_hours and
+                    self._hvac_last_mode in ("heat", "cool", "auto") and
+                    self._should_restore_hvac_mode(
+                        self._hvac_last_mode,
+                        temp_f,
+                        heat_off_temp_f=heat_off_temp,
+                        cool_off_temp_f=cool_off_temp,
+                    )
+                ):
                     logger.info(f"ACTION: HVAC RESTORE (ERV stopped, within occupancy hours)")
                     try:
-                        if self._hvac_last_mode == "heat":
-                            await self.kumo.set_heat(self._hvac_setpoint_c)
-                        elif self._hvac_last_mode == "cool":
-                            await self.kumo.set_cool(self._hvac_setpoint_c)
-                        self._hvac_mode = self._hvac_last_mode
+                        await self._apply_hvac_mode(self._hvac_last_mode, reason="erv_stopped_occupancy_hours")
                         self._hvac_suspended = False
-                        self.db.log_climate_action("hvac", self._hvac_last_mode,
-                                                   setpoint=self._hvac_setpoint_c,
-                                                   reason="erv_stopped_occupancy_hours")
                     except Exception as e:
                         logger.error(f"Failed to restore HVAC: {e}")
                 else:
@@ -988,6 +1104,11 @@ class Orchestrator:
                 device_sp_heat = status.get("spHeat")
                 device_sp_cool = status.get("spCool")
 
+                if device_sp_heat is not None:
+                    self._hvac_heat_setpoint_c = device_sp_heat
+                if device_sp_cool is not None:
+                    self._hvac_cool_setpoint_c = device_sp_cool
+
                 # Determine the active setpoint based on mode
                 if device_mode == "heat" and device_sp_heat:
                     device_setpoint_c = device_sp_heat
@@ -1023,6 +1144,7 @@ class Orchestrator:
                     if self._hvac_temp_band_paused and device_mode != "off":
                         logger.info("Clearing HVAC temp-band pause (device is on)")
                         self._hvac_temp_band_paused = False
+                        self._hvac_temp_band_mode = None
 
                     # If we thought HVAC was suspended but it's actually on,
                     # clear the suspended flag
@@ -1095,16 +1217,10 @@ class Orchestrator:
         self._evaluate_erv_state()
 
         # Evaluate HVAC coordination
-        try:
-            asyncio.get_event_loop().create_task(self._evaluate_hvac_state())
-        except RuntimeError:
-            pass
+        self._schedule_task(self._evaluate_hvac_state, context="state_change_hvac_eval")
 
         # Broadcast to WebSocket clients (schedule async call)
-        try:
-            asyncio.get_event_loop().create_task(self._broadcast_status())
-        except RuntimeError:
-            pass  # No event loop running
+        self._schedule_task(self._broadcast_status, context="state_change_broadcast_status")
 
     async def update_mac_occupancy(self, last_active_timestamp: float, external_monitor: bool):
         """Update from macOS occupancy detector."""
@@ -1199,16 +1315,16 @@ class Orchestrator:
     async def _handle_hvac_post(self, request: web.Request) -> web.Response:
         """Handle POST /hvac for manual HVAC control.
 
-        Body: {"mode": "off|heat", "setpoint_f": 70}
+        Body: {"mode": "off|heat|cool", "setpoint_f": 70}
         """
         try:
             data = await request.json()
             mode = data.get("mode", "").lower()
             setpoint_f = data.get("setpoint_f", 70)
 
-            if mode not in ("off", "heat"):
+            if mode not in ("off", "heat", "cool"):
                 return web.json_response(
-                    {"ok": False, "error": f"Invalid mode: {mode}. Must be off|heat"},
+                    {"ok": False, "error": f"Invalid mode: {mode}. Must be off|heat|cool"},
                     status=400
                 )
 
@@ -1231,16 +1347,26 @@ class Orchestrator:
             self._hvac_suspended = False
             self._hvac_last_mode = None
             self._hvac_temp_band_paused = False
+            self._hvac_temp_band_mode = None
 
             # Apply the change
             if mode == "off":
                 logger.info("MANUAL: HVAC OFF")
                 await self.kumo.turn_off()
                 self._hvac_mode = "off"
-            else:
+            elif mode == "heat":
                 logger.info(f"MANUAL: HVAC HEAT {setpoint_f}°F ({setpoint_c:.1f}°C)")
                 await self.kumo.set_heat(setpoint_c)
                 self._hvac_mode = "heat"
+                self._hvac_last_mode = "heat"
+                self._hvac_heat_setpoint_c = setpoint_c
+                self._hvac_setpoint_c = setpoint_c
+            else:
+                logger.info(f"MANUAL: HVAC COOL {setpoint_f}°F ({setpoint_c:.1f}°C)")
+                await self.kumo.set_cool(setpoint_c)
+                self._hvac_mode = "cool"
+                self._hvac_last_mode = "cool"
+                self._hvac_cool_setpoint_c = setpoint_c
                 self._hvac_setpoint_c = setpoint_c
 
             # Log to database
@@ -1861,6 +1987,7 @@ class Orchestrator:
     async def start(self):
         """Start the orchestrator."""
         logger.info("Starting Office Climate Automation...")
+        self._main_loop = asyncio.get_running_loop()
 
         # Register state change handler
         self.state_machine.on_state_change(self._on_state_change)
@@ -1887,11 +2014,17 @@ class Orchestrator:
                     mode = status.get("operationMode", "off") if power == 1 else "off"
                     self._hvac_mode = mode
                     self._hvac_last_mode = mode if mode != "off" else "heat"
+                    device_sp_heat = status.get("spHeat")
+                    device_sp_cool = status.get("spCool")
+                    if device_sp_heat is not None:
+                        self._hvac_heat_setpoint_c = device_sp_heat
+                    if device_sp_cool is not None:
+                        self._hvac_cool_setpoint_c = device_sp_cool
                     # Get setpoint based on mode
                     if mode == "heat":
-                        self._hvac_setpoint_c = status.get("spHeat", 22.0)
+                        self._hvac_setpoint_c = self._hvac_heat_setpoint_c
                     elif mode == "cool":
-                        self._hvac_setpoint_c = status.get("spCool", 24.0)
+                        self._hvac_setpoint_c = self._hvac_cool_setpoint_c
                     logger.info(f"Kumo connected. Mode: {mode}, Setpoint: {self._hvac_setpoint_c}°C")
             except Exception as e:
                 logger.error(f"Kumo connection failed: {e}")

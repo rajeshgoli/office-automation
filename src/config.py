@@ -68,6 +68,9 @@ class ThresholdsConfig:
     hvac_critical_temp_f: int = 55  # Always heat below this (pipe freeze protection)
     hvac_heat_off_temp_f: int = 75  # Turn heat off when temp reaches this
     hvac_heat_on_temp_f: int = 71  # Turn heat back on when temp drops to this
+    hvac_cool_on_temp_f: int = 81  # Start cooling when temp rises above this
+    hvac_cool_off_temp_f: int = 78  # Stop cooling when temp falls to/below this
+    hvac_cool_setpoint_f: int = 78  # Cooling target setpoint when automation starts cooling
     expected_occupancy_start: str = "07:00"  # When to allow pre-conditioning
     expected_occupancy_end: str = "22:00"  # After this, no heating unless critical
     motion_timeout_seconds: int = 60
