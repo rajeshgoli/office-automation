@@ -141,6 +141,7 @@ def _build_orchestrator(thresholds: ThresholdsConfig) -> Orchestrator:
     orchestrator._manual_hvac_setpoint_f = None
     orchestrator._manual_hvac_override_at = None
     orchestrator._manual_override_timeout = 30 * 60
+    orchestrator._main_loop = None
 
     orchestrator._room_closed_since = datetime.now()
     orchestrator._room_closed_state_known = True

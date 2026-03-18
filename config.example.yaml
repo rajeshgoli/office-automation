@@ -39,6 +39,9 @@ thresholds:
   co2_refresh_target_ppm: 500  # Target for away-mode ventilation
   hvac_heat_off_temp_f: 75     # Turn heat off at/above this Qingping temp
   hvac_heat_on_temp_f: 71      # Turn heat back on at/below this temp (hysteresis)
+  hvac_cool_on_temp_f: 81      # Start cooling above this Qingping temp
+  hvac_cool_off_temp_f: 78     # Stop cooling at/below this temp (hysteresis)
+  hvac_cool_setpoint_f: 78     # Cooling target when automation starts cooling
   motion_timeout_seconds: 60   # Time before motion absence triggers away
   mac_poll_interval_seconds: 5 # How often to check Mac occupancy
   away_stale_flush_enabled: true        # Periodic stale-air flush while away

@@ -316,7 +316,8 @@ const App: React.FC = () => {
       if (!result.ok) {
         console.error('HVAC control failed:', result.error);
       } else {
-        addEvent('hvac', `Manual: HVAC ${mode === 'off' ? 'OFF' : `HEAT ${setpoint_f}°F`}`);
+        const label = mode === 'off' ? 'OFF' : `${mode.toUpperCase()} ${setpoint_f}°F`;
+        addEvent('hvac', `Manual: HVAC ${label}`);
       }
     } catch (e) {
       console.error('HVAC control error:', e);
@@ -554,14 +555,14 @@ const App: React.FC = () => {
           {/* HVAC Controls */}
           <div className="space-y-3">
             <div className="flex items-center justify-between">
-              <span className="text-sm font-bold text-zinc-400 uppercase tracking-wide">🔥 Heating</span>
+              <span className="text-sm font-bold text-zinc-400 uppercase tracking-wide">🔥 HVAC</span>
               {manualOverride?.hvac && manualOverride.hvac_expires_in && (
                 <span className="text-[10px] text-zinc-500">
                   Expires in {Math.round(manualOverride.hvac_expires_in / 60)}m
                 </span>
               )}
             </div>
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid grid-cols-3 gap-2">
               <button
                 onClick={() => handleHVACControl('off')}
                 disabled={controlLoading !== null}
@@ -574,7 +575,7 @@ const App: React.FC = () => {
                   disabled:opacity-50 disabled:cursor-not-allowed
                 `}
               >
-                {controlLoading === 'hvac-off' ? '...' : 'Heat Off'}
+                {controlLoading === 'hvac-off' ? '...' : 'Off'}
               </button>
               <button
                 onClick={() => handleHVACControl('heat', 70)}
@@ -589,6 +590,20 @@ const App: React.FC = () => {
                 `}
               >
                 {controlLoading === 'hvac-heat' ? '...' : 'Heat 70°F'}
+              </button>
+              <button
+                onClick={() => handleHVACControl('cool', 78)}
+                disabled={controlLoading !== null}
+                className={`px-3 py-2 text-xs font-bold uppercase rounded-lg transition-all
+                  ${manualOverride?.hvac && manualOverride.hvac_mode === 'cool'
+                    ? 'bg-amber-500 text-black ring-2 ring-amber-400'
+                    : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200'
+                  }
+                  ${controlLoading === 'hvac-cool' ? 'opacity-50 cursor-wait' : ''}
+                  disabled:opacity-50 disabled:cursor-not-allowed
+                `}
+              >
+                {controlLoading === 'hvac-cool' ? '...' : 'Cool 78°F'}
               </button>
             </div>
           </div>
