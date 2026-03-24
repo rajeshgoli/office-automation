@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Leaf shape -->
+    <path
+        android:fillColor="#34D399"
+        android:pathData="M54,32 C54,32 72,38 76,54 C80,70 68,78 54,78 C40,78 32,66 36,52 C40,38 54,32 54,32Z"/>
+    <!-- Leaf vein (center) -->
+    <path
+        android:fillColor="#09090B"
+        android:strokeColor="#09090B"
+        android:strokeWidth="0"
+        android:pathData="M54,36 C54,36 52,50 50,58 C48,66 46,74 54,76 C54,76 53,66 54,58 C55,50 54,36 54,36Z"/>
+    <!-- Wind lines -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#34D399"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:pathData="M30,44 Q38,42 42,44 Q46,46 40,48"/>
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#34D399"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:pathData="M28,54 Q36,52 42,54 Q48,56 42,58"/>
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#34D399"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:pathData="M32,64 Q38,62 42,64 Q46,66 40,68"/>
+</vector>
