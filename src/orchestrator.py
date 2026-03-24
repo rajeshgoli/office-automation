@@ -1775,10 +1775,9 @@ class Orchestrator:
             return web.json_response({"error": "OAuth not configured"}, status=501)
 
         # Determine redirect URI based on request host
-        # LocalTunnel: climate.loca.lt -> https://climate.loca.lt/auth/callback
-        # Local: localhost/IP -> http://localhost:8080/auth/callback
         host = request.host
-        if 'loca.lt' in host:
+        platform = request.query.get('platform', '')
+        if 'loca.lt' in host or '.' in host.split(':')[0]:
             redirect_uri = f"https://{host}/auth/callback"
         else:
             redirect_uri = f"http://localhost:{self.config.orchestrator.port}/auth/callback"
@@ -1791,10 +1790,13 @@ class Orchestrator:
         code_verifier, code_challenge = self.oauth.generate_pkce_pair()
         state = secrets.token_urlsafe(32)
 
-        # Store state and redirect_uri for callback
+        # Store state, redirect_uri, and platform for callback
         self._oauth_states[state] = code_verifier
         self._oauth_redirect_uris = getattr(self, '_oauth_redirect_uris', {})
         self._oauth_redirect_uris[state] = redirect_uri
+        self._oauth_platforms = getattr(self, '_oauth_platforms', {})
+        if platform:
+            self._oauth_platforms[state] = platform
 
         # Generate authorization URL
         auth_url = self.oauth.create_authorization_url(state, code_challenge)
@@ -1828,9 +1830,10 @@ class Orchestrator:
         if not code or not state:
             return web.Response(text="Missing code or state", status=400)
 
-        # Verify state and retrieve redirect_uri
+        # Verify state and retrieve redirect_uri + platform
         code_verifier = self._oauth_states.pop(state, None)
         redirect_uri = getattr(self, '_oauth_redirect_uris', {}).pop(state, None)
+        platform = getattr(self, '_oauth_platforms', {}).pop(state, None)
 
         if not code_verifier:
             return web.Response(text="Invalid state", status=400)
@@ -1847,6 +1850,12 @@ class Orchestrator:
 
         # Generate JWT
         jwt_token = self.oauth.generate_jwt(session.email)
+
+        # Android: redirect to custom scheme so the app captures the token
+        if platform == 'android':
+            from urllib.parse import urlencode, quote
+            redirect_url = f"officeclimate://auth?token={quote(jwt_token)}&email={quote(session.email)}"
+            raise web.HTTPFound(redirect_url)
 
         # Return HTML that stores token and redirects
         html = f"""
