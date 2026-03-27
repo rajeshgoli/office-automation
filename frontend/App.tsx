@@ -204,6 +204,11 @@ const App: React.FC = () => {
       } catch (e) {
         console.error('Failed to fetch status:', e);
         if (mounted) {
+          if (e instanceof Error && e.message === 'Authentication required') {
+            setAuthenticated(false);
+            setUserEmail(null);
+            return;
+          }
           setApiConnected(false);
           setState(prev => ({ ...prev, isSystemError: true }));
         }

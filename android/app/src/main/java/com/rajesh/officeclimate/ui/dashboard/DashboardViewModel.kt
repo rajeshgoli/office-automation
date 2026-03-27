@@ -21,6 +21,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     val apiConnected: StateFlow<Boolean> = climateRepo.apiConnected
     val wsConnected: StateFlow<Boolean> = climateRepo.wsConnected
     val error: StateFlow<String?> = climateRepo.error
+    val authExpired: StateFlow<Boolean> = climateRepo.authExpired
 
     private val _controlLoading = MutableStateFlow<String?>(null)
     val controlLoading: StateFlow<String?> = _controlLoading

@@ -39,7 +39,7 @@ tmp/
 *.tmp
 
 # Database
-data/
+/data/
 client_secret.json
 
 # tinytuya generated files

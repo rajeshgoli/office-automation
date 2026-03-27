@@ -63,7 +63,9 @@ fun AppNavigation(authResult: StateFlow<MainActivity.AuthResult?>) {
         composable(Routes.DASHBOARD) {
             DashboardScreen(
                 onNavigateToSettings = {
-                    navController.navigate(Routes.SETTINGS)
+                    navController.navigate(Routes.SETTINGS) {
+                        popUpTo(Routes.DASHBOARD) { inclusive = true }
+                    }
                 }
             )
         }
