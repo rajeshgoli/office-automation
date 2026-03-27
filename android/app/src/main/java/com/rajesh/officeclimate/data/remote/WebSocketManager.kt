@@ -31,7 +31,6 @@ class WebSocketManager(
 
     fun connect(url: String, token: String) {
         shouldReconnect = true
-        reconnectDelay = Defaults.WS_RECONNECT_BASE_MS
 
         val wsUrl = url
             .replace("https://", "wss://")
