@@ -58,6 +58,11 @@ fun DashboardScreen(
     val error by viewModel.error.collectAsState()
     val controlLoading by viewModel.controlLoading.collectAsState()
     val controlError by viewModel.controlError.collectAsState()
+    val authExpired by viewModel.authExpired.collectAsState()
+
+    LaunchedEffect(authExpired) {
+        if (authExpired) onNavigateToSettings()
+    }
 
     val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(controlError) {
