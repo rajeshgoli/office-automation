@@ -10,6 +10,12 @@ from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
 
+if "aiomqtt" not in sys.modules:
+    aiomqtt_module = types.ModuleType("aiomqtt")
+    aiomqtt_module.Message = object
+    aiomqtt_module.Client = object
+    sys.modules["aiomqtt"] = aiomqtt_module
+
 if "google_auth_oauthlib.flow" not in sys.modules:
     flow_module = types.ModuleType("google_auth_oauthlib.flow")
 
