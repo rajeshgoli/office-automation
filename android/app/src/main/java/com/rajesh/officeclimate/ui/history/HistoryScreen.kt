@@ -50,6 +50,7 @@ import com.rajesh.officeclimate.data.model.SessionDay
 import com.rajesh.officeclimate.data.model.SessionSummary
 import com.rajesh.officeclimate.data.model.TempPoint
 import com.rajesh.officeclimate.ui.theme.*
+import java.time.LocalDate
 
 // Time axis: 6am (360 min) to 10pm (1320 min)
 private const val AXIS_START_MIN = 360
@@ -171,13 +172,14 @@ fun HistoryScreen(
 
                 // Section 4: Daily Stats
                 dailyStats?.let { data ->
-                    if (data.stats.isNotEmpty()) {
+                    val todayStat = data.stats.firstOrNull { it.date == LocalDate.now().toString() }
+                    if (todayStat != null) {
                         Text(
                             "TODAY",
                             style = MaterialTheme.typography.labelLarge,
                             color = TextPrimary,
                         )
-                        DailyStatsSection(stat = data.stats.last())
+                        DailyStatsSection(stat = todayStat)
                     }
                 }
 

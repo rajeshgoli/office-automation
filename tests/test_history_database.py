@@ -126,3 +126,28 @@ def test_daily_stats_include_open_presence_and_runtime_intervals(monkeypatch, tm
             "presence_hours": 6.0,
         }
     ]
+
+
+def test_daily_stats_seed_open_state_from_before_cutoff(monkeypatch, tmp_path):
+    db = Database(tmp_path / "history.db")
+    fixed_now = datetime(2026, 3, 27, 15, 0, 0)
+    _set_fixed_now(monkeypatch, fixed_now)
+
+    _insert_occupancy(db, "2026-03-26 14:00:00", "present")
+    _insert_occupancy(db, "2026-03-26 16:00:00", "away")
+    _insert_climate_action(db, "2026-03-26 14:00:00", "erv", "quiet")
+    _insert_climate_action(db, "2026-03-26 16:00:00", "erv", "off")
+    _insert_climate_action(db, "2026-03-26 14:30:00", "hvac", "cool")
+    _insert_climate_action(db, "2026-03-26 16:00:00", "hvac", "off")
+
+    stats = db.get_daily_stats(days=1)
+
+    assert stats == [
+        {
+            "date": "2026-03-26",
+            "door_events": 0,
+            "erv_runtime_min": 60,
+            "hvac_runtime_min": 60,
+            "presence_hours": 1.0,
+        }
+    ]

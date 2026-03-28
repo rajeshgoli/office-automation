@@ -582,10 +582,16 @@ class Database:
                 WHERE timestamp > ?
                 ORDER BY timestamp ASC
             """, (cutoff,)).fetchall()
+            last_occ_before_cutoff = conn.execute("""
+                SELECT timestamp, state FROM occupancy_log
+                WHERE timestamp <= ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (cutoff,)).fetchone()
 
             presence_by_date: Dict[str, float] = {}
-            prev_ts = None
-            prev_state = None
+            prev_ts = since if last_occ_before_cutoff and last_occ_before_cutoff["state"] == "present" else None
+            prev_state = last_occ_before_cutoff["state"] if last_occ_before_cutoff else None
             for row in occ_rows:
                 ts = self._parse_timestamp(row["timestamp"])
                 if prev_ts and prev_state == "present":
@@ -612,9 +618,19 @@ class Database:
                 WHERE timestamp > ? AND system = 'erv'
                 ORDER BY timestamp ASC
             """, (cutoff,)).fetchall()
+            last_erv_before_cutoff = conn.execute("""
+                SELECT timestamp, action FROM climate_actions
+                WHERE timestamp <= ? AND system = 'erv'
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (cutoff,)).fetchone()
 
             erv_by_date: Dict[str, float] = {}
-            erv_on_ts = None
+            erv_on_ts = (
+                since
+                if last_erv_before_cutoff and last_erv_before_cutoff["action"] in ("quiet", "medium", "turbo", "on")
+                else None
+            )
             for row in erv_rows:
                 ts = self._parse_timestamp(row["timestamp"])
                 action = row["action"]
@@ -644,9 +660,19 @@ class Database:
                 WHERE timestamp > ? AND system = 'hvac'
                 ORDER BY timestamp ASC
             """, (cutoff,)).fetchall()
+            last_hvac_before_cutoff = conn.execute("""
+                SELECT timestamp, action FROM climate_actions
+                WHERE timestamp <= ? AND system = 'hvac'
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (cutoff,)).fetchone()
 
             hvac_by_date: Dict[str, float] = {}
-            hvac_on_ts = None
+            hvac_on_ts = (
+                since
+                if last_hvac_before_cutoff and last_hvac_before_cutoff["action"] in ("heat", "cool", "on")
+                else None
+            )
             for row in hvac_rows:
                 ts = self._parse_timestamp(row["timestamp"])
                 action = row["action"]
