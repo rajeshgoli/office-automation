@@ -16,7 +16,7 @@ This spec also addresses two operational gaps: a generic artifact server for dep
 
 2. **Prefer session-meta over git log.** Session-meta attributes output to sessions directly — it covers zero-commit work (research, debugging, exploration) and avoids the timestamp-matching complexity of `git log` parsing.
 
-3. **Pipeline is idempotent and append-only.** Same principle as Phase 1. Re-running the parser on the same data must not create duplicates. Session-meta uses `session_id` as a natural primary key; PRs use `(repo, pr_number)`.
+3. **Pipeline is idempotent and upsert-safe.** Re-running the parser on the same data must not create duplicates or lose updates. Session-meta uses `INSERT OR REPLACE` keyed on `session_id`; PRs upsert on `(repo, pr_number)`. Phase 1's orchestration_activity is append-only; Phase 2's sources are mutable.
 
 4. **Ship the ratio card before the trend chart.** Summary cards first, sparklines and trend lines later. Get the numbers visible, iterate on visualization.
 
@@ -61,7 +61,7 @@ Claude Code writes per-session analytics to `~/.claude/usage-data/session-meta/*
 }
 ```
 
-Key fields for leverage: `session_id`, `project_path`, `start_time` (UTC — must convert to PST), `duration_minutes`, `lines_added`, `lines_removed`, `files_modified`, `git_commits`, `git_pushes`, `user_message_count`, `assistant_message_count`, `input_tokens`, `output_tokens`, `tool_counts` (JSON dict), `languages` (JSON dict), `first_prompt`.
+Key fields for leverage: `session_id`, `project_path`, `start_time` (UTC — must convert to local Pacific time), `duration_minutes`, `lines_added`, `lines_removed`, `files_modified`, `git_commits`, `git_pushes`, `user_message_count`, `assistant_message_count`, `input_tokens`, `output_tokens`, `tool_counts` (JSON dict), `languages` (JSON dict), `first_prompt`.
 
 ### Sync Mechanism
 
@@ -169,7 +169,7 @@ Timestamps from the GitHub API are UTC ISO 8601. Convert to local Pacific time o
 1. Run `gh repo list rajeshgoli --json name --limit 100`. Parse repo names.
 2. For each repo, run `gh pr list` as above.
 3. For each PR, upsert by `(repo, pr_number)`. PRs change state over time (open → merged, additions change during review).
-4. Convert `createdAt` and `mergedAt` from UTC to PST.
+4. Convert `createdAt` and `mergedAt` from UTC to local Pacific time (use `astimezone()`, same as session-meta).
 5. If `gh` CLI is not available or not authenticated, log a warning and skip. The pipeline must not fail if GitHub is unreachable.
 
 ---
@@ -367,9 +367,9 @@ Rename `climate.rajeshgo.li` to `office.rajeshgo.li` in the Cloudflare tunnel co
 
 **Changes required:**
 1. Cloudflare dashboard: Update tunnel public hostname from `climate.rajeshgo.li` to `office.rajeshgo.li`.
-2. Android app: Update default server URL in `android/.../util/Constants.kt:10` (the actual `BASE_URL` constant). Also update the placeholder URL shown in `android/.../ui/settings/SettingsScreen.kt:89`.
+2. Android app: Update default server URL in `android/.../util/Constants.kt:10` (`SERVER_URL` constant). Also update the placeholder URL shown in `android/.../ui/settings/SettingsScreen.kt:89`.
 3. `occupancy_detector.py`: Default URL is `http://localhost:8080` (line 308-309), not the public domain. No change needed — the production Launch Agent overrides with `--url http://192.168.5.140:8080`. But update `CLAUDE.md` examples that reference the public URL.
-4. `CLAUDE.md`: Update all references from `climate.loca.lt` / `climate.rajeshgo.li` to `office.rajeshgo.li`.
+4. `CLAUDE.md`: Update `climate.rajeshgo.li` references to `office.rajeshgo.li`. Leave `climate.loca.lt` references as-is — that's the LocalTunnel hostname, a separate access path that may or may not be renamed independently.
 5. OAuth redirect URIs in Google Cloud Console: Add `https://office.rajeshgo.li/auth/callback`.
 6. Keep `climate.rajeshgo.li` as a redirect to `office.rajeshgo.li` for a transition period (Cloudflare Page Rule or second tunnel route).
 
@@ -472,7 +472,7 @@ Phase 2 ships Tier 2 (session-meta + GitHub PRs). Tier 3 collection follows in P
 
 1. **Basic import.** Create a temp directory with 3 session-meta JSON files: one with 5 commits and 100 lines_added, one with 0 commits but 20 lines (research session), one with `duration_minutes=0 AND user_message_count=0` (process artifact). Assert parser imports exactly 2 rows. Assert the artifact session is skipped.
 
-2. **Idempotency.** Run parser twice on the same 3 files. Assert row count is still 2 (INSERT OR IGNORE on session_id PK).
+2. **Idempotency.** Run parser twice on the same 3 files. Assert row count is still 2 (INSERT OR REPLACE on session_id PK — second run replaces, not duplicates).
 
 3. **Upsert on update.** Import a session-meta file with `lines_added=0, git_commits=0`. Replace the file with an updated version where `lines_added=50, git_commits=3`. Re-run parser. Assert the row now shows `lines_added=50` AND `git_commits=3` (unconditional replace, not field-by-field check).
 
