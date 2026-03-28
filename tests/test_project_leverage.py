@@ -203,6 +203,39 @@ def test_collects_agent_os_persona_reads(tmp_path):
     assert _project_metric(db, "2026-03-27", "agent-os", "persona_projects") == 2
 
 
+def test_collects_agent_os_persona_projects_with_fractal_normalization(tmp_path):
+    db_path = tmp_path / "office.db"
+    tool_usage_db = tmp_path / "tool_usage.db"
+    Database(db_path)
+    _create_tool_usage_db(tool_usage_db)
+
+    for session_id, project_name in [
+        ("s1", "fractal-market-simulator"),
+        ("s2", "fractal-1808-em"),
+        ("s3", "fractal-1812-fix"),
+    ]:
+        _insert_tool_usage(
+            tool_usage_db,
+            session_id=session_id,
+            project_name=project_name,
+            tool_name="Read",
+            target_file="/Users/rajesh/.agent-os/personas/engineer.md",
+            timestamp="2026-03-27 09:30:00",
+        )
+
+    collect_project_leverage(
+        db_path=db_path,
+        tool_usage_db_path=tool_usage_db,
+        engram_db_path=tmp_path / "missing_engram.db",
+        concept_registry_path=tmp_path / "missing_registry.md",
+        now=datetime(2026, 3, 27, 12, 0, 0),
+    )
+
+    db = Database(db_path)
+    assert _project_metric(db, "2026-03-27", "agent-os", "persona_projects") == 1
+    assert _project_metric(db, "2026-03-27", "agent-os", "persona_project::fractal") == 1
+
+
 def test_collects_engram_fold_metrics(tmp_path):
     db_path = tmp_path / "office.db"
     engram_db = tmp_path / "engram_state.db"

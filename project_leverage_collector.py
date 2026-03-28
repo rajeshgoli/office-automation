@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from src.database import Database, DEFAULT_DB_PATH
+from src.project_names import normalize_project_name
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +37,7 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
 
 
 def _normalize_project_name(project_name: Optional[str]) -> str:
-    if not project_name:
-        return "unknown"
-    return project_name.strip() or "unknown"
+    return normalize_project_name(project_name)
 
 
 def _parse_datetime(value: str) -> datetime:
@@ -144,20 +143,25 @@ def _collect_tool_usage_metrics(tool_usage_db_path: Path) -> list[tuple[str, str
             """
             SELECT
                 date(timestamp) AS date,
-                COUNT(DISTINCT COALESCE(NULLIF(project_name, ''), 'unknown')) AS persona_projects
+                COALESCE(NULLIF(project_name, ''), 'unknown') AS persona_project
             FROM tool_usage
             WHERE tool_name = 'Read'
               AND target_file LIKE '%agent-os/personas/%'
-            GROUP BY date(timestamp)
-            ORDER BY date(timestamp)
+            ORDER BY date(timestamp), persona_project
             """
         ).fetchall()
+
+        projects_by_date: dict[str, set[str]] = {}
         for row in persona_project_rows:
+            date = row["date"]
+            projects_by_date.setdefault(date, set()).add(_normalize_project_name(row["persona_project"]))
+
+        for date, projects in projects_by_date.items():
             rows.append((
-                row["date"],
+                date,
                 "agent-os",
                 "persona_projects",
-                float(row["persona_projects"] or 0),
+                float(len(projects)),
             ))
 
         persona_project_detail_rows = conn.execute(

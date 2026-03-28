@@ -498,6 +498,25 @@ def test_import_session_meta_normalizes_project_names(tmp_path):
     assert row["project"] == "office-automate"
 
 
+def test_import_session_meta_collapses_fractal_worktrees(tmp_path):
+    db_path = tmp_path / "history.db"
+    session_meta_dir = tmp_path / "session-meta"
+    session_meta_dir.mkdir()
+
+    _write_session_meta(
+        session_meta_dir / "session-1.json",
+        _session_payload(project_path="/Users/rajesh/worktrees/fractal-1808-em"),
+    )
+
+    import_session_meta(db_path=db_path, session_meta_dir=session_meta_dir)
+
+    db = Database(db_path)
+    with db._connection() as conn:
+        row = conn.execute("SELECT project FROM session_output").fetchone()
+
+    assert row["project"] == "fractal"
+
+
 def test_import_session_meta_marks_machine_generated_sessions(tmp_path):
     db_path = tmp_path / "history.db"
     session_meta_dir = tmp_path / "session-meta"
