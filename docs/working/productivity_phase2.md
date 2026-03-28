@@ -389,14 +389,15 @@ The highest-leverage tool. Enables parallel agent orchestration and mobile produ
 
 | Signal | Source | Why it matters |
 |--------|--------|---------------|
-| sm-managed sessions | session-manager logs/DB | How many agents are running under sm vs. bare Claude |
-| sm dispatches | `[sm dispatch]` messages in history | Parallel work units launched |
-| sm sends | `[sm send]` messages | Inter-agent coordination events |
-| sm reminds | `[sm remind]` messages | Active monitoring of agent work |
+| sm-managed sessions (daily total) | sm server telemetry | Total sessions managed through the day, not just concurrent count — shows actual orchestration volume |
+| sm dispatches | sm server command log | Actual `sm dispatch` commands executed, not `[sm dispatch]` messages in history. Server-side telemetry is authoritative. |
+| sm sends | sm server command log | Actual `sm send` commands — inter-agent coordination events |
+| sm reminds | sm server command log | Actual `sm remind` commands — active monitoring |
 | Telegram messages | Telegram bot logs | Mobile orchestration — highest leverage signal. Every Telegram message means Rajesh is productive while away from his desk |
-| SSH sessions | sm ssh connection logs | Remote terminal access to agents |
+| SSH sessions | sm server connection log | Remote terminal access to agents |
+| App opens (daily/hourly) | sm app telemetry | Is the sm app being opened? Daily opens show habitual use, hourly distribution shows when orchestration happens |
 
-**Mechanically derivable now?** Not from `orchestration_activity` — Phase 1's parser (`session_stats_parser.py:25-27`) filters out `[sm` and `[Input from:` messages *before* inserting, so they never reach the database. To count sm usage, the parser would need a schema change (e.g., a separate `sm_activity` table) or a direct scan of the raw `claude_history.jsonl` file counting excluded lines. Telegram and SSH require instrumentation in session-manager.
+**Preferred instrumentation:** The sm server already processes every command — adding telemetry counters there is far more reliable than parsing `[sm ...]` messages from Claude history (which are filtered out before reaching `orchestration_activity` anyway). The server knows the ground truth; message parsing is a lossy proxy.
 
 ### engram
 
@@ -418,9 +419,9 @@ Climate/productivity automation for the shed office.
 |--------|--------|---------------|
 | Automation events | `climate_actions` table | ERV/HVAC actions that would have been manual |
 | State transitions | `occupancy_log` table | System correctly detecting presence without manual input |
-| Dashboard views | HTTP access logs (if logged) | Is the dashboard actually consulted? |
+| App opens (daily/hourly) | App telemetry or HTTP access logs | Is the dashboard actually being consulted? Daily/hourly open counts show if the app is useful enough to check regularly |
 
-**Mechanically derivable now?** Yes — the data is already in the database. A simple daily count of `climate_actions` and `occupancy_log` entries shows automation activity.
+**Mechanically derivable now?** Partially — automation events and state transitions are already in the database. App opens would need either HTTP request logging on the backend or client-side telemetry in the Android app.
 
 ### taskbar
 
@@ -439,18 +440,18 @@ Workflow conventions and personas for AI agents.
 
 | Signal | Source | Why it matters |
 |--------|--------|---------------|
-| Persona activations | Grep for "As engineer", "As reviewer" etc. in orchestration history | Which personas are actually used? |
-| Persona adoption across repos | Cross-reference project field with persona mentions | Is agent-os used beyond office-automate? |
+| File reads by agents | Agent tool-use telemetry (session-meta `tool_counts` + file paths) | Count how often agents read agent-os persona files. Direct measure of adoption — more reads = more agents using the workflow system |
+| Persona adoption across repos | Cross-reference reads with project context | Is agent-os used beyond one repo? |
 
-**Mechanically derivable now?** Partially — persona invocations appear in Claude history prompts. A regex scan of orchestration_activity or raw history.jsonl could count these.
+**Preferred instrumentation:** Counting file reads from session-meta `tool_counts` is far better than parsing prompt text for persona invocations. An agent (like Claude) has comprehension and can fuzzy-match "as reviewer" to the reviewer persona, but a parser can't — and many persona activations happen via CLAUDE.md instructions, not explicit user prompts. File-read telemetry captures actual usage regardless of how the persona was invoked.
 
 ### Implementation path for Tier 3
 
 Phase 2 ships Tier 2 (session-meta + GitHub PRs). Tier 3 collection follows in Phase 3:
 
-1. **Quick wins (derivable from existing data):** sm message counts from raw `claude_history.jsonl` (scan for `[sm` / `[Input from:` prefixes — these are excluded by the parser, so must be counted from the source file or via a new parser pass), office-automate automation event counts from `climate_actions` table, persona activation grep from raw history.
-2. **Needs instrumentation:** Telegram message counts (session-manager), fold timestamps (engram), window switch counts (taskbar).
-3. **Needs API:** engram concept registry queries, session-manager SSH session counts.
+1. **Quick wins (derivable from existing data):** office-automate automation event counts from `climate_actions` table, agent-os file-read counts from session-meta `tool_counts`.
+2. **Needs server-side telemetry (preferred path):** sm command counters (dispatch/send/remind/managed sessions), sm and office app open counts, Telegram message counts. The sm server already processes every command — adding counters is straightforward.
+3. **Needs API or deeper instrumentation:** engram fold timestamps + concept registry queries, engram briefing generation counts, taskbar window switch telemetry.
 
 ---
 
