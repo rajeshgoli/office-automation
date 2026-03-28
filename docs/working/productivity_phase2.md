@@ -1,6 +1,21 @@
 # Productivity Phase 2: Leverage & Deployment
 
-**Classification: Epic** — 5 sub-tickets (A: session-meta pipeline, B: GitHub PR pipeline, C: leverage endpoints, D: Android UI, E: artifact server + domain rename). A and B are independent; C depends on both; D depends on C; E is independent.
+**Classification: Cross-Repo Epic** — 8 sub-tickets across 3 repos. A–E in office-automate, F in session-manager, G in engram, H spans office-automate + Android.
+
+| Ticket | Repo | Dependencies | Scope |
+|--------|------|-------------|-------|
+| **A: Session-meta pipeline** | office-automate | None | Parser, DB schema, rsync |
+| **B: GitHub PR pipeline** | office-automate | None | gh collector, DB schema |
+| **C: Leverage endpoints** | office-automate | A, B | `/history/leverage` endpoint |
+| **D: Android leverage UI** | office-automate | C | Leverage cards in Productivity tab |
+| **E: Artifact server + domain** | office-automate | None | `/deploy/{app}`, `/apps/{app}`, domain rename |
+| **F: sm Telegram telemetry** | session-manager | None | Telegram message counters only (sm commands already in tool_usage.db) |
+| **G: engram fold telemetry** | engram | None | Fold stats CLI/export |
+| **H: Project leverage pipeline + UI** | office-automate | G (engram), F (Telegram, optional) | Collection from tool_usage.db + engram DB, endpoint, Android cards |
+
+A, B, E, F, G can all run in parallel. C depends on A+B. D depends on C. H depends on F+G.
+
+The EM managing this epic must spawn agents in session-manager and engram repos for tickets F and G respectively.
 
 ## Context
 
@@ -377,87 +392,320 @@ Rename `climate.rajeshgo.li` to `office.rajeshgo.li` in the Cloudflare tunnel co
 
 ---
 
-## Tier 3: Per-Project Leverage Metrics (Design Only)
-
-This section captures the vision for domain-specific leverage signals per project. These are not implemented in Phase 2 — they require instrumentation in each project. The purpose is to identify what's measurable so that future phases can add collection.
-
-Each project Rajesh builds is a tool that multiplies his own output. The leverage question per project is: "is this tool actually being used, and how much is it amplifying my work?"
-
-### session-manager
+## Part F: session-manager Command Telemetry (session-manager repo — minimal)
 
 The highest-leverage tool. Enables parallel agent orchestration and mobile productivity.
 
-| Signal | Source | Why it matters |
-|--------|--------|---------------|
-| sm-managed sessions (daily total) | sm server telemetry | Total sessions managed through the day, not just concurrent count — shows actual orchestration volume |
-| sm dispatches | sm server command log | Actual `sm dispatch` commands executed, not `[sm dispatch]` messages in history. Server-side telemetry is authoritative. |
-| sm sends | sm server command log | Actual `sm send` commands — inter-agent coordination events |
-| sm reminds | sm server command log | Actual `sm remind` commands — active monitoring |
-| Telegram messages | Telegram bot logs | Mobile orchestration — highest leverage signal. Every Telegram message means Rajesh is productive while away from his desk |
-| SSH sessions | sm server connection log | Remote terminal access to agents |
-| App opens (daily/hourly) | sm app telemetry | Is the sm app being opened? Daily opens show habitual use, hourly distribution shows when orchestration happens |
+### What already exists — tool_usage.db
 
-**Requires new instrumentation.** These sources (sm server command log, sm app telemetry) do not exist today. The sm server processes every command but does not currently persist counts or emit telemetry. `tool_usage.db` (via `tool_logger.py`) records per-tool-use data but not sm-command-level events. Adding command counters to the sm server is the proposed path — straightforward since the server already handles every command. This is far more reliable than parsing `[sm ...]` messages from Claude history (which are filtered out before reaching `orchestration_activity` anyway).
+Every `sm` command executed by an agent via Bash is **already captured** in `tool_usage.db` (`~/.local/share/claude-sessions/tool_usage.db`). The `bash_command` column contains the full command text. Current totals:
 
-### engram
+| Command | Count | How to query |
+|---------|-------|-------------|
+| `sm send` | 4,597 | `bash_command LIKE 'sm send%'` |
+| `sm dispatch` | 1,601 | `bash_command LIKE 'sm dispatch%'` |
+| `sm spawn` | 599 | `bash_command LIKE 'sm spawn%'` |
+| `sm wait` | 1,113 | `bash_command LIKE 'sm wait%'` |
+| `sm remind` | 145 | `bash_command LIKE 'sm remind%'` |
+| `sm name` | 724 | `bash_command LIKE 'sm name%'` |
+| Other sm | 8,198 | status, what, clear, output, inbox, etc. |
 
-Knowledge maintenance for codebases.
+Daily breakdown already shows clear patterns (e.g., 2026-03-25: 182 sends, 116 spawns, 628 total sm commands).
 
-| Signal | Source | Why it matters |
-|--------|--------|---------------|
-| Fold recency | engram's fold timestamps | Is the knowledge up to date? Stale folds = no leverage |
-| Concept registry hits | Agent session logs (grep for registry terms) | Are agents actually using the maintained knowledge? |
-| Briefing generations | engram API/logs | How often are compressed briefings requested? |
+**No new instrumentation needed for agent-side sm metrics.** The collection script (Part H) queries `tool_usage.db` directly.
 
-**Mechanically derivable now?** No — requires engram to expose an API or write telemetry.
+### What's NOT in tool_usage.db
 
-### office-automate
+**Telegram messages.** When Rajesh sends a message from his phone via Telegram, it hits the sm server's `_handle_message()` in `telegram_bot.py:1194` — but that's a direct HTTP call to the Telegram bot, not a Claude Code Bash command. These are the highest-leverage signals (mobile productivity while away from desk).
 
-Climate/productivity automation for the shed office.
+**Session lifecycle.** Sessions are created via `create_session()` in `session_manager.py:1845` and tracked in `sessions.json`, but daily session counts aren't persisted in a queryable form.
 
-| Signal | Source | Why it matters |
-|--------|--------|---------------|
-| Automation events | `climate_actions` table | ERV/HVAC actions that would have been manual |
-| State transitions | `occupancy_log` table | System correctly detecting presence without manual input |
-| App opens (daily/hourly) | Client-side telemetry in Android app (e.g., POST `/telemetry/open` on app foreground) | Is the dashboard actually being consulted? Daily/hourly open counts show habitual use. |
+### New instrumentation (Telegram + sessions only)
 
-**Mechanically derivable now?** Partially — automation events and state transitions are already in the database. App opens require new client-side telemetry (a lightweight POST on app foreground). HTTP access logs are not equivalent to app opens — they'd count every API poll unless a sessionization heuristic is defined.
+Add a `telegram_telemetry` table to the sm server's SQLite (alongside `tool_usage.db`):
 
-### taskbar
+```sql
+CREATE TABLE IF NOT EXISTS telegram_telemetry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    direction TEXT NOT NULL CHECK(direction IN ('in', 'out')),
+    session_id TEXT,
+    chat_id TEXT,
+    result TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tg_timestamp ON telegram_telemetry(timestamp);
+```
 
-Native macOS taskbar replacement.
+**Instrument two places:**
+1. `_handle_message()` in `telegram_bot.py:1194` — INSERT with `direction='in'`, `result` = DELIVERED/QUEUED/FAILED
+2. Wherever the bot sends outbound notifications — INSERT with `direction='out'`
 
-| Signal | Source | Why it matters |
-|--------|--------|---------------|
-| Active usage | Process uptime / launch frequency | Is it running? Is it the primary window manager? |
-| Window switches | AppKit event counts (needs instrumentation) | How many context switches does it handle per day? |
+Fire-and-forget async, same pattern as `tool_logger.py`.
 
-**Mechanically derivable now?** No — requires taskbar to log telemetry.
+For **session lifecycle**, add a daily snapshot to `sessions.json` processing — or simply count distinct `session_id` values from `tool_usage.db` per day (agents only run inside sessions, so this is a reasonable proxy).
 
-### agent-os
+### Stats endpoint (optional)
 
-Workflow conventions and personas for AI agents.
+If co-located querying is easier than rsync, add `GET /stats/commands?days=7` to the sm server that queries `tool_usage.db` + `telegram_telemetry` and returns aggregated counts. But this is optional — the collection script can query the rsynced DBs directly.
 
-| Signal | Source | Why it matters |
-|--------|--------|---------------|
-| Persona file reads | session-manager's `tool_usage.db` via `tool_logger.py` (records `target_file` for Read/Write/Edit) | Count reads of `~/.agent-os/personas/*` files. Direct measure of adoption. |
-| Persona adoption across repos | Cross-reference reads with project/session context in `tool_usage.db` | Is agent-os used beyond one repo? |
+---
 
-**Why not session-meta?** Session-meta `tool_counts` only stores aggregate counts like `{"Bash": 5, "Read": 4}` — no file paths. The session-manager's tool logger (`tool_logger.py`) records `target_file` per tool use, which is what's needed to count reads of specific persona files.
+## Part G: engram Fold Telemetry (engram repo)
 
-### Implementation path for Tier 3
+### What exists today
 
-Phase 2 ships Tier 2 (session-meta + GitHub PRs). Tier 3 collection follows in Phase 3:
+Engram runs as a foreground CLI service (`engram run`). State lives in `.engram/engram.db` (SQLite) with these tables:
 
-1. **Quick wins (derivable from existing data):** office-automate automation event counts from `climate_actions` table, agent-os persona file reads from session-manager's `tool_usage.db`.
-2. **Needs server-side telemetry (preferred path):** sm command counters (dispatch/send/remind/managed sessions), sm and office app open counts, Telegram message counts. The sm server already processes every command — adding counters is straightforward.
-3. **Needs API or deeper instrumentation:** engram fold timestamps + concept registry queries, engram briefing generation counts, taskbar window switch telemetry.
+- **`dispatches`**: Fold lifecycle — `created_at`, `updated_at`, `state` (building → dispatched → validated → committed)
+- **`buffer_items`**: Pending context (path, type, chars, date, drift_type)
+- **`id_counters`**: Next available ID per category (C, E, W concepts)
+- **`server_state`**: Singleton with poll bookmarks, `fold_from` marker, L0 stale flag
+
+The concept registry lives in a markdown file with stable IDs (`C001`, `C002`...) and states (ACTIVE, DEAD, EVOLVED).
+
+There is **no HTTP API** — only CLI queries via `engram status`.
+
+### New instrumentation
+
+Add an `engram stats` CLI command that outputs JSON (machine-readable counterpart to `engram status`):
+
+```json
+{
+  "last_fold_at": "2026-03-27T14:30:00",
+  "last_fold_age_hours": 3.5,
+  "folds_last_7d": 12,
+  "folds_last_30d": 45,
+  "active_concepts": 42,
+  "dead_concepts": 8,
+  "buffer_fill_pct": 35,
+  "buffer_items": 28
+}
+```
+
+**Implementation:** Query the existing `dispatches` table for fold timestamps (WHERE state = 'committed'), count concept IDs from the registry markdown (parse `## C{NNN}:` headers, count ACTIVE vs DEAD), read buffer state from `server_state`.
+
+Also add `--json` flag to the existing `engram status` command as an alternative entry point.
+
+### Collection
+
+The office-automate Mac Mini rsyncs engram's DB:
+
+```
+rsync -az rajesh@<work-mac-ip>:~/Desktop/engram/.engram/engram.db ~/office-automate/data/engram_state.db
+```
+
+Or, if engram runs on the Mac Mini itself, query locally. The collection script reads `dispatches` and `id_counters` tables directly — no need for the CLI if the DB is available.
+
+---
+
+## Part H: Project Leverage Pipeline + UI (office-automate repo)
+
+This ticket collects Tier 3 signals from across repos and surfaces them in the Productivity tab. Depends on F (Telegram telemetry only) and G (engram stats). Most sm data is already in `tool_usage.db`.
+
+### Data sources (4 arms)
+
+| Source | Location | Collection method | New instrumentation? |
+|--------|----------|-------------------|---------------------|
+| **sm commands** | `tool_usage.db` (`~/.local/share/claude-sessions/`) | rsync from work Mac, query `bash_command LIKE 'sm %'` | **No** — already tracked |
+| **sm Telegram** | `telegram_telemetry` table (Part F) | rsync or query sm server | **Yes** — Part F |
+| **agent-os persona reads** | `tool_usage.db` | Same rsync, query `target_file LIKE '%agent-os/personas/%'` | **No** — already tracked |
+| **engram fold state** | `.engram/engram.db` | rsync from work Mac, query `dispatches` table | **No** — already exists |
+| **office-automate automation** | Local `climate_actions` + `occupancy_log` tables | Direct query (same DB) | **No** — already exists |
+
+### tool_usage.db queries for agent-os
+
+The `tool_usage` table (schema in `session-manager/src/tool_logger.py:93-138`) has `target_file` populated for Read/Write/Edit operations. Query:
+
+```sql
+-- Daily persona reads
+SELECT date(timestamp) AS date,
+       target_file,
+       COUNT(*) AS reads
+FROM tool_usage
+WHERE tool_name = 'Read'
+  AND target_file LIKE '%agent-os/personas/%'
+  AND timestamp >= ?
+GROUP BY date(timestamp), target_file
+ORDER BY date ASC;
+
+-- Per-project adoption
+SELECT project_name, COUNT(DISTINCT session_id) AS sessions_using_personas
+FROM tool_usage
+WHERE tool_name = 'Read'
+  AND target_file LIKE '%agent-os/personas/%'
+  AND timestamp >= ?
+GROUP BY project_name;
+```
+
+### tool_usage.db queries for sm commands
+
+```sql
+-- Daily sm command breakdown
+SELECT date(timestamp) AS date,
+  SUM(CASE WHEN bash_command LIKE 'sm send%' THEN 1 ELSE 0 END) AS sends,
+  SUM(CASE WHEN bash_command LIKE 'sm dispatch%' THEN 1 ELSE 0 END) AS dispatches,
+  SUM(CASE WHEN bash_command LIKE 'sm spawn%' THEN 1 ELSE 0 END) AS spawns,
+  SUM(CASE WHEN bash_command LIKE 'sm remind%' THEN 1 ELSE 0 END) AS reminds,
+  SUM(CASE WHEN bash_command LIKE 'sm wait%' THEN 1 ELSE 0 END) AS waits,
+  COUNT(*) AS total_sm
+FROM tool_usage
+WHERE tool_name = 'Bash'
+  AND bash_command LIKE 'sm %'
+  AND hook_type = 'PreToolUse'
+  AND timestamp >= ?
+GROUP BY date(timestamp)
+ORDER BY date ASC;
+
+-- Daily managed sessions (distinct session_id per day)
+SELECT date(timestamp) AS date,
+       COUNT(DISTINCT session_id) AS managed_sessions
+FROM tool_usage
+WHERE hook_type = 'PreToolUse'
+  AND timestamp >= ?
+GROUP BY date(timestamp);
+```
+
+### office-automate automation query
+
+```sql
+-- Daily automation events
+SELECT date(timestamp) AS date, COUNT(*) AS actions
+FROM climate_actions
+WHERE timestamp >= ?
+GROUP BY date(timestamp);
+
+-- Daily state transitions
+SELECT date(timestamp) AS date, COUNT(*) AS transitions
+FROM occupancy_log
+WHERE timestamp >= ?
+GROUP BY date(timestamp);
+```
+
+### Database schema
+
+Add to `src/database.py`:
+
+```sql
+CREATE TABLE IF NOT EXISTS project_leverage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    project TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    value REAL NOT NULL DEFAULT 0,
+    UNIQUE(date, project, metric)
+);
+CREATE INDEX IF NOT EXISTS idx_proj_lev_date ON project_leverage(date);
+```
+
+Metrics stored as `(date, project, metric_name, value)` tuples. This is a flexible EAV schema that accommodates different metrics per project without schema changes.
+
+**Metric names:**
+
+| Project | Metric | Description |
+|---------|--------|-------------|
+| session-manager | `sm_dispatches` | dispatch commands that day |
+| session-manager | `sm_sends` | send commands |
+| session-manager | `sm_reminds` | remind commands |
+| session-manager | `sm_sessions_created` | new managed sessions |
+| session-manager | `sm_telegram_in` | inbound Telegram messages |
+| session-manager | `sm_telegram_out` | outbound Telegram messages |
+| engram | `engram_last_fold_age_hours` | hours since last committed fold |
+| engram | `engram_folds_7d` | folds in last 7 days |
+| engram | `engram_active_concepts` | count of ACTIVE concepts |
+| agent-os | `persona_reads` | total reads of persona files |
+| agent-os | `persona_projects` | distinct projects using personas |
+| office-automate | `automation_events` | climate actions fired |
+| office-automate | `state_transitions` | occupancy state changes |
+
+### Collection script
+
+Extend `session_stats_parser.py` (or create `project_leverage_collector.py`) to run on the 30-min cron alongside the existing history parser. For each source:
+
+1. **tool_usage.db** (sm commands + agent-os personas): Open the rsynced copy at `data/tool_usage.db`. Run sm command queries (below) and agent-os persona queries (above).
+2. **Telegram telemetry**: Open `data/telegram_telemetry.db` (rsynced from sm server) or query `GET /stats/commands?days=1` if available. If unavailable, skip — Telegram is the only metric requiring Part F.
+3. **engram**: Open the rsynced copy at `data/engram_state.db`. Query `SELECT created_at, state FROM dispatches WHERE state = 'committed' ORDER BY created_at DESC`.
+4. **office-automate**: Query local `climate_actions` and `occupancy_log` tables directly.
+
+Upsert all results into `project_leverage` by `(date, project, metric)`.
+
+### Sync additions
+
+Add to the existing rsync cron:
+
+```
+rsync -az rajesh@<work-mac-ip>:~/.local/share/claude-sessions/tool_usage.db ~/office-automate/data/tool_usage.db
+rsync -az rajesh@<work-mac-ip>:~/Desktop/engram/.engram/engram.db ~/office-automate/data/engram_state.db
+```
+
+### API endpoint
+
+**`GET /history/project-leverage?days=7`**
+
+```json
+{
+  "ok": true,
+  "projects": {
+    "session-manager": {
+      "summary": "Highest leverage — 52 dispatches, 95 Telegram messages this week",
+      "days": [
+        {
+          "date": "2026-03-27",
+          "sm_dispatches": 12,
+          "sm_sends": 45,
+          "sm_reminds": 8,
+          "sm_sessions_created": 18,
+          "sm_telegram_in": 23,
+          "sm_telegram_out": 19
+        }
+      ],
+      "week": {"sm_dispatches": 52, "sm_sends": 180, "sm_telegram_in": 95}
+    },
+    "engram": {
+      "summary": "Last fold 3.5h ago, 42 active concepts",
+      "days": [...],
+      "current": {
+        "last_fold_age_hours": 3.5,
+        "active_concepts": 42,
+        "folds_7d": 12
+      }
+    },
+    "agent-os": {
+      "summary": "28 persona reads across 4 projects this week",
+      "days": [...],
+      "week": {"persona_reads": 28, "persona_projects": 4}
+    },
+    "office-automate": {
+      "summary": "45 automation events, 12 state transitions this week",
+      "days": [...],
+      "week": {"automation_events": 45, "state_transitions": 12}
+    }
+  }
+}
+```
+
+The `summary` field is a human-readable one-liner generated server-side from the metrics — displayed as a subtitle on the Android card.
+
+### Android UI
+
+Add a **Project Leverage** section to `ProductivityScreen.kt` below the existing leverage cards. One card per project, vertically stacked:
+
+| Card | Title | Value | Subtitle |
+|------|-------|-------|----------|
+| session-manager | SM | "52 dispatches" | "95 Telegram msgs this week" |
+| engram | ENGRAM | "3.5h since fold" | "42 active concepts" |
+| agent-os | AGENT-OS | "28 persona reads" | "across 4 projects" |
+| office-automate | OFFICE | "45 automations" | "12 state transitions" |
+
+Cards use the same `StatTile` composable. Color: each project gets its color from the existing `KnownProjectColors` map in `ProductivityScreen.kt`.
+
+### Taskbar (deferred)
+
+Taskbar metrics (window switch counts, uptime) require AppKit instrumentation that doesn't exist. Not included in this epic. Can be added when taskbar gains telemetry.
 
 ---
 
 ## Out of Scope
 
-- **Tier 3 implementation.** This phase designs the Tier 3 vision but only implements Tier 2 (session-meta + GitHub PRs).
 - **Git log parsing.** Session-meta already provides lines_added/removed/commits per session. Git log adds commit-level granularity but complex timestamp matching. Deferred to Phase 2.5.
 - **Codex session-meta.** Codex CLI doesn't produce session-meta files. Only Claude Code output metrics are available.
 - **Trend charts / sparklines.** Summary cards only. Trend visualization is a follow-up.
@@ -526,3 +774,27 @@ Phase 2 ships Tier 2 (session-meta + GitHub PRs). Tier 3 collection follows in P
 23. **Missing app 404.** GET `/apps/nonexistent/latest.apk`. Assert 404.
 
 24. **Size limit.** POST with body exceeding 100 MB. Assert 413.
+
+### Part F: Telegram Telemetry
+
+25. **Telegram inbound logged.** Simulate `_handle_message()` with a test message. Assert a row appears in `telegram_telemetry` with `direction='in'` and correct `result`.
+
+26. **Telegram outbound logged.** Simulate bot sending a notification. Assert a row with `direction='out'`.
+
+### Part G: engram Stats
+
+27. **engram stats output.** Insert 3 dispatches into a test `engram.db` (2 committed, 1 building). Run the stats query. Assert `folds_last_7d=2`, `last_fold_age_hours` is reasonable, `buffer_items` matches.
+
+28. **No folds.** Empty dispatches table. Assert `last_fold_at=null`, `folds_last_7d=0`.
+
+### Part H: Project Leverage Pipeline
+
+29. **sm command collection.** Insert 5 `sm send` and 3 `sm dispatch` Bash rows into a test `tool_usage.db`. Run collector. Assert `project_leverage` has `sm_sends=5`, `sm_dispatches=3` for that date.
+
+30. **agent-os persona reads.** Insert 4 Read rows with `target_file` containing `agent-os/personas/engineer.md` across 2 projects. Run collector. Assert `persona_reads=4`, `persona_projects=2`.
+
+31. **engram fold collection.** Insert a committed dispatch 2 hours ago into test engram DB. Run collector. Assert `engram_last_fold_age_hours` ≈ 2.
+
+32. **Project leverage endpoint.** Populate `project_leverage` with test data. Call `GET /history/project-leverage?days=7`. Assert response has all 4 project sections with correct metrics.
+
+33. **Android project cards.** With mock project-leverage response, verify one card per project renders with correct title and values.
