@@ -86,7 +86,7 @@ fun SettingsScreen(
                 value = state.serverUrl,
                 onValueChange = viewModel::updateServerUrl,
                 label = { Text("Server URL") },
-                placeholder = { Text("https://climate.rajeshgo.li") },
+                placeholder = { Text("https://office.rajeshgo.li") },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                 modifier = Modifier.fillMaxWidth(),

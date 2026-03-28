@@ -14,7 +14,10 @@ import json
 import logging
 import base64
 import ipaddress
+import os
+import re
 import secrets
+import tempfile
 from collections import deque
 from pathlib import Path
 from typing import Optional, Set, Dict, Callable, Awaitable
@@ -33,6 +36,11 @@ from .database import Database
 from .oauth_service import OAuthService, UserSession
 
 logger = logging.getLogger(__name__)
+
+ARTIFACT_APP_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+ARTIFACT_MAX_SIZE_BYTES = 100 * 1024 * 1024
+DEFAULT_ARTIFACTS_ROOT = Path(__file__).parent.parent / "data" / "apps"
+DEFAULT_LEGACY_APK_PATH = Path(__file__).parent.parent / "data" / "app-debug.apk"
 
 
 class Orchestrator:
@@ -1456,6 +1464,105 @@ class Orchestrator:
                     status=500
                 )
 
+    async def _handle_deploy_post(self, request: web.Request) -> web.Response:
+        """Handle POST /deploy/{app} to upload the latest APK for an app."""
+        app = request.match_info.get("app", "")
+        if not self._is_valid_artifact_app_name(app):
+            return web.json_response({"ok": False, "error": "Invalid app name"}, status=400)
+
+        try:
+            reader = await request.multipart()
+        except Exception:
+            return web.json_response({"ok": False, "error": "Expected multipart form upload"}, status=400)
+
+        file_part = None
+        while True:
+            part = await reader.next()
+            if part is None:
+                break
+            if part.name == "file":
+                file_part = part
+                break
+
+        if file_part is None:
+            return web.json_response({"ok": False, "error": "Missing multipart field 'file'"}, status=400)
+
+        app_dir = self._get_app_artifact_dir(app)
+        artifact_path = self._get_app_artifact_path(app)
+        app_dir.mkdir(parents=True, exist_ok=True)
+
+        fd, temp_path = tempfile.mkstemp(dir=str(app_dir), prefix=".tmp-artifact-", suffix=".apk")
+        size_bytes = 0
+
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                while True:
+                    chunk = await file_part.read_chunk(size=64 * 1024)
+                    if not chunk:
+                        break
+
+                    size_bytes += len(chunk)
+                    if size_bytes > ARTIFACT_MAX_SIZE_BYTES:
+                        try:
+                            os.unlink(temp_path)
+                        except FileNotFoundError:
+                            pass
+                        return web.json_response(
+                            {"ok": False, "error": "Artifact exceeds 100 MB limit"},
+                            status=413,
+                        )
+
+                    handle.write(chunk)
+
+            os.replace(temp_path, artifact_path)
+
+            metadata = {
+                "uploaded_at": datetime.now().isoformat(timespec="seconds"),
+                "size_bytes": size_bytes,
+                "uploaded_by": request.get("user_email", "unknown"),
+            }
+            self._write_json_atomically(app_dir / "meta.json", metadata)
+
+            return web.json_response({
+                "ok": True,
+                "app": app,
+                "size_bytes": size_bytes,
+                "download_url": f"/apps/{app}/latest.apk",
+            })
+        except Exception as e:
+            logger.error(f"Error handling deploy upload for {app}: {e}")
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            raise web.HTTPInternalServerError(text="Failed to store artifact") from e
+
+    async def _handle_app_artifact_get(self, request: web.Request) -> web.Response:
+        """Handle GET /apps/{app}/latest.apk to download the latest app artifact."""
+        app = request.match_info.get("app", "")
+        if not self._is_valid_artifact_app_name(app):
+            raise web.HTTPNotFound(text="Artifact not found")
+
+        artifact_path = self._get_app_artifact_path(app)
+        if not artifact_path.exists():
+            raise web.HTTPNotFound(text="Artifact not found")
+
+        return web.FileResponse(
+            artifact_path,
+            headers={"Content-Disposition": f"attachment; filename={app}.apk"},
+        )
+
+    async def _handle_apk_get(self, request: web.Request) -> web.Response:
+        """Handle GET /apk for backward-compatible legacy APK downloads."""
+        artifact_path = self._get_legacy_apk_path()
+        if not artifact_path.exists():
+            raise web.HTTPNotFound(text="APK not found")
+
+        return web.FileResponse(
+            artifact_path,
+            headers={"Content-Disposition": "attachment; filename=office-climate.apk"},
+        )
+
     async def _handle_history_get(self, request: web.Request) -> web.Response:
         """Handle GET /history for historical data.
 
@@ -1730,6 +1837,9 @@ class Orchestrator:
             if request.headers.get("Upgrade") == "websocket":
                 return await handler(request)
 
+            if request.path.startswith("/apps/") or request.path == "/apk":
+                return await handler(request)
+
             # Get Authorization header
             auth_header = request.headers.get("Authorization", "")
 
@@ -1793,12 +1903,62 @@ class Orchestrator:
 
         return False
 
+    @staticmethod
+    def _is_valid_artifact_app_name(app: str) -> bool:
+        """Return True when an artifact app name is safe for filesystem storage."""
+        return bool(ARTIFACT_APP_PATTERN.fullmatch(app))
+
+    def _get_artifacts_root(self) -> Path:
+        """Return the root directory used for uploaded app artifacts."""
+        return getattr(self, "_artifacts_root", DEFAULT_ARTIFACTS_ROOT)
+
+    def _get_legacy_apk_path(self) -> Path:
+        """Return the legacy single-app APK path served by /apk."""
+        return getattr(self, "_legacy_apk_path", DEFAULT_LEGACY_APK_PATH)
+
+    def _get_app_artifact_dir(self, app: str) -> Path:
+        """Return the directory for a given app's uploaded artifacts."""
+        return self._get_artifacts_root() / app
+
+    def _get_app_artifact_path(self, app: str) -> Path:
+        """Return the latest artifact path for the given app."""
+        return self._get_app_artifact_dir(app) / "latest.apk"
+
+    @staticmethod
+    def _write_json_atomically(path: Path, payload: dict) -> None:
+        """Write JSON metadata via a temp file and os.replace."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-meta-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            os.replace(temp_path, path)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            raise
+
+    @staticmethod
+    def _resolve_redirect_scheme(request: web.Request) -> str:
+        """Resolve the scheme to use for OAuth redirects."""
+        forwarded_proto = request.headers.get("X-Forwarded-Proto")
+        if forwarded_proto:
+            return forwarded_proto.split(",", 1)[0].strip()
+
+        host_without_port = request.host.split(":", 1)[0].lower()
+        if host_without_port in {"localhost", "127.0.0.1"} or host_without_port.endswith(".local"):
+            return "http"
+
+        return "https"
+
     def _oauth_middleware(self):
         """Create OAuth JWT middleware."""
         @web.middleware
         async def middleware(request: web.Request, handler):
             # Skip auth for OAuth endpoints
-            skip_paths = ['/auth/login', '/auth/callback', '/auth/device/start', '/auth/device/poll']
+            skip_paths = ['/auth/login', '/auth/callback', '/auth/device/start', '/auth/device/poll', '/apps/', '/apk']
             if any(request.path.startswith(path) for path in skip_paths):
                 return await handler(request)
 
@@ -1846,13 +2006,8 @@ class Orchestrator:
         if not self.oauth:
             return web.json_response({"error": "OAuth not configured"}, status=501)
 
-        # Determine redirect URI based on request host
-        host = request.host
-        platform = request.query.get('platform', '')
-        if 'loca.lt' in host or '.' in host.split(':')[0]:
-            redirect_uri = f"https://{host}/auth/callback"
-        else:
-            redirect_uri = f"http://localhost:{self.config.orchestrator.port}/auth/callback"
+        # Use the incoming host so OAuth works for localhost, LAN hosts, and the public domain.
+        redirect_uri = f"{self._resolve_redirect_scheme(request)}://{request.host}/auth/callback"
 
         # Temporarily update OAuth redirect_uri for this request
         original_redirect_uri = self.oauth.redirect_uri
@@ -2012,12 +2167,18 @@ class Orchestrator:
         else:
             logger.warning("No authentication configured - API is open!")
 
-        self._app = web.Application(middlewares=middlewares)
+        self._app = web.Application(
+            middlewares=middlewares,
+            client_max_size=ARTIFACT_MAX_SIZE_BYTES + (1024 * 1024),
+        )
 
         # API routes
         self._app.router.add_post("/occupancy", self._handle_occupancy_post)
         self._app.router.add_get("/status", self._handle_status_get)
         self._app.router.add_get("/history", self._handle_history_get)
+        self._app.router.add_get("/apk", self._handle_apk_get)
+        self._app.router.add_get("/apps/{app}/latest.apk", self._handle_app_artifact_get)
+        self._app.router.add_post("/deploy/{app}", self._handle_deploy_post)
         self._app.router.add_get("/history/sessions", self._handle_history_sessions_get)
         self._app.router.add_get("/history/co2-ohlc", self._handle_history_co2_ohlc_get)
         self._app.router.add_get("/history/daily-stats", self._handle_history_daily_stats_get)

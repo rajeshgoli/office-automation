@@ -9,16 +9,16 @@ Office Climate Automation system for a backyard shed office. The system coordina
 ## Current Status (2026-01-09)
 
 **✅ Deployed to Mac Mini (Always-On Production)**
-- Mac Mini (macOS High Sierra 10.13.6) at 192.168.5.140
+- Mac Mini (macOS High Sierra 10.13.6) — hostname `bakasura4.local` (IP in config.yaml)
 - All services auto-start on boot via Launch Agents
-- MQTT broker (amqtt), Orchestrator, LocalTunnel all running
-- Remote access via LocalTunnel at https://climate.loca.lt
+- MQTT broker (amqtt) and Orchestrator running
+- Remote access via https://office.rajeshgo.li
 - SSH enabled for remote management
 
 **Working:**
 - YoLink sensors (door, window, motion) via Cloud MQTT
 - ERV control via Tuya local API (tinytuya)
-- Qingping Air Monitor via local MQTT (Mac Mini at 192.168.5.140:1883)
+- Qingping Air Monitor via local MQTT (Mac Mini — broker in config.yaml)
 - State machine (PRESENT/AWAY) with door open mode for ventilation scenarios
 - SQLite database for persistence and historical analysis (restores sensor states on startup)
 - React dashboard with live data (WebSocket + polling fallback)
@@ -37,12 +37,12 @@ Office Climate Automation system for a backyard shed office. The system coordina
 
 | Device | Control Method | Status |
 |--------|---------------|--------|
-| **ERV (Pioneer Airlink)** | Tuya local (`192.168.5.119`) | Working |
-| **Qingping Air Monitor** | Local MQTT (`192.168.5.140:1883`) | Working |
+| **ERV (Pioneer Airlink)** | Tuya local (IP in config.yaml) | Working |
+| **Qingping Air Monitor** | Local MQTT (broker in config.yaml) | Working |
 | **YoLink Sensors** | Cloud MQTT (`api.yosmart.com:8003`) | Working |
 | **Mitsubishi Split AC** | pykumo (Kumo Cloud) | Working |
-| **Mac Keyboard/Mouse** | HTTP POST to orchestrator (`192.168.5.140:8080`) | Working |
-| **Mac Mini (bakasura4)** | SSH (`192.168.5.140`) | Production host |
+| **Mac Keyboard/Mouse** | HTTP POST to orchestrator (server in config.yaml) | Working |
+| **Mac Mini (bakasura4)** | SSH (`bakasura4.local`) | Production host |
 
 ## Core Architecture
 
@@ -241,8 +241,8 @@ sqlite3 data/office_climate.db "SELECT timestamp, co2_ppm FROM sensor_readings W
    - Create OAuth 2.0 Client ID (Web application)
    - Add authorized redirect URIs:
      - `http://localhost:8080/auth/callback` (development)
-     - `http://192.168.5.140:8080/auth/callback` (local network)
-     - `https://climate.loca.lt/auth/callback` (remote access)
+     - `http://bakasura4.local:8080/auth/callback` (local network)
+     - `https://office.rajeshgo.li/auth/callback` (remote access)
 
 2. **Update config.yaml**:
 ```yaml
@@ -251,7 +251,7 @@ orchestrator:
     client_id: "YOUR_CLIENT_ID.apps.googleusercontent.com"
     client_secret: "YOUR_CLIENT_SECRET"
     allowed_emails:
-      - "rajeshgoli+kumo@gmail.com"
+      - "your_email@gmail.com"
 ```
 
 ### OAuth Features
@@ -306,7 +306,6 @@ orchestrator:
 | POST | `/erv` | Manual ERV control `{"speed": "off\|quiet\|medium\|turbo"}` |
 | POST | `/hvac` | Manual HVAC control `{"mode": "off\|heat", "setpoint_f": 70}` |
 | POST | `/qingping/interval` | Configure sensor report interval `{"interval": 60}` (seconds, min 15) |
-| GET | `/localtunnel/password` | Fetch LocalTunnel tunnel password from loca.lt API |
 
 ## Running
 
@@ -339,17 +338,17 @@ curl -X POST http://localhost:9001/erv \
 ## Device Details
 
 ### ERV (Tuya Local)
-- Device ID: `ebfb18b2fc8f6dc63eqvcw`
-- IP: `192.168.5.119`
-- Local Key: in config.yaml
+- Device ID: in config.yaml (`tuya.device_id`)
+- IP: in config.yaml (`tuya.device_ip`)
+- Local Key: in config.yaml (`tuya.local_key`)
 - DPS: 1 (power), 101 (SA fan 1-8), 102 (EA fan 1-8)
 - Presets: QUIET (1/1), MEDIUM (3/2), TURBO (8/8)
 
 ### Qingping (Local MQTT)
-- MAC: `582D3470765F`
-- Broker: amqtt on Mac Mini (`192.168.5.140:1883`)
-- Topic (receive): `qingping/582D3470765F/up`
-- Topic (configure): `qingping/582D3470765F/down`
+- MAC: in config.yaml (`qingping.mac`)
+- Broker: amqtt on Mac Mini (configured in config.yaml)
+- Topic (receive): `qingping/<mac>/up`
+- Topic (configure): `qingping/<mac>/down`
 - Report interval: 30s (configurable in config.yaml, min 15s)
 - Sensors: CO2 (ppm), temp (°C), humidity (%), PM2.5, PM10, tVOC index (SGP40 0-500 scale), noise (dB)
 - All sensor data saved to database for historical analysis
@@ -377,7 +376,7 @@ curl -X POST http://localhost:9001/erv \
 - **macOS detector**: Run locally (`python3 occupancy_detector.py --watch`)
 - Access at `http://localhost:9001` (backend) and `http://localhost:9002` (frontend)
 
-### Production: Mac Mini + LocalTunnel
+### Production: Mac Mini + office.rajeshgo.li
 
 **✅ Currently Deployed**
 
@@ -390,15 +389,14 @@ curl -X POST http://localhost:9001/erv \
          │ HTTPS
          ▼
 ┌─────────────────────────────────┐
-│  LocalTunnel                     │
-│  https://climate.loca.lt        │
-│  (HTTP Basic Auth)               │
+│  Public HTTPS Host              │
+│  https://office.rajeshgo.li     │
+│  (Google OAuth / API access)    │
 └────────┬────────────────────────┘
-         │ Encrypted tunnel
+         │ Tunnel / reverse proxy
          ▼
 ┌─────────────────────────────────┐
-│  Mac Mini (192.168.5.140)       │
-│  bakasura4.local                 │
+│  Mac Mini (bakasura4.local)     │
 │  orchestrator:8080 + amqtt:1883 │
 └─────────────────────────────────┘
          ▲
@@ -414,7 +412,7 @@ curl -X POST http://localhost:9001/erv \
 **Mac Mini Setup:**
 
 1. **✅ Set eero DHCP Reservation:**
-   - Mac Mini (bakasura4) reserved at `192.168.5.140`
+   - Mac Mini (bakasura4) should have a static DHCP reservation (configure IP in config.yaml)
 
 2. **✅ Install Python dependencies:**
    ```bash
@@ -425,33 +423,23 @@ curl -X POST http://localhost:9001/erv \
    pip install --user amqtt  # MQTT broker (Homebrew too new for High Sierra)
    ```
 
-3. **✅ Install Node.js for LocalTunnel:**
-   ```bash
-   # Node.js v14.21.3 (last version for High Sierra)
-   wget https://nodejs.org/dist/v14.21.3/node-v14.21.3-darwin-x64.tar.gz
-   tar -xzf node-v14.21.3-darwin-x64.tar.gz
-   sudo mv node-v14.21.3-darwin-x64 /usr/local/node
-   sudo ln -s /usr/local/node/bin/node /usr/local/bin/node
-   sudo ln -s /usr/local/node/bin/npx /usr/local/bin/npx
-   ```
+3. **✅ Reconfigure Qingping to use Mac Mini IP:**
+   - Via Qingping developer portal: Set MQTT broker to `bakasura4.local:1883`
 
-4. **✅ Reconfigure Qingping to use Mac Mini IP:**
-   - Via Qingping developer portal: Set MQTT broker to `192.168.5.140:1883`
-
-5. **✅ Enable SSH:**
+4. **✅ Enable SSH:**
    ```bash
    sudo systemsetup -setremotelogin on
    # Set up SSH key from work Mac for passwordless login
    ```
 
-6. **✅ Prevent Mac Mini sleep:**
+5. **✅ Prevent Mac Mini sleep:**
    ```bash
    sudo pmset -c sleep 0
    sudo pmset -c disksleep 0
    sudo pmset -c displaysleep 10
    ```
 
-7. **✅ Create Launch Agents (auto-start on boot):**
+6. **✅ Create Launch Agents (auto-start on boot):**
 
    **MQTT Broker (amqtt):**
    ```bash
@@ -504,47 +492,22 @@ curl -X POST http://localhost:9001/erv \
    launchctl load ~/Library/LaunchAgents/com.office-automate.orchestrator.plist
    ```
 
-   **LocalTunnel:**
-   ```bash
-   cat > ~/Library/LaunchAgents/com.office-automate.localtunnel.plist << 'EOF'
-   <?xml version="1.0" encoding="UTF-8"?>
-   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-   <plist version="1.0">
-   <dict>
-     <key>Label</key>
-     <string>com.office-automate.localtunnel</string>
-     <key>ProgramArguments</key>
-     <array>
-       <string>/usr/local/bin/npx</string>
-       <string>localtunnel</string>
-       <string>--port</string>
-       <string>8080</string>
-       <string>--subdomain</string>
-       <string>climate</string>
-     </array>
-     <key>RunAtLoad</key>
-     <true/>
-     <key>KeepAlive</key>
-     <true/>
-   </dict>
-   </plist>
-   EOF
+   **Public hostname:**
+   - Manage the `office.rajeshgo.li` hostname in the Cloudflare tunnel dashboard.
+   - Keep the legacy hostname redirecting to `office.rajeshgo.li` during the transition.
 
-   launchctl load ~/Library/LaunchAgents/com.office-automate.localtunnel.plist
-   ```
-
-8. **✅ Configure HTTP Basic Auth in config.yaml:**
+7. **✅ Configure HTTP Basic Auth in config.yaml:**
    ```yaml
    orchestrator:
      host: "0.0.0.0"
      port: 8080
-     auth_username: "rajesh"
+     auth_username: "admin"
      auth_password: "your_password"
    ```
 
 **Work Mac Setup:**
 
-9. **✅ Create occupancy detector Launch Agent:**
+8. **✅ Create occupancy detector Launch Agent:**
    ```bash
    cat > ~/Library/LaunchAgents/com.office-automate.occupancy.plist << 'EOF'
    <?xml version="1.0" encoding="UTF-8"?>
@@ -559,9 +522,9 @@ curl -X POST http://localhost:9001/erv \
        <string>/Users/rajesh/Desktop/office-automate/occupancy_detector.py</string>
        <string>--watch</string>
        <string>--url</string>
-       <string>http://192.168.5.140:8080</string>
+       <string>http://bakasura4.local:8080</string>
        <string>--auth-username</string>
-       <string>rajesh</string>
+       <string>admin</string>
        <string>--auth-password</string>
        <string>your_password</string>
      </array>
@@ -579,26 +542,24 @@ curl -X POST http://localhost:9001/erv \
 ### Usage & Remote Access
 
 **Local Network Access:**
-- Dashboard: `http://192.168.5.140:8080`
+- Dashboard: `http://bakasura4.local:8080`
 - Direct access from any device on home network
 
-**Remote Access (via LocalTunnel):**
-- URL: `https://climate.loca.lt`
-- First access: Enter tunnel password (get from Mac Mini: `curl https://loca.lt/mytunnelpassword`)
-- After IP whitelisting: HTTP Basic Auth (username: `rajesh`, password in config.yaml)
-- **Note:** LocalTunnel subdomain is first-come-first-served. If lost, check logs: `ssh rajesh@192.168.5.140 "tail /tmp/localtunnel.log"`
+**Remote Access:**
+- URL: `https://office.rajeshgo.li`
+- Use Google OAuth for browser sign-in.
+- The legacy hostname should redirect here during the transition.
 
 **Install PWA on iPhone:**
-1. Visit `https://climate.loca.lt` in Safari
-2. Enter LocalTunnel password (one-time per IP)
-3. Login with HTTP Basic Auth
-4. Tap Share button → "Add to Home Screen"
-5. Name it "Climate"
+1. Visit `https://office.rajeshgo.li` in Safari
+2. Sign in with Google
+3. Tap Share button → "Add to Home Screen"
+4. Name it "Office Climate"
 
 **Remote Management:**
 ```bash
 # SSH into Mac Mini
-ssh rajesh@192.168.5.140
+ssh rajesh@bakasura4.local
 
 # Check services status
 launchctl list | grep office-automate
@@ -606,16 +567,15 @@ launchctl list | grep office-automate
 # View logs
 tail -f /tmp/office-automate.error.log
 tail -f /tmp/mqtt.log
-tail -f /tmp/localtunnel.log
 
 # Restart services
 launchctl unload ~/Library/LaunchAgents/com.office-automate.orchestrator.plist
 launchctl load ~/Library/LaunchAgents/com.office-automate.orchestrator.plist
 
 # Deploy code updates from work Mac
-scp ~/Desktop/office-automate/src/orchestrator.py rajesh@192.168.5.140:~/office-automate/src/
-ssh rajesh@192.168.5.140 "launchctl unload ~/Library/LaunchAgents/com.office-automate.orchestrator.plist && launchctl load ~/Library/LaunchAgents/com.office-automate.orchestrator.plist"
+scp ~/Desktop/office-automate/src/orchestrator.py rajesh@bakasura4.local:~/office-automate/src/
+ssh rajesh@bakasura4.local "launchctl unload ~/Library/LaunchAgents/com.office-automate.orchestrator.plist && launchctl load ~/Library/LaunchAgents/com.office-automate.orchestrator.plist"
 
 # Database queries
-ssh rajesh@192.168.5.140 "sqlite3 ~/office-automate/data/office_climate.db 'SELECT * FROM occupancy_log ORDER BY timestamp DESC LIMIT 10'"
+ssh rajesh@bakasura4.local "sqlite3 ~/office-automate/data/office_climate.db 'SELECT * FROM occupancy_log ORDER BY timestamp DESC LIMIT 10'"
 ```
