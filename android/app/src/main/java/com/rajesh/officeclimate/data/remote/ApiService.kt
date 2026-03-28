@@ -1,10 +1,15 @@
 package com.rajesh.officeclimate.data.remote
 
 import com.rajesh.officeclimate.data.model.ApiStatus
+import com.rajesh.officeclimate.data.model.DailyStatsResponse
+import com.rajesh.officeclimate.data.model.OHLCResponse
+import com.rajesh.officeclimate.data.model.SessionsResponse
+import com.rajesh.officeclimate.data.model.TemperatureResponse
 import kotlinx.serialization.json.JsonObject
 import retrofit2.http.Body
 import retrofit2.http.GET
 import retrofit2.http.POST
+import retrofit2.http.Query
 
 interface ApiService {
     @GET("status")
@@ -15,4 +20,16 @@ interface ApiService {
 
     @POST("hvac")
     suspend fun setHvacMode(@Body body: JsonObject): JsonObject
+
+    @GET("history/sessions")
+    suspend fun getSessions(@Query("days") days: Int = 7): SessionsResponse
+
+    @GET("history/co2-ohlc")
+    suspend fun getCO2OHLC(@Query("hours") hours: Int = 24): OHLCResponse
+
+    @GET("history/daily-stats")
+    suspend fun getDailyStats(@Query("days") days: Int = 7): DailyStatsResponse
+
+    @GET("history/temperature")
+    suspend fun getTemperature(@Query("hours") hours: Int = 24): TemperatureResponse
 }

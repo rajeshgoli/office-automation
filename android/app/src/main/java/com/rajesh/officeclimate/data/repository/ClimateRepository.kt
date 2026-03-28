@@ -2,6 +2,10 @@ package com.rajesh.officeclimate.data.repository
 
 import android.util.Log
 import com.rajesh.officeclimate.data.model.ApiStatus
+import com.rajesh.officeclimate.data.model.DailyStatsResponse
+import com.rajesh.officeclimate.data.model.OHLCResponse
+import com.rajesh.officeclimate.data.model.SessionsResponse
+import com.rajesh.officeclimate.data.model.TemperatureResponse
 import com.rajesh.officeclimate.data.remote.ApiService
 import com.rajesh.officeclimate.data.remote.AuthInterceptor
 import com.rajesh.officeclimate.data.remote.WebSocketManager
@@ -59,12 +63,17 @@ class ClimateRepository(
 
     fun start() {
         scope.launch {
-            val url = settingsRepository.serverUrl.first()
-            val token = settingsRepository.jwtToken.first()
-            rebuild(url, token)
+            ensureInitialized()
             startPolling()
             startWebSocket()
         }
+    }
+
+    private suspend fun ensureInitialized() {
+        if (::apiService.isInitialized) return
+        val url = settingsRepository.serverUrl.first()
+        val token = settingsRepository.jwtToken.first()
+        rebuild(url, token)
     }
 
     fun stop() {
@@ -161,6 +170,26 @@ class ClimateRepository(
             if (setpointF != null) put("setpoint_f", setpointF)
         }
         apiService.setHvacMode(body)
+    }
+
+    suspend fun getSessions(days: Int = 7): Result<SessionsResponse> = runCatching {
+        ensureInitialized()
+        apiService.getSessions(days)
+    }
+
+    suspend fun getCO2OHLC(hours: Int = 24): Result<OHLCResponse> = runCatching {
+        ensureInitialized()
+        apiService.getCO2OHLC(hours)
+    }
+
+    suspend fun getDailyStats(days: Int = 7): Result<DailyStatsResponse> = runCatching {
+        ensureInitialized()
+        apiService.getDailyStats(days)
+    }
+
+    suspend fun getTemperature(hours: Int = 24): Result<TemperatureResponse> = runCatching {
+        ensureInitialized()
+        apiService.getTemperature(hours)
     }
 
     suspend fun testConnection(url: String, token: String): Result<ApiStatus> = runCatching {
