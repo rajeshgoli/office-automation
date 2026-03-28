@@ -2,9 +2,11 @@ package com.rajesh.officeclimate.data.remote
 
 import com.rajesh.officeclimate.data.model.ApiStatus
 import com.rajesh.officeclimate.data.model.DailyStatsResponse
+import com.rajesh.officeclimate.data.model.LeverageResponse
 import com.rajesh.officeclimate.data.model.OHLCResponse
 import com.rajesh.officeclimate.data.model.OpeningsResponse
 import com.rajesh.officeclimate.data.model.OrchestrationResponse
+import com.rajesh.officeclimate.data.model.ProjectLeverageResponse
 import com.rajesh.officeclimate.data.model.ProjectFocusResponse
 import com.rajesh.officeclimate.data.model.SessionsResponse
 import com.rajesh.officeclimate.data.model.TemperatureResponse
@@ -44,4 +46,10 @@ interface ApiService {
 
     @GET("history/project-focus")
     suspend fun getProjectFocus(@Query("days") days: Int = 7): ProjectFocusResponse
+
+    @GET("history/leverage")
+    suspend fun getLeverage(@Query("days") days: Int = 7): LeverageResponse
+
+    @GET("history/project-leverage")
+    suspend fun getProjectLeverage(@Query("days") days: Int = 7): ProjectLeverageResponse
 }

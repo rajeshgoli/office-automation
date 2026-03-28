@@ -161,3 +161,99 @@ data class ProjectCount(
     val name: String = "",
     val messages: Int = 0,
 )
+
+@Serializable
+data class LeverageResponse(
+    val ok: Boolean = false,
+    val days: List<LeverageDay> = emptyList(),
+    val week: LeverageWeek = LeverageWeek(),
+)
+
+@Serializable
+data class LeverageDay(
+    val date: String = "",
+    val prompts: Int = 0,
+    val sessions: Int = 0,
+    @SerialName("lines_added") val linesAdded: Int = 0,
+    @SerialName("lines_removed") val linesRemoved: Int = 0,
+    @SerialName("lines_changed") val linesChanged: Int = 0,
+    @SerialName("files_modified") val filesModified: Int = 0,
+    val commits: Int = 0,
+    @SerialName("prs_merged") val prsMerged: Int = 0,
+    @SerialName("prs_opened") val prsOpened: Int = 0,
+    @SerialName("avg_pr_cycle_hours") val avgPrCycleHours: Double? = null,
+    @SerialName("lines_per_prompt") val linesPerPrompt: Double? = null,
+    @SerialName("commits_per_prompt") val commitsPerPrompt: Double? = null,
+    @SerialName("lines_per_session_minute") val linesPerSessionMinute: Double? = null,
+)
+
+@Serializable
+data class LeverageWeek(
+    val prompts: Int = 0,
+    val sessions: Int = 0,
+    @SerialName("lines_added") val linesAdded: Int = 0,
+    @SerialName("lines_removed") val linesRemoved: Int = 0,
+    @SerialName("lines_changed") val linesChanged: Int = 0,
+    @SerialName("files_modified") val filesModified: Int = 0,
+    val commits: Int = 0,
+    @SerialName("prs_merged") val prsMerged: Int = 0,
+    @SerialName("prs_opened") val prsOpened: Int = 0,
+    @SerialName("avg_pr_cycle_hours") val avgPrCycleHours: Double? = null,
+    @SerialName("lines_per_prompt") val linesPerPrompt: Double? = null,
+    @SerialName("commits_per_prompt") val commitsPerPrompt: Double? = null,
+    @SerialName("lines_per_session_minute") val linesPerSessionMinute: Double? = null,
+    @SerialName("active_days") val activeDays: Int = 0,
+)
+
+@Serializable
+data class ProjectLeverageResponse(
+    val ok: Boolean = false,
+    val projects: Map<String, ProjectLeverageProject> = emptyMap(),
+)
+
+@Serializable
+data class ProjectLeverageProject(
+    val summary: String = "",
+    val days: List<ProjectLeverageDay> = emptyList(),
+    val week: ProjectLeverageWeek? = null,
+    val current: EngramCurrent? = null,
+)
+
+@Serializable
+data class ProjectLeverageDay(
+    val date: String = "",
+    @SerialName("sm_dispatches") val smDispatches: Int = 0,
+    @SerialName("sm_sends") val smSends: Int = 0,
+    @SerialName("sm_reminds") val smReminds: Int = 0,
+    @SerialName("sm_active_sessions") val smActiveSessions: Int = 0,
+    @SerialName("sm_telegram_in") val smTelegramIn: Int = 0,
+    @SerialName("sm_telegram_out") val smTelegramOut: Int = 0,
+    @SerialName("engram_last_fold_age_hours") val engramLastFoldAgeHours: Double = 0.0,
+    @SerialName("engram_folds_7d") val engramFolds7d: Int = 0,
+    @SerialName("engram_active_concepts") val engramActiveConcepts: Int = 0,
+    @SerialName("persona_reads") val personaReads: Int = 0,
+    @SerialName("persona_projects") val personaProjects: Int = 0,
+    @SerialName("automation_events") val automationEvents: Int = 0,
+    @SerialName("state_transitions") val stateTransitions: Int = 0,
+)
+
+@Serializable
+data class ProjectLeverageWeek(
+    @SerialName("sm_dispatches") val smDispatches: Int = 0,
+    @SerialName("sm_sends") val smSends: Int = 0,
+    @SerialName("sm_reminds") val smReminds: Int = 0,
+    @SerialName("sm_active_sessions") val smActiveSessions: Int = 0,
+    @SerialName("sm_telegram_in") val smTelegramIn: Int = 0,
+    @SerialName("sm_telegram_out") val smTelegramOut: Int = 0,
+    @SerialName("persona_reads") val personaReads: Int = 0,
+    @SerialName("persona_projects") val personaProjects: Int = 0,
+    @SerialName("automation_events") val automationEvents: Int = 0,
+    @SerialName("state_transitions") val stateTransitions: Int = 0,
+)
+
+@Serializable
+data class EngramCurrent(
+    @SerialName("last_fold_age_hours") val lastFoldAgeHours: Double? = null,
+    @SerialName("active_concepts") val activeConcepts: Int = 0,
+    @SerialName("folds_7d") val folds7d: Int = 0,
+)

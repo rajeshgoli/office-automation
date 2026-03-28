@@ -4,6 +4,7 @@ import android.app.Application
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.rajesh.officeclimate.data.model.LeverageResponse
 import com.rajesh.officeclimate.data.model.OrchestrationResponse
 import com.rajesh.officeclimate.data.model.ProjectFocusResponse
 import com.rajesh.officeclimate.data.model.SessionsResponse
@@ -27,6 +28,9 @@ class ProductivityViewModel(application: Application) : AndroidViewModel(applica
     private val _projectFocus = MutableStateFlow<ProjectFocusResponse?>(null)
     val projectFocus: StateFlow<ProjectFocusResponse?> = _projectFocus
 
+    private val _leverage = MutableStateFlow<LeverageResponse?>(null)
+    val leverage: StateFlow<LeverageResponse?> = _leverage
+
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading
 
@@ -45,6 +49,7 @@ class ProductivityViewModel(application: Application) : AndroidViewModel(applica
             val sessionsDeferred = async { climateRepo.getSessions(7) }
             val orchestrationDeferred = async { climateRepo.getOrchestration(7) }
             val projectFocusDeferred = async { climateRepo.getProjectFocus(7) }
+            val leverageDeferred = async { climateRepo.getLeverage(7) }
 
             sessionsDeferred.await()
                 .onSuccess { _sessions.value = it }
@@ -60,6 +65,10 @@ class ProductivityViewModel(application: Application) : AndroidViewModel(applica
             projectFocusDeferred.await()
                 .onSuccess { _projectFocus.value = it }
                 .onFailure { Log.e(TAG, "Project focus fetch failed", it) }
+
+            leverageDeferred.await()
+                .onSuccess { _leverage.value = it }
+                .onFailure { Log.e(TAG, "Leverage fetch failed", it) }
 
             _isLoading.value = false
         }
