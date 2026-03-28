@@ -1717,6 +1717,15 @@ class Orchestrator:
             logger.error(f"Error handling history/orchestration GET: {e}")
             return web.json_response({"ok": False, "error": str(e)}, status=400)
 
+    async def _handle_history_leverage_get(self, request: web.Request) -> web.Response:
+        """Handle GET /history/leverage for per-day leverage metrics."""
+        try:
+            days = min(max(1, int(request.query.get("days", "7"))), 30)
+            return web.json_response({"ok": True, **self.db.get_leverage_history(days=days)})
+        except Exception as e:
+            logger.error(f"Error handling history/leverage GET: {e}")
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
     async def _handle_history_project_focus_get(self, request: web.Request) -> web.Response:
         """Handle GET /history/project-focus for per-day project message mix."""
         try:
@@ -2419,6 +2428,7 @@ class Orchestrator:
         self._app.router.add_get("/history/daily-stats", self._handle_history_daily_stats_get)
         self._app.router.add_get("/history/temperature", self._handle_history_temperature_get)
         self._app.router.add_get("/history/orchestration", self._handle_history_orchestration_get)
+        self._app.router.add_get("/history/leverage", self._handle_history_leverage_get)
         self._app.router.add_get("/history/project-focus", self._handle_history_project_focus_get)
         self._app.router.add_get("/history/openings", self._handle_history_openings_get)
         self._app.router.add_get("/history/project-leverage", self._handle_history_project_leverage_get)
