@@ -1490,6 +1490,48 @@ class Orchestrator:
             logger.error(f"Error handling history GET: {e}")
             return web.json_response({"ok": False, "error": str(e)}, status=400)
 
+    async def _handle_history_sessions_get(self, request: web.Request) -> web.Response:
+        """Handle GET /history/sessions for office session data."""
+        try:
+            days = min(max(1, int(request.query.get("days", "7"))), 30)
+            result = self.db.get_office_sessions(days=days)
+            return web.json_response({"ok": True, "days": days, **result})
+        except Exception as e:
+            logger.error(f"Error handling history/sessions GET: {e}")
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+    async def _handle_history_co2_ohlc_get(self, request: web.Request) -> web.Response:
+        """Handle GET /history/co2-ohlc for CO2 candlestick data."""
+        try:
+            hours = min(max(1, int(request.query.get("hours", "24"))), 168)
+            bucket_minutes = request.query.get("bucket_minutes")
+            bucket_minutes = int(bucket_minutes) if bucket_minutes else None
+            result = self.db.get_co2_ohlc(hours=hours, bucket_minutes=bucket_minutes)
+            return web.json_response({"ok": True, "hours": hours, **result})
+        except Exception as e:
+            logger.error(f"Error handling history/co2-ohlc GET: {e}")
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+    async def _handle_history_temperature_get(self, request: web.Request) -> web.Response:
+        """Handle GET /history/temperature for temperature time series."""
+        try:
+            hours = min(max(1, int(request.query.get("hours", "24"))), 168)
+            result = self.db.get_temperature_history(hours=hours)
+            return web.json_response({"ok": True, "hours": hours, **result})
+        except Exception as e:
+            logger.error(f"Error handling history/temperature GET: {e}")
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+    async def _handle_history_daily_stats_get(self, request: web.Request) -> web.Response:
+        """Handle GET /history/daily-stats for daily aggregate stats."""
+        try:
+            days = min(max(1, int(request.query.get("days", "7"))), 30)
+            stats = self.db.get_daily_stats(days=days)
+            return web.json_response({"ok": True, "days": days, "stats": stats})
+        except Exception as e:
+            logger.error(f"Error handling history/daily-stats GET: {e}")
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
     def _get_status_dict(self) -> dict:
         """Get current status as a dictionary."""
         sm_status = self.state_machine.get_status()
@@ -1946,6 +1988,10 @@ class Orchestrator:
         self._app.router.add_post("/occupancy", self._handle_occupancy_post)
         self._app.router.add_get("/status", self._handle_status_get)
         self._app.router.add_get("/history", self._handle_history_get)
+        self._app.router.add_get("/history/sessions", self._handle_history_sessions_get)
+        self._app.router.add_get("/history/co2-ohlc", self._handle_history_co2_ohlc_get)
+        self._app.router.add_get("/history/daily-stats", self._handle_history_daily_stats_get)
+        self._app.router.add_get("/history/temperature", self._handle_history_temperature_get)
         self._app.router.add_get("/ws", self._handle_websocket)
         self._app.router.add_post("/erv", self._handle_erv_post)
         self._app.router.add_post("/hvac", self._handle_hvac_post)

@@ -15,6 +15,7 @@ Enables:
 import sqlite3
 import json
 import logging
+import math
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -314,3 +315,297 @@ class Database:
                 ORDER BY hour
             """, (since.isoformat(),)).fetchall()
             return [dict(row) for row in rows]
+
+    # --- History / trends ---
+
+    def get_office_sessions(self, days: int = 7) -> Dict[str, Any]:
+        """Get daily office sessions (arrival/departure/gaps) for the past N days."""
+        since = datetime.now() - timedelta(days=days)
+        with self._connection() as conn:
+            rows = conn.execute("""
+                SELECT timestamp, state FROM occupancy_log
+                WHERE timestamp > ?
+                ORDER BY timestamp ASC
+            """, (since.isoformat(),)).fetchall()
+
+        # Group transitions by date
+        by_date: Dict[str, List] = {}
+        for row in rows:
+            ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S")
+            date_str = ts.strftime("%Y-%m-%d")
+            by_date.setdefault(date_str, []).append((ts, row["state"]))
+
+        sessions = []
+        arrival_minutes = []
+        departure_minutes = []
+
+        for date_str, transitions in sorted(by_date.items()):
+            # Find first PRESENT after 5am (ignore overnight sensor noise)
+            first_present = None
+            last_away = None
+            for ts, state in transitions:
+                if state == "present" and first_present is None and ts.hour >= 5:
+                    first_present = ts
+                if state == "away" and first_present is not None:
+                    last_away = ts
+
+            if first_present is None:
+                continue
+
+            arrival = first_present
+            departure = last_away or transitions[-1][0]
+            duration = (departure - arrival).total_seconds() / 3600
+
+            # Find gaps (AWAY periods between arrival and departure)
+            gaps = []
+            gap_start = None
+            for ts, state in transitions:
+                if ts <= arrival or ts > departure:
+                    continue
+                if state == "away" and gap_start is None:
+                    gap_start = ts
+                elif state == "present" and gap_start is not None:
+                    gap_dur = (ts - gap_start).total_seconds() / 60
+                    if gap_dur >= 2:  # Only count gaps >= 2 min
+                        gaps.append({
+                            "left": gap_start.strftime("%H:%M:%S"),
+                            "returned": ts.strftime("%H:%M:%S"),
+                            "duration_min": round(gap_dur),
+                        })
+                        duration -= gap_dur / 60  # Subtract gap from duration
+                    gap_start = None
+
+            sessions.append({
+                "date": date_str,
+                "arrival": arrival.strftime("%H:%M:%S"),
+                "departure": departure.strftime("%H:%M:%S"),
+                "duration_hours": round(duration, 1),
+                "gaps": gaps,
+            })
+
+            arr_min = arrival.hour * 60 + arrival.minute
+            dep_min = departure.hour * 60 + departure.minute
+            arrival_minutes.append(arr_min)
+            departure_minutes.append(dep_min)
+
+        # Compute summary
+        summary = {
+            "avg_arrival": "00:00:00",
+            "avg_departure": "00:00:00",
+            "avg_duration_hours": 0,
+            "std_arrival_min": 0,
+            "std_departure_min": 0,
+            "total_hours_week": 0,
+        }
+
+        if sessions:
+            avg_arr = sum(arrival_minutes) / len(arrival_minutes)
+            avg_dep = sum(departure_minutes) / len(departure_minutes)
+            total_hrs = sum(s["duration_hours"] for s in sessions)
+            avg_dur = total_hrs / len(sessions)
+
+            std_arr = math.sqrt(sum((m - avg_arr) ** 2 for m in arrival_minutes) / len(arrival_minutes)) if len(arrival_minutes) > 1 else 0
+            std_dep = math.sqrt(sum((m - avg_dep) ** 2 for m in departure_minutes) / len(departure_minutes)) if len(departure_minutes) > 1 else 0
+
+            def mins_to_time(m):
+                h = int(m) // 60
+                mi = int(m) % 60
+                return f"{h:02d}:{mi:02d}:00"
+
+            summary = {
+                "avg_arrival": mins_to_time(avg_arr),
+                "avg_departure": mins_to_time(avg_dep),
+                "avg_duration_hours": round(avg_dur, 1),
+                "std_arrival_min": round(std_arr),
+                "std_departure_min": round(std_dep),
+                "total_hours_week": round(total_hrs, 1),
+            }
+
+        return {"sessions": sessions, "summary": summary}
+
+    def get_co2_ohlc(self, hours: int = 24, bucket_minutes: Optional[int] = None) -> Dict[str, Any]:
+        """Get CO2 data aggregated into OHLC buckets."""
+        if bucket_minutes is None:
+            if hours <= 1:
+                bucket_minutes = 5
+            elif hours <= 6:
+                bucket_minutes = 15
+            elif hours <= 24:
+                bucket_minutes = 60
+            else:
+                bucket_minutes = 240
+
+        since = datetime.now() - timedelta(hours=hours)
+        bucket_seconds = bucket_minutes * 60
+
+        # Single query: get all readings with their bucket, then compute OHLC in Python
+        with self._connection() as conn:
+            rows = conn.execute("""
+                SELECT
+                    datetime((strftime('%s', timestamp) / ?) * ?, 'unixepoch', 'localtime') as bucket,
+                    co2_ppm,
+                    timestamp
+                FROM sensor_readings
+                WHERE timestamp > ? AND co2_ppm IS NOT NULL
+                ORDER BY timestamp ASC
+            """, (bucket_seconds, bucket_seconds, since.isoformat())).fetchall()
+
+        # Group by bucket and compute OHLC
+        buckets: Dict[str, list] = {}
+        for row in rows:
+            buckets.setdefault(row["bucket"], []).append(row["co2_ppm"])
+
+        candles = []
+        for bucket_ts in sorted(buckets.keys()):
+            values = buckets[bucket_ts]
+            candles.append({
+                "timestamp": bucket_ts,
+                "open": values[0],
+                "high": max(values),
+                "low": min(values),
+                "close": values[-1],
+                "avg": round(sum(values) / len(values)),
+                "readings": len(values),
+            })
+
+        return {"bucket_minutes": bucket_minutes, "candles": candles}
+
+    def get_temperature_history(self, hours: int = 24, bucket_minutes: Optional[int] = None) -> Dict[str, Any]:
+        """Get temperature data as time series for line chart."""
+        if bucket_minutes is None:
+            if hours <= 1:
+                bucket_minutes = 5
+            elif hours <= 6:
+                bucket_minutes = 15
+            elif hours <= 24:
+                bucket_minutes = 30
+            else:
+                bucket_minutes = 120
+
+        since = datetime.now() - timedelta(hours=hours)
+        bucket_seconds = bucket_minutes * 60
+
+        with self._connection() as conn:
+            rows = conn.execute("""
+                SELECT
+                    datetime((strftime('%s', timestamp) / ?) * ?, 'unixepoch', 'localtime') as bucket,
+                    AVG(temp_c) as avg_temp,
+                    MIN(temp_c) as min_temp,
+                    MAX(temp_c) as max_temp,
+                    COUNT(*) as readings
+                FROM sensor_readings
+                WHERE timestamp > ? AND temp_c IS NOT NULL
+                GROUP BY bucket
+                ORDER BY bucket ASC
+            """, (bucket_seconds, bucket_seconds, since.isoformat())).fetchall()
+
+        points = []
+        for row in rows:
+            avg_c = row["avg_temp"]
+            min_c = row["min_temp"]
+            max_c = row["max_temp"]
+            points.append({
+                "timestamp": row["bucket"],
+                "avg_f": round(avg_c * 9 / 5 + 32, 1),
+                "min_f": round(min_c * 9 / 5 + 32, 1),
+                "max_f": round(max_c * 9 / 5 + 32, 1),
+                "readings": row["readings"],
+            })
+
+        return {"bucket_minutes": bucket_minutes, "points": points}
+
+    def get_daily_stats(self, days: int = 7) -> List[Dict[str, Any]]:
+        """Get daily aggregate stats (door events, runtimes, presence hours)."""
+        since = datetime.now() - timedelta(days=days)
+
+        with self._connection() as conn:
+            # Door events per day
+            door_rows = conn.execute("""
+                SELECT date(timestamp) as date, COUNT(*) as count
+                FROM device_events
+                WHERE timestamp > ? AND device_type = 'door'
+                GROUP BY date(timestamp)
+            """, (since.isoformat(),)).fetchall()
+            door_by_date = {r["date"]: r["count"] for r in door_rows}
+
+            # Presence hours per day from occupancy_log
+            occ_rows = conn.execute("""
+                SELECT timestamp, state FROM occupancy_log
+                WHERE timestamp > ?
+                ORDER BY timestamp ASC
+            """, (since.isoformat(),)).fetchall()
+
+            presence_by_date: Dict[str, float] = {}
+            prev_ts = None
+            prev_state = None
+            for row in occ_rows:
+                ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S")
+                if prev_ts and prev_state == "present":
+                    date_str = prev_ts.strftime("%Y-%m-%d")
+                    dur_hrs = (ts - prev_ts).total_seconds() / 3600
+                    # Cap at same-day boundary
+                    if ts.date() == prev_ts.date():
+                        presence_by_date[date_str] = presence_by_date.get(date_str, 0) + dur_hrs
+                prev_ts = ts
+                prev_state = row["state"]
+
+            # ERV runtime per day
+            erv_rows = conn.execute("""
+                SELECT timestamp, action FROM climate_actions
+                WHERE timestamp > ? AND system = 'erv'
+                ORDER BY timestamp ASC
+            """, (since.isoformat(),)).fetchall()
+
+            erv_by_date: Dict[str, float] = {}
+            erv_on_ts = None
+            for row in erv_rows:
+                ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S")
+                action = row["action"]
+                if action in ("quiet", "medium", "turbo", "on"):
+                    if erv_on_ts is None:
+                        erv_on_ts = ts
+                elif action == "off" and erv_on_ts:
+                    date_str = erv_on_ts.strftime("%Y-%m-%d")
+                    dur_min = (ts - erv_on_ts).total_seconds() / 60
+                    erv_by_date[date_str] = erv_by_date.get(date_str, 0) + dur_min
+                    erv_on_ts = None
+
+            # HVAC runtime per day
+            hvac_rows = conn.execute("""
+                SELECT timestamp, action FROM climate_actions
+                WHERE timestamp > ? AND system = 'hvac'
+                ORDER BY timestamp ASC
+            """, (since.isoformat(),)).fetchall()
+
+            hvac_by_date: Dict[str, float] = {}
+            hvac_on_ts = None
+            for row in hvac_rows:
+                ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S")
+                action = row["action"]
+                if action in ("heat", "cool", "on"):
+                    if hvac_on_ts is None:
+                        hvac_on_ts = ts
+                elif action == "off" and hvac_on_ts:
+                    date_str = hvac_on_ts.strftime("%Y-%m-%d")
+                    dur_min = (ts - hvac_on_ts).total_seconds() / 60
+                    hvac_by_date[date_str] = hvac_by_date.get(date_str, 0) + dur_min
+                    hvac_on_ts = None
+
+            # Collect all dates
+            all_dates = set()
+            all_dates.update(door_by_date.keys())
+            all_dates.update(presence_by_date.keys())
+            all_dates.update(erv_by_date.keys())
+            all_dates.update(hvac_by_date.keys())
+
+            stats = []
+            for date_str in sorted(all_dates):
+                stats.append({
+                    "date": date_str,
+                    "door_events": door_by_date.get(date_str, 0),
+                    "erv_runtime_min": round(erv_by_date.get(date_str, 0)),
+                    "hvac_runtime_min": round(hvac_by_date.get(date_str, 0)),
+                    "presence_hours": round(presence_by_date.get(date_str, 0), 1),
+                })
+
+            return stats
