@@ -11,9 +11,9 @@
 | **E: Artifact server + domain** | office-automate | None | `/deploy/{app}`, `/apps/{app}`, domain rename |
 | **F: sm Telegram telemetry** | session-manager | None | Telegram message counters only (sm commands already in tool_usage.db) |
 | **G: engram fold telemetry** | engram | None | Fold stats CLI/export |
-| **H: Project leverage pipeline + UI** | office-automate | G (engram), F (Telegram, optional) | Collection from tool_usage.db + engram DB, endpoint, Android cards |
+| **H: Project leverage pipeline + UI** | office-automate | G (engram); F is optional (Telegram only) | Collection from tool_usage.db + engram DB, endpoint, Android cards |
 
-A, B, E, F, G can all run in parallel. C depends on A+B. D depends on C. H depends on F+G.
+A, B, E, F, G can all run in parallel. C depends on A+B. D depends on C. H depends on G; F is optional (adds Telegram metrics only — H ships without them and shows "--" for Telegram).
 
 The EM managing this epic must spawn agents in session-manager and engram repos for tickets F and G respectively.
 
@@ -259,9 +259,25 @@ Register at `self._app.router.add_get("/history/leverage", self._handle_history_
 
 ---
 
-## Part D: Android UI
+## Part D: Android UI — Leverage Cards + Projects Tab
 
-### Leverage Cards
+Phase 2 adds leverage cards to the Productivity tab and a new **Projects** tab (4th bottom nav) for per-project metrics.
+
+### Navigation change
+
+Add a 4th tab to `AppNavigation.kt`. Current tabs: Dashboard, History, Productivity. New:
+
+```
+Dashboard  |  History  |  Productivity  |  Projects
+   🏠          📊          📈               🧩
+```
+
+- Route: `Routes.PROJECTS = "projects"`
+- Icon: `Icons.Filled.Apps` / `Icons.Outlined.Apps` (or `GridView`)
+- New screen: `ProjectsScreen.kt` in `ui/projects/`
+- New ViewModel: `ProjectsViewModel.kt`
+
+### Productivity tab additions
 
 Add two new sections to `ProductivityScreen.kt`, below the existing daily/weekly summary cards:
 
@@ -282,6 +298,104 @@ Add two new sections to `ProductivityScreen.kt`, below the existing daily/weekly
 | WEEK COMMITS | `week.commits` | "48" | Amber |
 | WEEK PRs | `week.prs_merged` | "14" | Blue |
 | AVG L/PROMPT | `week.lines_per_prompt` | "36.7" or "--" | Cyan |
+
+### Projects tab — screen layout
+
+The Projects tab is a vertically scrollable screen with one **project card** per active project. Each card is a self-contained section showing that project's health and usage metrics.
+
+```
+┌──────────────────────────────────────┐
+│  PROJECTS                            │
+│                                      │
+│  ┌──────────────────────────────────┐│
+│  │ 🟢 SESSION-MANAGER              ││
+│  │ Highest leverage tool            ││
+│  │                                  ││
+│  │  52        180       95          ││
+│  │  dispatches sends    telegram    ││
+│  │                                  ││
+│  │  ▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪▪  7d spark││
+│  │  599 spawns · 145 reminds        ││
+│  └──────────────────────────────────┘│
+│                                      │
+│  ┌──────────────────────────────────┐│
+│  │ 🟣 ENGRAM                       ││
+│  │ Knowledge maintenance            ││
+│  │                                  ││
+│  │  3.5h          42       12       ││
+│  │  since fold    concepts folds/7d ││
+│  │                                  ││
+│  │  ● Fold status: FRESH            ││
+│  └──────────────────────────────────┘│
+│                                      │
+│  ┌──────────────────────────────────┐│
+│  │ 🔵 AGENT-OS                     ││
+│  │ Workflow system                   ││
+│  │                                  ││
+│  │  28            4                 ││
+│  │  persona reads projects          ││
+│  │                                  ││
+│  │  Top: engineer (12) reviewer (8) ││
+│  └──────────────────────────────────┘│
+│                                      │
+│  ┌──────────────────────────────────┐│
+│  │ 🟢 OFFICE-AUTOMATE              ││
+│  │ Climate & productivity            ││
+│  │                                  ││
+│  │  45            12                ││
+│  │  automations   transitions       ││
+│  └──────────────────────────────────┘│
+│                                      │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ │
+│  Dashboard | History | Prod | Projects│
+└──────────────────────────────────────┘
+```
+
+### Project card anatomy
+
+Each card follows a consistent structure:
+
+```
+┌──────────────────────────────────────┐
+│ [color dot] PROJECT-NAME             │  ← Header: project color + name
+│ One-line description                 │  ← Subtitle: from server `summary` field
+│                                      │
+│  VALUE1     VALUE2     VALUE3        │  ← Metric row: 2-3 hero numbers
+│  label1     label2     label3        │     in large font with small labels
+│                                      │
+│  Secondary detail line               │  ← Footer: additional context
+└──────────────────────────────────────┘
+```
+
+- **Background**: `Surface` color (0xFF1A1A1E), same as existing `StatTile`
+- **Project color dot**: Uses `KnownProjectColors` map from `ProductivityScreen.kt`
+- **Hero numbers**: Large (20sp), bold, accent-colored
+- **Labels**: Small (10sp), `TextSecondary`
+- **Footer**: Small (11sp), `TextSecondary`, optional
+
+### Per-project card content
+
+**session-manager:**
+- Hero metrics: dispatches (week), sends (week), Telegram in (week)
+- Footer: "{spawns} spawns · {reminds} reminds this week"
+- If Telegram data unavailable (Part F not yet shipped), show "--" for Telegram and omit from footer
+
+**engram:**
+- Hero metrics: hours since fold, active concepts, folds in last 7 days
+- Footer: fold freshness indicator — "FRESH" (< 12h), "STALE" (12-48h), "OUTDATED" (> 48h)
+- Color-code the freshness: Emerald / Amber / Red
+
+**agent-os:**
+- Hero metrics: persona reads (week), distinct projects using personas
+- Footer: "Top: {persona1} ({count}), {persona2} ({count})" — most-read personas
+
+**office-automate:**
+- Hero metrics: automation events (week), state transitions (week)
+- Footer: none needed (this is the host app)
+
+### Project card ordering
+
+Cards are ordered by activity — most active project first. Activity = total metric values for the week. Projects with zero activity in the last 7 days are hidden (not shown as empty cards).
 
 ### Data Models
 
@@ -400,19 +514,25 @@ The highest-leverage tool. Enables parallel agent orchestration and mobile produ
 
 Every `sm` command executed by an agent via Bash is **already captured** in `tool_usage.db` (`~/.local/share/claude-sessions/tool_usage.db`). The `bash_command` column contains the full command text. Current totals:
 
-| Command | Count | How to query |
+| Command | Count (illustrative, as of 2026-03-28) | How to query |
 |---------|-------|-------------|
-| `sm send` | 4,597 | `bash_command LIKE 'sm send%'` |
-| `sm dispatch` | 1,601 | `bash_command LIKE 'sm dispatch%'` |
-| `sm spawn` | 599 | `bash_command LIKE 'sm spawn%'` |
-| `sm wait` | 1,113 | `bash_command LIKE 'sm wait%'` |
-| `sm remind` | 145 | `bash_command LIKE 'sm remind%'` |
-| `sm name` | 724 | `bash_command LIKE 'sm name%'` |
-| Other sm | 8,198 | status, what, clear, output, inbox, etc. |
+| `sm send` | ~4,600 | `bash_command LIKE 'sm send%'` |
+| `sm dispatch` | ~1,600 | `bash_command LIKE 'sm dispatch%'` |
+| `sm spawn` | ~600 | `bash_command LIKE 'sm spawn%'` |
+| `sm wait` | ~1,100 | `bash_command LIKE 'sm wait%'` |
+| `sm remind` | ~150 | `bash_command LIKE 'sm remind%'` |
+| `sm name` | ~700 | `bash_command LIKE 'sm name%'` |
+| Other sm | ~8,200 | status, what, clear, output, inbox, etc. |
 
-Daily breakdown already shows clear patterns (e.g., 2026-03-25: 182 sends, 116 spawns, 628 total sm commands).
+These counts grow continuously. Daily breakdown shows clear patterns (e.g., 2026-03-25: 182 sends, 116 spawns, 628 total).
 
 **No new instrumentation needed for agent-side sm metrics.** The collection script (Part H) queries `tool_usage.db` directly.
+
+**Additional dimensions already in tool_usage.db:**
+
+- **Sender → receiver**: `session_name` contains the sender's role (e.g., "em-epics", "spec-owner-taskbar", "2361-engineer"). The target session ID is the first argument of `sm send {id}` in `bash_command`. Cross-referencing target IDs with `session_name` from other rows resolves the full communication graph (e.g., em → engineer, spec-owner → reviewer).
+
+- **Claude vs Codex**: `tool_usage.db` doesn't have a `provider` column, but session-manager's `sessions.json` tracks `provider` per session (claude / codex / codex-fork / codex-app). Cross-reference `session_id` to get the provider dimension. This enables metrics like "dispatches to Claude vs Codex agents" and "which provider produces more output per session."
 
 ### What's NOT in tool_usage.db
 
@@ -422,7 +542,7 @@ Daily breakdown already shows clear patterns (e.g., 2026-03-25: 182 sends, 116 s
 
 ### New instrumentation (Telegram + sessions only)
 
-Add a `telegram_telemetry` table to the sm server's SQLite (alongside `tool_usage.db`):
+Add a `telegram_telemetry` table to the **same SQLite database** as `tool_usage.db` (at `~/.local/share/claude-sessions/tool_usage.db`):
 
 ```sql
 CREATE TABLE IF NOT EXISTS telegram_telemetry (
@@ -482,19 +602,27 @@ Add an `engram stats` CLI command that outputs JSON (machine-readable counterpar
 }
 ```
 
-**Implementation:** Query the existing `dispatches` table for fold timestamps (WHERE state = 'committed'), count concept IDs from the registry markdown (parse `## C{NNN}:` headers, count ACTIVE vs DEAD), read buffer state from `server_state`.
+**Implementation:** Fold timestamps come from `dispatches` table (WHERE state = 'committed'). Buffer state from `server_state` table. **Concept counts** must be derived from the project's concept registry markdown file (parsing `## C{NNN}: ... (ACTIVE` vs `(DEAD` headers) — they are NOT in the SQLite tables. The `id_counters` table only has the next-available ID, not active/dead counts.
 
 Also add `--json` flag to the existing `engram status` command as an alternative entry point.
 
 ### Collection
 
-The office-automate Mac Mini rsyncs engram's DB:
+**Important:** Engram's `.engram/engram.db` lives at `<project_root>/.engram/engram.db`, not in the engram repo itself. The live instance is at `~/Desktop/fractal-market-simulator/.engram/engram.db` (since engram is currently watching fractal). If engram watches multiple repos, there will be multiple DBs.
+
+The office-automate Mac Mini rsyncs the engram DB from the watched project:
 
 ```
-rsync -az rajesh@<work-mac-ip>:~/Desktop/engram/.engram/engram.db ~/office-automate/data/engram_state.db
+rsync -az rajesh@<work-mac-ip>:~/Desktop/fractal-market-simulator/.engram/engram.db ~/office-automate/data/engram_state.db
 ```
 
-Or, if engram runs on the Mac Mini itself, query locally. The collection script reads `dispatches` and `id_counters` tables directly — no need for the CLI if the DB is available.
+For concept counts, also rsync the concept registry markdown:
+
+```
+rsync -az rajesh@<work-mac-ip>:~/Desktop/fractal-market-simulator/docs/decisions/concept_registry.md ~/office-automate/data/engram_concept_registry.md
+```
+
+The collection script parses `## C{NNN}:` headers from the markdown to count ACTIVE vs DEAD concepts. If engram watches additional repos in the future, add their DBs and registries to the rsync list.
 
 ---
 
@@ -509,7 +637,7 @@ This ticket collects Tier 3 signals from across repos and surfaces them in the P
 | **sm commands** | `tool_usage.db` (`~/.local/share/claude-sessions/`) | rsync from work Mac, query `bash_command LIKE 'sm %'` | **No** — already tracked |
 | **sm Telegram** | `telegram_telemetry` table (Part F) | rsync or query sm server | **Yes** — Part F |
 | **agent-os persona reads** | `tool_usage.db` | Same rsync, query `target_file LIKE '%agent-os/personas/%'` | **No** — already tracked |
-| **engram fold state** | `.engram/engram.db` | rsync from work Mac, query `dispatches` table | **No** — already exists |
+| **engram fold state** | `<project>/.engram/engram.db` (live: `fractal-market-simulator/.engram/`) | rsync DB + concept registry markdown from work Mac | **No** — already exists (Part G adds `--json` convenience) |
 | **office-automate automation** | Local `climate_actions` + `occupancy_log` tables | Direct query (same DB) | **No** — already exists |
 
 ### tool_usage.db queries for agent-os
@@ -556,9 +684,12 @@ WHERE tool_name = 'Bash'
 GROUP BY date(timestamp)
 ORDER BY date ASC;
 
--- Daily managed sessions (distinct session_id per day)
+-- Daily active sessions (distinct session_id with any tool use that day)
+-- Note: this is sessions *touched*, not sessions *created* — creation
+-- time is not in tool_usage.db. This is a reasonable proxy for daily
+-- orchestration volume.
 SELECT date(timestamp) AS date,
-       COUNT(DISTINCT session_id) AS managed_sessions
+       COUNT(DISTINCT session_id) AS active_sessions
 FROM tool_usage
 WHERE hook_type = 'PreToolUse'
   AND timestamp >= ?
@@ -606,7 +737,7 @@ Metrics stored as `(date, project, metric_name, value)` tuples. This is a flexib
 | session-manager | `sm_dispatches` | dispatch commands that day |
 | session-manager | `sm_sends` | send commands |
 | session-manager | `sm_reminds` | remind commands |
-| session-manager | `sm_sessions_created` | new managed sessions |
+| session-manager | `sm_active_sessions` | distinct sessions with tool activity that day |
 | session-manager | `sm_telegram_in` | inbound Telegram messages |
 | session-manager | `sm_telegram_out` | outbound Telegram messages |
 | engram | `engram_last_fold_age_hours` | hours since last committed fold |
@@ -622,7 +753,7 @@ Metrics stored as `(date, project, metric_name, value)` tuples. This is a flexib
 Extend `session_stats_parser.py` (or create `project_leverage_collector.py`) to run on the 30-min cron alongside the existing history parser. For each source:
 
 1. **tool_usage.db** (sm commands + agent-os personas): Open the rsynced copy at `data/tool_usage.db`. Run sm command queries (below) and agent-os persona queries (above).
-2. **Telegram telemetry**: Open `data/telegram_telemetry.db` (rsynced from sm server) or query `GET /stats/commands?days=1` if available. If unavailable, skip — Telegram is the only metric requiring Part F.
+2. **Telegram telemetry**: Query `telegram_telemetry` table in the same rsynced `data/tool_usage.db` (Part F adds this table to the same DB). If the table doesn't exist (Part F not yet shipped), skip — Telegram is the only metric requiring Part F.
 3. **engram**: Open the rsynced copy at `data/engram_state.db`. Query `SELECT created_at, state FROM dispatches WHERE state = 'committed' ORDER BY created_at DESC`.
 4. **office-automate**: Query local `climate_actions` and `occupancy_log` tables directly.
 
@@ -653,7 +784,7 @@ rsync -az rajesh@<work-mac-ip>:~/Desktop/engram/.engram/engram.db ~/office-autom
           "sm_dispatches": 12,
           "sm_sends": 45,
           "sm_reminds": 8,
-          "sm_sessions_created": 18,
+          "sm_active_sessions": 18,
           "sm_telegram_in": 23,
           "sm_telegram_out": 19
         }
