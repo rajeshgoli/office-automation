@@ -3,9 +3,11 @@ package com.rajesh.officeclimate.data.repository
 import android.util.Log
 import com.rajesh.officeclimate.data.model.ApiStatus
 import com.rajesh.officeclimate.data.model.DailyStatsResponse
+import com.rajesh.officeclimate.data.model.LeverageResponse
 import com.rajesh.officeclimate.data.model.OHLCResponse
 import com.rajesh.officeclimate.data.model.OpeningsResponse
 import com.rajesh.officeclimate.data.model.OrchestrationResponse
+import com.rajesh.officeclimate.data.model.ProjectLeverageResponse
 import com.rajesh.officeclimate.data.model.ProjectFocusResponse
 import com.rajesh.officeclimate.data.model.SessionsResponse
 import com.rajesh.officeclimate.data.model.TemperatureResponse
@@ -208,6 +210,16 @@ class ClimateRepository(
     suspend fun getProjectFocus(days: Int = 7): Result<ProjectFocusResponse> = runCatching {
         ensureInitialized()
         apiService.getProjectFocus(days)
+    }
+
+    suspend fun getLeverage(days: Int = 7): Result<LeverageResponse> = runCatching {
+        ensureInitialized()
+        apiService.getLeverage(days)
+    }
+
+    suspend fun getProjectLeverage(days: Int = 7): Result<ProjectLeverageResponse> = runCatching {
+        ensureInitialized()
+        apiService.getProjectLeverage(days)
     }
 
     suspend fun testConnection(url: String, token: String): Result<ApiStatus> = runCatching {

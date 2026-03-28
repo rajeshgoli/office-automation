@@ -41,9 +41,10 @@ import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.rajesh.officeclimate.data.model.OrchestrationDay
-import com.rajesh.officeclimate.data.model.ProjectFocusDay
+import com.rajesh.officeclimate.data.model.LeverageDay
+import com.rajesh.officeclimate.data.model.LeverageResponse
 import com.rajesh.officeclimate.data.model.ProjectCount
+import com.rajesh.officeclimate.data.model.ProjectFocusDay
 import com.rajesh.officeclimate.ui.history.LegendDot
 import com.rajesh.officeclimate.ui.history.SessionsSection
 import com.rajesh.officeclimate.ui.history.StatTile
@@ -57,20 +58,18 @@ import com.rajesh.officeclimate.ui.theme.Blue
 import com.rajesh.officeclimate.ui.theme.Border
 import com.rajesh.officeclimate.ui.theme.Cyan
 import com.rajesh.officeclimate.ui.theme.Emerald
-import com.rajesh.officeclimate.ui.theme.Orange
 import com.rajesh.officeclimate.ui.theme.Red
 import com.rajesh.officeclimate.ui.theme.Surface
 import com.rajesh.officeclimate.ui.theme.TextPrimary
 import com.rajesh.officeclimate.ui.theme.TextSecondary
+import com.rajesh.officeclimate.ui.theme.projectColorFor
 import java.time.LocalDate
+import java.util.Locale
 
-private val ProjectPalette = listOf(
-    Emerald,
-    Amber,
-    Blue,
-    Cyan,
-    Orange,
-    Color(0xFFA855F7),
+private data class MetricTileSpec(
+    val label: String,
+    val value: String,
+    val accent: Color,
 )
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -81,13 +80,20 @@ fun ProductivityScreen(
     val sessions by viewModel.sessions.collectAsState()
     val orchestration by viewModel.orchestration.collectAsState()
     val projectFocus by viewModel.projectFocus.collectAsState()
+    val leverage by viewModel.leverage.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
     val error by viewModel.error.collectAsState()
 
-    val allFailed = !isLoading && sessions == null && orchestration == null && projectFocus == null
+    val allFailed = !isLoading &&
+        sessions == null &&
+        orchestration == null &&
+        projectFocus == null &&
+        leverage == null
+
     val today = LocalDate.now().toString()
     val todayOrchestration = orchestration?.days?.firstOrNull { it.date == today }
     val todayProjectFocus = projectFocus?.days?.firstOrNull { it.date == today }
+    val todayLeverage = leverage?.days?.firstOrNull { it.date == today }
     val topProject = todayProjectFocus?.projects?.maxByOrNull { it.messages }?.name ?: "none"
     val activeHours = when {
         todayOrchestration?.firstPrompt != null && todayOrchestration?.lastPrompt != null ->
@@ -95,7 +101,11 @@ fun ProductivityScreen(
         else -> "--"
     }
 
-    Box(modifier = Modifier.fillMaxSize().background(Background)) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Background),
+    ) {
         if (isLoading && sessions == null) {
             Column(
                 modifier = Modifier.fillMaxSize(),
@@ -174,10 +184,21 @@ fun ProductivityScreen(
                     maxItemsInEachRow = 2,
                 ) {
                     val tileModifier = Modifier.weight(1f)
-                    StatTile("MESSAGES", "${todayOrchestration?.messages ?: 0}", Emerald, tileModifier)
-                    StatTile("SESSIONS", "${todayOrchestration?.sessions ?: 0}", Amber, tileModifier)
+                    StatTile("MESSAGES", formatCount(todayOrchestration?.messages ?: 0), Emerald, tileModifier)
+                    StatTile("SESSIONS", formatCount(todayOrchestration?.sessions ?: 0), Amber, tileModifier)
                     StatTile("TOP PROJECT", topProject, Blue, tileModifier)
                     StatTile("ACTIVE HOURS", activeHours, Cyan, tileModifier)
+                }
+
+                leverage?.let { leverageData ->
+                    LeverageTilesSection(
+                        title = "TODAY LEVERAGE",
+                        tiles = todayLeverageTiles(todayLeverage),
+                    )
+                    LeverageTilesSection(
+                        title = "THIS WEEK LEVERAGE",
+                        tiles = weekLeverageTiles(leverageData),
+                    )
                 }
 
                 Spacer(Modifier.height(64.dp))
@@ -186,8 +207,36 @@ fun ProductivityScreen(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun OrchestrationSection(days: List<OrchestrationDay>) {
+private fun LeverageTilesSection(
+    title: String,
+    tiles: List<MetricTileSpec>,
+) {
+    Text(
+        text = title,
+        style = MaterialTheme.typography.labelLarge,
+        color = TextPrimary,
+    )
+    FlowRow(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        maxItemsInEachRow = 2,
+    ) {
+        tiles.forEach { tile ->
+            StatTile(
+                label = tile.label,
+                value = tile.value,
+                accentColor = tile.accent,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun OrchestrationSection(days: List<com.rajesh.officeclimate.data.model.OrchestrationDay>) {
     val shape = RoundedCornerShape(12.dp)
     Column(
         modifier = Modifier
@@ -215,7 +264,7 @@ private fun OrchestrationSection(days: List<OrchestrationDay>) {
 }
 
 @Composable
-private fun OrchestrationDayRow(day: OrchestrationDay) {
+private fun OrchestrationDayRow(day: com.rajesh.officeclimate.data.model.OrchestrationDay) {
     val grouped = day.timestamps.groupBy { it.time }
     val textMeasurer = rememberTextMeasurer()
     val labelStyle = TextStyle(
@@ -268,14 +317,17 @@ private fun OrchestrationDayRow(day: OrchestrationDay) {
                     val overflow = textMeasurer.measure("+${prompts.size - 3}", labelStyle)
                     drawText(
                         overflow,
-                        topLeft = Offset((x + 6f).coerceAtMost(size.width - overflow.size.width), size.height - overflow.size.height),
+                        topLeft = Offset(
+                            (x + 6f).coerceAtMost(size.width - overflow.size.width),
+                            size.height - overflow.size.height,
+                        ),
                     )
                 }
             }
         }
 
         Text(
-            text = "${day.messages}",
+            text = formatCount(day.messages),
             style = MaterialTheme.typography.labelSmall.copy(
                 fontFamily = FontFamily.Monospace,
                 fontSize = 10.sp,
@@ -296,8 +348,7 @@ private fun ProjectFocusSection(days: List<ProjectFocusDay>) {
         .flatMap { day -> day.projects.map(ProjectCount::name) }
         .distinct()
         .sorted()
-        .mapIndexed { index, name -> name to ProjectPalette[index % ProjectPalette.size] }
-        .toMap()
+        .associateWith(::projectColorFor)
 
     Column(
         modifier = Modifier
@@ -376,7 +427,7 @@ private fun ProjectFocusRow(day: ProjectFocusDay, projectColors: Map<String, Col
         }
 
         Text(
-            text = "${day.total}",
+            text = formatCount(day.total),
             style = MaterialTheme.typography.labelSmall.copy(
                 fontFamily = FontFamily.Monospace,
                 fontSize = 10.sp,
@@ -388,3 +439,21 @@ private fun ProjectFocusRow(day: ProjectFocusDay, projectColors: Map<String, Col
         )
     }
 }
+
+private fun todayLeverageTiles(today: LeverageDay?): List<MetricTileSpec> = listOf(
+    MetricTileSpec("LINES/PROMPT", today?.linesPerPrompt.formatDecimalOrDash(), Emerald),
+    MetricTileSpec("COMMITS", formatCount(today?.commits ?: 0), Amber),
+    MetricTileSpec("PRS MERGED", formatCount(today?.prsMerged ?: 0), Blue),
+    MetricTileSpec("LINES CHANGED", formatCount(today?.linesChanged ?: 0), Cyan),
+)
+
+private fun weekLeverageTiles(leverage: LeverageResponse): List<MetricTileSpec> = listOf(
+    MetricTileSpec("WEEK LINES", formatCount(leverage.week.linesChanged), Emerald),
+    MetricTileSpec("WEEK COMMITS", formatCount(leverage.week.commits), Amber),
+    MetricTileSpec("WEEK PRS", formatCount(leverage.week.prsMerged), Blue),
+    MetricTileSpec("AVG L/PROMPT", leverage.week.linesPerPrompt.formatDecimalOrDash(), Cyan),
+)
+
+private fun formatCount(value: Int): String = String.format(Locale.US, "%,d", value)
+
+private fun Double?.formatDecimalOrDash(): String = this?.let { String.format(Locale.US, "%.1f", it) } ?: "--"
