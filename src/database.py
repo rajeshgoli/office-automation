@@ -251,6 +251,13 @@ class Database:
             for offset in range(days)
         ]
 
+    @staticmethod
+    def _safe_ratio(numerator: float, denominator: float) -> Optional[float]:
+        """Return a rounded ratio or None when the denominator is zero."""
+        if denominator == 0:
+            return None
+        return round(float(numerator) / float(denominator), 2)
+
     # --- Sensor readings ---
 
     def log_sensor_reading(
@@ -860,6 +867,179 @@ class Database:
             grouped[date_str]["sessions"] = len(session_ids)
 
         return [grouped[date_str] for date_str in day_labels]
+
+    def get_leverage_history(self, days: int = 7) -> Dict[str, Any]:
+        """Get per-day and weekly leverage metrics for the trailing day window."""
+        now = self._now()
+        day_labels = self._build_day_range(now, days)
+        cutoff = self._format_timestamp(datetime.combine(
+            now.date() - timedelta(days=max(days - 1, 0)),
+            datetime.min.time(),
+        ))
+
+        grouped: Dict[str, Dict[str, Any]] = {
+            date_str: {
+                "date": date_str,
+                "prompts": 0,
+                "sessions": 0,
+                "lines_added": 0,
+                "lines_removed": 0,
+                "files_modified": 0,
+                "commits": 0,
+                "prs_merged": 0,
+                "prs_opened": 0,
+                "avg_pr_cycle_hours": None,
+                "_duration_minutes": 0,
+                "_pr_cycle_hours_total": 0.0,
+            }
+            for date_str in day_labels
+        }
+
+        with self._connection() as conn:
+            orchestration_rows = conn.execute("""
+                SELECT
+                    date(timestamp) AS date,
+                    COUNT(*) AS prompts,
+                    COUNT(DISTINCT session_id) AS sessions
+                FROM orchestration_activity
+                WHERE timestamp >= ?
+                GROUP BY date(timestamp)
+            """, (cutoff,)).fetchall()
+
+            session_rows = conn.execute("""
+                SELECT
+                    date(start_time) AS date,
+                    SUM(lines_added) AS lines_added,
+                    SUM(lines_removed) AS lines_removed,
+                    SUM(files_modified) AS files_modified,
+                    SUM(git_commits) AS commits,
+                    SUM(duration_minutes) AS duration_minutes
+                FROM session_output
+                WHERE start_time >= ?
+                GROUP BY date(start_time)
+            """, (cutoff,)).fetchall()
+
+            pr_opened_rows = conn.execute("""
+                SELECT
+                    date(created_at) AS date,
+                    COUNT(*) AS prs_opened
+                FROM github_prs
+                WHERE created_at >= ?
+                GROUP BY date(created_at)
+            """, (cutoff,)).fetchall()
+
+            pr_merged_rows = conn.execute("""
+                SELECT
+                    date(merged_at) AS date,
+                    COUNT(*) AS prs_merged,
+                    SUM((julianday(merged_at) - julianday(created_at)) * 24.0) AS pr_cycle_hours_total
+                FROM github_prs
+                WHERE merged_at IS NOT NULL AND merged_at >= ?
+                GROUP BY date(merged_at)
+            """, (cutoff,)).fetchall()
+
+        for row in orchestration_rows:
+            day = grouped.get(row["date"])
+            if day is None:
+                continue
+            day["prompts"] = int(row["prompts"] or 0)
+            day["sessions"] = int(row["sessions"] or 0)
+
+        for row in session_rows:
+            day = grouped.get(row["date"])
+            if day is None:
+                continue
+            day["lines_added"] = int(row["lines_added"] or 0)
+            day["lines_removed"] = int(row["lines_removed"] or 0)
+            day["files_modified"] = int(row["files_modified"] or 0)
+            day["commits"] = int(row["commits"] or 0)
+            day["_duration_minutes"] = int(row["duration_minutes"] or 0)
+
+        for row in pr_opened_rows:
+            day = grouped.get(row["date"])
+            if day is None:
+                continue
+            day["prs_opened"] = int(row["prs_opened"] or 0)
+
+        for row in pr_merged_rows:
+            day = grouped.get(row["date"])
+            if day is None:
+                continue
+            day["prs_merged"] = int(row["prs_merged"] or 0)
+            day["_pr_cycle_hours_total"] = float(row["pr_cycle_hours_total"] or 0.0)
+
+        days_payload: List[Dict[str, Any]] = []
+        week = {
+            "prompts": 0,
+            "sessions": 0,
+            "lines_added": 0,
+            "lines_removed": 0,
+            "lines_changed": 0,
+            "files_modified": 0,
+            "commits": 0,
+            "prs_merged": 0,
+            "prs_opened": 0,
+            "avg_pr_cycle_hours": None,
+            "lines_per_prompt": None,
+            "commits_per_prompt": None,
+            "lines_per_session_minute": None,
+            "active_days": 0,
+        }
+        total_duration_minutes = 0
+        total_pr_cycle_hours = 0.0
+
+        for date_str in day_labels:
+            raw_day = grouped[date_str]
+            lines_changed = raw_day["lines_added"] + raw_day["lines_removed"]
+            day = {
+                "date": date_str,
+                "prompts": raw_day["prompts"],
+                "sessions": raw_day["sessions"],
+                "lines_added": raw_day["lines_added"],
+                "lines_removed": raw_day["lines_removed"],
+                "lines_changed": lines_changed,
+                "files_modified": raw_day["files_modified"],
+                "commits": raw_day["commits"],
+                "prs_merged": raw_day["prs_merged"],
+                "prs_opened": raw_day["prs_opened"],
+                "avg_pr_cycle_hours": self._safe_ratio(
+                    raw_day["_pr_cycle_hours_total"],
+                    raw_day["prs_merged"],
+                ),
+                "lines_per_prompt": self._safe_ratio(lines_changed, raw_day["prompts"]),
+                "commits_per_prompt": self._safe_ratio(raw_day["commits"], raw_day["prompts"]),
+                "lines_per_session_minute": self._safe_ratio(
+                    lines_changed,
+                    raw_day["_duration_minutes"],
+                ),
+            }
+            days_payload.append(day)
+
+            week["prompts"] += day["prompts"]
+            week["sessions"] += day["sessions"]
+            week["lines_added"] += day["lines_added"]
+            week["lines_removed"] += day["lines_removed"]
+            week["lines_changed"] += day["lines_changed"]
+            week["files_modified"] += day["files_modified"]
+            week["commits"] += day["commits"]
+            week["prs_merged"] += day["prs_merged"]
+            week["prs_opened"] += day["prs_opened"]
+            week["active_days"] += 1 if day["prompts"] > 0 else 0
+            total_duration_minutes += raw_day["_duration_minutes"]
+            total_pr_cycle_hours += raw_day["_pr_cycle_hours_total"]
+
+        week["avg_pr_cycle_hours"] = self._safe_ratio(total_pr_cycle_hours, week["prs_merged"])
+        week["lines_per_prompt"] = self._safe_ratio(week["lines_changed"], week["prompts"])
+        week["commits_per_prompt"] = self._safe_ratio(week["commits"], week["prompts"])
+        week["lines_per_session_minute"] = self._safe_ratio(
+            week["lines_changed"],
+            total_duration_minutes,
+        )
+
+        return {
+            "days": days_payload,
+            "week": week,
+        }
 
     def get_project_focus(self, days: int = 7) -> List[Dict[str, Any]]:
         """Get per-day project message distribution."""
