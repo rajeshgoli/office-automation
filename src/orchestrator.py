@@ -20,7 +20,7 @@ import secrets
 import tempfile
 from collections import deque
 from pathlib import Path
-from typing import Optional, Set, Dict, Callable, Awaitable
+from typing import Optional, Set, Dict, Any, List, Callable, Awaitable
 
 from aiohttp import web, WSMsgType
 
@@ -41,6 +41,31 @@ ARTIFACT_APP_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 ARTIFACT_MAX_SIZE_BYTES = 100 * 1024 * 1024
 DEFAULT_ARTIFACTS_ROOT = Path(__file__).parent.parent / "data" / "apps"
 DEFAULT_LEGACY_APK_PATH = Path(__file__).parent.parent / "data" / "app-debug.apk"
+
+PROJECT_LEVERAGE_METRICS = {
+    "session-manager": [
+        "sm_dispatches",
+        "sm_sends",
+        "sm_reminds",
+        "sm_active_sessions",
+        "sm_telegram_in",
+        "sm_telegram_out",
+    ],
+    "engram": [
+        "engram_last_fold_age_hours",
+        "engram_folds_7d",
+        "engram_active_concepts",
+    ],
+    "agent-os": [
+        "persona_reads",
+        "persona_projects",
+    ],
+    "office-automate": [
+        "automation_events",
+        "state_transitions",
+    ],
+}
+PERSONA_PROJECT_METRIC_PREFIX = "persona_project::"
 
 
 class Orchestrator:
@@ -1669,6 +1694,172 @@ class Orchestrator:
             logger.error(f"Error handling history/openings GET: {e}")
             return web.json_response({"ok": False, "error": str(e)}, status=400)
 
+    @staticmethod
+    def _project_leverage_value(value: Optional[float]) -> Any:
+        """Return integer-like metrics as ints while preserving fractional values."""
+        if value is None:
+            return None
+        if float(value).is_integer():
+            return int(value)
+        return round(float(value), 2)
+
+    @staticmethod
+    def _project_leverage_window_phrase(days: int) -> str:
+        """Return a short human-readable window phrase."""
+        if days == 7:
+            return "this week"
+        if days == 1:
+            return "today"
+        return f"in the last {days} days"
+
+    def _build_project_leverage_days(
+        self,
+        project_rows: Dict[str, Dict[str, float]],
+        metric_names: List[str],
+        date_range: List[str],
+    ) -> List[Dict[str, Any]]:
+        """Expand sparse EAV rows into dense per-day dictionaries."""
+        days: List[Dict[str, Any]] = []
+        for date_str in date_range:
+            day = {"date": date_str}
+            for metric_name in metric_names:
+                day[metric_name] = self._project_leverage_value(
+                    project_rows.get(date_str, {}).get(metric_name, 0.0)
+                )
+            days.append(day)
+        return days
+
+    def _summarize_session_manager_project(self, week: Dict[str, Any], days: int) -> str:
+        dispatches = int(week.get("sm_dispatches", 0) or 0)
+        sends = int(week.get("sm_sends", 0) or 0)
+        telegram_messages = int(week.get("sm_telegram_in", 0) or 0) + int(week.get("sm_telegram_out", 0) or 0)
+        if telegram_messages:
+            return f"{dispatches} dispatches, {telegram_messages} Telegram messages {self._project_leverage_window_phrase(days)}"
+        return f"{dispatches} dispatches, {sends} sends {self._project_leverage_window_phrase(days)}"
+
+    def _summarize_engram_project(self, current: Dict[str, Any]) -> str:
+        last_fold_age = current.get("last_fold_age_hours")
+        active_concepts = int(current.get("active_concepts", 0) or 0)
+        if last_fold_age is None:
+            return f"{active_concepts} active concepts, no committed fold data yet"
+        return f"Last fold {last_fold_age:.1f}h ago, {active_concepts} active concepts"
+
+    def _summarize_agent_os_project(self, week: Dict[str, Any], days: int) -> str:
+        persona_reads = int(week.get("persona_reads", 0) or 0)
+        persona_projects = int(week.get("persona_projects", 0) or 0)
+        return f"{persona_reads} persona reads across {persona_projects} projects {self._project_leverage_window_phrase(days)}"
+
+    def _summarize_office_automation_project(self, week: Dict[str, Any], days: int) -> str:
+        automation_events = int(week.get("automation_events", 0) or 0)
+        state_transitions = int(week.get("state_transitions", 0) or 0)
+        return f"{automation_events} automation events, {state_transitions} state transitions {self._project_leverage_window_phrase(days)}"
+
+    def _build_project_leverage_payload(self, days: int) -> Dict[str, Any]:
+        """Build the /history/project-leverage response body."""
+        raw_rows = self.db.get_project_leverage_rows(days)
+        today = self.db._now().date()
+        date_range = [
+            (today - timedelta(days=offset)).strftime("%Y-%m-%d")
+            for offset in range(days - 1, -1, -1)
+        ]
+
+        by_project: Dict[str, Dict[str, Dict[str, float]]] = {}
+        persona_projects_seen: set[str] = set()
+        for row in raw_rows:
+            project = row["project"]
+            date_str = row["date"]
+            metric = row["metric"]
+            value = float(row["value"])
+            by_project.setdefault(project, {}).setdefault(date_str, {})[metric] = value
+            if project == "agent-os" and metric.startswith(PERSONA_PROJECT_METRIC_PREFIX):
+                persona_projects_seen.add(metric[len(PERSONA_PROJECT_METRIC_PREFIX):])
+
+        session_days = self._build_project_leverage_days(
+            by_project.get("session-manager", {}),
+            PROJECT_LEVERAGE_METRICS["session-manager"],
+            date_range,
+        )
+        session_week = {
+            metric: self._project_leverage_value(sum(day[metric] for day in session_days))
+            for metric in PROJECT_LEVERAGE_METRICS["session-manager"]
+        }
+
+        engram_days = self._build_project_leverage_days(
+            by_project.get("engram", {}),
+            PROJECT_LEVERAGE_METRICS["engram"],
+            date_range,
+        )
+        latest_engram_rows = by_project.get("engram", {})
+        latest_engram_date = max(latest_engram_rows) if latest_engram_rows else None
+        latest_engram_metrics = latest_engram_rows.get(latest_engram_date, {}) if latest_engram_date else {}
+        engram_current = {
+            "last_fold_age_hours": self._project_leverage_value(
+                latest_engram_metrics.get("engram_last_fold_age_hours")
+            ),
+            "folds_7d": self._project_leverage_value(latest_engram_metrics.get("engram_folds_7d", 0.0)),
+            "active_concepts": self._project_leverage_value(latest_engram_metrics.get("engram_active_concepts", 0.0)),
+        }
+
+        agent_days = self._build_project_leverage_days(
+            by_project.get("agent-os", {}),
+            PROJECT_LEVERAGE_METRICS["agent-os"],
+            date_range,
+        )
+        agent_week = {
+            "persona_reads": self._project_leverage_value(sum(day["persona_reads"] for day in agent_days)),
+            "persona_projects": len(persona_projects_seen),
+        }
+        if not agent_week["persona_projects"]:
+            agent_week["persona_projects"] = self._project_leverage_value(
+                sum(day["persona_projects"] for day in agent_days)
+            )
+
+        office_days = self._build_project_leverage_days(
+            by_project.get("office-automate", {}),
+            PROJECT_LEVERAGE_METRICS["office-automate"],
+            date_range,
+        )
+        office_week = {
+            metric: self._project_leverage_value(sum(day[metric] for day in office_days))
+            for metric in PROJECT_LEVERAGE_METRICS["office-automate"]
+        }
+
+        return {
+            "ok": True,
+            "projects": {
+                "session-manager": {
+                    "summary": self._summarize_session_manager_project(session_week, days),
+                    "days": session_days,
+                    "week": session_week,
+                },
+                "engram": {
+                    "summary": self._summarize_engram_project(engram_current),
+                    "days": engram_days,
+                    "current": engram_current,
+                },
+                "agent-os": {
+                    "summary": self._summarize_agent_os_project(agent_week, days),
+                    "days": agent_days,
+                    "week": agent_week,
+                },
+                "office-automate": {
+                    "summary": self._summarize_office_automation_project(office_week, days),
+                    "days": office_days,
+                    "week": office_week,
+                },
+            },
+        }
+
+    async def _handle_history_project_leverage_get(self, request: web.Request) -> web.Response:
+        """Handle GET /history/project-leverage for per-project leverage metrics."""
+        try:
+            days = int(request.query.get("days", "7"))
+            days = min(max(1, days), 30)
+            return web.json_response(self._build_project_leverage_payload(days))
+        except Exception as e:
+            logger.error(f"Error handling project leverage GET: {e}")
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
     def _get_status_dict(self) -> dict:
         """Get current status as a dictionary."""
         sm_status = self.state_machine.get_status()
@@ -2186,6 +2377,7 @@ class Orchestrator:
         self._app.router.add_get("/history/orchestration", self._handle_history_orchestration_get)
         self._app.router.add_get("/history/project-focus", self._handle_history_project_focus_get)
         self._app.router.add_get("/history/openings", self._handle_history_openings_get)
+        self._app.router.add_get("/history/project-leverage", self._handle_history_project_leverage_get)
         self._app.router.add_get("/ws", self._handle_websocket)
         self._app.router.add_post("/erv", self._handle_erv_post)
         self._app.router.add_post("/hvac", self._handle_hvac_post)
