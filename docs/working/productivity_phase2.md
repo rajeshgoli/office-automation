@@ -368,7 +368,7 @@ Each card follows a consistent structure:
 ```
 
 - **Background**: `Surface` color (0xFF1A1A1E), same as existing `StatTile`
-- **Project color dot**: Uses `KnownProjectColors` map from `ProductivityScreen.kt`
+- **Project color dot**: Uses `KnownProjectColors` map (move from `ProductivityScreen.kt:65` to shared `ui/theme/ProjectColors.kt`)
 - **Hero numbers**: Large (20sp), bold, accent-colored
 - **Labels**: Small (10sp), `TextSecondary`
 - **Footer**: Small (11sp), `TextSecondary`, optional
@@ -628,7 +628,7 @@ The collection script parses `## C{NNN}:` headers from the markdown to count ACT
 
 ## Part H: Project Leverage Pipeline + UI (office-automate repo)
 
-This ticket collects Tier 3 signals from across repos and surfaces them in the Productivity tab. Depends on F (Telegram telemetry only) and G (engram stats). Most sm data is already in `tool_usage.db`.
+This ticket collects Tier 3 signals from across repos and surfaces them in the **Projects tab** (`ProjectsScreen.kt` — see Part D for UI spec). No hard dependencies — reads rsynced DBs directly. F (Telegram) is optional; G (engram `--json`) is convenience only. Most sm data is already in `tool_usage.db`.
 
 ### Data sources (4 arms)
 
