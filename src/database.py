@@ -129,6 +129,44 @@ class Database:
                     UNIQUE(date, project, metric)
                 );
                 CREATE INDEX IF NOT EXISTS idx_proj_lev_date ON project_leverage(date);
+
+                -- GitHub PR activity imported via gh CLI
+                CREATE TABLE IF NOT EXISTS github_prs (
+                    repo TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    title TEXT,
+                    state TEXT NOT NULL,
+                    additions INTEGER NOT NULL DEFAULT 0,
+                    deletions INTEGER NOT NULL DEFAULT 0,
+                    changed_files INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL,
+                    merged_at DATETIME,
+                    PRIMARY KEY (repo, pr_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_prs_created ON github_prs(created_at);
+                CREATE INDEX IF NOT EXISTS idx_prs_merged ON github_prs(merged_at);
+
+                -- Claude session output imported from session-meta JSON
+                CREATE TABLE IF NOT EXISTS session_output (
+                    session_id TEXT PRIMARY KEY,
+                    project TEXT NOT NULL DEFAULT 'unknown',
+                    start_time DATETIME NOT NULL,
+                    duration_minutes INTEGER NOT NULL DEFAULT 0,
+                    lines_added INTEGER NOT NULL DEFAULT 0,
+                    lines_removed INTEGER NOT NULL DEFAULT 0,
+                    files_modified INTEGER NOT NULL DEFAULT 0,
+                    git_commits INTEGER NOT NULL DEFAULT 0,
+                    git_pushes INTEGER NOT NULL DEFAULT 0,
+                    user_message_count INTEGER NOT NULL DEFAULT 0,
+                    assistant_message_count INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    tool_counts TEXT,
+                    languages TEXT,
+                    is_human_session INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_output_start ON session_output(start_time);
+                CREATE INDEX IF NOT EXISTS idx_session_output_project ON session_output(project);
             """)
             logger.info(f"Database initialized at {self.db_path}")
 
@@ -393,6 +431,86 @@ class Database:
                 LIMIT ?
             """, (since.isoformat(), limit)).fetchall()
             return [dict(row) for row in rows]
+
+    def upsert_github_prs(
+        self,
+        rows: List[tuple[str, int, Optional[str], str, int, int, int, str, Optional[str]]]
+    ) -> None:
+        """Insert or update GitHub PR rows keyed by repo and PR number."""
+        if not rows:
+            return
+
+        with self._connection() as conn:
+            conn.executemany("""
+                INSERT INTO github_prs (
+                    repo,
+                    pr_number,
+                    title,
+                    state,
+                    additions,
+                    deletions,
+                    changed_files,
+                    created_at,
+                    merged_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(repo, pr_number) DO UPDATE SET
+                    title = excluded.title,
+                    state = excluded.state,
+                    additions = excluded.additions,
+                    deletions = excluded.deletions,
+                    changed_files = excluded.changed_files,
+                    created_at = excluded.created_at,
+                    merged_at = excluded.merged_at
+            """, rows)
+
+    def replace_session_output(
+        self,
+        rows: List[tuple[
+            str,
+            str,
+            str,
+            int,
+            int,
+            int,
+            int,
+            int,
+            int,
+            int,
+            int,
+            int,
+            int,
+            Optional[str],
+            Optional[str],
+            int,
+        ]],
+    ) -> None:
+        """Replace session-meta rows keyed by session ID."""
+        if not rows:
+            return
+
+        with self._connection() as conn:
+            conn.executemany("""
+                INSERT OR REPLACE INTO session_output (
+                    session_id,
+                    project,
+                    start_time,
+                    duration_minutes,
+                    lines_added,
+                    lines_removed,
+                    files_modified,
+                    git_commits,
+                    git_pushes,
+                    user_message_count,
+                    assistant_message_count,
+                    input_tokens,
+                    output_tokens,
+                    tool_counts,
+                    languages,
+                    is_human_session
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, rows)
 
     def upsert_project_leverage(
         self,
