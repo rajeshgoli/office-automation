@@ -96,6 +96,23 @@ class Database:
                     reason TEXT                 -- why this action was taken
                 );
                 CREATE INDEX IF NOT EXISTS idx_climate_timestamp ON climate_actions(timestamp);
+
+                -- Orchestration activity imported from Claude/Codex history
+                CREATE TABLE IF NOT EXISTS orchestration_activity (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME NOT NULL,
+                    tool TEXT NOT NULL CHECK(tool IN ('claude', 'codex')),
+                    project TEXT NOT NULL DEFAULT 'unknown',
+                    session_id TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_orch_timestamp ON orchestration_activity(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_orch_date ON orchestration_activity(date(timestamp));
+
+                -- Incremental parser bookkeeping
+                CREATE TABLE IF NOT EXISTS session_parser_state (
+                    source TEXT PRIMARY KEY,
+                    last_line INTEGER NOT NULL DEFAULT 0
+                );
             """)
             logger.info(f"Database initialized at {self.db_path}")
 
@@ -141,6 +158,44 @@ class Database:
         durations[date_str] = durations.get(date_str, 0) + (
             (end - cursor).total_seconds() / seconds_per_unit
         )
+
+    @staticmethod
+    def _split_interval_by_date(start: datetime, end: datetime) -> List[tuple[str, str, str]]:
+        """Split an interval into per-day HH:MM segments."""
+        if end <= start:
+            return []
+
+        segments: List[tuple[str, str, str]] = []
+        cursor = start
+        while cursor.date() < end.date():
+            day_end = datetime.combine(cursor.date(), datetime.max.time()).replace(
+                hour=23,
+                minute=59,
+                second=59,
+                microsecond=0,
+            )
+            segments.append((
+                cursor.strftime("%Y-%m-%d"),
+                cursor.strftime("%H:%M"),
+                day_end.strftime("%H:%M"),
+            ))
+            cursor = datetime.combine(cursor.date() + timedelta(days=1), datetime.min.time())
+
+        segments.append((
+            cursor.strftime("%Y-%m-%d"),
+            cursor.strftime("%H:%M"),
+            end.strftime("%H:%M"),
+        ))
+        return segments
+
+    @staticmethod
+    def _build_day_range(now: datetime, days: int) -> List[str]:
+        """Return YYYY-MM-DD strings for the inclusive trailing day range."""
+        start_date = now.date() - timedelta(days=max(days - 1, 0))
+        return [
+            (start_date + timedelta(days=offset)).strftime("%Y-%m-%d")
+            for offset in range(days)
+        ]
 
     # --- Sensor readings ---
 
@@ -322,6 +377,38 @@ class Database:
                     LIMIT ?
                 """, (since.isoformat(), limit)).fetchall()
             return [dict(row) for row in rows]
+
+    # --- Session history / orchestration imports ---
+
+    def get_parser_line_count(self, source: str) -> int:
+        """Return the last imported line number for a parser source."""
+        with self._connection() as conn:
+            row = conn.execute("""
+                SELECT last_line
+                FROM session_parser_state
+                WHERE source = ?
+            """, (source,)).fetchone()
+            return int(row["last_line"]) if row else 0
+
+    def set_parser_line_count(self, source: str, last_line: int) -> None:
+        """Persist the parser checkpoint for a source file."""
+        with self._connection() as conn:
+            conn.execute("""
+                INSERT INTO session_parser_state (source, last_line)
+                VALUES (?, ?)
+                ON CONFLICT(source) DO UPDATE SET last_line = excluded.last_line
+            """, (source, last_line))
+
+    def insert_orchestration_activity(self, rows: List[tuple[str, str, str, str]]) -> None:
+        """Insert imported orchestration activity rows."""
+        if not rows:
+            return
+
+        with self._connection() as conn:
+            conn.executemany("""
+                INSERT INTO orchestration_activity (timestamp, tool, project, session_id)
+                VALUES (?, ?, ?, ?)
+            """, rows)
 
     # --- Analysis helpers ---
 
@@ -559,6 +646,162 @@ class Database:
             })
 
         return {"bucket_minutes": bucket_minutes, "points": points}
+
+    def get_orchestration_activity(self, days: int = 7) -> List[Dict[str, Any]]:
+        """Get per-day orchestration counts and prompt timestamps."""
+        now = self._now()
+        day_labels = self._build_day_range(now, days)
+        cutoff = self._format_timestamp(datetime.combine(
+            now.date() - timedelta(days=max(days - 1, 0)),
+            datetime.min.time(),
+        ))
+
+        with self._connection() as conn:
+            rows = conn.execute("""
+                SELECT timestamp, tool, session_id
+                FROM orchestration_activity
+                WHERE timestamp >= ?
+                ORDER BY timestamp ASC
+            """, (cutoff,)).fetchall()
+
+        grouped: Dict[str, Dict[str, Any]] = {
+            date_str: {
+                "date": date_str,
+                "messages": 0,
+                "sessions": 0,
+                "first_prompt": None,
+                "last_prompt": None,
+                "by_tool": {"claude": 0, "codex": 0},
+                "timestamps": [],
+            }
+            for date_str in day_labels
+        }
+        sessions_by_date: Dict[str, set[str]] = {date_str: set() for date_str in day_labels}
+
+        for row in rows:
+            ts = self._parse_timestamp(row["timestamp"])
+            date_str = ts.strftime("%Y-%m-%d")
+            if date_str not in grouped:
+                continue
+            item = grouped[date_str]
+            time_str = ts.strftime("%H:%M")
+            item["messages"] += 1
+            item["by_tool"][row["tool"]] = item["by_tool"].get(row["tool"], 0) + 1
+            item["timestamps"].append({"time": time_str, "tool": row["tool"]})
+            if item["first_prompt"] is None:
+                item["first_prompt"] = time_str
+            item["last_prompt"] = time_str
+            sessions_by_date[date_str].add(row["session_id"])
+
+        for date_str, session_ids in sessions_by_date.items():
+            grouped[date_str]["sessions"] = len(session_ids)
+
+        return [grouped[date_str] for date_str in day_labels]
+
+    def get_project_focus(self, days: int = 7) -> List[Dict[str, Any]]:
+        """Get per-day project message distribution."""
+        now = self._now()
+        day_labels = self._build_day_range(now, days)
+        cutoff = self._format_timestamp(datetime.combine(
+            now.date() - timedelta(days=max(days - 1, 0)),
+            datetime.min.time(),
+        ))
+
+        with self._connection() as conn:
+            rows = conn.execute("""
+                SELECT date(timestamp) AS date, project, COUNT(*) AS messages
+                FROM orchestration_activity
+                WHERE timestamp >= ?
+                GROUP BY date(timestamp), project
+                ORDER BY date(timestamp) ASC, messages DESC, project ASC
+            """, (cutoff,)).fetchall()
+
+        grouped: Dict[str, Dict[str, Any]] = {
+            date_str: {
+                "date": date_str,
+                "total": 0,
+                "projects": [],
+            }
+            for date_str in day_labels
+        }
+
+        for row in rows:
+            date_str = row["date"]
+            if date_str not in grouped:
+                continue
+            messages = int(row["messages"])
+            grouped[date_str]["total"] += messages
+            grouped[date_str]["projects"].append({
+                "name": row["project"],
+                "messages": messages,
+            })
+
+        return [grouped[date_str] for date_str in day_labels]
+
+    def get_openings(self, days: int = 7) -> List[Dict[str, Any]]:
+        """Get per-day door and window open intervals."""
+        now = self._now()
+        start_dt = datetime.combine(
+            now.date() - timedelta(days=max(days - 1, 0)),
+            datetime.min.time(),
+        )
+        cutoff = self._format_timestamp(start_dt)
+        day_labels = self._build_day_range(now, days)
+
+        grouped: Dict[str, Dict[str, Any]] = {
+            date_str: {
+                "date": date_str,
+                "door": [],
+                "window": [],
+            }
+            for date_str in day_labels
+        }
+
+        with self._connection() as conn:
+            for device_type in ("door", "window"):
+                last_before_cutoff = conn.execute("""
+                    SELECT timestamp, event
+                    FROM device_events
+                    WHERE timestamp < ? AND device_type = ?
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """, (cutoff, device_type)).fetchone()
+                rows = conn.execute("""
+                    SELECT timestamp, event
+                    FROM device_events
+                    WHERE timestamp >= ? AND device_type = ?
+                    ORDER BY timestamp ASC
+                """, (cutoff, device_type)).fetchall()
+
+                open_start = start_dt if (
+                    last_before_cutoff and last_before_cutoff["event"] == "open"
+                ) else None
+
+                for row in rows:
+                    ts = self._parse_timestamp(row["timestamp"])
+                    event = row["event"]
+                    if event == "open":
+                        if open_start is None:
+                            open_start = ts
+                    elif event == "closed" and open_start is not None:
+                        for date_str, open_time, close_time in self._split_interval_by_date(open_start, ts):
+                            if date_str in grouped:
+                                grouped[date_str][device_type].append({
+                                    "open": open_time,
+                                    "close": close_time,
+                                })
+                        open_start = None
+
+                if open_start is not None:
+                    trailing_end = now
+                    for date_str, open_time, close_time in self._split_interval_by_date(open_start, trailing_end):
+                        if date_str in grouped:
+                            grouped[date_str][device_type].append({
+                                "open": open_time,
+                                "close": close_time,
+                            })
+
+        return [grouped[date_str] for date_str in day_labels]
 
     def get_daily_stats(self, days: int = 7) -> List[Dict[str, Any]]:
         """Get daily aggregate stats (door events, runtimes, presence hours)."""

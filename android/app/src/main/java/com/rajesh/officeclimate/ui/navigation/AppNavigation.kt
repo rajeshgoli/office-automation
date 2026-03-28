@@ -11,8 +11,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Insights
 import androidx.compose.material.icons.outlined.Dashboard
 import androidx.compose.material.icons.outlined.History
+import androidx.compose.material.icons.outlined.Insights
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -30,6 +32,7 @@ import com.rajesh.officeclimate.MainActivity
 import com.rajesh.officeclimate.data.repository.SettingsRepository
 import com.rajesh.officeclimate.ui.dashboard.DashboardScreen
 import com.rajesh.officeclimate.ui.history.HistoryScreen
+import com.rajesh.officeclimate.ui.productivity.ProductivityScreen
 import com.rajesh.officeclimate.ui.settings.SettingsScreen
 import com.rajesh.officeclimate.ui.settings.SettingsViewModel
 import com.rajesh.officeclimate.ui.theme.*
@@ -39,6 +42,7 @@ object Routes {
     const val SETTINGS = "settings"
     const val DASHBOARD = "dashboard"
     const val HISTORY = "history"
+    const val PRODUCTIVITY = "productivity"
 }
 
 private data class NavItem(
@@ -51,6 +55,7 @@ private data class NavItem(
 private val navItems = listOf(
     NavItem(Routes.DASHBOARD, "Dashboard", Icons.Filled.Dashboard, Icons.Outlined.Dashboard),
     NavItem(Routes.HISTORY, "History", Icons.Filled.History, Icons.Outlined.History),
+    NavItem(Routes.PRODUCTIVITY, "Productivity", Icons.Filled.Insights, Icons.Outlined.Insights),
 )
 
 @Composable
@@ -68,7 +73,7 @@ fun AppNavigation(authResult: StateFlow<MainActivity.AuthResult?>) {
 
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route
-    val showBottomBar = currentRoute in listOf(Routes.DASHBOARD, Routes.HISTORY)
+    val showBottomBar = currentRoute in listOf(Routes.DASHBOARD, Routes.HISTORY, Routes.PRODUCTIVITY)
 
     Scaffold(
         containerColor = Background,
@@ -156,6 +161,9 @@ fun AppNavigation(authResult: StateFlow<MainActivity.AuthResult?>) {
             }
             composable(Routes.HISTORY) {
                 HistoryScreen()
+            }
+            composable(Routes.PRODUCTIVITY) {
+                ProductivityScreen()
             }
         }
     }

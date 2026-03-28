@@ -4,6 +4,9 @@ import android.util.Log
 import com.rajesh.officeclimate.data.model.ApiStatus
 import com.rajesh.officeclimate.data.model.DailyStatsResponse
 import com.rajesh.officeclimate.data.model.OHLCResponse
+import com.rajesh.officeclimate.data.model.OpeningsResponse
+import com.rajesh.officeclimate.data.model.OrchestrationResponse
+import com.rajesh.officeclimate.data.model.ProjectFocusResponse
 import com.rajesh.officeclimate.data.model.SessionsResponse
 import com.rajesh.officeclimate.data.model.TemperatureResponse
 import com.rajesh.officeclimate.data.remote.ApiService
@@ -190,6 +193,21 @@ class ClimateRepository(
     suspend fun getTemperature(hours: Int = 24): Result<TemperatureResponse> = runCatching {
         ensureInitialized()
         apiService.getTemperature(hours)
+    }
+
+    suspend fun getOpenings(days: Int = 7): Result<OpeningsResponse> = runCatching {
+        ensureInitialized()
+        apiService.getOpenings(days)
+    }
+
+    suspend fun getOrchestration(days: Int = 7): Result<OrchestrationResponse> = runCatching {
+        ensureInitialized()
+        apiService.getOrchestration(days)
+    }
+
+    suspend fun getProjectFocus(days: Int = 7): Result<ProjectFocusResponse> = runCatching {
+        ensureInitialized()
+        apiService.getProjectFocus(days)
     }
 
     suspend fun testConnection(url: String, token: String): Result<ApiStatus> = runCatching {

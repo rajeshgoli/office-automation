@@ -6,7 +6,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.rajesh.officeclimate.data.model.DailyStatsResponse
 import com.rajesh.officeclimate.data.model.OHLCResponse
-import com.rajesh.officeclimate.data.model.SessionsResponse
+import com.rajesh.officeclimate.data.model.OpeningsResponse
 import com.rajesh.officeclimate.data.model.TemperatureResponse
 import com.rajesh.officeclimate.data.repository.ClimateRepository
 import com.rajesh.officeclimate.data.repository.SettingsRepository
@@ -24,10 +24,7 @@ enum class OHLCRange(val hours: Int, val label: String) {
 
 class HistoryViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepo = SettingsRepository(application)
-    val climateRepo = ClimateRepository(settingsRepo, viewModelScope)
-
-    private val _sessions = MutableStateFlow<SessionsResponse?>(null)
-    val sessions: StateFlow<SessionsResponse?> = _sessions
+    private val climateRepo = ClimateRepository(settingsRepo, viewModelScope)
 
     private val _ohlcData = MutableStateFlow<OHLCResponse?>(null)
     val ohlcData: StateFlow<OHLCResponse?> = _ohlcData
@@ -37,6 +34,9 @@ class HistoryViewModel(application: Application) : AndroidViewModel(application)
 
     private val _temperature = MutableStateFlow<TemperatureResponse?>(null)
     val temperature: StateFlow<TemperatureResponse?> = _temperature
+
+    private val _openings = MutableStateFlow<OpeningsResponse?>(null)
+    val openings: StateFlow<OpeningsResponse?> = _openings
 
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading
@@ -56,14 +56,10 @@ class HistoryViewModel(application: Application) : AndroidViewModel(application)
             _isLoading.value = true
             _error.value = null
 
-            val sessionsDeferred = async { climateRepo.getSessions(7) }
             val ohlcDeferred = async { climateRepo.getCO2OHLC(_selectedRange.value.hours) }
             val statsDeferred = async { climateRepo.getDailyStats(7) }
             val tempDeferred = async { climateRepo.getTemperature(_selectedRange.value.hours) }
-
-            sessionsDeferred.await()
-                .onSuccess { _sessions.value = it }
-                .onFailure { Log.e(TAG, "Sessions fetch failed", it) }
+            val openingsDeferred = async { climateRepo.getOpenings(7) }
 
             ohlcDeferred.await()
                 .onSuccess { _ohlcData.value = it }
@@ -79,6 +75,10 @@ class HistoryViewModel(application: Application) : AndroidViewModel(application)
             tempDeferred.await()
                 .onSuccess { _temperature.value = it }
                 .onFailure { Log.e(TAG, "Temperature fetch failed", it) }
+
+            openingsDeferred.await()
+                .onSuccess { _openings.value = it }
+                .onFailure { Log.e(TAG, "Openings fetch failed", it) }
 
             _isLoading.value = false
         }

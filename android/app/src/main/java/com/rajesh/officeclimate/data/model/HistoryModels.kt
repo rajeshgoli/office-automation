@@ -96,3 +96,68 @@ data class DailyStat(
     @SerialName("hvac_runtime_min") val hvacRuntimeMin: Int = 0,
     @SerialName("presence_hours") val presenceHours: Double = 0.0,
 )
+
+// --- Openings ---
+
+@Serializable
+data class OpeningsResponse(
+    val ok: Boolean = false,
+    val days: List<OpeningDay> = emptyList(),
+)
+
+@Serializable
+data class OpeningDay(
+    val date: String = "",
+    val door: List<OpeningPeriod> = emptyList(),
+    val window: List<OpeningPeriod> = emptyList(),
+)
+
+@Serializable
+data class OpeningPeriod(
+    val open: String = "",
+    val close: String = "",
+)
+
+// --- Productivity ---
+
+@Serializable
+data class OrchestrationResponse(
+    val ok: Boolean = false,
+    val days: List<OrchestrationDay> = emptyList(),
+)
+
+@Serializable
+data class OrchestrationDay(
+    val date: String = "",
+    val messages: Int = 0,
+    val sessions: Int = 0,
+    @SerialName("first_prompt") val firstPrompt: String? = null,
+    @SerialName("last_prompt") val lastPrompt: String? = null,
+    @SerialName("by_tool") val byTool: Map<String, Int> = emptyMap(),
+    val timestamps: List<PromptTimestamp> = emptyList(),
+)
+
+@Serializable
+data class PromptTimestamp(
+    val time: String = "",
+    val tool: String = "",
+)
+
+@Serializable
+data class ProjectFocusResponse(
+    val ok: Boolean = false,
+    val days: List<ProjectFocusDay> = emptyList(),
+)
+
+@Serializable
+data class ProjectFocusDay(
+    val date: String = "",
+    val total: Int = 0,
+    val projects: List<ProjectCount> = emptyList(),
+)
+
+@Serializable
+data class ProjectCount(
+    val name: String = "",
+    val messages: Int = 0,
+)
