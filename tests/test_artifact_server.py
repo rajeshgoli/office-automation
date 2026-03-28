@@ -16,6 +16,27 @@ if "aiomqtt" not in sys.modules:
     aiomqtt_module.Client = object
     sys.modules["aiomqtt"] = aiomqtt_module
 
+if "tinytuya" not in sys.modules:
+    tinytuya_module = types.ModuleType("tinytuya")
+    tinytuya_module.Device = object
+    tinytuya_module.Cloud = object
+    sys.modules["tinytuya"] = tinytuya_module
+
+if "jwt" not in sys.modules:
+    jwt_module = types.ModuleType("jwt")
+
+    class ExpiredSignatureError(Exception):
+        pass
+
+    class InvalidTokenError(Exception):
+        pass
+
+    jwt_module.decode = lambda *args, **kwargs: {}
+    jwt_module.encode = lambda *args, **kwargs: "token"
+    jwt_module.ExpiredSignatureError = ExpiredSignatureError
+    jwt_module.InvalidTokenError = InvalidTokenError
+    sys.modules["jwt"] = jwt_module
+
 if "google_auth_oauthlib.flow" not in sys.modules:
     flow_module = types.ModuleType("google_auth_oauthlib.flow")
 
@@ -65,11 +86,26 @@ from src.orchestrator import Orchestrator
 class FakeOAuth:
     def __init__(self):
         self.trusted_networks = []
+        self.redirect_uri = "http://configured.example/auth/callback"
+        self.fail_authorization = False
 
     def verify_jwt(self, token: str):
         if token == "good-token":
             return "engineer@rajeshgo.li"
         return None
+
+    def generate_pkce_pair(self):
+        return ("verifier", "challenge")
+
+    def create_authorization_url(self, state: str, code_challenge: str):
+        if self.fail_authorization:
+            raise RuntimeError("boom")
+        return (
+            "https://accounts.example/authorize"
+            f"?state={state}"
+            f"&challenge={code_challenge}"
+            f"&redirect_uri={self.redirect_uri}"
+        )
 
 
 class ArtifactServerTests(unittest.IsolatedAsyncioTestCase):
@@ -83,6 +119,7 @@ class ArtifactServerTests(unittest.IsolatedAsyncioTestCase):
     async def _make_client(self) -> tuple[Orchestrator, TestClient]:
         orchestrator = Orchestrator.__new__(Orchestrator)
         orchestrator.oauth = FakeOAuth()
+        orchestrator._oauth_states = {}
         orchestrator._artifacts_root = self.root / "data" / "apps"
         orchestrator._legacy_apk_path = self.root / "data" / "app-debug.apk"
 
@@ -93,6 +130,21 @@ class ArtifactServerTests(unittest.IsolatedAsyncioTestCase):
         app.router.add_post("/deploy/{app}", orchestrator._handle_deploy_post)
         app.router.add_get("/apps/{app}/latest.apk", orchestrator._handle_app_artifact_get)
         app.router.add_get("/apk", orchestrator._handle_apk_get)
+
+        server = TestServer(app)
+        client = TestClient(server)
+        await client.start_server()
+        self.addAsyncCleanup(client.close)
+        self.addAsyncCleanup(server.close)
+        return orchestrator, client
+
+    async def _make_auth_client(self) -> tuple[Orchestrator, TestClient]:
+        orchestrator = Orchestrator.__new__(Orchestrator)
+        orchestrator.oauth = FakeOAuth()
+        orchestrator._oauth_states = {}
+
+        app = web.Application()
+        app.router.add_get("/auth/login", orchestrator._handle_auth_login)
 
         server = TestServer(app)
         client = TestClient(server)
@@ -181,3 +233,33 @@ class ArtifactServerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 413)
         self.assertEqual(payload["error"], "Artifact exceeds 100 MB limit")
+
+    async def test_auth_login_android_returns_json_and_persists_platform(self):
+        orchestrator, client = await self._make_auth_client()
+
+        response = await client.get(
+            "/auth/login?platform=android",
+            headers={"Host": "office.rajeshgo.li"},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertIn("authorization_url", payload)
+        self.assertIn("state", payload)
+        self.assertEqual(
+            orchestrator._oauth_redirect_uris[payload["state"]],
+            "https://office.rajeshgo.li/auth/callback",
+        )
+        self.assertEqual(orchestrator._oauth_platforms[payload["state"]], "android")
+        self.assertEqual(orchestrator.oauth.redirect_uri, "http://configured.example/auth/callback")
+
+    async def test_auth_login_returns_json_error_when_authorization_fails(self):
+        orchestrator, client = await self._make_auth_client()
+        orchestrator.oauth.fail_authorization = True
+
+        response = await client.get("/auth/login?platform=android")
+        payload = await response.json()
+
+        self.assertEqual(response.status, 500)
+        self.assertEqual(payload["error"], "Failed to start OAuth")
+        self.assertEqual(orchestrator._oauth_states, {})

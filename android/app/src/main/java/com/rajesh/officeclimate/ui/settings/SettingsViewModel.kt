@@ -3,7 +3,6 @@ package com.rajesh.officeclimate.ui.settings
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.rajesh.officeclimate.data.repository.ClimateRepository
 import com.rajesh.officeclimate.data.repository.SettingsRepository
 import com.rajesh.officeclimate.util.Defaults
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -11,7 +10,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
-import okhttp3.MediaType.Companion.toMediaType
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.concurrent.TimeUnit
@@ -67,8 +68,23 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 val body = response.body?.string() ?: ""
 
                 val json = Json { ignoreUnknownKeys = true }
-                val map = json.decodeFromString<Map<String, String>>(body)
-                val authUrl = map["authorization_url"]
+                val payload = runCatching { json.parseToJsonElement(body).jsonObject }.getOrNull()
+
+                if (!response.isSuccessful) {
+                    val errorMessage = payload
+                        ?.get("error")
+                        ?.jsonPrimitive
+                        ?.contentOrNull
+                        ?: body.ifBlank { "HTTP ${response.code}" }
+                    throw IllegalStateException(errorMessage)
+                }
+
+                val authUrl = payload
+                    ?.get("authorization_url")
+                    ?.jsonPrimitive
+                    ?.contentOrNull
+                    ?: throw IllegalStateException("OAuth response missing authorization_url")
+
                 _uiState.value = _uiState.value.copy(loading = false)
                 callback(authUrl)
             } catch (e: Exception) {

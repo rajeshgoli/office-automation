@@ -2250,35 +2250,45 @@ class Orchestrator:
         if not self.oauth:
             return web.json_response({"error": "OAuth not configured"}, status=501)
 
-        # Use the incoming host so OAuth works for localhost, LAN hosts, and the public domain.
-        redirect_uri = f"{self._resolve_redirect_scheme(request)}://{request.host}/auth/callback"
-
-        # Temporarily update OAuth redirect_uri for this request
+        platform = request.query.get("platform", "").strip().lower() or None
         original_redirect_uri = self.oauth.redirect_uri
-        self.oauth.redirect_uri = redirect_uri
+        state: Optional[str] = None
 
-        # Generate PKCE pair
-        code_verifier, code_challenge = self.oauth.generate_pkce_pair()
-        state = secrets.token_urlsafe(32)
+        try:
+            # Use the incoming host so OAuth works for localhost, LAN hosts, and the public domain.
+            redirect_uri = f"{self._resolve_redirect_scheme(request)}://{request.host}/auth/callback"
 
-        # Store state, redirect_uri, and platform for callback
-        self._oauth_states[state] = code_verifier
-        self._oauth_redirect_uris = getattr(self, '_oauth_redirect_uris', {})
-        self._oauth_redirect_uris[state] = redirect_uri
-        self._oauth_platforms = getattr(self, '_oauth_platforms', {})
-        if platform:
-            self._oauth_platforms[state] = platform
+            # Temporarily update OAuth redirect_uri for this request
+            self.oauth.redirect_uri = redirect_uri
 
-        # Generate authorization URL
-        auth_url = self.oauth.create_authorization_url(state, code_challenge)
+            # Generate PKCE pair
+            code_verifier, code_challenge = self.oauth.generate_pkce_pair()
+            state = secrets.token_urlsafe(32)
 
-        # Restore original redirect_uri
-        self.oauth.redirect_uri = original_redirect_uri
+            # Store state, redirect_uri, and platform for callback
+            self._oauth_states[state] = code_verifier
+            self._oauth_redirect_uris = getattr(self, '_oauth_redirect_uris', {})
+            self._oauth_redirect_uris[state] = redirect_uri
+            self._oauth_platforms = getattr(self, '_oauth_platforms', {})
+            if platform:
+                self._oauth_platforms[state] = platform
 
-        return web.json_response({
-            "authorization_url": auth_url,
-            "state": state
-        })
+            # Generate authorization URL
+            auth_url = self.oauth.create_authorization_url(state, code_challenge)
+
+            return web.json_response({
+                "authorization_url": auth_url,
+                "state": state
+            })
+        except Exception:
+            if state:
+                self._oauth_states.pop(state, None)
+                getattr(self, "_oauth_redirect_uris", {}).pop(state, None)
+                getattr(self, "_oauth_platforms", {}).pop(state, None)
+            logger.exception("Failed to start OAuth login flow")
+            return web.json_response({"error": "Failed to start OAuth"}, status=500)
+        finally:
+            self.oauth.redirect_uri = original_redirect_uri
 
     async def _handle_auth_callback(self, request: web.Request) -> web.Response:
         """Handle GET /auth/callback - OAuth redirect."""
