@@ -46,6 +46,34 @@ def _insert_climate_action(db: Database, timestamp: str, system: str, action: st
         )
 
 
+def _insert_device_event(db: Database, timestamp: str, device_type: str, event: str) -> None:
+    with db._connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO device_events (timestamp, device_type, event)
+            VALUES (?, ?, ?)
+            """,
+            (timestamp, device_type, event),
+        )
+
+
+def _insert_orchestration(
+    db: Database,
+    timestamp: str,
+    tool: str,
+    project: str,
+    session_id: str,
+) -> None:
+    with db._connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO orchestration_activity (timestamp, tool, project, session_id)
+            VALUES (?, ?, ?, ?)
+            """,
+            (timestamp, tool, project, session_id),
+        )
+
+
 def test_get_office_sessions_uses_now_for_active_day(monkeypatch, tmp_path):
     db = Database(tmp_path / "history.db")
     fixed_now = datetime(2026, 3, 27, 15, 0, 0)
@@ -150,4 +178,120 @@ def test_daily_stats_seed_open_state_from_before_cutoff(monkeypatch, tmp_path):
             "hvac_runtime_min": 60,
             "presence_hours": 1.0,
         }
+    ]
+
+
+def test_orchestration_activity_returns_daily_counts(monkeypatch, tmp_path):
+    db = Database(tmp_path / "history.db")
+    fixed_now = datetime(2026, 3, 27, 15, 0, 0)
+    _set_fixed_now(monkeypatch, fixed_now)
+
+    _insert_orchestration(db, "2026-03-25 09:15:00", "claude", "office-automate", "s1")
+    _insert_orchestration(db, "2026-03-25 10:02:00", "codex", "office-automate", "s1")
+    _insert_orchestration(db, "2026-03-26 11:30:00", "claude", "taskbar", "s2")
+    _insert_orchestration(db, "2026-03-27 08:45:00", "claude", "office-automate", "s3")
+    _insert_orchestration(db, "2026-03-27 14:20:00", "codex", "taskbar", "s4")
+
+    result = db.get_orchestration_activity(days=3)
+
+    assert [day["date"] for day in result] == ["2026-03-25", "2026-03-26", "2026-03-27"]
+    assert [day["messages"] for day in result] == [2, 1, 2]
+    assert result[0]["sessions"] == 1
+    assert result[2]["sessions"] == 2
+    assert result[0]["first_prompt"] == "09:15"
+    assert result[0]["last_prompt"] == "10:02"
+    assert result[2]["by_tool"] == {"claude": 1, "codex": 1}
+    assert result[2]["timestamps"] == [
+        {"time": "08:45", "tool": "claude"},
+        {"time": "14:20", "tool": "codex"},
+    ]
+
+
+def test_project_focus_returns_daily_project_mix(monkeypatch, tmp_path):
+    db = Database(tmp_path / "history.db")
+    fixed_now = datetime(2026, 3, 27, 15, 0, 0)
+    _set_fixed_now(monkeypatch, fixed_now)
+
+    _insert_orchestration(db, "2026-03-25 09:15:00", "claude", "office-automate", "s1")
+    _insert_orchestration(db, "2026-03-25 10:02:00", "codex", "office-automate", "s1")
+    _insert_orchestration(db, "2026-03-26 11:30:00", "claude", "taskbar", "s2")
+    _insert_orchestration(db, "2026-03-27 08:45:00", "claude", "office-automate", "s3")
+    _insert_orchestration(db, "2026-03-27 14:20:00", "codex", "taskbar", "s4")
+    _insert_orchestration(db, "2026-03-27 14:45:00", "claude", "taskbar", "s4")
+
+    result = db.get_project_focus(days=3)
+
+    assert [day["date"] for day in result] == ["2026-03-25", "2026-03-26", "2026-03-27"]
+    assert result[0]["total"] == 2
+    assert result[0]["projects"] == [{"name": "office-automate", "messages": 2}]
+    assert result[2]["total"] == 3
+    assert result[2]["projects"] == [
+        {"name": "taskbar", "messages": 2},
+        {"name": "office-automate", "messages": 1},
+    ]
+
+
+def test_get_openings_handles_unclosed_opening(monkeypatch, tmp_path):
+    db = Database(tmp_path / "history.db")
+    fixed_now = datetime(2026, 3, 27, 15, 0, 0)
+    _set_fixed_now(monkeypatch, fixed_now)
+
+    _insert_device_event(db, "2026-03-27 09:00:00", "door", "open")
+    _insert_device_event(db, "2026-03-27 09:05:00", "door", "closed")
+    _insert_device_event(db, "2026-03-27 12:00:00", "door", "open")
+
+    result = db.get_openings(days=1)
+
+    assert result == [
+        {
+            "date": "2026-03-27",
+            "door": [
+                {"open": "09:00", "close": "09:05"},
+                {"open": "12:00", "close": "15:00"},
+            ],
+            "window": [],
+        }
+    ]
+
+
+def test_get_openings_seeds_from_pre_cutoff_open(monkeypatch, tmp_path):
+    db = Database(tmp_path / "history.db")
+    fixed_now = datetime(2026, 3, 27, 15, 0, 0)
+    _set_fixed_now(monkeypatch, fixed_now)
+
+    _insert_device_event(db, "2026-03-26 23:00:00", "door", "open")
+    _insert_device_event(db, "2026-03-27 09:00:00", "door", "closed")
+
+    result = db.get_openings(days=1)
+
+    assert result == [
+        {
+            "date": "2026-03-27",
+            "door": [{"open": "00:00", "close": "09:00"}],
+            "window": [],
+        }
+    ]
+
+
+def test_get_openings_splits_midnight_span(monkeypatch, tmp_path):
+    db = Database(tmp_path / "history.db")
+    fixed_now = datetime(2026, 3, 27, 15, 0, 0)
+    _set_fixed_now(monkeypatch, fixed_now)
+
+    _insert_device_event(db, "2026-03-26 22:00:00", "door", "open")
+    _insert_device_event(db, "2026-03-27 02:00:00", "door", "closed")
+
+    result = db.get_openings(days=2)
+
+    assert result == [
+        {
+            "date": "2026-03-26",
+            "door": [{"open": "22:00", "close": "23:59"}],
+            "window": [],
+        },
+        {
+            "date": "2026-03-27",
+            "door": [{"open": "00:00", "close": "02:00"}],
+            "window": [],
+        },
     ]

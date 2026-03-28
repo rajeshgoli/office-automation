@@ -1,0 +1,390 @@
+package com.rajesh.officeclimate.ui.productivity
+
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.rajesh.officeclimate.data.model.OrchestrationDay
+import com.rajesh.officeclimate.data.model.ProjectFocusDay
+import com.rajesh.officeclimate.data.model.ProjectCount
+import com.rajesh.officeclimate.ui.history.LegendDot
+import com.rajesh.officeclimate.ui.history.SessionsSection
+import com.rajesh.officeclimate.ui.history.StatTile
+import com.rajesh.officeclimate.ui.history.TIME_GRID
+import com.rajesh.officeclimate.ui.history.TimeAxisHeader
+import com.rajesh.officeclimate.ui.history.dayOfWeekLabel
+import com.rajesh.officeclimate.ui.history.timeToFraction
+import com.rajesh.officeclimate.ui.theme.Amber
+import com.rajesh.officeclimate.ui.theme.Background
+import com.rajesh.officeclimate.ui.theme.Blue
+import com.rajesh.officeclimate.ui.theme.Border
+import com.rajesh.officeclimate.ui.theme.Cyan
+import com.rajesh.officeclimate.ui.theme.Emerald
+import com.rajesh.officeclimate.ui.theme.Orange
+import com.rajesh.officeclimate.ui.theme.Red
+import com.rajesh.officeclimate.ui.theme.Surface
+import com.rajesh.officeclimate.ui.theme.TextPrimary
+import com.rajesh.officeclimate.ui.theme.TextSecondary
+import java.time.LocalDate
+
+private val ProjectPalette = listOf(
+    Emerald,
+    Amber,
+    Blue,
+    Cyan,
+    Orange,
+    Color(0xFFA855F7),
+)
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun ProductivityScreen(
+    viewModel: ProductivityViewModel = viewModel(),
+) {
+    val sessions by viewModel.sessions.collectAsState()
+    val orchestration by viewModel.orchestration.collectAsState()
+    val projectFocus by viewModel.projectFocus.collectAsState()
+    val isLoading by viewModel.isLoading.collectAsState()
+    val error by viewModel.error.collectAsState()
+
+    val allFailed = !isLoading && sessions == null && orchestration == null && projectFocus == null
+    val today = LocalDate.now().toString()
+    val todayOrchestration = orchestration?.days?.firstOrNull { it.date == today }
+    val todayProjectFocus = projectFocus?.days?.firstOrNull { it.date == today }
+    val topProject = todayProjectFocus?.projects?.maxByOrNull { it.messages }?.name ?: "none"
+    val activeHours = when {
+        todayOrchestration?.firstPrompt != null && todayOrchestration?.lastPrompt != null ->
+            "${todayOrchestration?.firstPrompt} - ${todayOrchestration?.lastPrompt}"
+        else -> "--"
+    }
+
+    Box(modifier = Modifier.fillMaxSize().background(Background)) {
+        if (isLoading && sessions == null) {
+            Column(
+                modifier = Modifier.fillMaxSize(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                CircularProgressIndicator(color = Emerald)
+                Spacer(Modifier.height(16.dp))
+                Text("Loading productivity...", color = TextSecondary)
+            }
+        } else {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Text(
+                    text = "Productivity",
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = TextPrimary,
+                )
+
+                if (allFailed) {
+                    Spacer(Modifier.height(32.dp))
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(
+                            "Could not load productivity data",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = Red,
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            error ?: "Check that the server is updated with productivity endpoints",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextSecondary,
+                        )
+                        Spacer(Modifier.height(16.dp))
+                        Button(
+                            onClick = { viewModel.loadData() },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Emerald.copy(alpha = 0.2f),
+                                contentColor = Emerald,
+                            ),
+                        ) {
+                            Text("Retry")
+                        }
+                    }
+                }
+
+                sessions?.let { data ->
+                    SessionsSection(sessions = data.sessions, summary = data.summary)
+                }
+
+                orchestration?.let { data ->
+                    OrchestrationSection(days = data.days)
+                }
+
+                projectFocus?.let { data ->
+                    ProjectFocusSection(days = data.days)
+                }
+
+                Text(
+                    "TODAY",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = TextPrimary,
+                )
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    maxItemsInEachRow = 2,
+                ) {
+                    val tileModifier = Modifier.weight(1f)
+                    StatTile("MESSAGES", "${todayOrchestration?.messages ?: 0}", Emerald, tileModifier)
+                    StatTile("SESSIONS", "${todayOrchestration?.sessions ?: 0}", Amber, tileModifier)
+                    StatTile("TOP PROJECT", topProject, Blue, tileModifier)
+                    StatTile("ACTIVE HOURS", activeHours, Cyan, tileModifier)
+                }
+
+                Spacer(Modifier.height(64.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun OrchestrationSection(days: List<OrchestrationDay>) {
+    val shape = RoundedCornerShape(12.dp)
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(Surface.copy(alpha = 0.5f))
+            .border(1.dp, Border, shape)
+            .padding(16.dp),
+    ) {
+        Text("ORCHESTRATION ACTIVITY", style = MaterialTheme.typography.labelLarge, color = TextPrimary)
+        Spacer(Modifier.height(12.dp))
+        TimeAxisHeader()
+        Spacer(Modifier.height(4.dp))
+        days.forEach { day ->
+            OrchestrationDayRow(day)
+            Spacer(Modifier.height(4.dp))
+        }
+
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            LegendDot(Emerald, "CLAUDE")
+            LegendDot(Amber, "CODEX")
+        }
+    }
+}
+
+@Composable
+private fun OrchestrationDayRow(day: OrchestrationDay) {
+    val grouped = day.timestamps.groupBy { it.time }
+    val textMeasurer = rememberTextMeasurer()
+    val labelStyle = TextStyle(
+        fontFamily = FontFamily.Monospace,
+        fontSize = 8.sp,
+        color = TextSecondary,
+    )
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = dayOfWeekLabel(day.date),
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                fontSize = 10.sp,
+            ),
+            color = TextPrimary,
+            modifier = Modifier.width(36.dp),
+        )
+
+        Canvas(
+            modifier = Modifier
+                .weight(1f)
+                .height(28.dp),
+        ) {
+            TIME_GRID.forEach { (_, frac) ->
+                val x = frac * size.width
+                drawLine(
+                    color = Border.copy(alpha = 0.3f),
+                    start = Offset(x, 0f),
+                    end = Offset(x, size.height),
+                    strokeWidth = 0.5f,
+                )
+            }
+
+            grouped.forEach { (time, prompts) ->
+                val x = timeToFraction(time) * size.width
+                prompts.take(3).forEachIndexed { index, prompt ->
+                    val y = 7f + index * 7f
+                    drawCircle(
+                        color = if (prompt.tool == "codex") Amber else Emerald,
+                        radius = 4f,
+                        center = Offset(x, y),
+                    )
+                }
+                if (prompts.size > 3) {
+                    val overflow = textMeasurer.measure("+${prompts.size - 3}", labelStyle)
+                    drawText(
+                        overflow,
+                        topLeft = Offset((x + 6f).coerceAtMost(size.width - overflow.size.width), size.height - overflow.size.height),
+                    )
+                }
+            }
+        }
+
+        Text(
+            text = "${day.messages}",
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.sp,
+            ),
+            color = TextSecondary,
+            modifier = Modifier
+                .width(44.dp)
+                .padding(start = 8.dp),
+        )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ProjectFocusSection(days: List<ProjectFocusDay>) {
+    val shape = RoundedCornerShape(12.dp)
+    val projectColors = days
+        .flatMap { day -> day.projects.map(ProjectCount::name) }
+        .distinct()
+        .sorted()
+        .mapIndexed { index, name -> name to ProjectPalette[index % ProjectPalette.size] }
+        .toMap()
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(Surface.copy(alpha = 0.5f))
+            .border(1.dp, Border, shape)
+            .padding(16.dp),
+    ) {
+        Text("PROJECT FOCUS", style = MaterialTheme.typography.labelLarge, color = TextPrimary)
+        Spacer(Modifier.height(12.dp))
+
+        days.forEach { day ->
+            ProjectFocusRow(day = day, projectColors = projectColors)
+            Spacer(Modifier.height(6.dp))
+        }
+
+        if (projectColors.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                projectColors.forEach { (name, color) ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .width(8.dp)
+                                .height(8.dp)
+                                .clip(CircleShape)
+                                .background(color),
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(name, style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProjectFocusRow(day: ProjectFocusDay, projectColors: Map<String, Color>) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = dayOfWeekLabel(day.date),
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                fontSize = 10.sp,
+            ),
+            color = TextPrimary,
+            modifier = Modifier.width(36.dp),
+        )
+
+        Row(
+            modifier = Modifier
+                .weight(1f)
+                .height(16.dp)
+                .clip(RoundedCornerShape(6.dp))
+                .background(Border.copy(alpha = 0.3f)),
+        ) {
+            if (day.total > 0) {
+                day.projects.forEach { project ->
+                    Box(
+                        modifier = Modifier
+                            .weight(project.messages.toFloat())
+                            .fillMaxSize()
+                            .background(projectColors[project.name] ?: TextSecondary),
+                    )
+                }
+            }
+        }
+
+        Text(
+            text = "${day.total}",
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.sp,
+            ),
+            color = TextSecondary,
+            modifier = Modifier
+                .width(44.dp)
+                .padding(start = 8.dp),
+        )
+    }
+}

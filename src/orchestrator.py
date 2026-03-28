@@ -1532,6 +1532,36 @@ class Orchestrator:
             logger.error(f"Error handling history/daily-stats GET: {e}")
             return web.json_response({"ok": False, "error": str(e)}, status=400)
 
+    async def _handle_history_orchestration_get(self, request: web.Request) -> web.Response:
+        """Handle GET /history/orchestration for per-day orchestration activity."""
+        try:
+            days = min(max(1, int(request.query.get("days", "7"))), 30)
+            data = self.db.get_orchestration_activity(days=days)
+            return web.json_response({"ok": True, "days": data})
+        except Exception as e:
+            logger.error(f"Error handling history/orchestration GET: {e}")
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+    async def _handle_history_project_focus_get(self, request: web.Request) -> web.Response:
+        """Handle GET /history/project-focus for per-day project message mix."""
+        try:
+            days = min(max(1, int(request.query.get("days", "7"))), 30)
+            data = self.db.get_project_focus(days=days)
+            return web.json_response({"ok": True, "days": data})
+        except Exception as e:
+            logger.error(f"Error handling history/project-focus GET: {e}")
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+    async def _handle_history_openings_get(self, request: web.Request) -> web.Response:
+        """Handle GET /history/openings for door and window open intervals."""
+        try:
+            days = min(max(1, int(request.query.get("days", "7"))), 30)
+            data = self.db.get_openings(days=days)
+            return web.json_response({"ok": True, "days": data})
+        except Exception as e:
+            logger.error(f"Error handling history/openings GET: {e}")
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
     def _get_status_dict(self) -> dict:
         """Get current status as a dictionary."""
         sm_status = self.state_machine.get_status()
@@ -1992,6 +2022,9 @@ class Orchestrator:
         self._app.router.add_get("/history/co2-ohlc", self._handle_history_co2_ohlc_get)
         self._app.router.add_get("/history/daily-stats", self._handle_history_daily_stats_get)
         self._app.router.add_get("/history/temperature", self._handle_history_temperature_get)
+        self._app.router.add_get("/history/orchestration", self._handle_history_orchestration_get)
+        self._app.router.add_get("/history/project-focus", self._handle_history_project_focus_get)
+        self._app.router.add_get("/history/openings", self._handle_history_openings_get)
         self._app.router.add_get("/ws", self._handle_websocket)
         self._app.router.add_post("/erv", self._handle_erv_post)
         self._app.router.add_post("/hvac", self._handle_hvac_post)
