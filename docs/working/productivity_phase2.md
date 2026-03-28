@@ -118,9 +118,9 @@ Add a new function to `session_stats_parser.py`:
 
 1. Scan `data/session-meta/` for all `.json` files.
 2. For each file, parse JSON. If malformed, skip and log a warning.
-3. Extract `session_id`. Attempt `INSERT OR IGNORE` — if the session_id already exists, check if `duration_minutes` or `lines_added` have changed (session-meta files update as sessions progress). If changed, `UPDATE` the row. If unchanged, skip.
+3. Extract `session_id`. Use `INSERT OR REPLACE` (unconditional upsert) keyed on `session_id`. Session-meta files mutate many fields over time — not just `duration_minutes` and `lines_added`, but also `files_modified`, `git_commits`, `git_pushes`, `assistant_message_count`, `input_tokens`, `output_tokens`, `tool_counts`, and `languages`. Checking individual fields for staleness is fragile; unconditional replace is correct and cheap (one row per session, ~800 total).
 4. Filter: skip if `duration_minutes == 0 AND user_message_count == 0`.
-5. Convert `start_time` from UTC ISO 8601 to local PST: `datetime.fromisoformat(start_time.replace('Z', '+00:00')).astimezone().strftime(...)`.
+5. Convert `start_time` from UTC ISO 8601 to local Pacific time: `datetime.fromisoformat(start_time.replace('Z', '+00:00')).astimezone().strftime(...)`.
 6. Extract project name: `os.path.basename(project_path)` → apply `_normalize_project()`.
 7. Set `is_human_session = 0` if `is_machine_generated(first_prompt)`, else `1`.
 8. Upsert the row.
@@ -162,7 +162,7 @@ CREATE INDEX IF NOT EXISTS idx_prs_created ON github_prs(created_at);
 CREATE INDEX IF NOT EXISTS idx_prs_merged ON github_prs(merged_at);
 ```
 
-Timestamps from the GitHub API are UTC ISO 8601. Convert to PST on insert, consistent with every other table in this database.
+Timestamps from the GitHub API are UTC ISO 8601. Convert to local Pacific time on insert, consistent with every other table in this database.
 
 ### Parser Contract
 
@@ -338,6 +338,7 @@ Replace the current single-file `/apk` endpoint with a multi-app artifact server
 **`POST /deploy/{app}`** — Upload an artifact.
 
 - OAuth-protected (NOT in `skip_paths`).
+- **App name validation:** `{app}` must match `^[a-z0-9][a-z0-9-]*$` (lowercase alphanumeric + hyphens, no leading hyphen). Return 400 on mismatch. This prevents path traversal and unexpected filesystem writes.
 - Multipart form upload, field name `file`.
 - Writes atomically to `data/apps/{app}/latest.apk` using temp file + `os.replace()`.
 - Creates `data/apps/{app}/` directory on first upload.
@@ -366,9 +367,9 @@ Rename `climate.rajeshgo.li` to `office.rajeshgo.li` in the Cloudflare tunnel co
 
 **Changes required:**
 1. Cloudflare dashboard: Update tunnel public hostname from `climate.rajeshgo.li` to `office.rajeshgo.li`.
-2. Android app `ApiService.kt`: Update `BASE_URL` constant.
-3. `occupancy_detector.py`: Update default URL if hardcoded.
-4. `CLAUDE.md`: Update all references.
+2. Android app: Update default server URL in `android/.../util/Constants.kt:10` (the actual `BASE_URL` constant). Also update the placeholder URL shown in `android/.../ui/settings/SettingsScreen.kt:89`.
+3. `occupancy_detector.py`: Default URL is `http://localhost:8080` (line 308-309), not the public domain. No change needed — the production Launch Agent overrides with `--url http://192.168.5.140:8080`. But update `CLAUDE.md` examples that reference the public URL.
+4. `CLAUDE.md`: Update all references from `climate.loca.lt` / `climate.rajeshgo.li` to `office.rajeshgo.li`.
 5. OAuth redirect URIs in Google Cloud Console: Add `https://office.rajeshgo.li/auth/callback`.
 6. Keep `climate.rajeshgo.li` as a redirect to `office.rajeshgo.li` for a transition period (Cloudflare Page Rule or second tunnel route).
 
@@ -395,7 +396,7 @@ The highest-leverage tool. Enables parallel agent orchestration and mobile produ
 | Telegram messages | Telegram bot logs | Mobile orchestration — highest leverage signal. Every Telegram message means Rajesh is productive while away from his desk |
 | SSH sessions | sm ssh connection logs | Remote terminal access to agents |
 
-**Mechanically derivable now?** Partially — sm dispatches, sends, and reminds can be counted from `orchestration_activity` (they're the machine-generated messages that Phase 1 *excludes*). A separate counter of these excluded messages per day would show sm usage. Telegram and SSH require instrumentation in session-manager.
+**Mechanically derivable now?** Not from `orchestration_activity` — Phase 1's parser (`session_stats_parser.py:25-27`) filters out `[sm` and `[Input from:` messages *before* inserting, so they never reach the database. To count sm usage, the parser would need a schema change (e.g., a separate `sm_activity` table) or a direct scan of the raw `claude_history.jsonl` file counting excluded lines. Telegram and SSH require instrumentation in session-manager.
 
 ### engram
 
@@ -447,7 +448,7 @@ Workflow conventions and personas for AI agents.
 
 Phase 2 ships Tier 2 (session-meta + GitHub PRs). Tier 3 collection follows in Phase 3:
 
-1. **Quick wins (derivable from existing data):** sm message counts from excluded orchestration_activity rows, office-automate automation event counts, persona activation grep.
+1. **Quick wins (derivable from existing data):** sm message counts from raw `claude_history.jsonl` (scan for `[sm` / `[Input from:` prefixes — these are excluded by the parser, so must be counted from the source file or via a new parser pass), office-automate automation event counts from `climate_actions` table, persona activation grep from raw history.
 2. **Needs instrumentation:** Telegram message counts (session-manager), fold timestamps (engram), window switch counts (taskbar).
 3. **Needs API:** engram concept registry queries, session-manager SSH session counts.
 
@@ -473,9 +474,9 @@ Phase 2 ships Tier 2 (session-meta + GitHub PRs). Tier 3 collection follows in P
 
 2. **Idempotency.** Run parser twice on the same 3 files. Assert row count is still 2 (INSERT OR IGNORE on session_id PK).
 
-3. **Upsert on update.** Import a session-meta file with `lines_added=0`. Replace the file with an updated version where `lines_added=50`. Re-run parser. Assert the row now shows `lines_added=50`.
+3. **Upsert on update.** Import a session-meta file with `lines_added=0, git_commits=0`. Replace the file with an updated version where `lines_added=50, git_commits=3`. Re-run parser. Assert the row now shows `lines_added=50` AND `git_commits=3` (unconditional replace, not field-by-field check).
 
-4. **UTC to PST conversion.** Session with `start_time: "2026-03-03T02:49:15.095Z"` must parse to `2026-03-02 18:49:15` PST (UTC-8 in winter). Verify stored timestamp.
+4. **UTC to Pacific time conversion.** Session with `start_time: "2026-03-03T02:49:15.095Z"` must parse to `2026-03-02 18:49:15` Pacific (PST, UTC-8 in winter). Verify stored timestamp.
 
 5. **Project normalization.** Session with `project_path: "/Users/rajesh/worktrees/fractal-1808-em"` must store project as `"fractal"`. Session with `project_path: "/Users/rajesh/Desktop/automation/session-manager"` must store as `"session-manager"`.
 
@@ -489,7 +490,7 @@ Phase 2 ships Tier 2 (session-meta + GitHub PRs). Tier 3 collection follows in P
 
 9. **PR upsert.** Import a PR with state "open". Re-import with state "merged" and a `merged_at` timestamp. Assert the row is updated, not duplicated.
 
-10. **UTC to PST.** PR with `createdAt: "2026-03-15T20:30:00Z"` must store as `2026-03-15 13:30:00` PDT (UTC-7 in March after DST). Verify.
+10. **UTC to Pacific time.** PR with `createdAt: "2026-03-15T20:30:00Z"` must store as `2026-03-15 13:30:00` Pacific (PDT, UTC-7 in March after DST). Verify.
 
 11. **gh CLI unavailable.** Mock `gh` as not found. Assert the pipeline logs a warning and returns gracefully without crashing.
 
