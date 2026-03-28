@@ -369,7 +369,7 @@ Rename `climate.rajeshgo.li` to `office.rajeshgo.li` in the Cloudflare tunnel co
 1. Cloudflare dashboard: Update tunnel public hostname from `climate.rajeshgo.li` to `office.rajeshgo.li`.
 2. Android app: Update default server URL in `android/.../util/Constants.kt:10` (`SERVER_URL` constant). Also update the placeholder URL shown in `android/.../ui/settings/SettingsScreen.kt:89`.
 3. `occupancy_detector.py`: Default URL is `http://localhost:8080` (line 308-309), not the public domain. No change needed — the production Launch Agent overrides with `--url http://192.168.5.140:8080`. But update `CLAUDE.md` examples that reference the public URL.
-4. `CLAUDE.md`: Update `climate.rajeshgo.li` references to `office.rajeshgo.li`. Leave `climate.loca.lt` references as-is — that's the LocalTunnel hostname, a separate access path that may or may not be renamed independently.
+4. `CLAUDE.md`: Update all domain references — both `climate.rajeshgo.li` and `climate.loca.lt` — to `office.rajeshgo.li`. LocalTunnel is dead and no longer in use; remove LocalTunnel setup instructions and references entirely.
 5. OAuth redirect URIs in Google Cloud Console: Add `https://office.rajeshgo.li/auth/callback`.
 6. Keep `climate.rajeshgo.li` as a redirect to `office.rajeshgo.li` for a transition period (Cloudflare Page Rule or second tunnel route).
 
