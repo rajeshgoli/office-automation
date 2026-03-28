@@ -397,7 +397,7 @@ The highest-leverage tool. Enables parallel agent orchestration and mobile produ
 | SSH sessions | sm server connection log | Remote terminal access to agents |
 | App opens (daily/hourly) | sm app telemetry | Is the sm app being opened? Daily opens show habitual use, hourly distribution shows when orchestration happens |
 
-**Preferred instrumentation:** The sm server already processes every command — adding telemetry counters there is far more reliable than parsing `[sm ...]` messages from Claude history (which are filtered out before reaching `orchestration_activity` anyway). The server knows the ground truth; message parsing is a lossy proxy.
+**Requires new instrumentation.** These sources (sm server command log, sm app telemetry) do not exist today. The sm server processes every command but does not currently persist counts or emit telemetry. `tool_usage.db` (via `tool_logger.py`) records per-tool-use data but not sm-command-level events. Adding command counters to the sm server is the proposed path — straightforward since the server already handles every command. This is far more reliable than parsing `[sm ...]` messages from Claude history (which are filtered out before reaching `orchestration_activity` anyway).
 
 ### engram
 
@@ -419,9 +419,9 @@ Climate/productivity automation for the shed office.
 |--------|--------|---------------|
 | Automation events | `climate_actions` table | ERV/HVAC actions that would have been manual |
 | State transitions | `occupancy_log` table | System correctly detecting presence without manual input |
-| App opens (daily/hourly) | App telemetry or HTTP access logs | Is the dashboard actually being consulted? Daily/hourly open counts show if the app is useful enough to check regularly |
+| App opens (daily/hourly) | Client-side telemetry in Android app (e.g., POST `/telemetry/open` on app foreground) | Is the dashboard actually being consulted? Daily/hourly open counts show habitual use. |
 
-**Mechanically derivable now?** Partially — automation events and state transitions are already in the database. App opens would need either HTTP request logging on the backend or client-side telemetry in the Android app.
+**Mechanically derivable now?** Partially — automation events and state transitions are already in the database. App opens require new client-side telemetry (a lightweight POST on app foreground). HTTP access logs are not equivalent to app opens — they'd count every API poll unless a sessionization heuristic is defined.
 
 ### taskbar
 
@@ -440,16 +440,16 @@ Workflow conventions and personas for AI agents.
 
 | Signal | Source | Why it matters |
 |--------|--------|---------------|
-| File reads by agents | Agent tool-use telemetry (session-meta `tool_counts` + file paths) | Count how often agents read agent-os persona files. Direct measure of adoption — more reads = more agents using the workflow system |
-| Persona adoption across repos | Cross-reference reads with project context | Is agent-os used beyond one repo? |
+| Persona file reads | session-manager's `tool_usage.db` via `tool_logger.py` (records `target_file` for Read/Write/Edit) | Count reads of `~/.agent-os/personas/*` files. Direct measure of adoption. |
+| Persona adoption across repos | Cross-reference reads with project/session context in `tool_usage.db` | Is agent-os used beyond one repo? |
 
-**Preferred instrumentation:** Counting file reads from session-meta `tool_counts` is far better than parsing prompt text for persona invocations. An agent (like Claude) has comprehension and can fuzzy-match "as reviewer" to the reviewer persona, but a parser can't — and many persona activations happen via CLAUDE.md instructions, not explicit user prompts. File-read telemetry captures actual usage regardless of how the persona was invoked.
+**Why not session-meta?** Session-meta `tool_counts` only stores aggregate counts like `{"Bash": 5, "Read": 4}` — no file paths. The session-manager's tool logger (`tool_logger.py`) records `target_file` per tool use, which is what's needed to count reads of specific persona files.
 
 ### Implementation path for Tier 3
 
 Phase 2 ships Tier 2 (session-meta + GitHub PRs). Tier 3 collection follows in Phase 3:
 
-1. **Quick wins (derivable from existing data):** office-automate automation event counts from `climate_actions` table, agent-os file-read counts from session-meta `tool_counts`.
+1. **Quick wins (derivable from existing data):** office-automate automation event counts from `climate_actions` table, agent-os persona file reads from session-manager's `tool_usage.db`.
 2. **Needs server-side telemetry (preferred path):** sm command counters (dispatch/send/remind/managed sessions), sm and office app open counts, Telegram message counts. The sm server already processes every command — adding counters is straightforward.
 3. **Needs API or deeper instrumentation:** engram fold timestamps + concept registry queries, engram briefing generation counts, taskbar window switch telemetry.
 
