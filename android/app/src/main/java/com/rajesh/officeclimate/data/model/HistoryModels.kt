@@ -160,6 +160,8 @@ data class ProjectFocusDay(
 data class ProjectCount(
     val name: String = "",
     val messages: Int = 0,
+    @SerialName("first_prompt") val firstPrompt: String? = null,
+    @SerialName("last_prompt") val lastPrompt: String? = null,
 )
 
 @Serializable

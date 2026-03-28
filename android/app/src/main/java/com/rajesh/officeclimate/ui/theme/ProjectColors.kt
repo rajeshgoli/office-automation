@@ -4,9 +4,12 @@ import androidx.compose.ui.graphics.Color
 
 val KnownProjectColors = mapOf(
     "session-manager" to Emerald,
-    "engram" to Color(0xFFA855F7),
-    "agent-os" to Blue,
-    "office-automate" to Cyan,
+    "agent-os" to Amber,
+    "office-automate" to Blue,
+    "taskbar" to Cyan,
+    "deskbar" to Orange,
+    "engram" to Color(0xFFF43F5E),
+    "fractal" to Color(0xFF8B5CF6),
 )
 
 private val ProjectFallbackPalette = listOf(
@@ -15,7 +18,8 @@ private val ProjectFallbackPalette = listOf(
     Blue,
     Cyan,
     Orange,
-    Color(0xFFA855F7),
+    Color(0xFFF43F5E),
+    Color(0xFF8B5CF6),
 )
 
 fun projectColorFor(name: String): Color {

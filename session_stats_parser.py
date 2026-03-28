@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 from src.database import DEFAULT_DB_PATH, Database
+from src.project_names import normalize_project_name
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +28,6 @@ DATABASE_TIMEZONE = ZoneInfo("America/Los_Angeles")
 DEFAULT_GITHUB_OWNER = "rajeshgoli"
 GH_REPO_LIMIT = 100
 GH_PR_LIMIT = 500
-_PROJECT_ALIASES = {
-    "office-automation": "office-automate",
-}
-
 GhRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
@@ -71,15 +68,7 @@ class CodexProjectResolver:
 
 def _normalize_project(project: str) -> str:
     """Normalize project names across local path aliases."""
-    if not project:
-        return "unknown"
-
-    normalized = project.strip().rstrip("/")
-    if not normalized:
-        return "unknown"
-
-    basename = os.path.basename(normalized) or normalized
-    return _PROJECT_ALIASES.get(basename, basename)
+    return normalize_project_name(project)
 
 
 def _timestamp_to_sqlite(ts: datetime) -> str:

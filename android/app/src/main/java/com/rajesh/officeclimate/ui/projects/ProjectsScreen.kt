@@ -251,13 +251,12 @@ private fun buildProjectCards(response: ProjectLeverageResponse): List<ProjectCa
     val projects = response.projects
 
     return listOfNotNull(
-        buildSessionManagerCard(projects["session-manager"]),
-        buildEngramCard(projects["engram"]),
         buildAgentOsCard(projects["agent-os"]),
+        buildSessionManagerCard(projects["session-manager"]),
         buildOfficeAutomationCard(projects["office-automate"]),
+        buildDeskbarTaskbarPlaceholderCard(),
+        buildEngramCard(projects["engram"]),
     )
-        .filter { it.activity > 0 }
-        .sortedByDescending { it.activity }
 }
 
 private fun buildSessionManagerCard(project: ProjectLeverageProject?): ProjectCardUi? {
@@ -347,6 +346,19 @@ private fun buildOfficeAutomationCard(project: ProjectLeverageProject?): Project
         activity = activity,
     )
 }
+
+private fun buildDeskbarTaskbarPlaceholderCard(): ProjectCardUi = ProjectCardUi(
+    title = "deskbar / taskbar",
+    summary = "Project card reserved. Telemetry is not wired into project leverage yet.",
+    color = projectColorFor("taskbar"),
+    metrics = listOf(
+        ProjectMetricUi("--", "window switches", Cyan),
+        ProjectMetricUi("--", "focus time", Amber),
+        ProjectMetricUi("--", "uptime", Blue),
+    ),
+    footer = "Placeholder card stays visible until taskbar metrics land.",
+    activity = 0,
+)
 
 private fun foldFreshness(lastFoldAgeHours: Double?): Pair<String, Color> {
     if (lastFoldAgeHours == null) return "NO DATA" to TextSecondary

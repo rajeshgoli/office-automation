@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from contextlib import contextmanager
 
+from src.project_names import normalize_project_name
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path(__file__).parent.parent / "data" / "office_climate.db"
@@ -111,7 +113,6 @@ class Database:
                     session_id TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_orch_timestamp ON orchestration_activity(timestamp);
-                CREATE INDEX IF NOT EXISTS idx_orch_date ON orchestration_activity(date(timestamp));
 
                 -- Incremental parser bookkeeping
                 CREATE TABLE IF NOT EXISTS session_parser_state (
@@ -1052,7 +1053,12 @@ class Database:
 
         with self._connection() as conn:
             rows = conn.execute("""
-                SELECT date(timestamp) AS date, project, COUNT(*) AS messages
+                SELECT
+                    date(timestamp) AS date,
+                    project,
+                    COUNT(*) AS messages,
+                    MIN(strftime('%H:%M', timestamp)) AS first_prompt,
+                    MAX(strftime('%H:%M', timestamp)) AS last_prompt
                 FROM orchestration_activity
                 WHERE timestamp >= ?
                 GROUP BY date(timestamp), project
@@ -1067,17 +1073,44 @@ class Database:
             }
             for date_str in day_labels
         }
+        projects_by_date: Dict[str, Dict[str, Dict[str, Any]]] = {
+            date_str: {}
+            for date_str in day_labels
+        }
 
         for row in rows:
             date_str = row["date"]
             if date_str not in grouped:
                 continue
-            messages = int(row["messages"])
+
+            normalized_project = normalize_project_name(row["project"])
+            messages = int(row["messages"] or 0)
             grouped[date_str]["total"] += messages
-            grouped[date_str]["projects"].append({
-                "name": row["project"],
-                "messages": messages,
-            })
+
+            project = projects_by_date[date_str].setdefault(
+                normalized_project,
+                {
+                    "name": normalized_project,
+                    "messages": 0,
+                    "first_prompt": None,
+                    "last_prompt": None,
+                },
+            )
+            project["messages"] += messages
+
+            first_prompt = row["first_prompt"]
+            if first_prompt and (project["first_prompt"] is None or first_prompt < project["first_prompt"]):
+                project["first_prompt"] = first_prompt
+
+            last_prompt = row["last_prompt"]
+            if last_prompt and (project["last_prompt"] is None or last_prompt > project["last_prompt"]):
+                project["last_prompt"] = last_prompt
+
+        for date_str in day_labels:
+            grouped[date_str]["projects"] = sorted(
+                projects_by_date[date_str].values(),
+                key=lambda item: (-item["messages"], item["name"]),
+            )
 
         return [grouped[date_str] for date_str in day_labels]
 

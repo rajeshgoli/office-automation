@@ -31,8 +31,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontFamily
@@ -70,6 +72,8 @@ private data class MetricTileSpec(
     val label: String,
     val value: String,
     val accent: Color,
+    val trend: List<Float?> = emptyList(),
+    val trendLabel: String = "",
 )
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -193,7 +197,7 @@ fun ProductivityScreen(
                 leverage?.let { leverageData ->
                     LeverageTilesSection(
                         title = "TODAY LEVERAGE",
-                        tiles = todayLeverageTiles(todayLeverage),
+                        tiles = todayLeverageTiles(todayLeverage, leverageData.days),
                     )
                     LeverageTilesSection(
                         title = "THIS WEEK LEVERAGE",
@@ -225,11 +229,50 @@ private fun LeverageTilesSection(
         maxItemsInEachRow = 2,
     ) {
         tiles.forEach { tile ->
-            StatTile(
-                label = tile.label,
-                value = tile.value,
-                accentColor = tile.accent,
+            LeverageTile(
+                tile = tile,
                 modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun LeverageTile(tile: MetricTileSpec, modifier: Modifier = Modifier) {
+    val shape = RoundedCornerShape(12.dp)
+
+    Column(
+        modifier = modifier
+            .clip(shape)
+            .background(Surface.copy(alpha = 0.5f))
+            .border(1.dp, Border, shape)
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = tile.label,
+            style = MaterialTheme.typography.labelSmall,
+            color = TextSecondary,
+        )
+        Text(
+            text = tile.value,
+            style = MaterialTheme.typography.titleLarge,
+            color = tile.accent,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.SemiBold,
+        )
+        SparklineChart(
+            values = tile.trend,
+            accent = tile.accent,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(40.dp),
+        )
+        if (tile.trendLabel.isNotEmpty()) {
+            Text(
+                text = tile.trendLabel,
+                style = MaterialTheme.typography.labelSmall,
+                color = TextSecondary,
             )
         }
     }
@@ -360,6 +403,8 @@ private fun ProjectFocusSection(days: List<ProjectFocusDay>) {
     ) {
         Text("PROJECT FOCUS", style = MaterialTheme.typography.labelLarge, color = TextPrimary)
         Spacer(Modifier.height(12.dp))
+        TimeAxisHeader()
+        Spacer(Modifier.height(4.dp))
 
         days.forEach { day ->
             ProjectFocusRow(day = day, projectColors = projectColors)
@@ -392,9 +437,12 @@ private fun ProjectFocusSection(days: List<ProjectFocusDay>) {
 
 @Composable
 private fun ProjectFocusRow(day: ProjectFocusDay, projectColors: Map<String, Color>) {
+    val rowHeight = (day.projects.size * 12 + (day.projects.size - 1).coerceAtLeast(0) * 4)
+        .coerceAtLeast(16)
+
     Row(
         modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
+        verticalAlignment = Alignment.Top,
     ) {
         Text(
             text = dayOfWeekLabel(day.date),
@@ -404,25 +452,45 @@ private fun ProjectFocusRow(day: ProjectFocusDay, projectColors: Map<String, Col
                 fontSize = 10.sp,
             ),
             color = TextPrimary,
-            modifier = Modifier.width(36.dp),
+            modifier = Modifier
+                .width(36.dp)
+                .padding(top = 2.dp),
         )
 
-        Row(
+        Canvas(
             modifier = Modifier
                 .weight(1f)
-                .height(16.dp)
-                .clip(RoundedCornerShape(6.dp))
-                .background(Border.copy(alpha = 0.3f)),
+                .height(rowHeight.dp),
         ) {
-            if (day.total > 0) {
-                day.projects.forEach { project ->
-                    Box(
-                        modifier = Modifier
-                            .weight(project.messages.toFloat())
-                            .fillMaxSize()
-                            .background(projectColors[project.name] ?: TextSecondary),
-                    )
-                }
+            TIME_GRID.forEach { (_, frac) ->
+                val x = frac * size.width
+                drawLine(
+                    color = Border.copy(alpha = 0.3f),
+                    start = Offset(x, 0f),
+                    end = Offset(x, size.height),
+                    strokeWidth = 0.5f,
+                )
+            }
+
+            if (day.total == 0 || day.projects.isEmpty()) {
+                return@Canvas
+            }
+
+            val barHeight = 10.dp.toPx()
+            val barSpacing = 4.dp.toPx()
+
+            day.projects.forEachIndexed { index, project ->
+                val start = project.firstPrompt?.let(::timeToFraction) ?: 0f
+                val end = project.lastPrompt?.let(::timeToFraction) ?: start
+                val top = index * (barHeight + barSpacing)
+                val width = ((end - start) * size.width).coerceAtLeast(8.dp.toPx())
+
+                drawRoundRect(
+                    color = (projectColors[project.name] ?: TextSecondary).copy(alpha = 0.8f),
+                    topLeft = Offset(start * size.width, top),
+                    size = Size(width, barHeight),
+                    cornerRadius = CornerRadius(4.dp.toPx(), 4.dp.toPx()),
+                )
             }
         }
 
@@ -435,23 +503,147 @@ private fun ProjectFocusRow(day: ProjectFocusDay, projectColors: Map<String, Col
             color = TextSecondary,
             modifier = Modifier
                 .width(44.dp)
+                .padding(top = 2.dp)
                 .padding(start = 8.dp),
         )
     }
 }
 
-private fun todayLeverageTiles(today: LeverageDay?): List<MetricTileSpec> = listOf(
-    MetricTileSpec("LINES/PROMPT", today?.linesPerPrompt.formatDecimalOrDash(), Emerald),
-    MetricTileSpec("COMMITS", formatCount(today?.commits ?: 0), Amber),
-    MetricTileSpec("PRS MERGED", formatCount(today?.prsMerged ?: 0), Blue),
-    MetricTileSpec("LINES CHANGED", formatCount(today?.linesChanged ?: 0), Cyan),
+@Composable
+private fun SparklineChart(
+    values: List<Float?>,
+    accent: Color,
+    modifier: Modifier = Modifier,
+) {
+    val definedValues = values.filterNotNull()
+
+    Canvas(modifier = modifier) {
+        val gridColor = Border.copy(alpha = 0.35f)
+        val height = size.height
+        val width = size.width
+
+        drawLine(
+            color = gridColor,
+            start = Offset(0f, height),
+            end = Offset(width, height),
+            strokeWidth = 1f,
+        )
+        drawLine(
+            color = gridColor,
+            start = Offset(0f, height / 2f),
+            end = Offset(width, height / 2f),
+            strokeWidth = 1f,
+        )
+
+        if (definedValues.isEmpty()) {
+            return@Canvas
+        }
+
+        val minValue = definedValues.minOrNull() ?: 0f
+        val maxValue = definedValues.maxOrNull() ?: 0f
+        val valueRange = (maxValue - minValue).takeIf { it > 0.001f } ?: 1f
+        val maxIndex = (values.lastIndex).coerceAtLeast(1)
+
+        fun pointAt(index: Int, value: Float): Offset {
+            val x = index.toFloat() / maxIndex * width
+            val normalized = (value - minValue) / valueRange
+            val y = height - (normalized * (height - 4.dp.toPx())) - 2.dp.toPx()
+            return Offset(x, y)
+        }
+
+        var previousPoint: Offset? = null
+        var lastPoint: Offset? = null
+
+        values.forEachIndexed { index, value ->
+            if (value == null) {
+                previousPoint = null
+                return@forEachIndexed
+            }
+
+            val point = pointAt(index, value)
+            if (previousPoint != null) {
+                drawLine(
+                    color = accent,
+                    start = previousPoint!!,
+                    end = point,
+                    strokeWidth = 3f,
+                    cap = StrokeCap.Round,
+                )
+            }
+            previousPoint = point
+            lastPoint = point
+        }
+
+        lastPoint?.let {
+            drawCircle(
+                color = accent,
+                radius = 3.5.dp.toPx(),
+                center = it,
+            )
+        }
+    }
+}
+
+private fun todayLeverageTiles(today: LeverageDay?, days: List<LeverageDay>): List<MetricTileSpec> = listOf(
+    MetricTileSpec(
+        "LINES/PROMPT",
+        today?.linesPerPrompt.formatDecimalOrDash(),
+        Emerald,
+        trend = days.map { it.linesPerPrompt?.toFloat() },
+        trendLabel = "7D TREND",
+    ),
+    MetricTileSpec(
+        "COMMITS",
+        formatCount(today?.commits ?: 0),
+        Amber,
+        trend = days.map { it.commits.toFloat() },
+        trendLabel = "7D TREND",
+    ),
+    MetricTileSpec(
+        "PRS MERGED",
+        formatCount(today?.prsMerged ?: 0),
+        Blue,
+        trend = days.map { it.prsMerged.toFloat() },
+        trendLabel = "7D TREND",
+    ),
+    MetricTileSpec(
+        "LINES CHANGED",
+        formatCount(today?.linesChanged ?: 0),
+        Cyan,
+        trend = days.map { it.linesChanged.toFloat() },
+        trendLabel = "7D TREND",
+    ),
 )
 
 private fun weekLeverageTiles(leverage: LeverageResponse): List<MetricTileSpec> = listOf(
-    MetricTileSpec("WEEK LINES", formatCount(leverage.week.linesChanged), Emerald),
-    MetricTileSpec("WEEK COMMITS", formatCount(leverage.week.commits), Amber),
-    MetricTileSpec("WEEK PRS", formatCount(leverage.week.prsMerged), Blue),
-    MetricTileSpec("AVG L/PROMPT", leverage.week.linesPerPrompt.formatDecimalOrDash(), Cyan),
+    MetricTileSpec(
+        "WEEK LINES",
+        formatCount(leverage.week.linesChanged),
+        Emerald,
+        trend = leverage.days.map { it.linesChanged.toFloat() },
+        trendLabel = "DAILY TOTALS",
+    ),
+    MetricTileSpec(
+        "WEEK COMMITS",
+        formatCount(leverage.week.commits),
+        Amber,
+        trend = leverage.days.map { it.commits.toFloat() },
+        trendLabel = "DAILY TOTALS",
+    ),
+    MetricTileSpec(
+        "WEEK PRS",
+        formatCount(leverage.week.prsMerged),
+        Blue,
+        trend = leverage.days.map { it.prsMerged.toFloat() },
+        trendLabel = "DAILY TOTALS",
+    ),
+    MetricTileSpec(
+        "AVG L/PROMPT",
+        leverage.week.linesPerPrompt.formatDecimalOrDash(),
+        Cyan,
+        trend = leverage.days.map { it.linesPerPrompt?.toFloat() },
+        trendLabel = "DAILY EFFICIENCY",
+    ),
 )
 
 private fun formatCount(value: Int): String = String.format(Locale.US, "%,d", value)

@@ -223,12 +223,50 @@ def test_project_focus_returns_daily_project_mix(monkeypatch, tmp_path):
 
     assert [day["date"] for day in result] == ["2026-03-25", "2026-03-26", "2026-03-27"]
     assert result[0]["total"] == 2
-    assert result[0]["projects"] == [{"name": "office-automate", "messages": 2}]
+    assert result[0]["projects"] == [{
+        "name": "office-automate",
+        "messages": 2,
+        "first_prompt": "09:15",
+        "last_prompt": "10:02",
+    }]
     assert result[2]["total"] == 3
     assert result[2]["projects"] == [
-        {"name": "taskbar", "messages": 2},
-        {"name": "office-automate", "messages": 1},
+        {
+            "name": "taskbar",
+            "messages": 2,
+            "first_prompt": "14:20",
+            "last_prompt": "14:45",
+        },
+        {
+            "name": "office-automate",
+            "messages": 1,
+            "first_prompt": "08:45",
+            "last_prompt": "08:45",
+        },
     ]
+
+
+def test_project_focus_collapses_fractal_worktrees(monkeypatch, tmp_path):
+    db = Database(tmp_path / "history.db")
+    fixed_now = datetime(2026, 3, 27, 15, 0, 0)
+    _set_fixed_now(monkeypatch, fixed_now)
+
+    _insert_orchestration(db, "2026-03-27 09:00:00", "claude", "fractal-market-simulator", "s1")
+    _insert_orchestration(db, "2026-03-27 11:30:00", "codex", "fractal-1808-em", "s2")
+    _insert_orchestration(db, "2026-03-27 13:45:00", "claude", "fractal-1812-fix", "s3")
+
+    result = db.get_project_focus(days=1)
+
+    assert result == [{
+        "date": "2026-03-27",
+        "total": 3,
+        "projects": [{
+            "name": "fractal",
+            "messages": 3,
+            "first_prompt": "09:00",
+            "last_prompt": "13:45",
+        }],
+    }]
 
 
 def test_get_openings_handles_unclosed_opening(monkeypatch, tmp_path):
