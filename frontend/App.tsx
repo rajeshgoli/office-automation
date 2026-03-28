@@ -659,6 +659,27 @@ const App: React.FC = () => {
       {/* Office Replay */}
       <OfficeReplay />
 
+      {/* Mobile App Download */}
+      <div className="flex justify-end pb-16">
+        <a
+          href="/apps/office-climate/latest.apk"
+          download
+          className="inline-flex items-center gap-2 rounded-full border border-zinc-800/80 px-3 py-1.5 text-xs font-medium text-zinc-500 transition-colors hover:text-zinc-300 hover:border-zinc-700"
+        >
+          <svg
+            aria-hidden="true"
+            viewBox="0 0 20 20"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.7"
+            className="h-3.5 w-3.5"
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" d="M10 3v8m0 0 3-3m-3 3-3-3M4 14.5h12" />
+          </svg>
+          <span>Install App</span>
+        </a>
+      </div>
+
       {/* System Health Status Bar */}
       <footer className="fixed bottom-0 left-0 right-0 bg-black/80 backdrop-blur-md border-t border-zinc-800 p-3 flex justify-center items-center gap-6">
         <ConnectionDot connected={apiConnected} label="API" />
