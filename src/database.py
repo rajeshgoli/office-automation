@@ -34,6 +34,11 @@ class Database:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
+    @staticmethod
+    def _now() -> datetime:
+        """Return the current local time."""
+        return datetime.now()
+
     @contextmanager
     def _connection(self):
         """Context manager for database connections."""
@@ -113,6 +118,17 @@ class Database:
                     source TEXT PRIMARY KEY,
                     last_line INTEGER NOT NULL DEFAULT 0
                 );
+
+                -- Cross-project leverage metrics (EAV)
+                CREATE TABLE IF NOT EXISTS project_leverage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    project TEXT NOT NULL,
+                    metric TEXT NOT NULL,
+                    value REAL NOT NULL DEFAULT 0,
+                    UNIQUE(date, project, metric)
+                );
+                CREATE INDEX IF NOT EXISTS idx_proj_lev_date ON project_leverage(date);
             """)
             logger.info(f"Database initialized at {self.db_path}")
 
@@ -374,8 +390,37 @@ class Database:
                     SELECT * FROM climate_actions
                     WHERE timestamp > ?
                     ORDER BY timestamp DESC
-                    LIMIT ?
-                """, (since.isoformat(), limit)).fetchall()
+                LIMIT ?
+            """, (since.isoformat(), limit)).fetchall()
+            return [dict(row) for row in rows]
+
+    def upsert_project_leverage(
+        self,
+        rows: List[tuple[str, str, str, float]],
+    ) -> None:
+        """Insert or update project leverage rows keyed by date, project, and metric."""
+        if not rows:
+            return
+
+        with self._connection() as conn:
+            conn.executemany("""
+                INSERT INTO project_leverage (date, project, metric, value)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(date, project, metric) DO UPDATE SET
+                    value = excluded.value
+            """, rows)
+
+    def get_project_leverage_rows(self, days: int = 7) -> List[Dict[str, Any]]:
+        """Return raw project leverage rows for the trailing day window."""
+        days = min(max(1, days), 30)
+        since = (self._now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        with self._connection() as conn:
+            rows = conn.execute("""
+                SELECT date, project, metric, value
+                FROM project_leverage
+                WHERE date >= ?
+                ORDER BY date ASC, project ASC, metric ASC
+            """, (since,)).fetchall()
             return [dict(row) for row in rows]
 
     # --- Session history / orchestration imports ---
