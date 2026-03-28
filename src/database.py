@@ -95,6 +95,22 @@ class Database:
                     reason TEXT                 -- why this action was taken
                 );
                 CREATE INDEX IF NOT EXISTS idx_climate_timestamp ON climate_actions(timestamp);
+
+                -- GitHub PR activity imported via gh CLI
+                CREATE TABLE IF NOT EXISTS github_prs (
+                    repo TEXT NOT NULL,
+                    pr_number INTEGER NOT NULL,
+                    title TEXT,
+                    state TEXT NOT NULL,
+                    additions INTEGER NOT NULL DEFAULT 0,
+                    deletions INTEGER NOT NULL DEFAULT 0,
+                    changed_files INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL,
+                    merged_at DATETIME,
+                    PRIMARY KEY (repo, pr_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_prs_created ON github_prs(created_at);
+                CREATE INDEX IF NOT EXISTS idx_prs_merged ON github_prs(merged_at);
             """)
             logger.info(f"Database initialized at {self.db_path}")
 
@@ -278,6 +294,38 @@ class Database:
                     LIMIT ?
                 """, (since.isoformat(), limit)).fetchall()
             return [dict(row) for row in rows]
+
+    def upsert_github_prs(
+        self,
+        rows: List[tuple[str, int, Optional[str], str, int, int, int, str, Optional[str]]]
+    ) -> None:
+        """Insert or update GitHub PR rows keyed by repo and PR number."""
+        if not rows:
+            return
+
+        with self._connection() as conn:
+            conn.executemany("""
+                INSERT INTO github_prs (
+                    repo,
+                    pr_number,
+                    title,
+                    state,
+                    additions,
+                    deletions,
+                    changed_files,
+                    created_at,
+                    merged_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(repo, pr_number) DO UPDATE SET
+                    title = excluded.title,
+                    state = excluded.state,
+                    additions = excluded.additions,
+                    deletions = excluded.deletions,
+                    changed_files = excluded.changed_files,
+                    created_at = excluded.created_at,
+                    merged_at = excluded.merged_at
+            """, rows)
 
     # --- Analysis helpers ---
 
