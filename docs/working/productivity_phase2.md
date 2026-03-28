@@ -11,9 +11,9 @@
 | **E: Artifact server + domain** | office-automate | None | `/deploy/{app}`, `/apps/{app}`, domain rename |
 | **F: sm Telegram telemetry** | session-manager | None | Telegram message counters only (sm commands already in tool_usage.db) |
 | **G: engram fold telemetry** | engram | None | Fold stats CLI/export |
-| **H: Project leverage pipeline + UI** | office-automate | G (engram); F is optional (Telegram only) | Collection from tool_usage.db + engram DB, endpoint, Android cards |
+| **H: Project leverage pipeline + UI** | office-automate | None hard; F optional (Telegram), G optional (convenience) | Collection from tool_usage.db + rsynced engram DB, endpoint, Android cards |
 
-A, B, E, F, G can all run in parallel. C depends on A+B. D depends on C. H depends on G; F is optional (adds Telegram metrics only — H ships without them and shows "--" for Telegram).
+A, B, E, F, G, H can all run in parallel. C depends on A+B. D depends on C. H has no hard dependencies — it reads rsynced engram DB directly (G just adds `--json` convenience). F is optional for H (adds Telegram metrics only — H shows "--" for Telegram without it).
 
 The EM managing this epic must spawn agents in session-manager and engram repos for tickets F and G respectively.
 
@@ -530,9 +530,9 @@ These counts grow continuously. Daily breakdown shows clear patterns (e.g., 2026
 
 **Additional dimensions already in tool_usage.db:**
 
-- **Sender → receiver**: `session_name` contains the sender's role (e.g., "em-epics", "spec-owner-taskbar", "2361-engineer"). The target session ID is the first argument of `sm send {id}` in `bash_command`. Cross-referencing target IDs with `session_name` from other rows resolves the full communication graph (e.g., em → engineer, spec-owner → reviewer).
+- **Sender → receiver**: `session_name` contains the sender's role (e.g., "em-epics", "spec-owner-taskbar", "2361-engineer"). The target is the first argument of `sm send {target}` in `bash_command`. **Caveat:** targets are not always session IDs — session-manager's `resolve_session_id()` accepts IDs, aliases, and friendly names (e.g., "scout-coordinator", "sessionmgr"). Approximately 20% of `sm send` commands use non-ID targets. For the communication graph, resolve what's possible (8-char hex IDs cross-reference directly with other `session_id` values) and bucket the rest as "unresolved." This gives a partial but useful view of role-to-role communication patterns.
 
-- **Claude vs Codex**: `tool_usage.db` doesn't have a `provider` column, but session-manager's `sessions.json` tracks `provider` per session (claude / codex / codex-fork / codex-app). Cross-reference `session_id` to get the provider dimension. This enables metrics like "dispatches to Claude vs Codex agents" and "which provider produces more output per session."
+- **Claude vs Codex**: `tool_usage.db` doesn't have a `provider` column. Session-manager's `sessions.json` tracks `provider` per session (claude / codex / codex-fork / codex-app), but it's a live state file — currently only 3 sessions — not a historical ledger. The 516+ distinct session IDs in `tool_usage.db` cannot be retroactively resolved. **To make this work historically**, either: (a) add a `provider` column to `tool_usage` in a future session-manager update (preferred — instrument once, always available), or (b) snapshot `sessions.json` periodically and build a lookup table. For now, mark Claude vs Codex as a **future dimension** pending instrumentation.
 
 ### What's NOT in tool_usage.db
 
@@ -765,7 +765,8 @@ Add to the existing rsync cron:
 
 ```
 rsync -az rajesh@<work-mac-ip>:~/.local/share/claude-sessions/tool_usage.db ~/office-automate/data/tool_usage.db
-rsync -az rajesh@<work-mac-ip>:~/Desktop/engram/.engram/engram.db ~/office-automate/data/engram_state.db
+rsync -az rajesh@<work-mac-ip>:~/Desktop/fractal-market-simulator/.engram/engram.db ~/office-automate/data/engram_state.db
+rsync -az rajesh@<work-mac-ip>:~/Desktop/fractal-market-simulator/docs/decisions/concept_registry.md ~/office-automate/data/engram_concept_registry.md
 ```
 
 ### API endpoint
@@ -818,16 +819,9 @@ The `summary` field is a human-readable one-liner generated server-side from the
 
 ### Android UI
 
-Add a **Project Leverage** section to `ProductivityScreen.kt` below the existing leverage cards. One card per project, vertically stacked:
+Project cards live in the **Projects tab** (`ProjectsScreen.kt`), not in `ProductivityScreen.kt`. See Part D for the full UI spec including wireframes, card anatomy, and per-project content.
 
-| Card | Title | Value | Subtitle |
-|------|-------|-------|----------|
-| session-manager | SM | "52 dispatches" | "95 Telegram msgs this week" |
-| engram | ENGRAM | "3.5h since fold" | "42 active concepts" |
-| agent-os | AGENT-OS | "28 persona reads" | "across 4 projects" |
-| office-automate | OFFICE | "45 automations" | "12 state transitions" |
-
-Cards use the same `StatTile` composable. Color: each project gets its color from the existing `KnownProjectColors` map in `ProductivityScreen.kt`.
+**Note on shared code:** The `KnownProjectColors` map is currently `private` in `ProductivityScreen.kt:65`. Move it to a shared location (e.g., `ui/theme/ProjectColors.kt`) so both `ProductivityScreen` and `ProjectsScreen` can reference it.
 
 ### Taskbar (deferred)
 
