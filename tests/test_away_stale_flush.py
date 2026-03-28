@@ -93,9 +93,11 @@ class FakeERV:
 
     def turn_on(self, fan_speed):
         self.calls.append(("on", fan_speed.value))
+        return True
 
     def turn_off(self):
         self.calls.append(("off", None))
+        return True
 
 
 class FakeDB:
