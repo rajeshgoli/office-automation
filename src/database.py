@@ -99,6 +99,49 @@ class Database:
             """)
             logger.info(f"Database initialized at {self.db_path}")
 
+    @staticmethod
+    def _now() -> datetime:
+        """Return the current local time."""
+        return datetime.now()
+
+    @staticmethod
+    def _format_timestamp(ts: datetime) -> str:
+        """Format timestamps the same way SQLite stores them in this database."""
+        return ts.strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _parse_timestamp(value: str) -> datetime:
+        """Parse timestamps read back from SQLite."""
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _accumulate_duration_by_date(
+        durations: Dict[str, float],
+        start: datetime,
+        end: datetime,
+        seconds_per_unit: float,
+    ) -> None:
+        """Split a duration across calendar days and accumulate it in-place."""
+        if end <= start:
+            return
+
+        cursor = start
+        while cursor.date() < end.date():
+            next_midnight = datetime.combine(
+                cursor.date() + timedelta(days=1),
+                datetime.min.time(),
+            )
+            date_str = cursor.strftime("%Y-%m-%d")
+            durations[date_str] = durations.get(date_str, 0) + (
+                (next_midnight - cursor).total_seconds() / seconds_per_unit
+            )
+            cursor = next_midnight
+
+        date_str = cursor.strftime("%Y-%m-%d")
+        durations[date_str] = durations.get(date_str, 0) + (
+            (end - cursor).total_seconds() / seconds_per_unit
+        )
+
     # --- Sensor readings ---
 
     def log_sensor_reading(
@@ -320,18 +363,20 @@ class Database:
 
     def get_office_sessions(self, days: int = 7) -> Dict[str, Any]:
         """Get daily office sessions (arrival/departure/gaps) for the past N days."""
-        since = datetime.now() - timedelta(days=days)
+        now = self._now()
+        since = now - timedelta(days=days)
+        cutoff = self._format_timestamp(since)
         with self._connection() as conn:
             rows = conn.execute("""
                 SELECT timestamp, state FROM occupancy_log
                 WHERE timestamp > ?
                 ORDER BY timestamp ASC
-            """, (since.isoformat(),)).fetchall()
+            """, (cutoff,)).fetchall()
 
         # Group transitions by date
         by_date: Dict[str, List] = {}
         for row in rows:
-            ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S")
+            ts = self._parse_timestamp(row["timestamp"])
             date_str = ts.strftime("%Y-%m-%d")
             by_date.setdefault(date_str, []).append((ts, row["state"]))
 
@@ -342,18 +387,17 @@ class Database:
         for date_str, transitions in sorted(by_date.items()):
             # Find first PRESENT after 5am (ignore overnight sensor noise)
             first_present = None
-            last_away = None
             for ts, state in transitions:
                 if state == "present" and first_present is None and ts.hour >= 5:
                     first_present = ts
-                if state == "away" and first_present is not None:
-                    last_away = ts
 
             if first_present is None:
                 continue
 
             arrival = first_present
-            departure = last_away or transitions[-1][0]
+            departure, departure_state = transitions[-1]
+            if departure_state == "present" and arrival.date() == now.date():
+                departure = now
             duration = (departure - arrival).total_seconds() / 3600
 
             # Find gaps (AWAY periods between arrival and departure)
@@ -435,7 +479,8 @@ class Database:
             else:
                 bucket_minutes = 240
 
-        since = datetime.now() - timedelta(hours=hours)
+        since = self._now() - timedelta(hours=hours)
+        cutoff = self._format_timestamp(since)
         bucket_seconds = bucket_minutes * 60
 
         # Single query: get all readings with their bucket, then compute OHLC in Python
@@ -448,7 +493,7 @@ class Database:
                 FROM sensor_readings
                 WHERE timestamp > ? AND co2_ppm IS NOT NULL
                 ORDER BY timestamp ASC
-            """, (bucket_seconds, bucket_seconds, since.isoformat())).fetchall()
+            """, (bucket_seconds, bucket_seconds, cutoff)).fetchall()
 
         # Group by bucket and compute OHLC
         buckets: Dict[str, list] = {}
@@ -482,7 +527,8 @@ class Database:
             else:
                 bucket_minutes = 120
 
-        since = datetime.now() - timedelta(hours=hours)
+        since = self._now() - timedelta(hours=hours)
+        cutoff = self._format_timestamp(since)
         bucket_seconds = bucket_minutes * 60
 
         with self._connection() as conn:
@@ -497,7 +543,7 @@ class Database:
                 WHERE timestamp > ? AND temp_c IS NOT NULL
                 GROUP BY bucket
                 ORDER BY bucket ASC
-            """, (bucket_seconds, bucket_seconds, since.isoformat())).fetchall()
+            """, (bucket_seconds, bucket_seconds, cutoff)).fetchall()
 
         points = []
         for row in rows:
@@ -516,7 +562,9 @@ class Database:
 
     def get_daily_stats(self, days: int = 7) -> List[Dict[str, Any]]:
         """Get daily aggregate stats (door events, runtimes, presence hours)."""
-        since = datetime.now() - timedelta(days=days)
+        now = self._now()
+        since = now - timedelta(days=days)
+        cutoff = self._format_timestamp(since)
 
         with self._connection() as conn:
             # Door events per day
@@ -525,7 +573,7 @@ class Database:
                 FROM device_events
                 WHERE timestamp > ? AND device_type = 'door'
                 GROUP BY date(timestamp)
-            """, (since.isoformat(),)).fetchall()
+            """, (cutoff,)).fetchall()
             door_by_date = {r["date"]: r["count"] for r in door_rows}
 
             # Presence hours per day from occupancy_log
@@ -533,63 +581,94 @@ class Database:
                 SELECT timestamp, state FROM occupancy_log
                 WHERE timestamp > ?
                 ORDER BY timestamp ASC
-            """, (since.isoformat(),)).fetchall()
+            """, (cutoff,)).fetchall()
 
             presence_by_date: Dict[str, float] = {}
             prev_ts = None
             prev_state = None
             for row in occ_rows:
-                ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S")
+                ts = self._parse_timestamp(row["timestamp"])
                 if prev_ts and prev_state == "present":
-                    date_str = prev_ts.strftime("%Y-%m-%d")
-                    dur_hrs = (ts - prev_ts).total_seconds() / 3600
-                    # Cap at same-day boundary
-                    if ts.date() == prev_ts.date():
-                        presence_by_date[date_str] = presence_by_date.get(date_str, 0) + dur_hrs
+                    self._accumulate_duration_by_date(
+                        presence_by_date,
+                        prev_ts,
+                        ts,
+                        seconds_per_unit=3600,
+                    )
                 prev_ts = ts
                 prev_state = row["state"]
+
+            if prev_ts and prev_state == "present":
+                self._accumulate_duration_by_date(
+                    presence_by_date,
+                    prev_ts,
+                    now,
+                    seconds_per_unit=3600,
+                )
 
             # ERV runtime per day
             erv_rows = conn.execute("""
                 SELECT timestamp, action FROM climate_actions
                 WHERE timestamp > ? AND system = 'erv'
                 ORDER BY timestamp ASC
-            """, (since.isoformat(),)).fetchall()
+            """, (cutoff,)).fetchall()
 
             erv_by_date: Dict[str, float] = {}
             erv_on_ts = None
             for row in erv_rows:
-                ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S")
+                ts = self._parse_timestamp(row["timestamp"])
                 action = row["action"]
                 if action in ("quiet", "medium", "turbo", "on"):
                     if erv_on_ts is None:
                         erv_on_ts = ts
                 elif action == "off" and erv_on_ts:
-                    date_str = erv_on_ts.strftime("%Y-%m-%d")
-                    dur_min = (ts - erv_on_ts).total_seconds() / 60
-                    erv_by_date[date_str] = erv_by_date.get(date_str, 0) + dur_min
+                    self._accumulate_duration_by_date(
+                        erv_by_date,
+                        erv_on_ts,
+                        ts,
+                        seconds_per_unit=60,
+                    )
                     erv_on_ts = None
+
+            if erv_on_ts:
+                self._accumulate_duration_by_date(
+                    erv_by_date,
+                    erv_on_ts,
+                    now,
+                    seconds_per_unit=60,
+                )
 
             # HVAC runtime per day
             hvac_rows = conn.execute("""
                 SELECT timestamp, action FROM climate_actions
                 WHERE timestamp > ? AND system = 'hvac'
                 ORDER BY timestamp ASC
-            """, (since.isoformat(),)).fetchall()
+            """, (cutoff,)).fetchall()
 
             hvac_by_date: Dict[str, float] = {}
             hvac_on_ts = None
             for row in hvac_rows:
-                ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S")
+                ts = self._parse_timestamp(row["timestamp"])
                 action = row["action"]
                 if action in ("heat", "cool", "on"):
                     if hvac_on_ts is None:
                         hvac_on_ts = ts
                 elif action == "off" and hvac_on_ts:
-                    date_str = hvac_on_ts.strftime("%Y-%m-%d")
-                    dur_min = (ts - hvac_on_ts).total_seconds() / 60
-                    hvac_by_date[date_str] = hvac_by_date.get(date_str, 0) + dur_min
+                    self._accumulate_duration_by_date(
+                        hvac_by_date,
+                        hvac_on_ts,
+                        ts,
+                        seconds_per_unit=60,
+                    )
                     hvac_on_ts = None
+
+            if hvac_on_ts:
+                self._accumulate_duration_by_date(
+                    hvac_by_date,
+                    hvac_on_ts,
+                    now,
+                    seconds_per_unit=60,
+                )
 
             # Collect all dates
             all_dates = set()
