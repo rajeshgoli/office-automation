@@ -61,7 +61,7 @@ class AppUpdateRepository(
     suspend fun downloadUpdate(update: AvailableAppUpdate): File = withContext(Dispatchers.IO) {
         val serverUrl = settingsRepository.serverUrl.first().trimEnd('/')
         val request = Request.Builder()
-            .url("$serverUrl/apps/office-climate/latest.apk")
+            .url("$serverUrl/apps/office-climate/${update.artifactHash}.apk")
             .build()
 
         val updatesDir = File(context.cacheDir, "updates").apply { mkdirs() }
