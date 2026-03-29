@@ -5,6 +5,12 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val officeClimateBuildHash = (
+    project.findProperty("officeClimateBuildHash") as String?
+        ?: System.getenv("OFFICE_CLIMATE_BUILD_HASH")
+        ?: ""
+)
+
 android {
     namespace = "com.rajesh.officeclimate"
     compileSdk = 35
@@ -15,6 +21,7 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
+        buildConfigField("String", "APK_HASH", "\"$officeClimateBuildHash\"")
     }
 
     buildTypes {
@@ -35,6 +42,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
