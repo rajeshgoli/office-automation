@@ -244,6 +244,23 @@ class Database:
             return None
         return round(float(numerator) / float(denominator), 2)
 
+    @staticmethod
+    def _sqlite_local_datetime_expr(column: str) -> str:
+        """Return a SQLite expression that normalizes timestamps into Pacific local time."""
+        has_explicit_timezone = (
+            f"({column} LIKE '%Z' OR {column} LIKE '%+__:__' OR {column} LIKE '%-__:__')"
+        )
+        return (
+            f"CASE WHEN {has_explicit_timezone} "
+            f"THEN datetime({column}, 'localtime') "
+            f"ELSE datetime({column}) END"
+        )
+
+    @classmethod
+    def _sqlite_local_date_expr(cls, column: str) -> str:
+        """Return a SQLite expression that extracts the Pacific local calendar date."""
+        return f"date({cls._sqlite_local_datetime_expr(column)})"
+
     # --- Sensor readings ---
 
     def log_sensor_reading(
@@ -814,6 +831,14 @@ class Database:
             now.date() - timedelta(days=max(days - 1, 0)),
             datetime.min.time(),
         ))
+        orchestration_local_datetime = self._sqlite_local_datetime_expr("timestamp")
+        orchestration_local_date = self._sqlite_local_date_expr("timestamp")
+        session_local_datetime = self._sqlite_local_datetime_expr("start_time")
+        session_local_date = self._sqlite_local_date_expr("start_time")
+        pr_created_local_datetime = self._sqlite_local_datetime_expr("created_at")
+        pr_created_local_date = self._sqlite_local_date_expr("created_at")
+        pr_merged_local_datetime = self._sqlite_local_datetime_expr("merged_at")
+        pr_merged_local_date = self._sqlite_local_date_expr("merged_at")
 
         grouped: Dict[str, Dict[str, Any]] = {
             date_str: {
@@ -837,46 +862,46 @@ class Database:
             ensure_telemetry_db(self.telemetry_db_path)
             conn.execute("ATTACH DATABASE ? AS telemetry", (str(self.telemetry_db_path),))
             try:
-                orchestration_rows = conn.execute("""
+                orchestration_rows = conn.execute(f"""
                     SELECT
-                        date(timestamp) AS date,
+                        {orchestration_local_date} AS date,
                         COUNT(*) AS prompts,
                         COUNT(DISTINCT session_id) AS sessions
                     FROM orchestration_activity
-                    WHERE timestamp >= ?
-                    GROUP BY date(timestamp)
+                    WHERE {orchestration_local_datetime} >= ?
+                    GROUP BY {orchestration_local_date}
                 """, (cutoff,)).fetchall()
 
-                session_rows = conn.execute("""
+                session_rows = conn.execute(f"""
                     SELECT
-                        date(start_time) AS date,
+                        {session_local_date} AS date,
                         SUM(lines_added) AS lines_added,
                         SUM(lines_removed) AS lines_removed,
                         SUM(files_modified) AS files_modified,
                         SUM(git_commits) AS commits,
                         SUM(duration_minutes) AS duration_minutes
                     FROM telemetry.session_output
-                    WHERE start_time >= ?
-                    GROUP BY date(start_time)
+                    WHERE {session_local_datetime} >= ?
+                    GROUP BY {session_local_date}
                 """, (cutoff,)).fetchall()
 
-                pr_opened_rows = conn.execute("""
+                pr_opened_rows = conn.execute(f"""
                     SELECT
-                        date(created_at) AS date,
+                        {pr_created_local_date} AS date,
                         COUNT(*) AS prs_opened
                     FROM github_prs
-                    WHERE created_at >= ?
-                    GROUP BY date(created_at)
+                    WHERE {pr_created_local_datetime} >= ?
+                    GROUP BY {pr_created_local_date}
                 """, (cutoff,)).fetchall()
 
-                pr_merged_rows = conn.execute("""
+                pr_merged_rows = conn.execute(f"""
                     SELECT
-                        date(merged_at) AS date,
+                        {pr_merged_local_date} AS date,
                         COUNT(*) AS prs_merged,
                         SUM((julianday(merged_at) - julianday(created_at)) * 24.0) AS pr_cycle_hours_total
                     FROM github_prs
-                    WHERE merged_at IS NOT NULL AND merged_at >= ?
-                    GROUP BY date(merged_at)
+                    WHERE merged_at IS NOT NULL AND {pr_merged_local_datetime} >= ?
+                    GROUP BY {pr_merged_local_date}
                 """, (cutoff,)).fetchall()
             finally:
                 conn.execute("DETACH DATABASE telemetry")

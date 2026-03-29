@@ -245,6 +245,93 @@ def test_leverage_endpoint_averages_pr_cycle_hours_for_merged_day(monkeypatch, t
     assert payload["week"]["avg_pr_cycle_hours"] == 3.0
 
 
+def test_leverage_endpoint_groups_offset_timestamps_by_pacific_day(monkeypatch, tmp_path):
+    telemetry_db_path = tmp_path / "telemetry.db"
+    db = Database(tmp_path / "history.db", telemetry_db_path=telemetry_db_path)
+    _set_fixed_now(monkeypatch, datetime(2026, 3, 28, 12, 0, 0))
+
+    _insert_orchestration(
+        db,
+        "2026-03-27 23:45:00",
+        tool="claude",
+        project="office-automate",
+        session_id="late-session",
+    )
+
+    _replace_session_output(telemetry_db_path, [
+        _session_row(
+            "late-session",
+            "2026-03-28T06:30:00+00:00",
+            duration_minutes=30,
+            lines_added=120,
+            lines_removed=30,
+            files_modified=5,
+            git_commits=4,
+        ),
+    ])
+    db.upsert_github_prs([
+        _pr_row(
+            40,
+            "2026-03-28T06:00:00+00:00",
+            "2026-03-28T06:45:00+00:00",
+        ),
+    ])
+
+    status, payload = _call_leverage_endpoint(db, 2)
+
+    assert status == 200
+    assert payload["days"] == [
+        {
+            "date": "2026-03-27",
+            "prompts": 1,
+            "sessions": 1,
+            "lines_added": 120,
+            "lines_removed": 30,
+            "lines_changed": 150,
+            "files_modified": 5,
+            "commits": 4,
+            "prs_merged": 1,
+            "prs_opened": 1,
+            "avg_pr_cycle_hours": 0.75,
+            "lines_per_prompt": 150.0,
+            "commits_per_prompt": 4.0,
+            "lines_per_session_minute": 5.0,
+        },
+        {
+            "date": "2026-03-28",
+            "prompts": 0,
+            "sessions": 0,
+            "lines_added": 0,
+            "lines_removed": 0,
+            "lines_changed": 0,
+            "files_modified": 0,
+            "commits": 0,
+            "prs_merged": 0,
+            "prs_opened": 0,
+            "avg_pr_cycle_hours": None,
+            "lines_per_prompt": None,
+            "commits_per_prompt": None,
+            "lines_per_session_minute": None,
+        },
+    ]
+    assert payload["week"] == {
+        "prompts": 1,
+        "sessions": 1,
+        "lines_added": 120,
+        "lines_removed": 30,
+        "lines_changed": 150,
+        "files_modified": 5,
+        "commits": 4,
+        "prs_merged": 1,
+        "prs_opened": 1,
+        "avg_pr_cycle_hours": 0.75,
+        "lines_per_prompt": 150.0,
+        "commits_per_prompt": 4.0,
+        "lines_per_session_minute": 5.0,
+        "active_days": 1,
+    }
+
+
 def test_leverage_endpoint_aggregates_week_from_day_totals(monkeypatch, tmp_path):
     telemetry_db_path = tmp_path / "telemetry.db"
     db = Database(tmp_path / "history.db", telemetry_db_path=telemetry_db_path)
