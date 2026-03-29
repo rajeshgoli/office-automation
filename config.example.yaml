@@ -56,3 +56,12 @@ orchestrator:
   # Optional: Enable HTTP Basic Auth for remote access (recommended with Cloudflare Tunnel)
   # auth_username: "admin"
   # auth_password: "your_secure_password"
+
+telemetry:
+  repos:
+    - ~/Desktop/automation/office-automate
+    - ~/Desktop/automation/session-manager
+    - ~/Desktop/automation/taskbar
+    - ~/Desktop/fractal-market-simulator
+    - ~/Desktop/automation/social_media
+    - ~/Desktop/automation/backup-manager

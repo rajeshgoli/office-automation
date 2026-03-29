@@ -19,6 +19,7 @@ sys.modules.setdefault(
 
 from src.database import Database
 from src.orchestrator import Orchestrator
+from src.telemetry_db import replace_session_output_rows
 
 
 def _set_fixed_now(monkeypatch, now: datetime) -> None:
@@ -102,8 +103,13 @@ def _call_leverage_endpoint(db: Database, days: int) -> tuple[int, dict]:
     return response.status, json.loads(response.body.decode("utf-8"))
 
 
+def _replace_session_output(telemetry_db_path: Path, rows: list[tuple]) -> None:
+    replace_session_output_rows(rows, telemetry_db_path)
+
+
 def test_leverage_endpoint_basic_computation(monkeypatch, tmp_path):
-    db = Database(tmp_path / "history.db")
+    telemetry_db_path = tmp_path / "telemetry.db"
+    db = Database(tmp_path / "history.db", telemetry_db_path=telemetry_db_path)
     _set_fixed_now(monkeypatch, datetime(2026, 3, 27, 12, 0, 0))
 
     for minute in range(5):
@@ -122,7 +128,7 @@ def test_leverage_endpoint_basic_computation(monkeypatch, tmp_path):
             session_id="agent-session",
         )
 
-    db.replace_session_output([
+    _replace_session_output(telemetry_db_path, [
         _session_row(
             "human-session",
             "2026-03-27 09:00:00",
@@ -188,10 +194,11 @@ def test_leverage_endpoint_basic_computation(monkeypatch, tmp_path):
 
 
 def test_leverage_endpoint_returns_null_ratios_when_prompt_count_is_zero(monkeypatch, tmp_path):
-    db = Database(tmp_path / "history.db")
+    telemetry_db_path = tmp_path / "telemetry.db"
+    db = Database(tmp_path / "history.db", telemetry_db_path=telemetry_db_path)
     _set_fixed_now(monkeypatch, datetime(2026, 3, 27, 12, 0, 0))
 
-    db.replace_session_output([
+    _replace_session_output(telemetry_db_path, [
         _session_row(
             "machine-session",
             "2026-03-27 09:00:00",
@@ -222,7 +229,7 @@ def test_leverage_endpoint_returns_null_ratios_when_prompt_count_is_zero(monkeyp
 
 
 def test_leverage_endpoint_averages_pr_cycle_hours_for_merged_day(monkeypatch, tmp_path):
-    db = Database(tmp_path / "history.db")
+    db = Database(tmp_path / "history.db", telemetry_db_path=tmp_path / "telemetry.db")
     _set_fixed_now(monkeypatch, datetime(2026, 3, 27, 12, 0, 0))
 
     db.upsert_github_prs([
@@ -239,7 +246,8 @@ def test_leverage_endpoint_averages_pr_cycle_hours_for_merged_day(monkeypatch, t
 
 
 def test_leverage_endpoint_aggregates_week_from_day_totals(monkeypatch, tmp_path):
-    db = Database(tmp_path / "history.db")
+    telemetry_db_path = tmp_path / "telemetry.db"
+    db = Database(tmp_path / "history.db", telemetry_db_path=telemetry_db_path)
     _set_fixed_now(monkeypatch, datetime(2026, 3, 27, 12, 0, 0))
 
     per_day = [
@@ -272,7 +280,7 @@ def test_leverage_endpoint_aggregates_week_from_day_totals(monkeypatch, tmp_path
             )
         )
 
-    db.replace_session_output(session_rows)
+    _replace_session_output(telemetry_db_path, session_rows)
     db.upsert_github_prs([
         _pr_row(31, "2026-03-24 09:00:00", "2026-03-24 11:00:00"),
         _pr_row(32, "2026-03-25 08:00:00", "2026-03-25 12:00:00"),

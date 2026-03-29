@@ -143,6 +143,11 @@ class OrchestratorConfig:
 
 
 @dataclass
+class TelemetryConfig:
+    repos: list[str]
+
+
+@dataclass
 class Config:
     yolink: YoLinkConfig
     qingping: QingpingConfig
@@ -151,6 +156,7 @@ class Config:
     thresholds: ThresholdsConfig
     orchestrator: OrchestratorConfig
     tuya_cloud: Optional[TuyaCloudConfig] = None
+    telemetry: Optional[TelemetryConfig] = None
 
 
 def load_config(path: str = "config.yaml") -> Config:
@@ -180,6 +186,10 @@ def load_config(path: str = "config.yaml") -> Config:
     if "tuya_cloud" in data:
         tuya_cloud = TuyaCloudConfig(**data["tuya_cloud"])
 
+    telemetry = None
+    if "telemetry" in data:
+        telemetry = TelemetryConfig(**data["telemetry"])
+
     return Config(
         yolink=YoLinkConfig(**data["yolink"]),
         qingping=QingpingConfig(**data["qingping"]),
@@ -188,4 +198,5 @@ def load_config(path: str = "config.yaml") -> Config:
         thresholds=ThresholdsConfig(**data.get("thresholds", {})),
         orchestrator=orchestrator_config,
         tuya_cloud=tuya_cloud,
+        telemetry=telemetry,
     )

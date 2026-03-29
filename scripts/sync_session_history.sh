@@ -14,5 +14,6 @@ mkdir -p "${DATA_DIR}"
 rsync -az "${WORK_MAC_USER}@${WORK_MAC_HOST}:${CLAUDE_REMOTE}" "${DATA_DIR}/claude_history.jsonl"
 rsync -az "${WORK_MAC_USER}@${WORK_MAC_HOST}:${CODEX_REMOTE}" "${DATA_DIR}/codex_history.jsonl"
 rsync -az "${WORK_MAC_USER}@${WORK_MAC_HOST}:${CODEX_STATE_REMOTE}" "${DATA_DIR}/codex_state.sqlite"
+rsync -az "${WORK_MAC_USER}@${WORK_MAC_HOST}:~/Desktop/automation/office-automate/data/telemetry.db" "${DATA_DIR}/telemetry.db"
 
 python3 "${REPO_ROOT}/session_stats_parser.py"

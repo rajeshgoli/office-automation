@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.office-automate.telemetry</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/rajesh/Desktop/automation/office-automate/venv/bin/python</string>
+    <string>/Users/rajesh/Desktop/automation/office-automate/collect_session_telemetry.py</string>
+    <string>--output</string>
+    <string>/Users/rajesh/Desktop/automation/office-automate/data/telemetry.db</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/rajesh/Desktop/automation/office-automate</string>
+  <key>StartInterval</key>
+  <integer>1800</integer>
+  <key>StandardErrorPath</key>
+  <string>/tmp/session-telemetry.log</string>
+</dict>
+</plist>

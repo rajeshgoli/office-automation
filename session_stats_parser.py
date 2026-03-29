@@ -16,6 +16,11 @@ from zoneinfo import ZoneInfo
 
 from src.database import DEFAULT_DB_PATH, Database
 from src.project_names import normalize_project_name
+from src.telemetry_db import (
+    DEFAULT_TELEMETRY_DB_PATH,
+    migrate_legacy_session_output,
+    replace_session_output_rows,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -301,10 +306,11 @@ def collect_github_prs(
 def import_session_meta(
     *,
     db_path: Path = DEFAULT_DB_PATH,
+    telemetry_db_path: Path = DEFAULT_TELEMETRY_DB_PATH,
     session_meta_dir: Path = DEFAULT_SESSION_META_DIR,
 ) -> int:
-    """Import all session-meta JSON files into SQLite using replace semantics."""
-    db = Database(db_path)
+    """Import all session-meta JSON files into telemetry.db using replace semantics."""
+    migrate_legacy_session_output(db_path, telemetry_db_path)
     rows = []
 
     for path in sorted(session_meta_dir.glob("*.json")):
@@ -349,8 +355,7 @@ def import_session_meta(
             0 if is_machine_generated(first_prompt) else 1,
         ))
 
-    db.replace_session_output(rows)
-    return len(rows)
+    return replace_session_output_rows(rows, telemetry_db_path)
 
 
 def main() -> None:
@@ -366,6 +371,7 @@ def main() -> None:
     parser.add_argument("--codex-state", type=Path, default=DEFAULT_CODEX_STATE)
     parser.add_argument("--owner", default=DEFAULT_GITHUB_OWNER)
     parser.add_argument("--session-meta-dir", type=Path, default=DEFAULT_SESSION_META_DIR)
+    parser.add_argument("--telemetry-db-path", type=Path, default=DEFAULT_TELEMETRY_DB_PATH)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -388,6 +394,7 @@ def main() -> None:
     else:
         imported = import_session_meta(
             db_path=args.db_path,
+            telemetry_db_path=args.telemetry_db_path,
             session_meta_dir=args.session_meta_dir,
         )
         logger.info("Imported session-meta rows: %s", imported)

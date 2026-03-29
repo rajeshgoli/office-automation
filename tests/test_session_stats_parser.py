@@ -5,6 +5,7 @@ from pathlib import Path
 
 from session_stats_parser import collect_github_prs, import_history, import_session_meta
 from src.database import Database
+from src.telemetry_db import SESSION_OUTPUT_SCHEMA, telemetry_connection
 
 
 def _write_jsonl(path: Path, rows: list[object]) -> None:
@@ -348,6 +349,7 @@ def test_collect_github_prs_imports_prs_across_repos(tmp_path):
 
 def test_import_session_meta_basic_import_filters_zero_activity_artifacts(tmp_path):
     db_path = tmp_path / "history.db"
+    telemetry_db_path = tmp_path / "telemetry.db"
     session_meta_dir = tmp_path / "session-meta"
     session_meta_dir.mkdir()
 
@@ -385,12 +387,15 @@ def test_import_session_meta_basic_import_filters_zero_activity_artifacts(tmp_pa
         ),
     )
 
-    imported = import_session_meta(db_path=db_path, session_meta_dir=session_meta_dir)
+    imported = import_session_meta(
+        db_path=db_path,
+        telemetry_db_path=telemetry_db_path,
+        session_meta_dir=session_meta_dir,
+    )
 
     assert imported == 2
 
-    db = Database(db_path)
-    with db._connection() as conn:
+    with telemetry_connection(telemetry_db_path) as conn:
         rows = conn.execute("""
             SELECT session_id, project, start_time, lines_added, lines_removed, tool_counts, languages
             FROM session_output
@@ -407,36 +412,52 @@ def test_import_session_meta_basic_import_filters_zero_activity_artifacts(tmp_pa
 
 def test_import_session_meta_is_idempotent(tmp_path):
     db_path = tmp_path / "history.db"
+    telemetry_db_path = tmp_path / "telemetry.db"
     session_meta_dir = tmp_path / "session-meta"
     session_meta_dir.mkdir()
 
     _write_session_meta(session_meta_dir / "session-1.json", _session_payload())
 
-    first_import = import_session_meta(db_path=db_path, session_meta_dir=session_meta_dir)
-    second_import = import_session_meta(db_path=db_path, session_meta_dir=session_meta_dir)
+    first_import = import_session_meta(
+        db_path=db_path,
+        telemetry_db_path=telemetry_db_path,
+        session_meta_dir=session_meta_dir,
+    )
+    second_import = import_session_meta(
+        db_path=db_path,
+        telemetry_db_path=telemetry_db_path,
+        session_meta_dir=session_meta_dir,
+    )
 
     assert first_import == 1
     assert second_import == 1
 
-    db = Database(db_path)
-    with db._connection() as conn:
+    with telemetry_connection(telemetry_db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM session_output").fetchone()[0] == 1
 
 
 def test_import_session_meta_upserts_when_file_updates(tmp_path):
     db_path = tmp_path / "history.db"
+    telemetry_db_path = tmp_path / "telemetry.db"
     session_meta_dir = tmp_path / "session-meta"
     session_meta_dir.mkdir()
     session_path = session_meta_dir / "session-1.json"
 
     _write_session_meta(session_path, _session_payload(lines_added=10, git_commits=0))
-    import_session_meta(db_path=db_path, session_meta_dir=session_meta_dir)
+    import_session_meta(
+        db_path=db_path,
+        telemetry_db_path=telemetry_db_path,
+        session_meta_dir=session_meta_dir,
+    )
 
     _write_session_meta(session_path, _session_payload(lines_added=250, git_commits=3))
-    import_session_meta(db_path=db_path, session_meta_dir=session_meta_dir)
+    import_session_meta(
+        db_path=db_path,
+        telemetry_db_path=telemetry_db_path,
+        session_meta_dir=session_meta_dir,
+    )
 
-    db = Database(db_path)
-    with db._connection() as conn:
+    with telemetry_connection(telemetry_db_path) as conn:
         row = conn.execute("""
             SELECT lines_added, git_commits
             FROM session_output
@@ -448,6 +469,7 @@ def test_import_session_meta_upserts_when_file_updates(tmp_path):
 
 def test_import_session_meta_converts_utc_to_los_angeles_time(tmp_path):
     db_path = tmp_path / "history.db"
+    telemetry_db_path = tmp_path / "telemetry.db"
     session_meta_dir = tmp_path / "session-meta"
     session_meta_dir.mkdir()
 
@@ -463,10 +485,13 @@ def test_import_session_meta_converts_utc_to_los_angeles_time(tmp_path):
         ),
     )
 
-    import_session_meta(db_path=db_path, session_meta_dir=session_meta_dir)
+    import_session_meta(
+        db_path=db_path,
+        telemetry_db_path=telemetry_db_path,
+        session_meta_dir=session_meta_dir,
+    )
 
-    db = Database(db_path)
-    with db._connection() as conn:
+    with telemetry_connection(telemetry_db_path) as conn:
         rows = conn.execute("""
             SELECT session_id, start_time
             FROM session_output
@@ -481,6 +506,7 @@ def test_import_session_meta_converts_utc_to_los_angeles_time(tmp_path):
 
 def test_import_session_meta_normalizes_project_names(tmp_path):
     db_path = tmp_path / "history.db"
+    telemetry_db_path = tmp_path / "telemetry.db"
     session_meta_dir = tmp_path / "session-meta"
     session_meta_dir.mkdir()
 
@@ -489,10 +515,13 @@ def test_import_session_meta_normalizes_project_names(tmp_path):
         _session_payload(project_path="/Users/rajesh/Desktop/automation/office-automation"),
     )
 
-    import_session_meta(db_path=db_path, session_meta_dir=session_meta_dir)
+    import_session_meta(
+        db_path=db_path,
+        telemetry_db_path=telemetry_db_path,
+        session_meta_dir=session_meta_dir,
+    )
 
-    db = Database(db_path)
-    with db._connection() as conn:
+    with telemetry_connection(telemetry_db_path) as conn:
         row = conn.execute("SELECT project FROM session_output").fetchone()
 
     assert row["project"] == "office-automate"
@@ -500,6 +529,7 @@ def test_import_session_meta_normalizes_project_names(tmp_path):
 
 def test_import_session_meta_collapses_fractal_worktrees(tmp_path):
     db_path = tmp_path / "history.db"
+    telemetry_db_path = tmp_path / "telemetry.db"
     session_meta_dir = tmp_path / "session-meta"
     session_meta_dir.mkdir()
 
@@ -508,10 +538,13 @@ def test_import_session_meta_collapses_fractal_worktrees(tmp_path):
         _session_payload(project_path="/Users/rajesh/worktrees/fractal-1808-em"),
     )
 
-    import_session_meta(db_path=db_path, session_meta_dir=session_meta_dir)
+    import_session_meta(
+        db_path=db_path,
+        telemetry_db_path=telemetry_db_path,
+        session_meta_dir=session_meta_dir,
+    )
 
-    db = Database(db_path)
-    with db._connection() as conn:
+    with telemetry_connection(telemetry_db_path) as conn:
         row = conn.execute("SELECT project FROM session_output").fetchone()
 
     assert row["project"] == "fractal"
@@ -519,6 +552,7 @@ def test_import_session_meta_collapses_fractal_worktrees(tmp_path):
 
 def test_import_session_meta_marks_machine_generated_sessions(tmp_path):
     db_path = tmp_path / "history.db"
+    telemetry_db_path = tmp_path / "telemetry.db"
     session_meta_dir = tmp_path / "session-meta"
     session_meta_dir.mkdir()
 
@@ -538,10 +572,13 @@ def test_import_session_meta_marks_machine_generated_sessions(tmp_path):
         ),
     )
 
-    import_session_meta(db_path=db_path, session_meta_dir=session_meta_dir)
+    import_session_meta(
+        db_path=db_path,
+        telemetry_db_path=telemetry_db_path,
+        session_meta_dir=session_meta_dir,
+    )
 
-    db = Database(db_path)
-    with db._connection() as conn:
+    with telemetry_connection(telemetry_db_path) as conn:
         rows = conn.execute("""
             SELECT session_id, is_human_session
             FROM session_output
@@ -553,6 +590,7 @@ def test_import_session_meta_marks_machine_generated_sessions(tmp_path):
 
 def test_import_session_meta_skips_malformed_json_files(tmp_path, caplog):
     db_path = tmp_path / "history.db"
+    telemetry_db_path = tmp_path / "telemetry.db"
     session_meta_dir = tmp_path / "session-meta"
     session_meta_dir.mkdir()
 
@@ -560,11 +598,78 @@ def test_import_session_meta_skips_malformed_json_files(tmp_path, caplog):
     with (session_meta_dir / "broken.json").open("w", encoding="utf-8") as handle:
         handle.write('{"session_id":"broken",')
 
-    imported = import_session_meta(db_path=db_path, session_meta_dir=session_meta_dir)
+    imported = import_session_meta(
+        db_path=db_path,
+        telemetry_db_path=telemetry_db_path,
+        session_meta_dir=session_meta_dir,
+    )
 
     assert imported == 1
     assert "Skipping malformed JSON" in caplog.text
 
+    with telemetry_connection(telemetry_db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM session_output").fetchone()[0] == 1
+
+
+def test_import_session_meta_migrates_legacy_rows_to_telemetry_db(tmp_path):
+    db_path = tmp_path / "history.db"
+    telemetry_db_path = tmp_path / "telemetry.db"
+    session_meta_dir = tmp_path / "session-meta"
+    session_meta_dir.mkdir()
+
     db = Database(db_path)
     with db._connection() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM session_output").fetchone()[0] == 1
+        conn.executescript(SESSION_OUTPUT_SCHEMA)
+        conn.execute(
+            """
+            INSERT INTO session_output (
+                session_id, project, start_time, duration_minutes, lines_added, lines_removed,
+                files_modified, git_commits, git_pushes, user_message_count,
+                assistant_message_count, input_tokens, output_tokens, tool_counts,
+                languages, is_human_session
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-session",
+                "office-automate",
+                "2026-01-14 18:30:00",
+                25,
+                120,
+                15,
+                4,
+                2,
+                1,
+                3,
+                6,
+                1000,
+                2000,
+                json.dumps({"Read": 5}),
+                json.dumps({"Python": 120}),
+                1,
+            ),
+        )
+
+    _write_session_meta(session_meta_dir / "session-1.json", _session_payload(session_id="fresh-session"))
+
+    imported = import_session_meta(
+        db_path=db_path,
+        telemetry_db_path=telemetry_db_path,
+        session_meta_dir=session_meta_dir,
+    )
+
+    assert imported == 1
+
+    with telemetry_connection(telemetry_db_path) as conn:
+        rows = conn.execute(
+            "SELECT session_id FROM session_output ORDER BY session_id"
+        ).fetchall()
+
+    assert [row["session_id"] for row in rows] == ["fresh-session", "legacy-session"]
+
+    with db._connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_output'"
+        ).fetchone()
+
+    assert row is None
