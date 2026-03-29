@@ -1,5 +1,6 @@
 package com.rajesh.officeclimate.ui.projects
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -16,9 +17,14 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -27,13 +33,16 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.rajesh.officeclimate.data.model.EngramCurrent
+import com.rajesh.officeclimate.data.model.ProjectLeverageDay
 import com.rajesh.officeclimate.data.model.ProjectLeverageProject
 import com.rajesh.officeclimate.data.model.ProjectLeverageResponse
 import com.rajesh.officeclimate.data.model.ProjectLeverageWeek
@@ -49,6 +58,14 @@ import com.rajesh.officeclimate.ui.theme.TextPrimary
 import com.rajesh.officeclimate.ui.theme.TextSecondary
 import com.rajesh.officeclimate.ui.theme.projectColorFor
 import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.roundToInt
+
+private enum class TrendDirection {
+    Up,
+    Down,
+    Flat,
+}
 
 private data class ProjectMetricUi(
     val value: String,
@@ -56,16 +73,24 @@ private data class ProjectMetricUi(
     val accent: Color,
 )
 
+private data class ProjectTrendUi(
+    val values: List<Float?>,
+    val accent: Color,
+    val direction: TrendDirection,
+    val directionText: String,
+    val context: String,
+)
+
 private data class ProjectCardUi(
     val title: String,
     val summary: String,
     val color: Color,
     val metrics: List<ProjectMetricUi>,
+    val trend: ProjectTrendUi? = null,
     val footer: String? = null,
     val statusLabel: String? = null,
     val statusValue: String? = null,
     val statusColor: Color? = null,
-    val activity: Int,
 )
 
 @Composable
@@ -73,10 +98,11 @@ fun ProjectsScreen(
     viewModel: ProjectsViewModel = viewModel(),
 ) {
     val projectLeverage by viewModel.projectLeverage.collectAsState()
+    val projectLeverageComparison by viewModel.projectLeverageComparison.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
     val error by viewModel.error.collectAsState()
 
-    val cards = projectLeverage?.let(::buildProjectCards).orEmpty()
+    val cards = projectLeverage?.let { buildProjectCards(it, projectLeverageComparison) }.orEmpty()
 
     Box(
         modifier = Modifier
@@ -218,6 +244,10 @@ private fun ProjectCard(card: ProjectCardUi) {
             }
         }
 
+        card.trend?.let {
+            ProjectTrendBlock(it)
+        }
+
         card.footer?.let {
             Text(
                 text = it,
@@ -247,19 +277,161 @@ private fun ProjectCard(card: ProjectCardUi) {
     }
 }
 
-private fun buildProjectCards(response: ProjectLeverageResponse): List<ProjectCardUi> {
+@Composable
+private fun ProjectTrendBlock(trend: ProjectTrendUi) {
+    val shape = RoundedCornerShape(12.dp)
+    val directionColor = when (trend.direction) {
+        TrendDirection.Up -> Emerald
+        TrendDirection.Down -> Red
+        TrendDirection.Flat -> TextSecondary
+    }
+    val directionIcon = when (trend.direction) {
+        TrendDirection.Up -> Icons.Filled.ArrowUpward
+        TrendDirection.Down -> Icons.Filled.ArrowDownward
+        TrendDirection.Flat -> Icons.AutoMirrored.Filled.ArrowForward
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(Background.copy(alpha = 0.32f))
+            .border(1.dp, Border, shape)
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = "7D ACTIVITY",
+            style = MaterialTheme.typography.labelSmall,
+            color = TextSecondary,
+        )
+        SparklineChart(
+            values = trend.values,
+            accent = trend.accent,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(40.dp),
+        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Icon(
+                imageVector = directionIcon,
+                contentDescription = null,
+                tint = directionColor,
+                modifier = Modifier.size(14.dp),
+            )
+            Text(
+                text = trend.directionText,
+                style = MaterialTheme.typography.labelSmall,
+                color = directionColor,
+            )
+        }
+        Text(
+            text = trend.context,
+            style = MaterialTheme.typography.labelSmall,
+            color = TextSecondary,
+        )
+    }
+}
+
+@Composable
+private fun SparklineChart(
+    values: List<Float?>,
+    accent: Color,
+    modifier: Modifier = Modifier,
+) {
+    val definedValues = values.filterNotNull()
+
+    Canvas(modifier = modifier) {
+        val gridColor = Border.copy(alpha = 0.35f)
+        val height = size.height
+        val width = size.width
+
+        drawLine(
+            color = gridColor,
+            start = Offset(0f, height),
+            end = Offset(width, height),
+            strokeWidth = 1f,
+        )
+        drawLine(
+            color = gridColor,
+            start = Offset(0f, height / 2f),
+            end = Offset(width, height / 2f),
+            strokeWidth = 1f,
+        )
+
+        if (definedValues.isEmpty()) {
+            return@Canvas
+        }
+
+        val minValue = definedValues.minOrNull() ?: 0f
+        val maxValue = definedValues.maxOrNull() ?: 0f
+        val valueRange = (maxValue - minValue).takeIf { it > 0.001f } ?: 1f
+        val maxIndex = values.lastIndex.coerceAtLeast(1)
+        val verticalPadding = 2.dp.toPx()
+
+        fun pointAt(index: Int, value: Float): Offset {
+            val x = index.toFloat() / maxIndex * width
+            val normalized = (value - minValue) / valueRange
+            val y = height - (normalized * (height - verticalPadding * 2f)) - verticalPadding
+            return Offset(x, y)
+        }
+
+        var previousPoint: Offset? = null
+        var lastPoint: Offset? = null
+
+        values.forEachIndexed { index, value ->
+            if (value == null) {
+                previousPoint = null
+                return@forEachIndexed
+            }
+
+            val point = pointAt(index, value)
+            previousPoint?.let {
+                drawLine(
+                    color = accent,
+                    start = it,
+                    end = point,
+                    strokeWidth = 3f,
+                    cap = StrokeCap.Round,
+                )
+            }
+            previousPoint = point
+            lastPoint = point
+        }
+
+        lastPoint?.let {
+            drawCircle(
+                color = accent,
+                radius = 3.5.dp.toPx(),
+                center = it,
+            )
+        }
+    }
+}
+
+private fun buildProjectCards(
+    response: ProjectLeverageResponse,
+    comparisonResponse: ProjectLeverageResponse?,
+): List<ProjectCardUi> {
     val projects = response.projects
+    val comparisonProjects = comparisonResponse?.projects.orEmpty()
 
     return listOfNotNull(
-        buildAgentOsCard(projects["agent-os"]),
-        buildSessionManagerCard(projects["session-manager"]),
-        buildOfficeAutomationCard(projects["office-automate"]),
+        buildAgentOsCard(projects["agent-os"], comparisonProjects["agent-os"]),
+        buildSessionManagerCard(projects["session-manager"], comparisonProjects["session-manager"]),
+        buildOfficeAutomationCard(projects["office-automate"], comparisonProjects["office-automate"]),
         buildDeskbarTaskbarPlaceholderCard(),
-        buildEngramCard(projects["engram"]),
+        buildEngramCard(projects["engram"], comparisonProjects["engram"]),
     )
 }
 
-private fun buildSessionManagerCard(project: ProjectLeverageProject?): ProjectCardUi? {
+private fun buildSessionManagerCard(
+    project: ProjectLeverageProject?,
+    comparisonProject: ProjectLeverageProject?,
+): ProjectCardUi? {
     if (project == null) return null
 
     val week = project.week ?: ProjectLeverageWeek()
@@ -272,8 +444,6 @@ private fun buildSessionManagerCard(project: ProjectLeverageProject?): ProjectCa
         }
     }.joinToString(" · ")
 
-    val activity = week.smDispatches + week.smSends + week.smReminds + week.smActiveSessions + week.smTelegramIn + week.smTelegramOut
-
     return ProjectCardUi(
         title = "session-manager",
         summary = project.summary,
@@ -283,17 +453,21 @@ private fun buildSessionManagerCard(project: ProjectLeverageProject?): ProjectCa
             ProjectMetricUi(formatCount(week.smSends), "sends", Amber),
             ProjectMetricUi(if (telegramUnavailable) "--" else formatCount(week.smTelegramIn), "telegram", Blue),
         ),
+        trend = buildProjectTrend(comparisonProject?.days ?: project.days, projectColorFor("session-manager")) { day ->
+            day.smDispatches + day.smSends + day.smReminds + day.smActiveSessions + day.smTelegramIn + day.smTelegramOut
+        },
         footer = footer,
-        activity = activity,
     )
 }
 
-private fun buildEngramCard(project: ProjectLeverageProject?): ProjectCardUi? {
+private fun buildEngramCard(
+    project: ProjectLeverageProject?,
+    comparisonProject: ProjectLeverageProject?,
+): ProjectCardUi? {
     if (project == null) return null
 
     val current = project.current ?: EngramCurrent()
     val freshness = foldFreshness(current.lastFoldAgeHours)
-    val activity = current.activeConcepts + current.folds7d
 
     return ProjectCardUi(
         title = "engram",
@@ -304,18 +478,22 @@ private fun buildEngramCard(project: ProjectLeverageProject?): ProjectCardUi? {
             ProjectMetricUi(formatCount(current.activeConcepts), "concepts", Amber),
             ProjectMetricUi(formatCount(current.folds7d), "folds / 7d", Cyan),
         ),
+        trend = buildProjectTrend(comparisonProject?.days ?: project.days, projectColorFor("engram")) { day ->
+            day.engramActiveConcepts + day.engramFolds7d
+        },
         statusLabel = "Fold status:",
         statusValue = freshness.first,
         statusColor = freshness.second,
-        activity = activity,
     )
 }
 
-private fun buildAgentOsCard(project: ProjectLeverageProject?): ProjectCardUi? {
+private fun buildAgentOsCard(
+    project: ProjectLeverageProject?,
+    comparisonProject: ProjectLeverageProject?,
+): ProjectCardUi? {
     if (project == null) return null
 
     val week = project.week ?: ProjectLeverageWeek()
-    val activity = week.personaReads + week.personaProjects
 
     return ProjectCardUi(
         title = "agent-os",
@@ -325,15 +503,19 @@ private fun buildAgentOsCard(project: ProjectLeverageProject?): ProjectCardUi? {
             ProjectMetricUi(formatCount(week.personaReads), "persona reads", Blue),
             ProjectMetricUi(formatCount(week.personaProjects), "projects", Cyan),
         ),
-        activity = activity,
+        trend = buildProjectTrend(comparisonProject?.days ?: project.days, projectColorFor("agent-os")) { day ->
+            day.personaReads + day.personaProjects
+        },
     )
 }
 
-private fun buildOfficeAutomationCard(project: ProjectLeverageProject?): ProjectCardUi? {
+private fun buildOfficeAutomationCard(
+    project: ProjectLeverageProject?,
+    comparisonProject: ProjectLeverageProject?,
+): ProjectCardUi? {
     if (project == null) return null
 
     val week = project.week ?: ProjectLeverageWeek()
-    val activity = week.automationEvents + week.stateTransitions
 
     return ProjectCardUi(
         title = "office-automate",
@@ -343,7 +525,9 @@ private fun buildOfficeAutomationCard(project: ProjectLeverageProject?): Project
             ProjectMetricUi(formatCount(week.automationEvents), "automations", Emerald),
             ProjectMetricUi(formatCount(week.stateTransitions), "transitions", Amber),
         ),
-        activity = activity,
+        trend = buildProjectTrend(comparisonProject?.days ?: project.days, projectColorFor("office-automate")) { day ->
+            day.automationEvents + day.stateTransitions
+        },
     )
 }
 
@@ -357,8 +541,62 @@ private fun buildDeskbarTaskbarPlaceholderCard(): ProjectCardUi = ProjectCardUi(
         ProjectMetricUi("--", "uptime", Blue),
     ),
     footer = "Placeholder card stays visible until taskbar metrics land.",
-    activity = 0,
 )
+
+private fun buildProjectTrend(
+    days: List<ProjectLeverageDay>,
+    accent: Color,
+    activityForDay: (ProjectLeverageDay) -> Int,
+): ProjectTrendUi? {
+    if (days.isEmpty()) return null
+
+    val recentDays = days.takeLast(7)
+    if (recentDays.isEmpty()) return null
+
+    val recentValues = recentDays.map { activityForDay(it).toFloat() }
+    val today = activityForDay(recentDays.last())
+    val weekAverage = recentDays.map(activityForDay).average()
+    val recentTotal = recentDays.sumOf(activityForDay)
+    val priorDays = days.dropLast(recentDays.size).takeLast(7)
+    val priorTotal = priorDays.sumOf(activityForDay)
+    val (direction, directionText) = buildWeekOverWeekSummary(
+        recentTotal = recentTotal,
+        priorTotal = priorTotal,
+        hasPriorWeek = priorDays.isNotEmpty(),
+    )
+
+    return ProjectTrendUi(
+        values = recentValues,
+        accent = accent,
+        direction = direction,
+        directionText = directionText,
+        context = "${formatCount(today)} today vs 7d avg ${formatDecimal(weekAverage)}",
+    )
+}
+
+private fun buildWeekOverWeekSummary(
+    recentTotal: Int,
+    priorTotal: Int,
+    hasPriorWeek: Boolean,
+): Pair<TrendDirection, String> {
+    if (!hasPriorWeek) {
+        return TrendDirection.Flat to "Prior week unavailable"
+    }
+    if (recentTotal == 0 && priorTotal == 0) {
+        return TrendDirection.Flat to "Flat vs prior week"
+    }
+    if (priorTotal == 0) {
+        return TrendDirection.Up to "New vs prior week"
+    }
+
+    val deltaPercent = ((recentTotal - priorTotal).toDouble() / priorTotal.toDouble()) * 100.0
+    if (abs(deltaPercent) < 1.0) {
+        return TrendDirection.Flat to "Flat vs prior week"
+    }
+
+    val direction = if (deltaPercent > 0) TrendDirection.Up else TrendDirection.Down
+    return direction to "${formatDecimal(abs(deltaPercent))}% vs prior week"
+}
 
 private fun foldFreshness(lastFoldAgeHours: Double?): Pair<String, Color> {
     if (lastFoldAgeHours == null) return "NO DATA" to TextSecondary
@@ -370,5 +608,14 @@ private fun foldFreshness(lastFoldAgeHours: Double?): Pair<String, Color> {
 }
 
 private fun formatCount(value: Int): String = String.format(Locale.US, "%,d", value)
+
+private fun formatDecimal(value: Double): String {
+    val rounded = (value * 10.0).roundToInt() / 10.0
+    return if (abs(rounded - rounded.roundToInt().toDouble()) < 0.05) {
+        formatCount(rounded.roundToInt())
+    } else {
+        String.format(Locale.US, "%.1f", rounded)
+    }
+}
 
 private fun Double?.formatHoursOrDash(): String = this?.let { String.format(Locale.US, "%.1fh", it) } ?: "--"
