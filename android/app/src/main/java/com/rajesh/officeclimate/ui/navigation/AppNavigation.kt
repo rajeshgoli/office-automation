@@ -10,11 +10,11 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Apps
-import androidx.compose.material.icons.filled.Dashboard
+import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Insights
 import androidx.compose.material.icons.outlined.Apps
-import androidx.compose.material.icons.outlined.Dashboard
+import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Insights
 import androidx.compose.runtime.Composable
@@ -57,7 +57,7 @@ private data class NavItem(
 )
 
 private val navItems = listOf(
-    NavItem(Routes.DASHBOARD, "Climate", Icons.Filled.Dashboard, Icons.Outlined.Dashboard),
+    NavItem(Routes.DASHBOARD, "Climate", Icons.Filled.Cloud, Icons.Outlined.Cloud),
     NavItem(Routes.HISTORY, "History", Icons.Filled.History, Icons.Outlined.History),
     NavItem(Routes.PRODUCTIVITY, "Productivity", Icons.Filled.Insights, Icons.Outlined.Insights),
     NavItem(Routes.PROJECTS, "Projects", Icons.Filled.Apps, Icons.Outlined.Apps),
