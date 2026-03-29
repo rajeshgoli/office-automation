@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.rajesh.officeclimate.util.Defaults
@@ -18,6 +19,7 @@ class SettingsRepository(private val context: Context) {
         val SERVER_URL = stringPreferencesKey("server_url")
         val JWT_TOKEN = stringPreferencesKey("jwt_token")
         val USER_EMAIL = stringPreferencesKey("user_email")
+        val DISMISSED_UPDATE_VERSION_CODE = longPreferencesKey("dismissed_update_version_code")
     }
 
     val serverUrl: Flow<String> = context.dataStore.data.map { prefs ->
@@ -34,6 +36,10 @@ class SettingsRepository(private val context: Context) {
 
     val isLoggedIn: Flow<Boolean> = context.dataStore.data.map { prefs ->
         !prefs[Keys.JWT_TOKEN].isNullOrBlank()
+    }
+
+    val dismissedUpdateVersionCode: Flow<Long?> = context.dataStore.data.map { prefs ->
+        prefs[Keys.DISMISSED_UPDATE_VERSION_CODE]
     }
 
     suspend fun saveServerUrl(serverUrl: String) {
@@ -53,6 +59,12 @@ class SettingsRepository(private val context: Context) {
         context.dataStore.edit { prefs ->
             prefs.remove(Keys.JWT_TOKEN)
             prefs.remove(Keys.USER_EMAIL)
+        }
+    }
+
+    suspend fun saveDismissedUpdateVersionCode(versionCode: Long) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.DISMISSED_UPDATE_VERSION_CODE] = versionCode
         }
     }
 }

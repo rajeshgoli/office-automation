@@ -1543,44 +1543,63 @@ class Orchestrator:
         except Exception:
             return web.json_response({"ok": False, "error": "Expected multipart form upload"}, status=400)
 
-        file_part = None
-        while True:
-            part = await reader.next()
-            if part is None:
-                break
-            if part.name == "file":
-                file_part = part
-                break
-
-        if file_part is None:
-            return web.json_response({"ok": False, "error": "Missing multipart field 'file'"}, status=400)
-
         app_dir = self._get_app_artifact_dir(app)
         artifact_path = self._get_app_artifact_path(app)
         app_dir.mkdir(parents=True, exist_ok=True)
 
         fd, temp_path = tempfile.mkstemp(dir=str(app_dir), prefix=".tmp-artifact-", suffix=".apk")
         size_bytes = 0
+        file_uploaded = False
+        version_code: Optional[int] = None
+        version_name: Optional[str] = None
 
         try:
             with os.fdopen(fd, "wb") as handle:
                 while True:
-                    chunk = await file_part.read_chunk(size=64 * 1024)
-                    if not chunk:
+                    part = await reader.next()
+                    if part is None:
                         break
+                    if part.name == "file":
+                        file_uploaded = True
+                        while True:
+                            chunk = await part.read_chunk(size=64 * 1024)
+                            if not chunk:
+                                break
 
-                    size_bytes += len(chunk)
-                    if size_bytes > ARTIFACT_MAX_SIZE_BYTES:
-                        try:
-                            os.unlink(temp_path)
-                        except FileNotFoundError:
-                            pass
-                        return web.json_response(
-                            {"ok": False, "error": "Artifact exceeds 100 MB limit"},
-                            status=413,
-                        )
+                            size_bytes += len(chunk)
+                            if size_bytes > ARTIFACT_MAX_SIZE_BYTES:
+                                try:
+                                    os.unlink(temp_path)
+                                except FileNotFoundError:
+                                    pass
+                                return web.json_response(
+                                    {"ok": False, "error": "Artifact exceeds 100 MB limit"},
+                                    status=413,
+                                )
 
-                    handle.write(chunk)
+                            handle.write(chunk)
+                        continue
+                    if part.name == "version_code":
+                        raw_version_code = (await part.text()).strip()
+                        if raw_version_code:
+                            try:
+                                version_code = int(raw_version_code)
+                            except ValueError:
+                                return web.json_response(
+                                    {"ok": False, "error": "version_code must be an integer"},
+                                    status=400,
+                                )
+                        continue
+                    if part.name == "version_name":
+                        raw_version_name = (await part.text()).strip()
+                        version_name = raw_version_name or None
+
+            if not file_uploaded:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+                return web.json_response({"ok": False, "error": "Missing multipart field 'file'"}, status=400)
 
             os.replace(temp_path, artifact_path)
 
@@ -1589,7 +1608,11 @@ class Orchestrator:
                 "size_bytes": size_bytes,
                 "uploaded_by": request.get("user_email", "unknown"),
             }
-            self._write_json_atomically(app_dir / "meta.json", metadata)
+            if version_code is not None:
+                metadata["version_code"] = version_code
+            if version_name is not None:
+                metadata["version_name"] = version_name
+            self._write_json_atomically(self._get_app_artifact_meta_path(app), metadata)
 
             return web.json_response({
                 "ok": True,
@@ -1619,6 +1642,24 @@ class Orchestrator:
             artifact_path,
             headers={"Content-Disposition": f"attachment; filename={app}.apk"},
         )
+
+    async def _handle_app_artifact_meta_get(self, request: web.Request) -> web.Response:
+        """Handle GET /apps/{app}/meta.json to read the latest artifact metadata."""
+        app = request.match_info.get("app", "")
+        if not self._is_valid_artifact_app_name(app):
+            raise web.HTTPNotFound(text="Artifact metadata not found")
+
+        metadata_path = self._get_app_artifact_meta_path(app)
+        if not metadata_path.exists():
+            raise web.HTTPNotFound(text="Artifact metadata not found")
+
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error(f"Failed to read artifact metadata for {app}: {e}")
+            raise web.HTTPInternalServerError(text="Artifact metadata unreadable") from e
+
+        return web.json_response(payload)
 
     async def _handle_apk_get(self, request: web.Request) -> web.Response:
         """Handle GET /apk for backward-compatible legacy APK downloads."""
@@ -2168,6 +2209,10 @@ class Orchestrator:
         """Return the latest artifact path for the given app."""
         return self._get_app_artifact_dir(app) / "latest.apk"
 
+    def _get_app_artifact_meta_path(self, app: str) -> Path:
+        """Return the metadata path for the given app."""
+        return self._get_app_artifact_dir(app) / "meta.json"
+
     @staticmethod
     def _write_json_atomically(path: Path, payload: dict) -> None:
         """Write JSON metadata via a temp file and os.replace."""
@@ -2432,6 +2477,7 @@ class Orchestrator:
         self._app.router.add_get("/history", self._handle_history_get)
         self._app.router.add_get("/apk", self._handle_apk_get)
         self._app.router.add_get("/apps/{app}/latest.apk", self._handle_app_artifact_get)
+        self._app.router.add_get("/apps/{app}/meta.json", self._handle_app_artifact_meta_get)
         self._app.router.add_post("/deploy/{app}", self._handle_deploy_post)
         self._app.router.add_get("/history/sessions", self._handle_history_sessions_get)
         self._app.router.add_get("/history/co2-ohlc", self._handle_history_co2_ohlc_get)

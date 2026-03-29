@@ -129,6 +129,7 @@ class ArtifactServerTests(unittest.IsolatedAsyncioTestCase):
         )
         app.router.add_post("/deploy/{app}", orchestrator._handle_deploy_post)
         app.router.add_get("/apps/{app}/latest.apk", orchestrator._handle_app_artifact_get)
+        app.router.add_get("/apps/{app}/meta.json", orchestrator._handle_app_artifact_meta_get)
         app.router.add_get("/apk", orchestrator._handle_apk_get)
 
         server = TestServer(app)
@@ -153,7 +154,15 @@ class ArtifactServerTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(server.close)
         return orchestrator, client
 
-    async def _upload(self, client: TestClient, *, body: bytes, token: str | None = "good-token"):
+    async def _upload(
+        self,
+        client: TestClient,
+        *,
+        body: bytes,
+        token: str | None = "good-token",
+        version_code: int | None = None,
+        version_name: str | None = None,
+    ):
         form = FormData()
         form.add_field(
             "file",
@@ -161,6 +170,10 @@ class ArtifactServerTests(unittest.IsolatedAsyncioTestCase):
             filename="artifact.apk",
             content_type="application/vnd.android.package-archive",
         )
+        if version_code is not None:
+            form.add_field("version_code", str(version_code))
+        if version_name is not None:
+            form.add_field("version_name", version_name)
         headers = {}
         if token is not None:
             headers["Authorization"] = f"Bearer {token}"
@@ -169,7 +182,12 @@ class ArtifactServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_upload_success_writes_artifact_and_metadata(self):
         _, client = await self._make_client()
 
-        response = await self._upload(client, body=b"apk-bytes")
+        response = await self._upload(
+            client,
+            body=b"apk-bytes",
+            version_code=7,
+            version_name="1.2.0",
+        )
         payload = await response.json()
 
         self.assertEqual(response.status, 200)
@@ -184,7 +202,22 @@ class ArtifactServerTests(unittest.IsolatedAsyncioTestCase):
         metadata = json.loads(metadata_path.read_text())
         self.assertEqual(metadata["size_bytes"], len(b"apk-bytes"))
         self.assertEqual(metadata["uploaded_by"], "engineer@rajeshgo.li")
+        self.assertEqual(metadata["version_code"], 7)
+        self.assertEqual(metadata["version_name"], "1.2.0")
         self.assertIn("uploaded_at", metadata)
+
+    async def test_meta_endpoint_returns_uploaded_metadata(self):
+        _, client = await self._make_client()
+        await self._upload(client, body=b"meta-bytes", version_code=9, version_name="2.0")
+
+        response = await client.get("/apps/office-climate/meta.json")
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["size_bytes"], len(b"meta-bytes"))
+        self.assertEqual(payload["version_code"], 9)
+        self.assertEqual(payload["version_name"], "2.0")
+        self.assertEqual(payload["uploaded_by"], "engineer@rajeshgo.li")
 
     async def test_download_returns_uploaded_artifact(self):
         _, client = await self._make_client()
@@ -224,6 +257,35 @@ class ArtifactServerTests(unittest.IsolatedAsyncioTestCase):
         response = await client.get("/apps/nonexistent/latest.apk")
 
         self.assertEqual(response.status, 404)
+
+    async def test_missing_metadata_returns_404(self):
+        _, client = await self._make_client()
+
+        response = await client.get("/apps/nonexistent/meta.json")
+
+        self.assertEqual(response.status, 404)
+
+    async def test_upload_rejects_invalid_version_code(self):
+        _, client = await self._make_client()
+
+        form = FormData()
+        form.add_field(
+            "file",
+            b"apk-bytes",
+            filename="artifact.apk",
+            content_type="application/vnd.android.package-archive",
+        )
+        form.add_field("version_code", "abc")
+
+        response = await client.post(
+            "/deploy/office-climate",
+            data=form,
+            headers={"Authorization": "Bearer good-token"},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual(payload["error"], "version_code must be an integer")
 
     async def test_upload_size_limit_returns_413(self):
         with patch.object(orchestrator_module, "ARTIFACT_MAX_SIZE_BYTES", 16):

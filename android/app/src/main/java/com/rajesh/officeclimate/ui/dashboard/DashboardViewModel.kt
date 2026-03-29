@@ -5,16 +5,24 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.rajesh.officeclimate.data.model.ApiStatus
+import com.rajesh.officeclimate.data.repository.AppUpdateRepository
+import com.rajesh.officeclimate.data.repository.AvailableAppUpdate
 import com.rajesh.officeclimate.data.repository.ClimateRepository
 import com.rajesh.officeclimate.data.repository.SettingsRepository
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+
+data class UpdateBannerUiState(
+    val update: AvailableAppUpdate? = null,
+    val installing: Boolean = false,
+    val error: String? = null,
+)
 
 class DashboardViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepo = SettingsRepository(application)
+    private val updateRepo = AppUpdateRepository(application, settingsRepo)
+
     val climateRepo = ClimateRepository(settingsRepo, viewModelScope)
 
     val status: StateFlow<ApiStatus?> = climateRepo.status
@@ -26,14 +34,20 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     private val _controlLoading = MutableStateFlow<String?>(null)
     val controlLoading: StateFlow<String?> = _controlLoading
 
-    init {
-        climateRepo.start()
-    }
-
     private val _controlError = MutableStateFlow<String?>(null)
     val controlError: StateFlow<String?> = _controlError
 
-    fun clearControlError() { _controlError.value = null }
+    private val _updateBannerState = MutableStateFlow(UpdateBannerUiState())
+    val updateBannerState: StateFlow<UpdateBannerUiState> = _updateBannerState
+
+    init {
+        climateRepo.start()
+        refreshUpdateBanner()
+    }
+
+    fun clearControlError() {
+        _controlError.value = null
+    }
 
     fun setErvSpeed(speed: String) {
         _controlLoading.value = "erv_$speed"
@@ -56,6 +70,53 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     _controlError.value = "HVAC command failed: ${e.message}"
                 }
             _controlLoading.value = null
+        }
+    }
+
+    fun dismissUpdateBanner() {
+        val update = _updateBannerState.value.update ?: return
+        viewModelScope.launch {
+            updateRepo.dismissUpdate(update.versionCode)
+            _updateBannerState.value = _updateBannerState.value.copy(update = null)
+        }
+    }
+
+    fun installUpdate() {
+        val update = _updateBannerState.value.update ?: return
+        if (_updateBannerState.value.installing) return
+
+        _updateBannerState.value = _updateBannerState.value.copy(installing = true, error = null)
+        viewModelScope.launch {
+            runCatching {
+                val apkFile = updateRepo.downloadUpdate(update)
+                updateRepo.launchInstaller(apkFile)
+            }.onFailure { e ->
+                Log.e("DashboardVM", "Update install failed", e)
+                _updateBannerState.value = _updateBannerState.value.copy(
+                    installing = false,
+                    error = "Update failed: ${e.message}",
+                )
+                return@launch
+            }
+
+            _updateBannerState.value = _updateBannerState.value.copy(installing = false)
+        }
+    }
+
+    fun clearUpdateError() {
+        _updateBannerState.value = _updateBannerState.value.copy(error = null)
+    }
+
+    private fun refreshUpdateBanner() {
+        viewModelScope.launch {
+            runCatching { updateRepo.getAvailableUpdate() }
+                .onSuccess { update ->
+                    _updateBannerState.value = UpdateBannerUiState(update = update)
+                }
+                .onFailure { e ->
+                    Log.w("DashboardVM", "Update check failed", e)
+                    _updateBannerState.value = UpdateBannerUiState()
+                }
         }
     }
 
