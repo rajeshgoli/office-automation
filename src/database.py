@@ -22,6 +22,7 @@ from typing import Optional, Dict, Any, List
 from contextlib import contextmanager
 
 from src.project_names import normalize_project_name
+from src.telemetry_db import DEFAULT_TELEMETRY_DB_PATH, ensure_telemetry_db
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +32,13 @@ DEFAULT_DB_PATH = Path(__file__).parent.parent / "data" / "office_climate.db"
 class Database:
     """SQLite database for office climate data."""
 
-    def __init__(self, db_path: Optional[Path] = None):
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        telemetry_db_path: Optional[Path] = None,
+    ):
         self.db_path = db_path or DEFAULT_DB_PATH
+        self.telemetry_db_path = telemetry_db_path or DEFAULT_TELEMETRY_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
@@ -147,27 +153,6 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_prs_created ON github_prs(created_at);
                 CREATE INDEX IF NOT EXISTS idx_prs_merged ON github_prs(merged_at);
 
-                -- Claude session output imported from session-meta JSON
-                CREATE TABLE IF NOT EXISTS session_output (
-                    session_id TEXT PRIMARY KEY,
-                    project TEXT NOT NULL DEFAULT 'unknown',
-                    start_time DATETIME NOT NULL,
-                    duration_minutes INTEGER NOT NULL DEFAULT 0,
-                    lines_added INTEGER NOT NULL DEFAULT 0,
-                    lines_removed INTEGER NOT NULL DEFAULT 0,
-                    files_modified INTEGER NOT NULL DEFAULT 0,
-                    git_commits INTEGER NOT NULL DEFAULT 0,
-                    git_pushes INTEGER NOT NULL DEFAULT 0,
-                    user_message_count INTEGER NOT NULL DEFAULT 0,
-                    assistant_message_count INTEGER NOT NULL DEFAULT 0,
-                    input_tokens INTEGER NOT NULL DEFAULT 0,
-                    output_tokens INTEGER NOT NULL DEFAULT 0,
-                    tool_counts TEXT,
-                    languages TEXT,
-                    is_human_session INTEGER NOT NULL DEFAULT 1
-                );
-                CREATE INDEX IF NOT EXISTS idx_session_output_start ON session_output(start_time);
-                CREATE INDEX IF NOT EXISTS idx_session_output_project ON session_output(project);
             """)
             logger.info(f"Database initialized at {self.db_path}")
 
@@ -470,54 +455,6 @@ class Database:
                     changed_files = excluded.changed_files,
                     created_at = excluded.created_at,
                     merged_at = excluded.merged_at
-            """, rows)
-
-    def replace_session_output(
-        self,
-        rows: List[tuple[
-            str,
-            str,
-            str,
-            int,
-            int,
-            int,
-            int,
-            int,
-            int,
-            int,
-            int,
-            int,
-            int,
-            Optional[str],
-            Optional[str],
-            int,
-        ]],
-    ) -> None:
-        """Replace session-meta rows keyed by session ID."""
-        if not rows:
-            return
-
-        with self._connection() as conn:
-            conn.executemany("""
-                INSERT OR REPLACE INTO session_output (
-                    session_id,
-                    project,
-                    start_time,
-                    duration_minutes,
-                    lines_added,
-                    lines_removed,
-                    files_modified,
-                    git_commits,
-                    git_pushes,
-                    user_message_count,
-                    assistant_message_count,
-                    input_tokens,
-                    output_tokens,
-                    tool_counts,
-                    languages,
-                    is_human_session
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, rows)
 
     def upsert_project_leverage(
@@ -897,47 +834,52 @@ class Database:
         }
 
         with self._connection() as conn:
-            orchestration_rows = conn.execute("""
-                SELECT
-                    date(timestamp) AS date,
-                    COUNT(*) AS prompts,
-                    COUNT(DISTINCT session_id) AS sessions
-                FROM orchestration_activity
-                WHERE timestamp >= ?
-                GROUP BY date(timestamp)
-            """, (cutoff,)).fetchall()
+            ensure_telemetry_db(self.telemetry_db_path)
+            conn.execute("ATTACH DATABASE ? AS telemetry", (str(self.telemetry_db_path),))
+            try:
+                orchestration_rows = conn.execute("""
+                    SELECT
+                        date(timestamp) AS date,
+                        COUNT(*) AS prompts,
+                        COUNT(DISTINCT session_id) AS sessions
+                    FROM orchestration_activity
+                    WHERE timestamp >= ?
+                    GROUP BY date(timestamp)
+                """, (cutoff,)).fetchall()
 
-            session_rows = conn.execute("""
-                SELECT
-                    date(start_time) AS date,
-                    SUM(lines_added) AS lines_added,
-                    SUM(lines_removed) AS lines_removed,
-                    SUM(files_modified) AS files_modified,
-                    SUM(git_commits) AS commits,
-                    SUM(duration_minutes) AS duration_minutes
-                FROM session_output
-                WHERE start_time >= ?
-                GROUP BY date(start_time)
-            """, (cutoff,)).fetchall()
+                session_rows = conn.execute("""
+                    SELECT
+                        date(start_time) AS date,
+                        SUM(lines_added) AS lines_added,
+                        SUM(lines_removed) AS lines_removed,
+                        SUM(files_modified) AS files_modified,
+                        SUM(git_commits) AS commits,
+                        SUM(duration_minutes) AS duration_minutes
+                    FROM telemetry.session_output
+                    WHERE start_time >= ?
+                    GROUP BY date(start_time)
+                """, (cutoff,)).fetchall()
 
-            pr_opened_rows = conn.execute("""
-                SELECT
-                    date(created_at) AS date,
-                    COUNT(*) AS prs_opened
-                FROM github_prs
-                WHERE created_at >= ?
-                GROUP BY date(created_at)
-            """, (cutoff,)).fetchall()
+                pr_opened_rows = conn.execute("""
+                    SELECT
+                        date(created_at) AS date,
+                        COUNT(*) AS prs_opened
+                    FROM github_prs
+                    WHERE created_at >= ?
+                    GROUP BY date(created_at)
+                """, (cutoff,)).fetchall()
 
-            pr_merged_rows = conn.execute("""
-                SELECT
-                    date(merged_at) AS date,
-                    COUNT(*) AS prs_merged,
-                    SUM((julianday(merged_at) - julianday(created_at)) * 24.0) AS pr_cycle_hours_total
-                FROM github_prs
-                WHERE merged_at IS NOT NULL AND merged_at >= ?
-                GROUP BY date(merged_at)
-            """, (cutoff,)).fetchall()
+                pr_merged_rows = conn.execute("""
+                    SELECT
+                        date(merged_at) AS date,
+                        COUNT(*) AS prs_merged,
+                        SUM((julianday(merged_at) - julianday(created_at)) * 24.0) AS pr_cycle_hours_total
+                    FROM github_prs
+                    WHERE merged_at IS NOT NULL AND merged_at >= ?
+                    GROUP BY date(merged_at)
+                """, (cutoff,)).fetchall()
+            finally:
+                conn.execute("DETACH DATABASE telemetry")
 
         for row in orchestration_rows:
             day = grouped.get(row["date"])
