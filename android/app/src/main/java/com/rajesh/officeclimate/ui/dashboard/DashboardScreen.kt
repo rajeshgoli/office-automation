@@ -106,7 +106,7 @@ fun DashboardScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "Office Climate",
+                    text = "Office",
                     style = MaterialTheme.typography.headlineMedium,
                     color = TextPrimary,
                 )
