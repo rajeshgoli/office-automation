@@ -1,6 +1,7 @@
 package com.rajesh.officeclimate.data.remote
 
 import com.rajesh.officeclimate.data.model.ApiStatus
+import com.rajesh.officeclimate.data.model.AppArtifactMetadata
 import com.rajesh.officeclimate.data.model.DailyStatsResponse
 import com.rajesh.officeclimate.data.model.LeverageResponse
 import com.rajesh.officeclimate.data.model.OHLCResponse
@@ -19,6 +20,9 @@ import retrofit2.http.Query
 interface ApiService {
     @GET("status")
     suspend fun getStatus(): ApiStatus
+
+    @GET("apps/office-climate/meta.json")
+    suspend fun getAppArtifactMetadata(): AppArtifactMetadata
 
     @POST("erv")
     suspend fun setErvSpeed(@Body body: Map<String, String>): JsonObject
