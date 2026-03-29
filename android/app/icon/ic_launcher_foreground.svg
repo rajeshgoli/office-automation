@@ -1,0 +1,13 @@
+<svg width="432" height="432" viewBox="0 0 432 432" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="monitorGlow" x1="96" y1="96" x2="336" y2="336" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#34D399"/>
+      <stop offset="1" stop-color="#14B8A6"/>
+    </linearGradient>
+  </defs>
+  <rect x="96" y="92" width="240" height="164" rx="30" fill="url(#monitorGlow)"/>
+  <rect x="122" y="118" width="188" height="112" rx="18" fill="#09090B"/>
+  <path d="M200 256H232V300H200V256Z" fill="url(#monitorGlow)"/>
+  <rect x="150" y="300" width="132" height="20" rx="10" fill="#2DD4BF"/>
+  <rect x="110" y="330" width="212" height="14" rx="7" fill="#115E59"/>
+</svg>

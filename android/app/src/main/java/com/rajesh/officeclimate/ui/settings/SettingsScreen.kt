@@ -62,7 +62,7 @@ fun SettingsScreen(
         verticalArrangement = Arrangement.Center,
     ) {
         Text(
-            text = "Office Climate",
+            text = "Office",
             style = MaterialTheme.typography.headlineMedium,
             color = MaterialTheme.colorScheme.onBackground,
             modifier = Modifier.combinedClickable(

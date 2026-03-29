@@ -57,7 +57,7 @@ private data class NavItem(
 )
 
 private val navItems = listOf(
-    NavItem(Routes.DASHBOARD, "Dashboard", Icons.Filled.Dashboard, Icons.Outlined.Dashboard),
+    NavItem(Routes.DASHBOARD, "Climate", Icons.Filled.Dashboard, Icons.Outlined.Dashboard),
     NavItem(Routes.HISTORY, "History", Icons.Filled.History, Icons.Outlined.History),
     NavItem(Routes.PRODUCTIVITY, "Productivity", Icons.Filled.Insights, Icons.Outlined.Insights),
     NavItem(Routes.PROJECTS, "Projects", Icons.Filled.Apps, Icons.Outlined.Apps),
