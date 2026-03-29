@@ -18,6 +18,9 @@ class ProjectsViewModel(application: Application) : AndroidViewModel(application
     private val _projectLeverage = MutableStateFlow<ProjectLeverageResponse?>(null)
     val projectLeverage: StateFlow<ProjectLeverageResponse?> = _projectLeverage
 
+    private val _projectLeverageComparison = MutableStateFlow<ProjectLeverageResponse?>(null)
+    val projectLeverageComparison: StateFlow<ProjectLeverageResponse?> = _projectLeverageComparison
+
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading
 
@@ -32,12 +35,19 @@ class ProjectsViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             _isLoading.value = true
             _error.value = null
+            _projectLeverageComparison.value = null
 
             climateRepo.getProjectLeverage(7)
                 .onSuccess { _projectLeverage.value = it }
                 .onFailure { error ->
                     Log.e(TAG, "Project leverage fetch failed", error)
                     _error.value = error.message
+                }
+
+            climateRepo.getProjectLeverage(14)
+                .onSuccess { _projectLeverageComparison.value = it }
+                .onFailure { error ->
+                    Log.w(TAG, "Project leverage comparison fetch failed", error)
                 }
 
             _isLoading.value = false
