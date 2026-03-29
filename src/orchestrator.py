@@ -10,13 +10,15 @@ Ties together:
 """
 
 import asyncio
+import base64
+import hashlib
+import ipaddress
 import json
 import logging
-import base64
-import ipaddress
 import os
 import re
 import secrets
+import shutil
 import tempfile
 from collections import deque
 from pathlib import Path
@@ -38,6 +40,7 @@ from .oauth_service import OAuthService, UserSession
 logger = logging.getLogger(__name__)
 
 ARTIFACT_APP_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+ARTIFACT_HASH_PATTERN = re.compile(r"^[0-9a-f]{8}$")
 ARTIFACT_MAX_SIZE_BYTES = 100 * 1024 * 1024
 DEFAULT_ARTIFACTS_ROOT = Path(__file__).parent.parent / "data" / "apps"
 DEFAULT_LEGACY_APK_PATH = Path(__file__).parent.parent / "data" / "app-debug.apk"
@@ -1550,6 +1553,7 @@ class Orchestrator:
         fd, temp_path = tempfile.mkstemp(dir=str(app_dir), prefix=".tmp-artifact-", suffix=".apk")
         size_bytes = 0
         file_uploaded = False
+        sha256 = hashlib.sha256()
         version_code: Optional[int] = None
         version_name: Optional[str] = None
 
@@ -1577,6 +1581,7 @@ class Orchestrator:
                                     status=413,
                                 )
 
+                            sha256.update(chunk)
                             handle.write(chunk)
                         continue
                     if part.name == "version_code":
@@ -1602,8 +1607,13 @@ class Orchestrator:
                 return web.json_response({"ok": False, "error": "Missing multipart field 'file'"}, status=400)
 
             os.replace(temp_path, artifact_path)
+            artifact_hash = sha256.hexdigest()[:8]
+            hashed_artifact_path = self._get_hashed_app_artifact_path(app, artifact_hash)
+            if not hashed_artifact_path.exists():
+                self._copy_file_atomically(artifact_path, hashed_artifact_path)
 
             metadata = {
+                "artifact_hash": artifact_hash,
                 "uploaded_at": datetime.now().isoformat(timespec="seconds"),
                 "size_bytes": size_bytes,
                 "uploaded_by": request.get("user_email", "unknown"),
@@ -1629,18 +1639,38 @@ class Orchestrator:
             raise web.HTTPInternalServerError(text="Failed to store artifact") from e
 
     async def _handle_app_artifact_get(self, request: web.Request) -> web.Response:
-        """Handle GET /apps/{app}/latest.apk to download the latest app artifact."""
+        """Handle GET /apps/{app}/latest.apk to redirect to the hashed app artifact."""
         app = request.match_info.get("app", "")
         if not self._is_valid_artifact_app_name(app):
             raise web.HTTPNotFound(text="Artifact not found")
 
-        artifact_path = self._get_app_artifact_path(app)
+        metadata = self._read_app_artifact_metadata(app)
+        artifact_hash = metadata.get("artifact_hash")
+        if not isinstance(artifact_hash, str) or not self._is_valid_artifact_hash(artifact_hash):
+            raise web.HTTPNotFound(text="Artifact not found")
+
+        raise web.HTTPFound(
+            location=f"/apps/{app}/{artifact_hash}.apk",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    async def _handle_hashed_app_artifact_get(self, request: web.Request) -> web.Response:
+        """Handle GET /apps/{app}/{hash}.apk to download an immutable app artifact."""
+        app = request.match_info.get("app", "")
+        artifact_hash = request.match_info.get("artifact_hash", "")
+        if not self._is_valid_artifact_app_name(app) or not self._is_valid_artifact_hash(artifact_hash):
+            raise web.HTTPNotFound(text="Artifact not found")
+
+        artifact_path = self._get_hashed_app_artifact_path(app, artifact_hash)
         if not artifact_path.exists():
             raise web.HTTPNotFound(text="Artifact not found")
 
         return web.FileResponse(
             artifact_path,
-            headers={"Content-Disposition": f"attachment; filename={app}.apk"},
+            headers={
+                "Cache-Control": "public, max-age=31536000, immutable",
+                "Content-Disposition": f"attachment; filename={app}.apk",
+            },
         )
 
     async def _handle_app_artifact_meta_get(self, request: web.Request) -> web.Response:
@@ -1649,17 +1679,7 @@ class Orchestrator:
         if not self._is_valid_artifact_app_name(app):
             raise web.HTTPNotFound(text="Artifact metadata not found")
 
-        metadata_path = self._get_app_artifact_meta_path(app)
-        if not metadata_path.exists():
-            raise web.HTTPNotFound(text="Artifact metadata not found")
-
-        try:
-            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            logger.error(f"Failed to read artifact metadata for {app}: {e}")
-            raise web.HTTPInternalServerError(text="Artifact metadata unreadable") from e
-
-        return web.json_response(payload)
+        return web.json_response(self._read_app_artifact_metadata(app))
 
     async def _handle_apk_get(self, request: web.Request) -> web.Response:
         """Handle GET /apk for backward-compatible legacy APK downloads."""
@@ -2193,6 +2213,11 @@ class Orchestrator:
         """Return True when an artifact app name is safe for filesystem storage."""
         return bool(ARTIFACT_APP_PATTERN.fullmatch(app))
 
+    @staticmethod
+    def _is_valid_artifact_hash(artifact_hash: str) -> bool:
+        """Return True when an artifact hash is safe for filesystem storage."""
+        return bool(ARTIFACT_HASH_PATTERN.fullmatch(artifact_hash))
+
     def _get_artifacts_root(self) -> Path:
         """Return the root directory used for uploaded app artifacts."""
         return getattr(self, "_artifacts_root", DEFAULT_ARTIFACTS_ROOT)
@@ -2208,6 +2233,10 @@ class Orchestrator:
     def _get_app_artifact_path(self, app: str) -> Path:
         """Return the latest artifact path for the given app."""
         return self._get_app_artifact_dir(app) / "latest.apk"
+
+    def _get_hashed_app_artifact_path(self, app: str, artifact_hash: str) -> Path:
+        """Return the immutable hashed artifact path for the given app."""
+        return self._get_app_artifact_dir(app) / f"{artifact_hash}.apk"
 
     def _get_app_artifact_meta_path(self, app: str) -> Path:
         """Return the metadata path for the given app."""
@@ -2228,6 +2257,38 @@ class Orchestrator:
             except FileNotFoundError:
                 pass
             raise
+
+    @staticmethod
+    def _copy_file_atomically(source_path: Path, destination_path: Path) -> None:
+        """Copy a file via a temp file and os.replace."""
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            dir=str(destination_path.parent),
+            prefix=".tmp-artifact-copy-",
+            suffix=destination_path.suffix,
+        )
+        os.close(fd)
+        try:
+            shutil.copyfile(source_path, temp_path)
+            os.replace(temp_path, destination_path)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _read_app_artifact_metadata(self, app: str) -> dict[str, Any]:
+        """Read persisted metadata for a deployed app artifact."""
+        metadata_path = self._get_app_artifact_meta_path(app)
+        if not metadata_path.exists():
+            raise web.HTTPNotFound(text="Artifact metadata not found")
+
+        try:
+            return json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error(f"Failed to read artifact metadata for {app}: {e}")
+            raise web.HTTPInternalServerError(text="Artifact metadata unreadable") from e
 
     @staticmethod
     def _resolve_redirect_scheme(request: web.Request) -> str:
@@ -2477,6 +2538,7 @@ class Orchestrator:
         self._app.router.add_get("/history", self._handle_history_get)
         self._app.router.add_get("/apk", self._handle_apk_get)
         self._app.router.add_get("/apps/{app}/latest.apk", self._handle_app_artifact_get)
+        self._app.router.add_get("/apps/{app}/{artifact_hash}.apk", self._handle_hashed_app_artifact_get)
         self._app.router.add_get("/apps/{app}/meta.json", self._handle_app_artifact_meta_get)
         self._app.router.add_post("/deploy/{app}", self._handle_deploy_post)
         self._app.router.add_get("/history/sessions", self._handle_history_sessions_get)

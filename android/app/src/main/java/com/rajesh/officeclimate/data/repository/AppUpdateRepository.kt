@@ -18,10 +18,11 @@ import retrofit2.Retrofit
 import retrofit2.converter.kotlinx.serialization.asConverterFactory
 import java.io.File
 import java.io.IOException
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 data class AvailableAppUpdate(
-    val versionCode: Long,
+    val artifactHash: String,
     val versionName: String,
     val uploadedAt: String?,
 )
@@ -31,28 +32,30 @@ class AppUpdateRepository(
     private val settingsRepository: SettingsRepository,
 ) {
     private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
+    @Volatile private var cachedCurrentArtifactHash: String? = null
 
     suspend fun getAvailableUpdate(): AvailableAppUpdate? {
         val serverUrl = settingsRepository.serverUrl.first().trimEnd('/')
         val metadata = fetchMetadata(serverUrl) ?: return null
-        val serverVersionCode = metadata.versionCode ?: return null
-        if (serverVersionCode <= BuildConfig.VERSION_CODE.toLong()) {
+        val serverArtifactHash = metadata.artifactHash?.trim()?.lowercase() ?: return null
+        val currentArtifactHash = currentBuildArtifactHash()
+        if (serverArtifactHash == currentArtifactHash) {
             return null
         }
 
-        if (settingsRepository.dismissedUpdateVersionCode.first() == serverVersionCode) {
+        if (settingsRepository.dismissedUpdateArtifactHash.first() == serverArtifactHash) {
             return null
         }
 
         return AvailableAppUpdate(
-            versionCode = serverVersionCode,
-            versionName = metadata.versionName ?: serverVersionCode.toString(),
+            artifactHash = serverArtifactHash,
+            versionName = metadata.versionName ?: serverArtifactHash,
             uploadedAt = metadata.uploadedAt,
         )
     }
 
-    suspend fun dismissUpdate(versionCode: Long) {
-        settingsRepository.saveDismissedUpdateVersionCode(versionCode)
+    suspend fun dismissUpdate(artifactHash: String) {
+        settingsRepository.saveDismissedUpdateArtifactHash(artifactHash)
     }
 
     suspend fun downloadUpdate(update: AvailableAppUpdate): File = withContext(Dispatchers.IO) {
@@ -62,7 +65,7 @@ class AppUpdateRepository(
             .build()
 
         val updatesDir = File(context.cacheDir, "updates").apply { mkdirs() }
-        val apkFile = File(updatesDir, "office-climate-${update.versionCode}.apk")
+        val apkFile = File(updatesDir, "office-climate-${update.artifactHash}.apk")
 
         okHttpClient().newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
@@ -100,6 +103,37 @@ class AppUpdateRepository(
         } catch (e: HttpException) {
             if (e.code() == 404) null else throw e
         }
+    }
+
+    private suspend fun currentBuildArtifactHash(): String {
+        cachedCurrentArtifactHash?.let { return it }
+
+        val configuredHash = BuildConfig.APK_HASH.trim().lowercase()
+        if (configuredHash.isNotEmpty()) {
+            cachedCurrentArtifactHash = configuredHash
+            return configuredHash
+        }
+
+        return withContext(Dispatchers.IO) {
+            val computedHash = sha256Prefix(File(context.packageCodePath))
+            cachedCurrentArtifactHash = computedHash
+            computedHash
+        }
+    }
+
+    private fun sha256Prefix(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val bytesRead = input.read(buffer)
+                if (bytesRead <= 0) break
+                digest.update(buffer, 0, bytesRead)
+            }
+        }
+        return digest.digest()
+            .joinToString(separator = "") { byte -> "%02x".format(byte) }
+            .take(8)
     }
 
     private fun apiService(serverUrl: String): ApiService {

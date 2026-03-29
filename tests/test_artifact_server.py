@@ -1,4 +1,5 @@
 import json
+import hashlib
 import sys
 import tempfile
 import types
@@ -129,6 +130,7 @@ class ArtifactServerTests(unittest.IsolatedAsyncioTestCase):
         )
         app.router.add_post("/deploy/{app}", orchestrator._handle_deploy_post)
         app.router.add_get("/apps/{app}/latest.apk", orchestrator._handle_app_artifact_get)
+        app.router.add_get("/apps/{app}/{artifact_hash}.apk", orchestrator._handle_hashed_app_artifact_get)
         app.router.add_get("/apps/{app}/meta.json", orchestrator._handle_app_artifact_meta_get)
         app.router.add_get("/apk", orchestrator._handle_apk_get)
 
@@ -195,11 +197,16 @@ class ArtifactServerTests(unittest.IsolatedAsyncioTestCase):
 
         artifact_path = self.root / "data" / "apps" / "office-climate" / "latest.apk"
         metadata_path = self.root / "data" / "apps" / "office-climate" / "meta.json"
+        artifact_hash = hashlib.sha256(b"apk-bytes").hexdigest()[:8]
+        hashed_artifact_path = self.root / "data" / "apps" / "office-climate" / f"{artifact_hash}.apk"
         self.assertTrue(artifact_path.exists())
+        self.assertTrue(hashed_artifact_path.exists())
         self.assertTrue(metadata_path.exists())
         self.assertEqual(artifact_path.read_bytes(), b"apk-bytes")
+        self.assertEqual(hashed_artifact_path.read_bytes(), b"apk-bytes")
 
         metadata = json.loads(metadata_path.read_text())
+        self.assertEqual(metadata["artifact_hash"], artifact_hash)
         self.assertEqual(metadata["size_bytes"], len(b"apk-bytes"))
         self.assertEqual(metadata["uploaded_by"], "engineer@rajeshgo.li")
         self.assertEqual(metadata["version_code"], 7)
@@ -214,20 +221,34 @@ class ArtifactServerTests(unittest.IsolatedAsyncioTestCase):
         payload = await response.json()
 
         self.assertEqual(response.status, 200)
+        self.assertEqual(payload["artifact_hash"], hashlib.sha256(b"meta-bytes").hexdigest()[:8])
         self.assertEqual(payload["size_bytes"], len(b"meta-bytes"))
         self.assertEqual(payload["version_code"], 9)
         self.assertEqual(payload["version_name"], "2.0")
         self.assertEqual(payload["uploaded_by"], "engineer@rajeshgo.li")
 
-    async def test_download_returns_uploaded_artifact(self):
+    async def test_latest_download_redirects_to_hashed_artifact(self):
         _, client = await self._make_client()
         await self._upload(client, body=b"download-me")
 
-        response = await client.get("/apps/office-climate/latest.apk")
+        response = await client.get("/apps/office-climate/latest.apk", allow_redirects=False)
+        artifact_hash = hashlib.sha256(b"download-me").hexdigest()[:8]
+
+        self.assertEqual(response.status, 302)
+        self.assertEqual(response.headers.get("Location"), f"/apps/office-climate/{artifact_hash}.apk")
+        self.assertEqual(response.headers.get("Cache-Control"), "no-cache")
+
+    async def test_hashed_download_returns_uploaded_artifact(self):
+        _, client = await self._make_client()
+        await self._upload(client, body=b"download-me")
+
+        artifact_hash = hashlib.sha256(b"download-me").hexdigest()[:8]
+        response = await client.get(f"/apps/office-climate/{artifact_hash}.apk")
         body = await response.read()
 
         self.assertEqual(response.status, 200)
         self.assertEqual(body, b"download-me")
+        self.assertEqual(response.headers.get("Cache-Control"), "public, max-age=31536000, immutable")
         self.assertEqual(
             response.headers.get("Content-Disposition"),
             "attachment; filename=office-climate.apk",
@@ -246,7 +267,8 @@ class ArtifactServerTests(unittest.IsolatedAsyncioTestCase):
         _, client = await self._make_client()
         await self._upload(client, body=b"public-download")
 
-        response = await client.get("/apps/office-climate/latest.apk")
+        artifact_hash = hashlib.sha256(b"public-download").hexdigest()[:8]
+        response = await client.get(f"/apps/office-climate/{artifact_hash}.apk")
 
         self.assertEqual(response.status, 200)
         self.assertEqual(await response.read(), b"public-download")

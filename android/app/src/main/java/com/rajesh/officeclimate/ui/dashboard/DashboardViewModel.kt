@@ -76,7 +76,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     fun dismissUpdateBanner() {
         val update = _updateBannerState.value.update ?: return
         viewModelScope.launch {
-            updateRepo.dismissUpdate(update.versionCode)
+            updateRepo.dismissUpdate(update.artifactHash)
             _updateBannerState.value = _updateBannerState.value.copy(update = null)
         }
     }
