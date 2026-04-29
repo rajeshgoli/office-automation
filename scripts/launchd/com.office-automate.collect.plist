@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  python3 → execv → bash: invoking /bin/bash directly under launchd hits
+  macOS TCC "Operation not permitted" on ~/Desktop/ paths. Homebrew python3
+  has Full Disk Access; macOS's responsible-process semantics carry that
+  grant through os.execv into bash.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.office-automate.collect</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>-c</string>
+    <string>import os; os.execv("/bin/bash", ["bash", "/Users/rajesh/Desktop/automation/office-automate/collect_and_push.sh"])</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/rajesh/Desktop/automation/office-automate</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>7200</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/office-automate-collect.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/office-automate-collect.launchd.error.log</string>
+</dict>
+</plist>
