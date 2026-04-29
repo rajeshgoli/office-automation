@@ -19,6 +19,7 @@ DEFAULT_TOOL_USAGE_DB_PATH = Path(__file__).parent / "data" / "tool_usage.db"
 DEFAULT_ENGRAM_DB_PATH = Path(__file__).parent / "data" / "engram_state.db"
 DEFAULT_ENGRAM_REGISTRY_PATH = Path(__file__).parent / "data" / "engram_concept_registry.md"
 PERSONA_PROJECT_METRIC_PREFIX = "persona_project::"
+ALL_SOURCES = ("tool_usage", "engram", "office_automation")
 CONCEPT_HEADER_RE = re.compile(r"^##\s+C\d{3}:.*\((ACTIVE|DEAD)\b", re.IGNORECASE)
 
 
@@ -296,16 +297,23 @@ def collect_project_leverage(
     engram_db_path: Path = DEFAULT_ENGRAM_DB_PATH,
     concept_registry_path: Path = DEFAULT_ENGRAM_REGISTRY_PATH,
     now: Optional[datetime] = None,
+    sources: tuple[str, ...] = ALL_SOURCES,
 ) -> list[tuple[str, str, str, float]]:
     """Collect all project leverage metrics and upsert them into the office DB."""
     now = now or datetime.now()
+    unknown = [s for s in sources if s not in ALL_SOURCES]
+    if unknown:
+        raise ValueError(f"Unknown source(s) {unknown}; valid: {ALL_SOURCES}")
     db = Database(db_path)
     rows: list[tuple[str, str, str, float]] = []
-    rows.extend(_collect_tool_usage_metrics(tool_usage_db_path))
-    rows.extend(_collect_engram_metrics(engram_db_path, concept_registry_path, now))
-    rows.extend(_collect_office_automation_metrics(db_path))
+    if "tool_usage" in sources:
+        rows.extend(_collect_tool_usage_metrics(tool_usage_db_path))
+    if "engram" in sources:
+        rows.extend(_collect_engram_metrics(engram_db_path, concept_registry_path, now))
+    if "office_automation" in sources:
+        rows.extend(_collect_office_automation_metrics(db_path))
     db.upsert_project_leverage(rows)
-    logger.info("Upserted %s project leverage rows", len(rows))
+    logger.info("Upserted %s project leverage rows from sources=%s", len(rows), ",".join(sources))
     return rows
 
 
@@ -315,6 +323,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--tool-usage-db", type=Path, default=DEFAULT_TOOL_USAGE_DB_PATH)
     parser.add_argument("--engram-db", type=Path, default=DEFAULT_ENGRAM_DB_PATH)
     parser.add_argument("--engram-registry", type=Path, default=DEFAULT_ENGRAM_REGISTRY_PATH)
+    parser.add_argument(
+        "--sources",
+        default=",".join(ALL_SOURCES),
+        help=f"Comma-separated subset of {ALL_SOURCES}",
+    )
     return parser.parse_args()
 
 
@@ -325,11 +338,13 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+    sources = tuple(s.strip() for s in args.sources.split(",") if s.strip())
     collect_project_leverage(
         db_path=args.db_path,
         tool_usage_db_path=args.tool_usage_db,
         engram_db_path=args.engram_db,
         concept_registry_path=args.engram_registry,
+        sources=sources,
     )
     return 0
 

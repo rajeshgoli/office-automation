@@ -29,6 +29,13 @@ $VENV collect_session_telemetry.py 2>&1
 # Collect GitHub PRs (needs gh CLI)
 $VENV session_stats_parser.py --mode github-prs 2>&1
 
+# Collect tool_usage-derived project leverage metrics
+# (work Mac has fresh tool_usage.db; office_automation + engram run on the Mini
+# below, since their inputs live there)
+$VENV project_leverage_collector.py \
+    --sources tool_usage \
+    --tool-usage-db "$HOME/.local/share/claude-sessions/tool_usage.db" 2>&1
+
 # Push to Mac Mini
 if ssh -o ConnectTimeout=5 "$MINI" true 2>/dev/null; then
     rsync -az data/telemetry.db "$MINI:~/office-automate/data/telemetry.db"
@@ -61,6 +68,39 @@ if ssh -o ConnectTimeout=5 "$MINI" true 2>/dev/null; then
         cat "$INDEXES"
         echo "COMMIT;"
     } | ssh "$MINI" "sqlite3 ~/office-automate/data/office_climate.db"
+
+    # Push project_leverage rows derived from tool_usage (session-manager,
+    # agent-os) inside one transaction. INSERT OR REPLACE on UNIQUE(date,
+    # project, metric) keeps it idempotent and works on the Mini's sqlite3
+    # 3.19 CLI, which predates the ON CONFLICT DO UPDATE syntax.
+    # office_automation + engram rows are produced on the Mini below, so we
+    # don't ship them from here.
+    LEVERAGE_DUMP=$(mktemp -t project_leverage_dump.XXXXXX)
+    trap 'rm -f "$DUMP" "$INDEXES" "$LEVERAGE_DUMP"' EXIT
+    sqlite3 data/office_climate.db <<'SQL' > "$LEVERAGE_DUMP"
+SELECT 'INSERT OR REPLACE INTO project_leverage(date,project,metric,value) VALUES('
+    || quote(date) || ',' || quote(project) || ',' || quote(metric) || ','
+    || value
+    || ');'
+FROM project_leverage
+WHERE project IN ('session-manager', 'agent-os');
+SQL
+    if [ -s "$LEVERAGE_DUMP" ]; then
+        {
+            echo "BEGIN;"
+            cat "$LEVERAGE_DUMP"
+            echo "COMMIT;"
+        } | ssh "$MINI" "sqlite3 ~/office-automate/data/office_climate.db"
+    fi
+
+    # Trigger the Mini to compute office_automation + engram leverage rows
+    # against its own DB (orchestrator writes climate_actions / occupancy_log
+    # there; engram source files also live on the Mini). Push the collector
+    # script first so the remote pick up any code changes without a separate
+    # deploy step.
+    rsync -az project_leverage_collector.py "$MINI:~/office-automate/project_leverage_collector.py"
+    ssh "$MINI" "cd ~/office-automate && venv/bin/python project_leverage_collector.py --sources office_automation,engram"
+
     echo "Pushed to Mac Mini"
 else
     echo "Mac Mini unreachable, skipping push"
