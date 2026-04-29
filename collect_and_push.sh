@@ -33,15 +33,27 @@ $VENV session_stats_parser.py --mode github-prs 2>&1
 if ssh -o ConnectTimeout=5 "$MINI" true 2>/dev/null; then
     rsync -az data/telemetry.db "$MINI:~/office-automate/data/telemetry.db"
     rsync -az data/worktree_map.json "$MINI:~/office-automate/data/worktree_map.json"
-    # Push only github_prs table via dump+load (don't overwrite the full DB).
-    # Dump to a temp file first so set -e halts before the remote DROP runs
-    # if the local dump fails — piping straight to ssh would let the remote
-    # destructive step proceed and clobber the Mac Mini's table.
+    # Replace the remote github_prs table atomically inside one transaction:
+    # DROP + restore + index DDL all stream into a single remote sqlite3
+    # invocation, so a mid-stream SSH failure rolls back instead of leaving
+    # the Mac Mini with a missing or partially rebuilt table. Indexes are
+    # pulled from sqlite_master (.dump TABLE doesn't include them) so any
+    # index added in database.py propagates without script edits.
     DUMP=$(mktemp -t github_prs_dump.XXXXXX)
-    trap 'rm -f "$DUMP"' EXIT
+    INDEXES=$(mktemp -t github_prs_idx.XXXXXX)
+    trap 'rm -f "$DUMP" "$INDEXES"' EXIT
     sqlite3 data/office_climate.db ".dump github_prs" > "$DUMP"
     [ -s "$DUMP" ] || { echo "ERROR: github_prs dump empty"; exit 1; }
-    ssh "$MINI" "sqlite3 ~/office-automate/data/office_climate.db 'DROP TABLE IF EXISTS github_prs;' && sqlite3 ~/office-automate/data/office_climate.db" < "$DUMP"
+    sqlite3 data/office_climate.db \
+        "SELECT sql || ';' FROM sqlite_master WHERE tbl_name='github_prs' AND type='index' AND sql IS NOT NULL" \
+        > "$INDEXES"
+    {
+        echo "BEGIN;"
+        echo "DROP TABLE IF EXISTS github_prs;"
+        grep -vE '^(PRAGMA |BEGIN TRANSACTION;|COMMIT;)' "$DUMP"
+        cat "$INDEXES"
+        echo "COMMIT;"
+    } | ssh "$MINI" "sqlite3 ~/office-automate/data/office_climate.db"
     echo "Pushed to Mac Mini"
 else
     echo "Mac Mini unreachable, skipping push"
