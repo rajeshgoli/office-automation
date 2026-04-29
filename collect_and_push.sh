@@ -33,8 +33,15 @@ $VENV session_stats_parser.py --mode github-prs 2>&1
 if ssh -o ConnectTimeout=5 "$MINI" true 2>/dev/null; then
     rsync -az data/telemetry.db "$MINI:~/office-automate/data/telemetry.db"
     rsync -az data/worktree_map.json "$MINI:~/office-automate/data/worktree_map.json"
-    # Push only github_prs table via dump+load (don't overwrite the full DB)
-    sqlite3 data/office_climate.db ".dump github_prs" | ssh "$MINI" "sqlite3 ~/office-automate/data/office_climate.db 'DROP TABLE IF EXISTS github_prs;' && sqlite3 ~/office-automate/data/office_climate.db"
+    # Push only github_prs table via dump+load (don't overwrite the full DB).
+    # Dump to a temp file first so set -e halts before the remote DROP runs
+    # if the local dump fails — piping straight to ssh would let the remote
+    # destructive step proceed and clobber the Mac Mini's table.
+    DUMP=$(mktemp -t github_prs_dump.XXXXXX)
+    trap 'rm -f "$DUMP"' EXIT
+    sqlite3 data/office_climate.db ".dump github_prs" > "$DUMP"
+    [ -s "$DUMP" ] || { echo "ERROR: github_prs dump empty"; exit 1; }
+    ssh "$MINI" "sqlite3 ~/office-automate/data/office_climate.db 'DROP TABLE IF EXISTS github_prs;' && sqlite3 ~/office-automate/data/office_climate.db" < "$DUMP"
     echo "Pushed to Mac Mini"
 else
     echo "Mac Mini unreachable, skipping push"
