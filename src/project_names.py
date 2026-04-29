@@ -204,12 +204,14 @@ def normalize_project_name(project_name: Optional[str]) -> str:
     if not project_name:
         return "unknown"
 
-    normalized = project_name.strip().rstrip("/")
+    # Normalize backslashes so basename / substring checks work uniformly
+    # for Windows-style worktree paths on POSIX runtimes.
+    normalized = project_name.strip().replace("\\", "/").rstrip("/")
     if not normalized:
         return "unknown"
 
     # Resolve git worktrees to their parent repo
-    if "/worktrees/" in normalized or "\\worktrees\\" in normalized:
+    if "/worktrees/" in normalized:
         parent = _resolve_worktree_parent(normalized)
         if parent:
             normalized = parent

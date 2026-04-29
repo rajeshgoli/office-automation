@@ -43,7 +43,14 @@ if ssh -o ConnectTimeout=5 "$MINI" true 2>/dev/null; then
     INDEXES=$(mktemp -t github_prs_idx.XXXXXX)
     trap 'rm -f "$DUMP" "$INDEXES"' EXIT
     sqlite3 data/office_climate.db ".dump github_prs" > "$DUMP"
-    [ -s "$DUMP" ] || { echo "ERROR: github_prs dump empty"; exit 1; }
+    # .dump TABLE emits PRAGMA + BEGIN/COMMIT boilerplate even when the table
+    # doesn't exist locally (e.g. fresh checkout, gh unavailable on first run).
+    # Without this guard the transaction would be DROP-only — wiping the
+    # remote table with nothing to put back.
+    grep -q '^CREATE TABLE github_prs' "$DUMP" || {
+        echo "ERROR: local github_prs table missing; refusing to push"
+        exit 1
+    }
     sqlite3 data/office_climate.db \
         "SELECT sql || ';' FROM sqlite_master WHERE tbl_name='github_prs' AND type='index' AND sql IS NOT NULL" \
         > "$INDEXES"
