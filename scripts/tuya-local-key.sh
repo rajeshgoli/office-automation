@@ -188,16 +188,31 @@ public class DumpTuya {
             return;
         }
 
+        String globalKey = sec.optString("GLOBAL_SECURITY_KEY", null);
+        Map<String, String> perFileKeys = new HashMap<>();
+        if (globalKey != null) {
+            Object gskKv = mmkvWithID.invoke(null, "GLOBAL_SECURITY_KEY", 2, globalKey);
+            if (gskKv != null) {
+                String[] gskKeys = (String[]) allKeysMethod.invoke(gskKv);
+                if (gskKeys != null) {
+                    for (String k : gskKeys) {
+                        String v = (String) getStringMethod.invoke(gskKv, k, null);
+                        if (v != null) perFileKeys.put(k, v);
+                    }
+                }
+            }
+        }
         for (File f : files) {
             String name = f.getName();
             if (name.endsWith(".crc")) continue;
             if (f.isDirectory()) continue;
-            String cryptKey = sec.optString(name, null);
+            if (name.equals("GLOBAL_SECURITY_KEY")) continue;
+            String cryptKey = perFileKeys.get(name);
             if (cryptKey == null || cryptKey.length() == 0) continue;
             Object kv = mmkvWithID.invoke(null, name, 2, cryptKey);
             if (kv == null) continue;
             String[] keys = (String[]) allKeysMethod.invoke(kv);
-            if (keys == null) continue;
+            if (keys == null || keys.length == 0) continue;
             for (String k : keys) {
                 String v = (String) getStringMethod.invoke(kv, k, null);
                 if (v == null) continue;
