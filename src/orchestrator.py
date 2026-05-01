@@ -277,7 +277,7 @@ class Orchestrator:
                 "title": "ERV local control recovered",
                 "message": "Local Tuya control is working again.",
                 "created_at": created_at,
-                "active": False,
+                "active": True,
                 "runbook_path": "docs/tuya-local-key.md",
             }
             logger.info("ERV local key recovered; notifying Android app")

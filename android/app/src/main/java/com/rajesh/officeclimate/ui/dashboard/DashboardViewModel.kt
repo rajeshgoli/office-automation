@@ -143,7 +143,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             combine(status, settingsRepo.dismissedAppNotificationIds) { currentStatus, dismissedIds ->
                 currentStatus
                     ?.notifications
-                    ?.firstOrNull { notification -> notification.id !in dismissedIds }
+                    ?.firstOrNull { notification ->
+                        notification.active && notification.id !in dismissedIds
+                    }
             }.collect { notification ->
                 _appNotificationBannerState.value = AppNotificationBannerUiState(notification = notification)
             }
