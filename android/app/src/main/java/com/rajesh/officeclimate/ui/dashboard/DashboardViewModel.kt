@@ -4,6 +4,7 @@ import android.app.Application
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.rajesh.officeclimate.data.model.AppNotification
 import com.rajesh.officeclimate.data.model.ApiStatus
 import com.rajesh.officeclimate.data.repository.AppUpdateRepository
 import com.rajesh.officeclimate.data.repository.AvailableAppUpdate
@@ -11,12 +12,17 @@ import com.rajesh.officeclimate.data.repository.ClimateRepository
 import com.rajesh.officeclimate.data.repository.SettingsRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
 data class UpdateBannerUiState(
     val update: AvailableAppUpdate? = null,
     val installing: Boolean = false,
     val error: String? = null,
+)
+
+data class AppNotificationBannerUiState(
+    val notification: AppNotification? = null,
 )
 
 class DashboardViewModel(application: Application) : AndroidViewModel(application) {
@@ -40,9 +46,13 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     private val _updateBannerState = MutableStateFlow(UpdateBannerUiState())
     val updateBannerState: StateFlow<UpdateBannerUiState> = _updateBannerState
 
+    private val _appNotificationBannerState = MutableStateFlow(AppNotificationBannerUiState())
+    val appNotificationBannerState: StateFlow<AppNotificationBannerUiState> = _appNotificationBannerState
+
     init {
         climateRepo.start()
         refreshUpdateBanner()
+        observeAppNotifications()
     }
 
     fun clearControlError() {
@@ -107,6 +117,14 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         _updateBannerState.value = _updateBannerState.value.copy(error = null)
     }
 
+    fun dismissAppNotificationBanner() {
+        val notification = _appNotificationBannerState.value.notification ?: return
+        viewModelScope.launch {
+            settingsRepo.dismissAppNotification(notification.id)
+            _appNotificationBannerState.value = AppNotificationBannerUiState()
+        }
+    }
+
     private fun refreshUpdateBanner() {
         viewModelScope.launch {
             runCatching { updateRepo.getAvailableUpdate() }
@@ -117,6 +135,20 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     Log.w("DashboardVM", "Update check failed", e)
                     _updateBannerState.value = UpdateBannerUiState()
                 }
+        }
+    }
+
+    private fun observeAppNotifications() {
+        viewModelScope.launch {
+            combine(status, settingsRepo.dismissedAppNotificationIds) { currentStatus, dismissedIds ->
+                currentStatus
+                    ?.notifications
+                    ?.firstOrNull { notification ->
+                        notification.active && notification.id !in dismissedIds
+                    }
+            }.collect { notification ->
+                _appNotificationBannerState.value = AppNotificationBannerUiState(notification = notification)
+            }
         }
     }
 
