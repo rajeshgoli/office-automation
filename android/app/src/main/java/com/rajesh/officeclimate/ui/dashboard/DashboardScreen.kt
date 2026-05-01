@@ -41,6 +41,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.rajesh.officeclimate.data.model.AppNotification
 import com.rajesh.officeclimate.data.model.ApiStatus
 import com.rajesh.officeclimate.ui.theme.Background
 import com.rajesh.officeclimate.ui.theme.Blue
@@ -70,6 +71,7 @@ fun DashboardScreen(
     val controlError by viewModel.controlError.collectAsState()
     val authExpired by viewModel.authExpired.collectAsState()
     val updateBannerState by viewModel.updateBannerState.collectAsState()
+    val appNotificationBannerState by viewModel.appNotificationBannerState.collectAsState()
 
     LaunchedEffect(authExpired) {
         if (authExpired) onNavigateToSettings()
@@ -124,6 +126,14 @@ fun DashboardScreen(
                     installing = updateBannerState.installing,
                     onDismiss = viewModel::dismissUpdateBanner,
                     onInstall = viewModel::installUpdate,
+                )
+                Spacer(Modifier.height(16.dp))
+            }
+
+            appNotificationBannerState.notification?.let { notification ->
+                AppNotificationBanner(
+                    notification = notification,
+                    onDismiss = viewModel::dismissAppNotificationBanner,
                 )
                 Spacer(Modifier.height(16.dp))
             }
@@ -280,6 +290,56 @@ fun DashboardScreen(
                 containerColor = Color(0xFF7F1D1D),
                 contentColor = Color.White,
             )
+        }
+    }
+}
+
+@Composable
+private fun AppNotificationBanner(
+    notification: AppNotification,
+    onDismiss: () -> Unit,
+) {
+    val accentColor = when (notification.severity.lowercase()) {
+        "critical" -> Red
+        "warning" -> Yellow
+        else -> Emerald
+    }
+    val shape = RoundedCornerShape(20.dp)
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = shape,
+        color = accentColor.copy(alpha = 0.12f),
+        contentColor = TextPrimary,
+        tonalElevation = 0.dp,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(1.dp, accentColor.copy(alpha = 0.35f), shape)
+                .padding(16.dp),
+        ) {
+            Text(
+                text = notification.title,
+                style = MaterialTheme.typography.titleMedium,
+                color = TextPrimary,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = notification.message,
+                style = MaterialTheme.typography.bodySmall,
+                color = TextSecondary,
+            )
+            Spacer(Modifier.height(12.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onDismiss) {
+                    Text("Dismiss")
+                }
+            }
         }
     }
 }

@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.rajesh.officeclimate.util.Defaults
@@ -19,6 +20,7 @@ class SettingsRepository(private val context: Context) {
         val JWT_TOKEN = stringPreferencesKey("jwt_token")
         val USER_EMAIL = stringPreferencesKey("user_email")
         val DISMISSED_UPDATE_ARTIFACT_HASH = stringPreferencesKey("dismissed_update_artifact_hash")
+        val DISMISSED_APP_NOTIFICATION_IDS = stringSetPreferencesKey("dismissed_app_notification_ids")
     }
 
     val serverUrl: Flow<String> = context.dataStore.data.map { prefs ->
@@ -39,6 +41,10 @@ class SettingsRepository(private val context: Context) {
 
     val dismissedUpdateArtifactHash: Flow<String?> = context.dataStore.data.map { prefs ->
         prefs[Keys.DISMISSED_UPDATE_ARTIFACT_HASH]
+    }
+
+    val dismissedAppNotificationIds: Flow<Set<String>> = context.dataStore.data.map { prefs ->
+        prefs[Keys.DISMISSED_APP_NOTIFICATION_IDS] ?: emptySet()
     }
 
     suspend fun saveServerUrl(serverUrl: String) {
@@ -64,6 +70,14 @@ class SettingsRepository(private val context: Context) {
     suspend fun saveDismissedUpdateArtifactHash(artifactHash: String) {
         context.dataStore.edit { prefs ->
             prefs[Keys.DISMISSED_UPDATE_ARTIFACT_HASH] = artifactHash
+        }
+    }
+
+    suspend fun dismissAppNotification(id: String) {
+        context.dataStore.edit { prefs ->
+            val dismissed = prefs[Keys.DISMISSED_APP_NOTIFICATION_IDS].orEmpty().toMutableSet()
+            dismissed.add(id)
+            prefs[Keys.DISMISSED_APP_NOTIFICATION_IDS] = dismissed
         }
     }
 }

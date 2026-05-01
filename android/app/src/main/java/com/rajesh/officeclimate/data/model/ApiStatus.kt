@@ -14,6 +14,7 @@ data class ApiStatus(
     val erv: ErvStatus = ErvStatus(),
     val hvac: HvacStatus = HvacStatus(),
     @SerialName("manual_override") val manualOverride: ManualOverride? = null,
+    val notifications: List<AppNotification> = emptyList(),
 )
 
 @Serializable
@@ -43,6 +44,18 @@ data class AirQuality(
 data class ErvStatus(
     val running: Boolean = false,
     val speed: String? = null,
+)
+
+@Serializable
+data class AppNotification(
+    val id: String,
+    val type: String,
+    val severity: String = "info",
+    val title: String,
+    val message: String,
+    @SerialName("created_at") val createdAt: String? = null,
+    val active: Boolean = false,
+    @SerialName("runbook_path") val runbookPath: String? = null,
 )
 
 @Serializable

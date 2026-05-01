@@ -95,14 +95,11 @@ class Orchestrator:
             report_interval=config.qingping.report_interval,
         )
 
-        # ERV client (Tuya local with cloud fallback)
+        # ERV client (Tuya local only)
         self.erv = ERVClient(
             device_id=config.erv.device_id,
             ip=config.erv.ip,
             local_key=config.erv.local_key,
-            cloud_api_key=config.tuya_cloud.access_id if config.tuya_cloud else None,
-            cloud_api_secret=config.tuya_cloud.access_secret if config.tuya_cloud else None,
-            cloud_region=config.tuya_cloud.region if config.tuya_cloud else "us",
         )
 
         # Kumo client (Mitsubishi HVAC)
@@ -196,12 +193,16 @@ class Orchestrator:
         self._manual_hvac_override_at: Optional[datetime] = None
         self._manual_override_timeout: int = 30 * 60  # 30 minutes default
 
+        # App notification state exposed through /status and WebSocket.
+        self._erv_control_notification: Optional[dict] = None
+
         # Background task for HVAC polling
         self._hvac_poll_task: Optional[asyncio.Task] = None
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Database for persistence and analysis
         self.db = Database()
+        self.erv.on_health_event(self._handle_erv_health_event)
 
     def _schedule_task(self, task_factory: Callable[[], Awaitable[None]], *, context: str) -> None:
         """Schedule async work on the orchestrator loop, even from callback threads."""
@@ -249,6 +250,43 @@ class Orchestrator:
 
         # Register event handler
         self.yolink.on_event(self._handle_yolink_event)
+
+    def _handle_erv_health_event(self, event: dict):
+        """Translate ERV control health transitions into in-app notifications."""
+        event_type = event.get("type")
+        if event_type == "erv_local_key_invalid":
+            created_at = event.get("started_at") or datetime.now().isoformat()
+            self._erv_control_notification = {
+                "id": f"erv_local_key_invalid:{created_at}",
+                "type": "erv_local_key_invalid",
+                "severity": "critical",
+                "title": "ERV local key rotated",
+                "message": "Local Tuya control is failing with Err 914. Run docs/tuya-local-key.md to recover it.",
+                "created_at": created_at,
+                "active": True,
+                "runbook_path": "docs/tuya-local-key.md",
+            }
+            logger.error("ERV local key invalid; notifying Android app")
+            self.db.log_device_event("erv", "local_key_invalid", "Pioneer ECOasis 150", details=event)
+        elif event_type == "erv_local_key_recovered":
+            created_at = event.get("recovered_at") or datetime.now().isoformat()
+            self._erv_control_notification = {
+                "id": f"erv_local_key_recovered:{created_at}",
+                "type": "erv_local_key_recovered",
+                "severity": "info",
+                "title": "ERV local control recovered",
+                "message": "Local Tuya control is working again.",
+                "created_at": created_at,
+                "active": False,
+                "runbook_path": "docs/tuya-local-key.md",
+            }
+            logger.info("ERV local key recovered; notifying Android app")
+            self.db.log_device_event("erv", "local_key_recovered", "Pioneer ECOasis 150", details=event)
+        else:
+            logger.debug(f"Ignoring ERV health event: {event}")
+            return
+
+        self._schedule_task(self._broadcast_status, context="erv_health_notification")
 
     async def _handle_yolink_event(self, device: YoLinkDevice, event_data: dict):
         """Handle YoLink sensor events."""
@@ -2036,6 +2074,9 @@ class Orchestrator:
             "hvac_setpoint_f": self._manual_hvac_setpoint_f,
             "hvac_expires_in": int(self._manual_override_timeout - (datetime.now() - self._manual_hvac_override_at).total_seconds()) if self._manual_hvac_override and self._manual_hvac_override_at else None,
         }
+
+        notification = getattr(self, "_erv_control_notification", None)
+        sm_status["notifications"] = [notification] if notification else []
 
         return sm_status
 

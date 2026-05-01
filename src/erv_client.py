@@ -1,7 +1,7 @@
 """
 Pioneer Airlink ERV Client (Tuya-based)
 
-Controls the ERV via local Tuya protocol with cloud fallback.
+Controls the ERV via local Tuya protocol and reports local key health.
 
 DPS Mapping (discovered via Smart Life):
 - DP 1: Power on/off (bool)
@@ -21,7 +21,7 @@ import time
 from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 import tinytuya
 
@@ -50,8 +50,8 @@ class ERVClient:
     """
     Client for controlling Pioneer Airlink ERV.
 
-    Tries local Tuya protocol first, falls back to cloud API.
-    Note: Cloud API only supports on/off, not fan speed control.
+    The orchestrator configures this for local-only control so fan speeds stay
+    available and local key rotation is surfaced immediately.
     """
 
     # Data Point mappings
@@ -62,6 +62,8 @@ class ERVClient:
 
     # Delay before read-back verification to allow the device to process commands
     VERIFY_DELAY_SECONDS = 1
+    LOCAL_KEY_ERROR_THRESHOLD = 5
+    LOCAL_KEY_ERROR_CODE = "914"
 
     # Fan speed presets: (supply, exhaust)
     SPEED_PRESETS = {
@@ -91,6 +93,11 @@ class ERVClient:
         self.last_error: Optional[str] = None
         self.last_error_at: Optional[datetime] = None
         self.last_ok_at: Optional[datetime] = None
+        self.last_local_ok_at: Optional[datetime] = None
+        self.consecutive_local_key_errors: int = 0
+        self.local_key_invalid: bool = False
+        self.local_key_invalid_since: Optional[datetime] = None
+        self._health_event_callback: Optional[Callable[[dict], None]] = None
 
         # Set up cloud fallback if credentials provided
         if cloud_api_key and cloud_api_secret:
@@ -100,8 +107,12 @@ class ERVClient:
                 apiSecret=cloud_api_secret
             )
 
+    def on_health_event(self, callback: Callable[[dict], None]):
+        """Register a callback for ERV control health transitions."""
+        self._health_event_callback = callback
+
     def connect(self):
-        """Connect to the ERV device. Tries local first, falls back to cloud."""
+        """Connect to the ERV device over local Tuya."""
         # Try local connection first
         logger.info(f"Connecting to ERV at {self.ip} (local)...")
         self._device = tinytuya.Device(
@@ -115,12 +126,12 @@ class ERVClient:
         if "Error" not in status:
             logger.info(f"Connected to ERV via local API. Status: {status}")
             self._use_cloud = False
-            self._record_success()
+            self._record_local_success()
             return status
 
         # Local failed, try cloud
         logger.warning(f"Local connection failed: {status}")
-        self._record_error(f"Local connection failed: {status}")
+        self._record_local_failure("Local connection failed", status)
         if self._cloud:
             logger.info("Falling back to cloud API...")
             cloud_status = self._cloud.getstatus(self.device_id)
@@ -149,7 +160,7 @@ class ERVClient:
 
         status = self._device.status()
         if "Error" in status:
-            self._record_error(f"Local status failed: {status}")
+            self._record_local_failure("Local status failed", status)
             raise RuntimeError(f"Failed to get status: {status}")
 
         dps = status.get("dps", {})
@@ -166,7 +177,7 @@ class ERVClient:
                     fan_speed = preset
                     break
 
-        self._record_success()
+        self._record_local_success()
         return ERVStatus(
             power=power,
             fan_speed=fan_speed,
@@ -251,20 +262,24 @@ class ERVClient:
             result = self._device.set_value(self.DP_POWER, False)
             if "Error" in str(result):
                 logger.error(f"Failed to set power off: {result}")
+                self._record_local_failure("Local set power off failed", result)
                 return False
         else:
             supply, exhaust = self.SPEED_PRESETS[speed]
             r1 = self._device.set_value(self.DP_POWER, True)
             if "Error" in str(r1):
                 logger.error(f"Failed to set power on: {r1}")
+                self._record_local_failure("Local set power on failed", r1)
                 return False
             r2 = self._device.set_value(self.DP_SUPPLY_SPEED, supply)
             if "Error" in str(r2):
                 logger.error(f"Failed to set supply speed: {r2}")
+                self._record_local_failure("Local set supply speed failed", r2)
                 return False
             r3 = self._device.set_value(self.DP_EXHAUST_SPEED, exhaust)
             if "Error" in str(r3):
                 logger.error(f"Failed to set exhaust speed: {r3}")
+                self._record_local_failure("Local set exhaust speed failed", r3)
                 return False
 
         # Read-back verification: confirm the device actually changed state
@@ -296,7 +311,7 @@ class ERVClient:
             return False
 
         logger.info(f"ERV speed set to {speed.value} (verified)")
-        self._record_success()
+        self._record_local_success()
         return True
 
     def _set_speed_cloud(self, speed: FanSpeed) -> bool:
@@ -339,9 +354,13 @@ class ERVClient:
         """Return ERV control health info."""
         return {
             "last_ok_at": self.last_ok_at.isoformat() if self.last_ok_at else None,
+            "last_local_ok_at": self.last_local_ok_at.isoformat() if self.last_local_ok_at else None,
             "last_error": self.last_error,
             "last_error_at": self.last_error_at.isoformat() if self.last_error_at else None,
             "using_cloud": self._use_cloud,
+            "local_key_invalid": self.local_key_invalid,
+            "local_key_invalid_since": self.local_key_invalid_since.isoformat() if self.local_key_invalid_since else None,
+            "consecutive_local_key_errors": self.consecutive_local_key_errors,
         }
 
     def _record_error(self, message: str):
@@ -351,6 +370,76 @@ class ERVClient:
     def _record_success(self):
         self.last_ok_at = datetime.now()
         self.last_error = None
+
+    def _record_local_failure(self, context: str, result):
+        self._record_error(f"{context}: {result}")
+
+        if not self._is_local_key_error(result):
+            self.consecutive_local_key_errors = 0
+            return
+
+        self.consecutive_local_key_errors += 1
+        if (
+            self.consecutive_local_key_errors >= self.LOCAL_KEY_ERROR_THRESHOLD and
+            not self.local_key_invalid
+        ):
+            self.local_key_invalid = True
+            self.local_key_invalid_since = datetime.now()
+            logger.error(
+                "ERV local Tuya key appears invalid after %s consecutive Err 914 failures",
+                self.consecutive_local_key_errors,
+            )
+            self._emit_health_event({
+                "type": "erv_local_key_invalid",
+                "started_at": self.local_key_invalid_since.isoformat(),
+                "consecutive_errors": self.consecutive_local_key_errors,
+                "last_local_ok_at": self.last_local_ok_at.isoformat() if self.last_local_ok_at else None,
+                "last_error": self.last_error,
+            })
+
+    def _record_local_success(self):
+        was_invalid = self.local_key_invalid
+        invalid_since = self.local_key_invalid_since
+
+        self._record_success()
+        self.last_local_ok_at = self.last_ok_at
+        self.consecutive_local_key_errors = 0
+        self.local_key_invalid = False
+        self.local_key_invalid_since = None
+
+        if was_invalid:
+            logger.info("ERV local Tuya control recovered after local key invalid state")
+            self._emit_health_event({
+                "type": "erv_local_key_recovered",
+                "recovered_at": self.last_local_ok_at.isoformat() if self.last_local_ok_at else None,
+                "invalid_since": invalid_since.isoformat() if invalid_since else None,
+            })
+
+    def _emit_health_event(self, event: dict):
+        if not self._health_event_callback:
+            return
+        try:
+            self._health_event_callback(event)
+        except Exception as e:
+            logger.error(f"ERV health event callback failed: {e}")
+
+    @classmethod
+    def _is_local_key_error(cls, value) -> bool:
+        if isinstance(value, dict):
+            err = value.get("Err") or value.get("err")
+            if str(err) == cls.LOCAL_KEY_ERROR_CODE:
+                return True
+            error = str(value.get("Error") or value.get("error") or "")
+            if "Check device key or version" in error:
+                return True
+            return any(cls._is_local_key_error(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(cls._is_local_key_error(item) for item in value)
+        text = str(value)
+        return (
+            cls.LOCAL_KEY_ERROR_CODE in text and
+            ("Err" in text or "Check device key or version" in text)
+        )
 
 
 # Standalone test
