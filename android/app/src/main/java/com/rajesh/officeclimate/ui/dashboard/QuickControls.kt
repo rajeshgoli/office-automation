@@ -38,6 +38,7 @@ private fun ervDisplayLabel(speed: String?): String = when (speed) {
 fun QuickControls(
     status: ApiStatus,
     controlLoading: String?,
+    bandUpdateInFlight: Boolean,
     onPresenceState: (String) -> Unit,
     onErvSpeed: (String) -> Unit,
     onHvacMode: (String, Int?) -> Unit,
@@ -48,7 +49,6 @@ fun QuickControls(
     val shape = RoundedCornerShape(12.dp)
     val override = status.manualOverride
     val isPresent = status.state.lowercase() == "present" || status.isPresent
-    val bandLoading = controlLoading?.startsWith("bands_") == true
     var bandsExpanded by rememberSaveable { mutableStateOf(false) }
 
     Column(
@@ -207,7 +207,7 @@ fun QuickControls(
                             label = "Heat",
                             rangeLabel = "${bands.heatOnTempF}-${bands.heatOffTempF}°F",
                             helper = "Resume at ${bands.heatOnTempF}° · pause at ${bands.heatOffTempF}°",
-                            loading = bandLoading,
+                            loading = bandUpdateInFlight,
                             onMoveDown = { onTemperatureBandAction("heat", "shift", -1) },
                             onMoveUp = { onTemperatureBandAction("heat", "shift", 1) },
                             onTighter = { onTemperatureBandAction("heat", "spread", -1) },
@@ -217,7 +217,7 @@ fun QuickControls(
                             label = "Cool",
                             rangeLabel = "${bands.coolOffTempF}-${bands.coolOnTempF}°F",
                             helper = "Stop at ${bands.coolOffTempF}° · start at ${bands.coolOnTempF}°",
-                            loading = bandLoading,
+                            loading = bandUpdateInFlight,
                             onMoveDown = { onTemperatureBandAction("cool", "shift", -1) },
                             onMoveUp = { onTemperatureBandAction("cool", "shift", 1) },
                             onTighter = { onTemperatureBandAction("cool", "spread", -1) },
@@ -226,7 +226,7 @@ fun QuickControls(
                         ControlButton(
                             label = "RESET",
                             isActive = false,
-                            isLoading = bandLoading,
+                            isLoading = bandUpdateInFlight,
                             enabled = status.hvac.temperatureBandDefaults != null,
                             onClick = onTemperatureBandReset,
                             modifier = Modifier.fillMaxWidth(),

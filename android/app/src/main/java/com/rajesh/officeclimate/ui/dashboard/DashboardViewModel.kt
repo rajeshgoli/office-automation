@@ -41,6 +41,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     private val _controlLoading = MutableStateFlow<String?>(null)
     val controlLoading: StateFlow<String?> = _controlLoading
 
+    private val _bandUpdateInFlight = MutableStateFlow(false)
+    val bandUpdateInFlight: StateFlow<Boolean> = _bandUpdateInFlight
+
     private val _controlError = MutableStateFlow<String?>(null)
     val controlError: StateFlow<String?> = _controlError
 
@@ -97,33 +100,33 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun updateTemperatureBand(band: String, action: String, delta: Int) {
-        if (_controlLoading.value?.startsWith("bands_") == true) return
+        if (_bandUpdateInFlight.value) return
 
         val currentBands = status.value?.hvac?.temperatureBands ?: return
         val nextBands = adjustTemperatureBands(currentBands, band, action, delta)
-        _controlLoading.value = "bands_$band"
+        _bandUpdateInFlight.value = true
         viewModelScope.launch {
             climateRepo.setTemperatureBands(nextBands)
                 .onFailure { e ->
                     Log.e("DashboardVM", "Temperature band update failed", e)
                     _controlError.value = "Band update failed: ${e.message}"
                 }
-            _controlLoading.value = null
+            _bandUpdateInFlight.value = false
         }
     }
 
     fun resetTemperatureBands() {
-        if (_controlLoading.value?.startsWith("bands_") == true) return
+        if (_bandUpdateInFlight.value) return
 
         val defaults = status.value?.hvac?.temperatureBandDefaults ?: return
-        _controlLoading.value = "bands_reset"
+        _bandUpdateInFlight.value = true
         viewModelScope.launch {
             climateRepo.setTemperatureBands(defaults)
                 .onFailure { e ->
                     Log.e("DashboardVM", "Temperature band reset failed", e)
                     _controlError.value = "Band reset failed: ${e.message}"
                 }
-            _controlLoading.value = null
+            _bandUpdateInFlight.value = false
         }
     }
 
