@@ -5,11 +5,9 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -49,6 +47,7 @@ fun QuickControls(
     val shape = RoundedCornerShape(12.dp)
     val override = status.manualOverride
     val isPresent = status.state.lowercase() == "present" || status.isPresent
+    var presenceExpanded by rememberSaveable { mutableStateOf(false) }
     var bandsExpanded by rememberSaveable { mutableStateOf(false) }
 
     Column(
@@ -61,28 +60,59 @@ fun QuickControls(
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         // Presence Controls
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Presence", style = MaterialTheme.typography.labelLarge, color = TextPrimary)
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    if (isPresent) "Here" else "Away",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (isPresent) Emerald else TextSecondary,
-                )
+        Column {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column {
+                    Text("Presence", style = MaterialTheme.typography.labelLarge, color = TextPrimary)
+                    Text(
+                        if (isPresent) "Detected Here" else "Detected Away",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (isPresent) Emerald else TextSecondary,
+                    )
+                }
+                TextButton(onClick = { presenceExpanded = !presenceExpanded }) {
+                    Text(if (presenceExpanded) "Hide" else "Edit")
+                }
             }
 
-            ControlButton(
-                label = if (isPresent) "I'M AWAY" else "I'M HERE",
-                isActive = false,
-                isLoading = controlLoading == "presence",
-                onClick = { onPresenceState(if (isPresent) "away" else "present") },
-                modifier = Modifier.weight(0.48f),
-            )
+            if (presenceExpanded) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Color.Black.copy(alpha = 0.12f))
+                        .border(1.dp, Border, RoundedCornerShape(10.dp))
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Detected presence", style = MaterialTheme.typography.labelLarge, color = TextPrimary)
+                        Text(
+                            if (isPresent) "Here" else "Away",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = if (isPresent) Emerald else TextSecondary,
+                        )
+                    }
+                    ControlButton(
+                        label = if (isPresent) "I'M AWAY" else "I'M HERE",
+                        isActive = false,
+                        isLoading = controlLoading == "presence",
+                        onClick = { onPresenceState(if (isPresent) "away" else "present") },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp),
+                    )
+                }
+            }
         }
 
         // ERV Controls
