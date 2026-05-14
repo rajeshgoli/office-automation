@@ -93,6 +93,7 @@ export interface ApiStatus {
     temp_c: number | null;
     humidity: number | null;
     pm25: number | null;
+    pm10: number | null;
     tvoc: number | null;
     noise_db: number | null;
     last_update: string | null;
@@ -104,6 +105,7 @@ export interface ApiStatus {
   hvac: {
     mode: string;
     setpoint_c: number;
+    temperature_bands?: HVACTemperatureBands;
   };
   manual_override?: {
     erv: boolean;
@@ -114,6 +116,13 @@ export interface ApiStatus {
     hvac_setpoint_f: number | null;
     hvac_expires_in: number | null;
   };
+}
+
+export interface HVACTemperatureBands {
+  heat_on_temp_f: number;
+  heat_off_temp_f: number;
+  cool_off_temp_f: number;
+  cool_on_temp_f: number;
 }
 
 export interface ApiEvent {
@@ -220,6 +229,7 @@ export async function setERVSpeed(speed: ERVSpeed): Promise<{ ok: boolean; error
 }
 
 export type HVACMode = 'off' | 'heat' | 'cool';
+export type PresenceState = 'present' | 'away';
 
 /**
  * Set HVAC mode manually
@@ -236,6 +246,58 @@ export async function setHVACMode(mode: HVACMode, setpoint_f: number = 70): Prom
     method: 'POST',
     headers,
     body: JSON.stringify({ mode, setpoint_f }),
+  });
+
+  if (response.status === 401) {
+    clearAuthToken();
+    throw new Error('Authentication required');
+  }
+
+  return response.json();
+}
+
+/**
+ * Manually correct detected presence.
+ */
+export async function setPresence(state: PresenceState): Promise<{ ok: boolean; error?: string; state?: string; is_present?: boolean }> {
+  const token = getAuthToken();
+  const headers: HeadersInit = { 'Content-Type': 'application/json' };
+
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  const response = await fetch(`${API_BASE}/presence`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ state }),
+  });
+
+  if (response.status === 401) {
+    clearAuthToken();
+    throw new Error('Authentication required');
+  }
+
+  return response.json();
+}
+
+/**
+ * Update HVAC temperature hysteresis bands.
+ */
+export async function setHVACTemperatureBands(
+  temperature_bands: HVACTemperatureBands
+): Promise<{ ok: boolean; error?: string; temperature_bands?: HVACTemperatureBands }> {
+  const token = getAuthToken();
+  const headers: HeadersInit = { 'Content-Type': 'application/json' };
+
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  const response = await fetch(`${API_BASE}/hvac/temperature-bands`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ temperature_bands }),
   });
 
   if (response.status === 401) {

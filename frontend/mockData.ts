@@ -1,5 +1,5 @@
 
-import { OfficeState, DeviceStatus, OccupancyState, ActivityEvent, ClimateDataPoint } from './types';
+import { OfficeState, DeviceStatus, OccupancyState, ActivityEvent, ClimateDataPoint, ERVSpeed } from './types';
 
 export const generateMockHistory = (): ClimateDataPoint[] => {
   const history: ClimateDataPoint[] = [];
@@ -40,7 +40,11 @@ export const INITIAL_STATE: OfficeState = {
   window: DeviceStatus.CLOSED,
   hvacMode: DeviceStatus.COOL,
   hvacTarget: 70,
-  ventMode: DeviceStatus.OFF,
+  tvoc: 0,
+  noise: 0,
+  pm25: 0,
+  pm10: 0,
+  ventMode: ERVSpeed.OFF,
   occupancy: OccupancyState.PRESENT,
   lastUpdated: new Date(),
   isSystemError: false

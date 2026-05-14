@@ -381,6 +381,39 @@ class StateMachine:
         logger.debug(f"Window: {'open' if is_open else 'closed'}")
         await self.evaluate()
 
+    async def set_manual_presence(self, present: bool):
+        """Manually correct presence from the app.
+
+        Setting PRESENT behaves like a fresh motion event. Setting AWAY resets stale
+        activity by treating the correction time as the latest door boundary, so old
+        Mac or motion timestamps do not immediately restore PRESENT.
+        """
+        now = time.time()
+        old_state = self.state
+
+        if present:
+            self.sensors.motion_detected = True
+            self.sensors.motion_last_seen = now
+            self._last_activity_time = now
+            if self._verifying_departure:
+                self._cancel_departure_verification("manual presence")
+            self.sensors.last_updated = now
+            await self.evaluate()
+            return
+
+        self._cancel_departure_verification("manual away")
+        self._cancel_door_open_away_timer("manual away")
+        self._verifying_departure = False
+        self.sensors.motion_detected = False
+        self.sensors.motion_last_seen = 0
+        self.sensors.door_last_changed = now
+        self.sensors.last_updated = now
+        self.state = OccupancyState.AWAY
+        self._last_door_state = self.sensors.door_open
+
+        if old_state != self.state:
+            await self._notify_state_change(old_state, self.state)
+
     def update_co2(self, ppm: int):
         """Update CO2 reading (sync - no state transitions needed)."""
         self.sensors.co2_ppm = ppm

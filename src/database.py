@@ -153,6 +153,13 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_prs_created ON github_prs(created_at);
                 CREATE INDEX IF NOT EXISTS idx_prs_merged ON github_prs(merged_at);
 
+                -- Runtime app settings that override static config.yaml values.
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+
             """)
             logger.info(f"Database initialized at {self.db_path}")
 
@@ -170,6 +177,33 @@ class Database:
     def _parse_timestamp(value: str) -> datetime:
         """Parse timestamps read back from SQLite."""
         return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+
+    def get_setting(self, key: str) -> Optional[Any]:
+        """Read a JSON setting value by key."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT value FROM app_settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+
+        if not row:
+            return None
+
+        return json.loads(row["value"])
+
+    def set_setting(self, key: str, value: Any) -> None:
+        """Persist a JSON setting value by key."""
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, json.dumps(value), self._format_timestamp(self._now())),
+            )
 
     @staticmethod
     def _accumulate_duration_by_date(
