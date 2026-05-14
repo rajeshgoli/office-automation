@@ -88,6 +88,7 @@ class StateMachine:
         self._departure_verification_task: Optional[asyncio.Task] = None
         self._verifying_departure: bool = False
         self._door_open_away_task: Optional[asyncio.Task] = None  # Timer for door open mode AWAY transition
+        self._suppress_next_door_close_departure: bool = False
         self._last_activity_time: float = time.time()  # Track last Mac or motion activity for door open mode
 
     @property
@@ -365,7 +366,11 @@ class StateMachine:
         logger.debug(f"Door: {'open' if is_open else 'closed'}")
 
         # Door closing exits door open mode - return to normal door-event logic
-        if was_open is True and is_open is False:
+        if is_open is False and self._suppress_next_door_close_departure:
+            logger.info("Door closed after manual presence correction - skipping departure verification")
+            self._cancel_door_open_away_timer("door closed")
+            self._suppress_next_door_close_departure = False
+        elif was_open is True and is_open is False:
             logger.info("Door closed - exiting door open mode, starting departure verification")
             # Cancel door open mode timer if active
             self._cancel_door_open_away_timer("door closed")
@@ -381,6 +386,48 @@ class StateMachine:
         logger.debug(f"Window: {'open' if is_open else 'closed'}")
         await self.evaluate()
 
+    async def set_manual_presence(self, present: bool):
+        """Manually correct presence from the app.
+
+        Setting PRESENT behaves like a fresh inside-room activity signal and forces
+        the occupancy state immediately. Setting AWAY resets stale activity by
+        treating the correction time as the latest door boundary, so old Mac or
+        motion timestamps do not immediately restore PRESENT.
+        """
+        now = time.time()
+        old_state = self.state
+
+        if present:
+            self.sensors.motion_detected = True
+            self.sensors.motion_last_seen = now
+            self._last_activity_time = now
+            if self._verifying_departure:
+                self._cancel_departure_verification("manual presence")
+            if self.sensors.door_open:
+                self._suppress_next_door_close_departure = True
+            self.sensors.last_updated = now
+            self.state = OccupancyState.PRESENT
+            self._last_door_state = self.sensors.door_open
+            if self.sensors.door_open:
+                self._start_door_open_away_timer()
+            if old_state != self.state:
+                await self._notify_state_change(old_state, self.state)
+            return
+
+        self._cancel_departure_verification("manual away")
+        self._cancel_door_open_away_timer("manual away")
+        self._verifying_departure = False
+        self._suppress_next_door_close_departure = False
+        self.sensors.motion_detected = False
+        self.sensors.motion_last_seen = 0
+        self.sensors.door_last_changed = now
+        self.sensors.last_updated = now
+        self.state = OccupancyState.AWAY
+        self._last_door_state = self.sensors.door_open
+
+        if old_state != self.state:
+            await self._notify_state_change(old_state, self.state)
+
     def update_co2(self, ppm: int):
         """Update CO2 reading (sync - no state transitions needed)."""
         self.sensors.co2_ppm = ppm
@@ -392,7 +439,8 @@ class StateMachine:
         """Get current status summary."""
         return {
             "state": self.state.value,
-            "is_present": self.is_present,
+            "is_present": self.state == OccupancyState.PRESENT,
+            "presence_signal_active": self.is_present,
             "safety_interlock": self.safety_interlock_active,
             "erv_should_run": self.erv_should_run,
             "verifying_departure": self._verifying_departure,

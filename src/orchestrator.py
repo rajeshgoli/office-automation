@@ -34,6 +34,11 @@ from .qingping_client import QingpingMQTTClient, QingpingReading
 from .erv_client import ERVClient, FanSpeed
 from .kumo_client import KumoClient, OperationMode as HVACMode
 from .hvac_hysteresis import get_hvac_band_action
+from .hvac_temperature_bands import (
+    apply_temperature_bands,
+    get_default_temperature_bands,
+    validate_temperature_bands,
+)
 from .database import Database
 from .oauth_service import OAuthService, UserSession
 
@@ -44,6 +49,7 @@ ARTIFACT_HASH_PATTERN = re.compile(r"^[0-9a-f]{8}$")
 ARTIFACT_MAX_SIZE_BYTES = 100 * 1024 * 1024
 DEFAULT_ARTIFACTS_ROOT = Path(__file__).parent.parent / "data" / "apps"
 DEFAULT_LEGACY_APK_PATH = Path(__file__).parent.parent / "data" / "app-debug.apk"
+HVAC_TEMPERATURE_BANDS_SETTING = "hvac_temperature_bands"
 
 PROJECT_LEVERAGE_METRICS = {
     "session-manager": [
@@ -202,7 +208,42 @@ class Orchestrator:
 
         # Database for persistence and analysis
         self.db = Database()
+        self._default_hvac_temperature_bands = get_default_temperature_bands(config.thresholds)
+        self._load_hvac_temperature_bands()
         self.erv.on_health_event(self._handle_erv_health_event)
+
+    def _get_hvac_temperature_bands(self) -> dict[str, int]:
+        """Return the active HVAC temperature hysteresis bands."""
+        return dict(get_default_temperature_bands(self.config.thresholds))
+
+    def _get_default_hvac_temperature_bands(self) -> dict[str, int]:
+        """Return the HVAC temperature bands loaded from config.yaml."""
+        defaults = getattr(
+            self,
+            "_default_hvac_temperature_bands",
+            get_default_temperature_bands(self.config.thresholds),
+        )
+        return dict(defaults)
+
+    def _load_hvac_temperature_bands(self) -> None:
+        """Load persisted HVAC temperature bands over config.yaml defaults."""
+        stored = self.db.get_setting(HVAC_TEMPERATURE_BANDS_SETTING)
+        if stored is None:
+            return
+
+        try:
+            bands = validate_temperature_bands(stored)
+        except ValueError as e:
+            logger.warning(f"Ignoring invalid stored HVAC temperature bands: {e}")
+            return
+
+        apply_temperature_bands(self.config.thresholds, bands)
+        logger.info(f"Loaded HVAC temperature bands from database: {bands}")
+
+    def _save_hvac_temperature_bands(self, bands: dict[str, int]) -> None:
+        """Persist and activate HVAC temperature bands."""
+        apply_temperature_bands(self.config.thresholds, bands)
+        self.db.set_setting(HVAC_TEMPERATURE_BANDS_SETTING, bands)
 
     def _schedule_task(self, task_factory: Callable[[], Awaitable[None]], *, context: str) -> None:
         """Schedule async work on the orchestrator loop, even from callback threads."""
@@ -1364,6 +1405,84 @@ class Orchestrator:
         """Handle GET /status for debugging."""
         return web.json_response(self._get_status_dict())
 
+    async def _handle_presence_post(self, request: web.Request) -> web.Response:
+        """Handle POST /presence for manual presence correction.
+
+        Body: {"state": "present|away"}
+        """
+        try:
+            data = await request.json()
+            requested_state = str(data.get("state", "")).lower()
+
+            if requested_state not in ("present", "away"):
+                return web.json_response(
+                    {"ok": False, "error": "state must be present or away"},
+                    status=400,
+                )
+
+            present = requested_state == "present"
+            logger.info(f"MANUAL: Presence correction to {requested_state.upper()}")
+            self.db.log_device_event(
+                "presence",
+                f"manual_{requested_state}",
+                "Dashboard",
+            )
+            await self.state_machine.set_manual_presence(present)
+
+            # Re-evaluate in case the state did not change but the signal did.
+            self._evaluate_erv_state()
+            await self._evaluate_hvac_state()
+            await self._broadcast_status()
+
+            status = self.state_machine.get_status()
+            return web.json_response(
+                {
+                    "ok": True,
+                    "state": status["state"],
+                    "is_present": status["is_present"],
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error handling presence POST: {e}")
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+    async def _handle_hvac_temperature_bands_get(self, request: web.Request) -> web.Response:
+        """Handle GET /hvac/temperature-bands."""
+        return web.json_response({
+            "ok": True,
+            "temperature_bands": self._get_hvac_temperature_bands(),
+            "temperature_band_defaults": self._get_default_hvac_temperature_bands(),
+        })
+
+    async def _handle_hvac_temperature_bands_post(self, request: web.Request) -> web.Response:
+        """Handle POST /hvac/temperature-bands."""
+        try:
+            data = await request.json()
+            raw_bands = data.get("temperature_bands", data)
+            if not isinstance(raw_bands, dict):
+                return web.json_response(
+                    {"ok": False, "error": "temperature_bands must be an object"},
+                    status=400,
+                )
+
+            bands = validate_temperature_bands(raw_bands)
+            self._save_hvac_temperature_bands(bands)
+            logger.info(f"Updated HVAC temperature bands: {bands}")
+
+            await self._evaluate_hvac_state()
+            await self._broadcast_status()
+
+            return web.json_response({
+                "ok": True,
+                "temperature_bands": self._get_hvac_temperature_bands(),
+                "temperature_band_defaults": self._get_default_hvac_temperature_bands(),
+            })
+        except ValueError as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+        except Exception as e:
+            logger.error(f"Error handling HVAC temperature bands POST: {e}")
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
     async def _handle_erv_post(self, request: web.Request) -> web.Response:
         """Handle POST /erv for manual ERV control.
 
@@ -2062,6 +2181,8 @@ class Orchestrator:
             "mode": self._hvac_mode,
             "setpoint_c": self._hvac_setpoint_c,
             "suspended": self._hvac_suspended,
+            "temperature_bands": self._get_hvac_temperature_bands(),
+            "temperature_band_defaults": self._get_default_hvac_temperature_bands(),
         }
 
         # Add manual override status
@@ -2575,6 +2696,7 @@ class Orchestrator:
 
         # API routes
         self._app.router.add_post("/occupancy", self._handle_occupancy_post)
+        self._app.router.add_post("/presence", self._handle_presence_post)
         self._app.router.add_get("/status", self._handle_status_get)
         self._app.router.add_get("/history", self._handle_history_get)
         self._app.router.add_get("/apk", self._handle_apk_get)
@@ -2594,6 +2716,8 @@ class Orchestrator:
         self._app.router.add_get("/ws", self._handle_websocket)
         self._app.router.add_post("/erv", self._handle_erv_post)
         self._app.router.add_post("/hvac", self._handle_hvac_post)
+        self._app.router.add_get("/hvac/temperature-bands", self._handle_hvac_temperature_bands_get)
+        self._app.router.add_post("/hvac/temperature-bands", self._handle_hvac_temperature_bands_post)
         self._app.router.add_post("/qingping/interval", self._handle_qingping_interval_post)
         self._app.router.add_get("/localtunnel/password", self._handle_localtunnel_password)
 

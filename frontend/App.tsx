@@ -12,7 +12,7 @@ import {
 import { STATUS_CONFIG } from './constants';
 import VitalTile from './components/VitalTile';
 import CO2Chart from './components/CO2Chart';
-import { fetchStatus, ApiStatus, toFahrenheit, StatusWebSocket, setERVSpeed, setHVACMode, ERVSpeed as ApiERVSpeed, HVACMode, isAuthenticated, logout, getUserEmail, checkTrustedNetwork } from './api';
+import { fetchStatus, ApiStatus, toFahrenheit, StatusWebSocket, setERVSpeed, setHVACMode, setPresence, setHVACTemperatureBands, ERVSpeed as ApiERVSpeed, HVACMode, HVACTemperatureBands, isAuthenticated, logout, getUserEmail, checkTrustedNetwork } from './api';
 import Login from './Login';
 import HistoricalCharts from './HistoricalCharts';
 import OfficeReplay from './OfficeReplay';
@@ -37,6 +37,20 @@ const DEFAULT_STATE: OfficeState = {
   isSystemError: true
 };
 
+const FALLBACK_TEMPERATURE_BANDS: HVACTemperatureBands = {
+  heat_on_temp_f: 71,
+  heat_off_temp_f: 75,
+  cool_off_temp_f: 78,
+  cool_on_temp_f: 81,
+};
+
+const TEMPERATURE_BAND_LIMITS: Record<keyof HVACTemperatureBands, { min: number; max: number }> = {
+  heat_on_temp_f: { min: 45, max: 85 },
+  heat_off_temp_f: { min: 46, max: 90 },
+  cool_off_temp_f: { min: 55, max: 95 },
+  cool_on_temp_f: { min: 56, max: 100 },
+};
+
 // Map API ERV speed to display speed
 function mapERVSpeed(apiSpeed: string | undefined): ERVSpeed {
   switch (apiSpeed) {
@@ -48,8 +62,16 @@ function mapERVSpeed(apiSpeed: string | undefined): ERVSpeed {
   }
 }
 
+function statusToOccupancy(api: ApiStatus): OccupancyState {
+  if (api.state === 'present') return OccupancyState.PRESENT;
+  if (api.state === 'away') return OccupancyState.AWAY;
+  return api.is_present ? OccupancyState.PRESENT : OccupancyState.AWAY;
+}
+
 // Convert API response to OfficeState
 function apiToState(api: ApiStatus): OfficeState {
+  const occupancy = statusToOccupancy(api);
+
   return {
     co2: api.air_quality.co2_ppm ?? api.sensors.co2_ppm ?? 0,
     temperature: api.air_quality.temp_c ? toFahrenheit(api.air_quality.temp_c) : 0,
@@ -66,7 +88,7 @@ function apiToState(api: ApiStatus): OfficeState {
               api.hvac?.mode === 'off' ? DeviceStatus.OFF : DeviceStatus.OFF,
     hvacTarget: api.hvac?.setpoint_c ? toFahrenheit(api.hvac.setpoint_c) : 70,
     ventMode: mapERVSpeed(api.erv.speed),
-    occupancy: api.is_present ? OccupancyState.PRESENT : OccupancyState.AWAY,
+    occupancy,
     lastUpdated: api.air_quality.last_update ? new Date(api.air_quality.last_update) : new Date(),
     isSystemError: false
   };
@@ -80,6 +102,8 @@ const App: React.FC = () => {
   const [isAmbient, setIsAmbient] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [apiConnected, setApiConnected] = useState(false);
+  const [temperatureBands, setTemperatureBands] = useState<HVACTemperatureBands>(FALLBACK_TEMPERATURE_BANDS);
+  const [temperatureBandDefaults, setTemperatureBandDefaults] = useState<HVACTemperatureBands | null>(null);
   const [manualOverride, setManualOverride] = useState<{
     erv: boolean;
     erv_speed: string | null;
@@ -171,6 +195,12 @@ const App: React.FC = () => {
           if (status.manual_override) {
             setManualOverride(status.manual_override);
           }
+          if (status.hvac?.temperature_bands) {
+            setTemperatureBands(status.hvac.temperature_bands);
+          }
+          if (status.hvac?.temperature_band_defaults) {
+            setTemperatureBandDefaults(status.hvac.temperature_band_defaults);
+          }
           setState(prev => {
             // Only log events after initial load (avoid spurious "Arrived" on page load)
             if (!initialLoadRef.current) {
@@ -197,7 +227,7 @@ const App: React.FC = () => {
           // Add to history every update
           addHistoryPoint(
             status.air_quality.co2_ppm ?? status.sensors.co2_ppm ?? 0,
-            status.is_present ? OccupancyState.PRESENT : OccupancyState.AWAY,
+            statusToOccupancy(status),
             status.erv.running
           );
         }
@@ -242,6 +272,12 @@ const App: React.FC = () => {
       if (status.manual_override) {
         setManualOverride(status.manual_override);
       }
+      if (status.hvac?.temperature_bands) {
+        setTemperatureBands(status.hvac.temperature_bands);
+      }
+      if (status.hvac?.temperature_band_defaults) {
+        setTemperatureBandDefaults(status.hvac.temperature_band_defaults);
+      }
       setState(prev => {
         // Only log real changes (compare against last known occupancy, not stale state)
         if (lastOccupancyRef.current !== null && lastOccupancyRef.current !== newState.occupancy) {
@@ -257,7 +293,7 @@ const App: React.FC = () => {
 
       addHistoryPoint(
         status.air_quality.co2_ppm ?? status.sensors.co2_ppm ?? 0,
-        status.is_present ? OccupancyState.PRESENT : OccupancyState.AWAY,
+        statusToOccupancy(status),
         status.erv.running
       );
     });
@@ -330,6 +366,101 @@ const App: React.FC = () => {
       setControlLoading(null);
     }
   }, [addEvent]);
+
+  const handlePresenceToggle = useCallback(async () => {
+    const requestedState = state.occupancy === OccupancyState.PRESENT ? 'away' : 'present';
+    setControlLoading('presence');
+    try {
+      const result = await setPresence(requestedState);
+      if (!result.ok) {
+        console.error('Presence control failed:', result.error);
+      } else {
+        addEvent('state', `Manual: ${requestedState === 'present' ? "I'm here" : "I'm away"}`, state.co2);
+      }
+    } catch (e) {
+      console.error('Presence control error:', e);
+    } finally {
+      setControlLoading(null);
+    }
+  }, [addEvent, state.co2, state.occupancy]);
+
+  const clampTemperatureBand = useCallback((key: keyof HVACTemperatureBands, value: number) => {
+    const limit = TEMPERATURE_BAND_LIMITS[key];
+    return Math.max(limit.min, Math.min(limit.max, value));
+  }, []);
+
+  const updateTemperatureBand = useCallback((band: 'heat' | 'cool', action: 'shift' | 'spread', delta: number) => {
+    const previousBands = temperatureBands;
+    const nextBands: HVACTemperatureBands = { ...temperatureBands };
+    const lowerKey: keyof HVACTemperatureBands = band === 'heat' ? 'heat_on_temp_f' : 'cool_off_temp_f';
+    const upperKey: keyof HVACTemperatureBands = band === 'heat' ? 'heat_off_temp_f' : 'cool_on_temp_f';
+
+    if (action === 'shift') {
+      nextBands[lowerKey] += delta;
+      nextBands[upperKey] += delta;
+    } else {
+      nextBands[lowerKey] -= delta;
+      nextBands[upperKey] += delta;
+    }
+
+    nextBands[lowerKey] = clampTemperatureBand(lowerKey, nextBands[lowerKey]);
+    nextBands[upperKey] = clampTemperatureBand(upperKey, nextBands[upperKey]);
+
+    if (nextBands[upperKey] <= nextBands[lowerKey]) {
+      nextBands[upperKey] = clampTemperatureBand(upperKey, nextBands[lowerKey] + 1);
+      nextBands[lowerKey] = clampTemperatureBand(lowerKey, nextBands[upperKey] - 1);
+    }
+
+    setTemperatureBands(nextBands);
+    setControlLoading(`bands-${band}`);
+
+    setHVACTemperatureBands(nextBands).then((result) => {
+      if (!result.ok || !result.temperature_bands) {
+        console.error('HVAC temperature band update failed:', result.error);
+        setTemperatureBands(previousBands);
+      } else {
+        setTemperatureBands(result.temperature_bands);
+        if (result.temperature_band_defaults) {
+          setTemperatureBandDefaults(result.temperature_band_defaults);
+        }
+        addEvent(
+          'hvac',
+          `Bands: heat ${result.temperature_bands.heat_on_temp_f}-${result.temperature_bands.heat_off_temp_f}°F, cool ${result.temperature_bands.cool_off_temp_f}-${result.temperature_bands.cool_on_temp_f}°F`
+        );
+      }
+    }).catch((e) => {
+      console.error('HVAC temperature band update error:', e);
+      setTemperatureBands(previousBands);
+    }).finally(() => {
+      setControlLoading(null);
+    });
+  }, [addEvent, clampTemperatureBand, temperatureBands]);
+
+  const resetTemperatureBands = useCallback(() => {
+    if (!temperatureBandDefaults) return;
+
+    const previousBands = temperatureBands;
+    setTemperatureBands(temperatureBandDefaults);
+    setControlLoading('bands-reset');
+
+    setHVACTemperatureBands(temperatureBandDefaults).then((result) => {
+      if (!result.ok || !result.temperature_bands) {
+        console.error('HVAC temperature band reset failed:', result.error);
+        setTemperatureBands(previousBands);
+      } else {
+        setTemperatureBands(result.temperature_bands);
+        if (result.temperature_band_defaults) {
+          setTemperatureBandDefaults(result.temperature_band_defaults);
+        }
+        addEvent('hvac', 'Bands reset to defaults');
+      }
+    }).catch((e) => {
+      console.error('HVAC temperature band reset error:', e);
+      setTemperatureBands(previousBands);
+    }).finally(() => {
+      setControlLoading(null);
+    });
+  }, [addEvent, temperatureBandDefaults, temperatureBands]);
 
   const currentStatus = getPrimaryStatus();
 
@@ -518,21 +649,53 @@ const App: React.FC = () => {
       <section className="bg-zinc-900/30 border border-zinc-800/50 rounded-3xl p-6">
         <div className="flex justify-between items-center mb-4">
           <h2 className="text-xs font-bold uppercase tracking-widest text-zinc-500">Quick Controls</h2>
-          {(manualOverride?.erv || manualOverride?.hvac) && (
-            <span className="text-[10px] font-bold uppercase text-amber-500 bg-amber-500/10 px-2 py-1 rounded animate-pulse">
-              Manual Override Active
-            </span>
-          )}
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="space-y-4">
+          {/* Presence Correction */}
+          <div className="flex flex-col sm:flex-row sm:items-center gap-3 rounded-2xl border border-emerald-500/20 bg-emerald-500/5 p-4">
+            <div className="flex items-center gap-2 shrink-0">
+              <span className="text-sm font-bold text-zinc-400">Detected presence:</span>
+              <span className={`text-[10px] font-bold uppercase px-2 py-1 rounded-full ${
+                state.occupancy === OccupancyState.PRESENT
+                  ? 'text-emerald-300 bg-emerald-500/10'
+                  : 'text-blue-300 bg-blue-500/10'
+              }`}>
+                {state.occupancy === OccupancyState.PRESENT ? 'Here' : 'Away'}
+              </span>
+            </div>
+            <button
+              onClick={handlePresenceToggle}
+              disabled={controlLoading !== null}
+              className={`flex-1 min-h-[38px] px-4 py-2 text-xs font-black uppercase rounded-lg transition-all
+                ${state.occupancy === OccupancyState.PRESENT
+                  ? 'bg-blue-500/15 text-blue-200 hover:bg-blue-500/25'
+                  : 'bg-emerald-500 text-black hover:bg-emerald-400'
+                }
+                ${controlLoading === 'presence' ? 'opacity-50 cursor-wait' : ''}
+                disabled:opacity-50 disabled:cursor-not-allowed
+              `}
+            >
+              {controlLoading === 'presence'
+                ? '...'
+                : state.occupancy === OccupancyState.PRESENT ? "I'm away" : "I'm here"}
+            </button>
+          </div>
+
           {/* ERV Controls */}
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-bold text-zinc-400 uppercase tracking-wide">🌀 Ventilation</span>
-              {manualOverride?.erv && manualOverride.erv_expires_in && (
-                <span className="text-[10px] text-zinc-500">
-                  Expires in {Math.round(manualOverride.erv_expires_in / 60)}m
+          <div className="rounded-2xl border border-zinc-800/70 bg-black/20 p-4 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <div className="text-sm font-bold text-zinc-400 uppercase tracking-wide">🌀 Ventilation</div>
+                {manualOverride?.erv && manualOverride.erv_expires_in && (
+                  <div className="text-xs font-semibold text-zinc-500 mt-1">
+                    Manual ERV control expires in {Math.round(manualOverride.erv_expires_in / 60)}m
+                  </div>
+                )}
+              </div>
+              {manualOverride?.erv && (
+                <span className="self-start sm:self-auto text-[10px] font-bold uppercase text-amber-500 bg-amber-500/10 px-2 py-1 rounded animate-pulse">
+                  Manual Override Active
                 </span>
               )}
             </div>
@@ -558,12 +721,19 @@ const App: React.FC = () => {
           </div>
 
           {/* HVAC Controls */}
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-bold text-zinc-400 uppercase tracking-wide">🔥 HVAC</span>
-              {manualOverride?.hvac && manualOverride.hvac_expires_in && (
-                <span className="text-[10px] text-zinc-500">
-                  Expires in {Math.round(manualOverride.hvac_expires_in / 60)}m
+          <div className="rounded-2xl border border-zinc-800/70 bg-black/20 p-4 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <div className="text-sm font-bold text-zinc-400 uppercase tracking-wide">🔥 HVAC</div>
+                {manualOverride?.hvac && manualOverride.hvac_expires_in && (
+                  <div className="text-xs font-semibold text-zinc-500 mt-1">
+                    Manual HVAC control expires in {Math.round(manualOverride.hvac_expires_in / 60)}m
+                  </div>
+                )}
+              </div>
+              {manualOverride?.hvac && (
+                <span className="self-start sm:self-auto text-[10px] font-bold uppercase text-amber-500 bg-amber-500/10 px-2 py-1 rounded animate-pulse">
+                  Manual Override Active
                 </span>
               )}
             </div>
@@ -612,6 +782,92 @@ const App: React.FC = () => {
               </button>
             </div>
           </div>
+
+          {/* HVAC Temperature Bands */}
+          <details className="border-t border-zinc-800/70 pt-4">
+            <summary className="cursor-pointer rounded-2xl border border-zinc-800/70 bg-black/20 p-4 text-sm font-black uppercase tracking-wider text-zinc-200 flex items-center justify-between gap-3">
+              <span>Hysteresis Bands</span>
+              <span className="text-xs font-bold normal-case tracking-normal text-zinc-500">
+                Heat {temperatureBands.heat_on_temp_f}-{temperatureBands.heat_off_temp_f}°F · Cool {temperatureBands.cool_off_temp_f}-{temperatureBands.cool_on_temp_f}°F
+              </span>
+            </summary>
+
+            <div className="pt-4 space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-black uppercase tracking-wider text-zinc-300">Temperature Bands</h3>
+                  <div className="text-xs font-semibold text-zinc-500 mt-1">
+                    Current Qingping temp {state.temperature || '---'}°F
+                  </div>
+                </div>
+                <button
+                  onClick={resetTemperatureBands}
+                  disabled={controlLoading !== null || temperatureBandDefaults === null}
+                  className="px-3 py-2 text-xs font-bold uppercase rounded-lg bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Reset
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3">
+                <div className="grid grid-cols-1 lg:grid-cols-[minmax(180px,1fr)_minmax(0,1.5fr)] gap-4 rounded-2xl border border-rose-400/20 bg-zinc-900/30 p-4">
+                  <div>
+                    <div className="text-sm font-black uppercase tracking-wider text-zinc-200">Heat</div>
+                    <div className="text-3xl font-black tracking-tighter text-zinc-100 mt-1">
+                      {temperatureBands.heat_on_temp_f}-{temperatureBands.heat_off_temp_f}°F
+                    </div>
+                    <div className="text-xs font-semibold text-zinc-500 mt-1">
+                      Resume at or below {temperatureBands.heat_on_temp_f}° · pause at or above {temperatureBands.heat_off_temp_f}°
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="rounded-xl border border-zinc-800/70 bg-black/20 p-3">
+                      <div className="text-[10px] font-black uppercase tracking-wider text-zinc-500 mb-2">Move Band</div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button onClick={() => updateTemperatureBand('heat', 'shift', -1)} disabled={controlLoading !== null} className="px-3 py-2 text-xs font-black uppercase rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-50">-1°</button>
+                        <button onClick={() => updateTemperatureBand('heat', 'shift', 1)} disabled={controlLoading !== null} className="px-3 py-2 text-xs font-black uppercase rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-50">+1°</button>
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-zinc-800/70 bg-black/20 p-3">
+                      <div className="text-[10px] font-black uppercase tracking-wider text-zinc-500 mb-2">Band Width</div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button onClick={() => updateTemperatureBand('heat', 'spread', -1)} disabled={controlLoading !== null} className="px-3 py-2 text-xs font-black uppercase rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-50">Tighter</button>
+                        <button onClick={() => updateTemperatureBand('heat', 'spread', 1)} disabled={controlLoading !== null} className="px-3 py-2 text-xs font-black uppercase rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-50">Wider</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-[minmax(180px,1fr)_minmax(0,1.5fr)] gap-4 rounded-2xl border border-sky-400/20 bg-zinc-900/30 p-4">
+                  <div>
+                    <div className="text-sm font-black uppercase tracking-wider text-zinc-200">Cool</div>
+                    <div className="text-3xl font-black tracking-tighter text-zinc-100 mt-1">
+                      {temperatureBands.cool_off_temp_f}-{temperatureBands.cool_on_temp_f}°F
+                    </div>
+                    <div className="text-xs font-semibold text-zinc-500 mt-1">
+                      Stop at or below {temperatureBands.cool_off_temp_f}° · start above {temperatureBands.cool_on_temp_f}°
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="rounded-xl border border-zinc-800/70 bg-black/20 p-3">
+                      <div className="text-[10px] font-black uppercase tracking-wider text-zinc-500 mb-2">Move Band</div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button onClick={() => updateTemperatureBand('cool', 'shift', -1)} disabled={controlLoading !== null} className="px-3 py-2 text-xs font-black uppercase rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-50">-1°</button>
+                        <button onClick={() => updateTemperatureBand('cool', 'shift', 1)} disabled={controlLoading !== null} className="px-3 py-2 text-xs font-black uppercase rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-50">+1°</button>
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-zinc-800/70 bg-black/20 p-3">
+                      <div className="text-[10px] font-black uppercase tracking-wider text-zinc-500 mb-2">Band Width</div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button onClick={() => updateTemperatureBand('cool', 'spread', -1)} disabled={controlLoading !== null} className="px-3 py-2 text-xs font-black uppercase rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-50">Tighter</button>
+                        <button onClick={() => updateTemperatureBand('cool', 'spread', 1)} disabled={controlLoading !== null} className="px-3 py-2 text-xs font-black uppercase rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 disabled:opacity-50">Wider</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </details>
         </div>
       </section>
 
