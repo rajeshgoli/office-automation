@@ -106,6 +106,7 @@ export interface ApiStatus {
     mode: string;
     setpoint_c: number;
     temperature_bands?: HVACTemperatureBands;
+    temperature_band_defaults?: HVACTemperatureBands;
   };
   manual_override?: {
     erv: boolean;
@@ -286,7 +287,12 @@ export async function setPresence(state: PresenceState): Promise<{ ok: boolean; 
  */
 export async function setHVACTemperatureBands(
   temperature_bands: HVACTemperatureBands
-): Promise<{ ok: boolean; error?: string; temperature_bands?: HVACTemperatureBands }> {
+): Promise<{
+  ok: boolean;
+  error?: string;
+  temperature_bands?: HVACTemperatureBands;
+  temperature_band_defaults?: HVACTemperatureBands;
+}> {
   const token = getAuthToken();
   const headers: HeadersInit = { 'Content-Type': 'application/json' };
 

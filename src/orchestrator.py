@@ -208,12 +208,22 @@ class Orchestrator:
 
         # Database for persistence and analysis
         self.db = Database()
+        self._default_hvac_temperature_bands = get_default_temperature_bands(config.thresholds)
         self._load_hvac_temperature_bands()
         self.erv.on_health_event(self._handle_erv_health_event)
 
     def _get_hvac_temperature_bands(self) -> dict[str, int]:
         """Return the active HVAC temperature hysteresis bands."""
-        return get_default_temperature_bands(self.config.thresholds)
+        return dict(get_default_temperature_bands(self.config.thresholds))
+
+    def _get_default_hvac_temperature_bands(self) -> dict[str, int]:
+        """Return the HVAC temperature bands loaded from config.yaml."""
+        defaults = getattr(
+            self,
+            "_default_hvac_temperature_bands",
+            get_default_temperature_bands(self.config.thresholds),
+        )
+        return dict(defaults)
 
     def _load_hvac_temperature_bands(self) -> None:
         """Load persisted HVAC temperature bands over config.yaml defaults."""
@@ -1441,6 +1451,7 @@ class Orchestrator:
         return web.json_response({
             "ok": True,
             "temperature_bands": self._get_hvac_temperature_bands(),
+            "temperature_band_defaults": self._get_default_hvac_temperature_bands(),
         })
 
     async def _handle_hvac_temperature_bands_post(self, request: web.Request) -> web.Response:
@@ -1464,6 +1475,7 @@ class Orchestrator:
             return web.json_response({
                 "ok": True,
                 "temperature_bands": self._get_hvac_temperature_bands(),
+                "temperature_band_defaults": self._get_default_hvac_temperature_bands(),
             })
         except ValueError as e:
             return web.json_response({"ok": False, "error": str(e)}, status=400)
@@ -2170,6 +2182,7 @@ class Orchestrator:
             "setpoint_c": self._hvac_setpoint_c,
             "suspended": self._hvac_suspended,
             "temperature_bands": self._get_hvac_temperature_bands(),
+            "temperature_band_defaults": self._get_default_hvac_temperature_bands(),
         }
 
         # Add manual override status

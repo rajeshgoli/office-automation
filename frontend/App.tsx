@@ -37,7 +37,7 @@ const DEFAULT_STATE: OfficeState = {
   isSystemError: true
 };
 
-const DEFAULT_TEMPERATURE_BANDS: HVACTemperatureBands = {
+const FALLBACK_TEMPERATURE_BANDS: HVACTemperatureBands = {
   heat_on_temp_f: 71,
   heat_off_temp_f: 75,
   cool_off_temp_f: 78,
@@ -62,8 +62,16 @@ function mapERVSpeed(apiSpeed: string | undefined): ERVSpeed {
   }
 }
 
+function statusToOccupancy(api: ApiStatus): OccupancyState {
+  if (api.state === 'present') return OccupancyState.PRESENT;
+  if (api.state === 'away') return OccupancyState.AWAY;
+  return api.is_present ? OccupancyState.PRESENT : OccupancyState.AWAY;
+}
+
 // Convert API response to OfficeState
 function apiToState(api: ApiStatus): OfficeState {
+  const occupancy = statusToOccupancy(api);
+
   return {
     co2: api.air_quality.co2_ppm ?? api.sensors.co2_ppm ?? 0,
     temperature: api.air_quality.temp_c ? toFahrenheit(api.air_quality.temp_c) : 0,
@@ -80,7 +88,7 @@ function apiToState(api: ApiStatus): OfficeState {
               api.hvac?.mode === 'off' ? DeviceStatus.OFF : DeviceStatus.OFF,
     hvacTarget: api.hvac?.setpoint_c ? toFahrenheit(api.hvac.setpoint_c) : 70,
     ventMode: mapERVSpeed(api.erv.speed),
-    occupancy: api.is_present ? OccupancyState.PRESENT : OccupancyState.AWAY,
+    occupancy,
     lastUpdated: api.air_quality.last_update ? new Date(api.air_quality.last_update) : new Date(),
     isSystemError: false
   };
@@ -94,7 +102,8 @@ const App: React.FC = () => {
   const [isAmbient, setIsAmbient] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const [apiConnected, setApiConnected] = useState(false);
-  const [temperatureBands, setTemperatureBands] = useState<HVACTemperatureBands>(DEFAULT_TEMPERATURE_BANDS);
+  const [temperatureBands, setTemperatureBands] = useState<HVACTemperatureBands>(FALLBACK_TEMPERATURE_BANDS);
+  const [temperatureBandDefaults, setTemperatureBandDefaults] = useState<HVACTemperatureBands | null>(null);
   const [manualOverride, setManualOverride] = useState<{
     erv: boolean;
     erv_speed: string | null;
@@ -189,6 +198,9 @@ const App: React.FC = () => {
           if (status.hvac?.temperature_bands) {
             setTemperatureBands(status.hvac.temperature_bands);
           }
+          if (status.hvac?.temperature_band_defaults) {
+            setTemperatureBandDefaults(status.hvac.temperature_band_defaults);
+          }
           setState(prev => {
             // Only log events after initial load (avoid spurious "Arrived" on page load)
             if (!initialLoadRef.current) {
@@ -215,7 +227,7 @@ const App: React.FC = () => {
           // Add to history every update
           addHistoryPoint(
             status.air_quality.co2_ppm ?? status.sensors.co2_ppm ?? 0,
-            status.is_present ? OccupancyState.PRESENT : OccupancyState.AWAY,
+            statusToOccupancy(status),
             status.erv.running
           );
         }
@@ -263,6 +275,9 @@ const App: React.FC = () => {
       if (status.hvac?.temperature_bands) {
         setTemperatureBands(status.hvac.temperature_bands);
       }
+      if (status.hvac?.temperature_band_defaults) {
+        setTemperatureBandDefaults(status.hvac.temperature_band_defaults);
+      }
       setState(prev => {
         // Only log real changes (compare against last known occupancy, not stale state)
         if (lastOccupancyRef.current !== null && lastOccupancyRef.current !== newState.occupancy) {
@@ -278,7 +293,7 @@ const App: React.FC = () => {
 
       addHistoryPoint(
         status.air_quality.co2_ppm ?? status.sensors.co2_ppm ?? 0,
-        status.is_present ? OccupancyState.PRESENT : OccupancyState.AWAY,
+        statusToOccupancy(status),
         status.erv.running
       );
     });
@@ -405,6 +420,9 @@ const App: React.FC = () => {
         setTemperatureBands(previousBands);
       } else {
         setTemperatureBands(result.temperature_bands);
+        if (result.temperature_band_defaults) {
+          setTemperatureBandDefaults(result.temperature_band_defaults);
+        }
         addEvent(
           'hvac',
           `Bands: heat ${result.temperature_bands.heat_on_temp_f}-${result.temperature_bands.heat_off_temp_f}°F, cool ${result.temperature_bands.cool_off_temp_f}-${result.temperature_bands.cool_on_temp_f}°F`
@@ -419,16 +437,21 @@ const App: React.FC = () => {
   }, [addEvent, clampTemperatureBand, temperatureBands]);
 
   const resetTemperatureBands = useCallback(() => {
+    if (!temperatureBandDefaults) return;
+
     const previousBands = temperatureBands;
-    setTemperatureBands(DEFAULT_TEMPERATURE_BANDS);
+    setTemperatureBands(temperatureBandDefaults);
     setControlLoading('bands-reset');
 
-    setHVACTemperatureBands(DEFAULT_TEMPERATURE_BANDS).then((result) => {
+    setHVACTemperatureBands(temperatureBandDefaults).then((result) => {
       if (!result.ok || !result.temperature_bands) {
         console.error('HVAC temperature band reset failed:', result.error);
         setTemperatureBands(previousBands);
       } else {
         setTemperatureBands(result.temperature_bands);
+        if (result.temperature_band_defaults) {
+          setTemperatureBandDefaults(result.temperature_band_defaults);
+        }
         addEvent('hvac', 'Bands reset to defaults');
       }
     }).catch((e) => {
@@ -437,7 +460,7 @@ const App: React.FC = () => {
     }).finally(() => {
       setControlLoading(null);
     });
-  }, [addEvent, temperatureBands]);
+  }, [addEvent, temperatureBandDefaults, temperatureBands]);
 
   const currentStatus = getPrimaryStatus();
 
@@ -779,7 +802,7 @@ const App: React.FC = () => {
                 </div>
                 <button
                   onClick={resetTemperatureBands}
-                  disabled={controlLoading !== null}
+                  disabled={controlLoading !== null || temperatureBandDefaults === null}
                   className="px-3 py-2 text-xs font-bold uppercase rounded-lg bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Reset
