@@ -10,6 +10,7 @@ import com.rajesh.officeclimate.data.model.OrchestrationResponse
 import com.rajesh.officeclimate.data.model.ProjectLeverageResponse
 import com.rajesh.officeclimate.data.model.ProjectFocusResponse
 import com.rajesh.officeclimate.data.model.SessionsResponse
+import com.rajesh.officeclimate.data.model.TemperatureBandsResponse
 import com.rajesh.officeclimate.data.model.TemperatureResponse
 import kotlinx.serialization.json.JsonObject
 import retrofit2.http.Body
@@ -34,7 +35,7 @@ interface ApiService {
     suspend fun setPresence(@Body body: Map<String, String>): JsonObject
 
     @POST("hvac/temperature-bands")
-    suspend fun setTemperatureBands(@Body body: JsonObject): JsonObject
+    suspend fun setTemperatureBands(@Body body: JsonObject): TemperatureBandsResponse
 
     @GET("history/sessions")
     suspend fun getSessions(@Query("days") days: Int = 7): SessionsResponse

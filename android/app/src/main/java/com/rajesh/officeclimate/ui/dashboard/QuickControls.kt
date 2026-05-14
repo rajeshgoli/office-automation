@@ -48,6 +48,7 @@ fun QuickControls(
     val shape = RoundedCornerShape(12.dp)
     val override = status.manualOverride
     val isPresent = status.state.lowercase() == "present" || status.isPresent
+    val bandLoading = controlLoading?.startsWith("bands_") == true
     var bandsExpanded by rememberSaveable { mutableStateOf(false) }
 
     Column(
@@ -206,7 +207,7 @@ fun QuickControls(
                             label = "Heat",
                             rangeLabel = "${bands.heatOnTempF}-${bands.heatOffTempF}°F",
                             helper = "Resume at ${bands.heatOnTempF}° · pause at ${bands.heatOffTempF}°",
-                            loading = controlLoading == "bands_heat",
+                            loading = bandLoading,
                             onMoveDown = { onTemperatureBandAction("heat", "shift", -1) },
                             onMoveUp = { onTemperatureBandAction("heat", "shift", 1) },
                             onTighter = { onTemperatureBandAction("heat", "spread", -1) },
@@ -216,7 +217,7 @@ fun QuickControls(
                             label = "Cool",
                             rangeLabel = "${bands.coolOffTempF}-${bands.coolOnTempF}°F",
                             helper = "Stop at ${bands.coolOffTempF}° · start at ${bands.coolOnTempF}°",
-                            loading = controlLoading == "bands_cool",
+                            loading = bandLoading,
                             onMoveDown = { onTemperatureBandAction("cool", "shift", -1) },
                             onMoveUp = { onTemperatureBandAction("cool", "shift", 1) },
                             onTighter = { onTemperatureBandAction("cool", "spread", -1) },
@@ -225,7 +226,7 @@ fun QuickControls(
                         ControlButton(
                             label = "RESET",
                             isActive = false,
-                            isLoading = controlLoading == "bands_reset",
+                            isLoading = bandLoading,
                             enabled = status.hvac.temperatureBandDefaults != null,
                             onClick = onTemperatureBandReset,
                             modifier = Modifier.fillMaxWidth(),

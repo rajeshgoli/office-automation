@@ -191,7 +191,13 @@ class ClimateRepository(
                 put("cool_on_temp_f", bands.coolOnTempF)
             })
         }
-        apiService.setTemperatureBands(body)
+        val response = apiService.setTemperatureBands(body)
+        val savedBands = response.temperatureBands ?: bands
+        _status.value = _status.value?.let { currentStatus ->
+            currentStatus.copy(
+                hvac = currentStatus.hvac.copy(temperatureBands = savedBands),
+            )
+        }
     }
 
     suspend fun getSessions(days: Int = 7): Result<SessionsResponse> = runCatching {

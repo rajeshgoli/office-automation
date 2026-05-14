@@ -76,6 +76,12 @@ data class TemperatureBands(
 )
 
 @Serializable
+data class TemperatureBandsResponse(
+    val ok: Boolean = false,
+    @SerialName("temperature_bands") val temperatureBands: TemperatureBands? = null,
+)
+
+@Serializable
 data class ManualOverride(
     val erv: Boolean = false,
     @SerialName("erv_speed") val ervSpeed: String? = null,

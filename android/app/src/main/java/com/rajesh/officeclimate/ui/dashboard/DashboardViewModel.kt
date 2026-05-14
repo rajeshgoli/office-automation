@@ -97,6 +97,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun updateTemperatureBand(band: String, action: String, delta: Int) {
+        if (_controlLoading.value?.startsWith("bands_") == true) return
+
         val currentBands = status.value?.hvac?.temperatureBands ?: return
         val nextBands = adjustTemperatureBands(currentBands, band, action, delta)
         _controlLoading.value = "bands_$band"
@@ -111,6 +113,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun resetTemperatureBands() {
+        if (_controlLoading.value?.startsWith("bands_") == true) return
+
         val defaults = status.value?.hvac?.temperatureBandDefaults ?: return
         _controlLoading.value = "bands_reset"
         viewModelScope.launch {
