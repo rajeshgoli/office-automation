@@ -68,6 +68,7 @@ fun DashboardScreen(
     val wsConnected by viewModel.wsConnected.collectAsState()
     val error by viewModel.error.collectAsState()
     val controlLoading by viewModel.controlLoading.collectAsState()
+    val bandUpdateInFlight by viewModel.bandUpdateInFlight.collectAsState()
     val controlError by viewModel.controlError.collectAsState()
     val authExpired by viewModel.authExpired.collectAsState()
     val updateBannerState by viewModel.updateBannerState.collectAsState()
@@ -268,8 +269,12 @@ fun DashboardScreen(
             QuickControls(
                 status = currentStatus,
                 controlLoading = controlLoading,
+                bandUpdateInFlight = bandUpdateInFlight,
+                onPresenceState = viewModel::setPresence,
                 onErvSpeed = viewModel::setErvSpeed,
                 onHvacMode = viewModel::setHvacMode,
+                onTemperatureBandAction = viewModel::updateTemperatureBand,
+                onTemperatureBandReset = viewModel::resetTemperatureBands,
             )
 
             Spacer(Modifier.height(16.dp))

@@ -63,6 +63,22 @@ data class HvacStatus(
     val mode: String = "off",
     @SerialName("setpoint_c") val setpointC: Double = 0.0,
     val suspended: Boolean = false,
+    @SerialName("temperature_bands") val temperatureBands: TemperatureBands? = null,
+    @SerialName("temperature_band_defaults") val temperatureBandDefaults: TemperatureBands? = null,
+)
+
+@Serializable
+data class TemperatureBands(
+    @SerialName("heat_on_temp_f") val heatOnTempF: Int = 71,
+    @SerialName("heat_off_temp_f") val heatOffTempF: Int = 75,
+    @SerialName("cool_off_temp_f") val coolOffTempF: Int = 78,
+    @SerialName("cool_on_temp_f") val coolOnTempF: Int = 81,
+)
+
+@Serializable
+data class TemperatureBandsResponse(
+    val ok: Boolean = false,
+    @SerialName("temperature_bands") val temperatureBands: TemperatureBands? = null,
 )
 
 @Serializable

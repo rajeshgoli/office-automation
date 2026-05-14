@@ -10,6 +10,7 @@ import com.rajesh.officeclimate.data.model.OrchestrationResponse
 import com.rajesh.officeclimate.data.model.ProjectLeverageResponse
 import com.rajesh.officeclimate.data.model.ProjectFocusResponse
 import com.rajesh.officeclimate.data.model.SessionsResponse
+import com.rajesh.officeclimate.data.model.TemperatureBands
 import com.rajesh.officeclimate.data.model.TemperatureResponse
 import com.rajesh.officeclimate.data.remote.ApiService
 import com.rajesh.officeclimate.data.remote.AuthInterceptor
@@ -175,6 +176,28 @@ class ClimateRepository(
             if (setpointF != null) put("setpoint_f", setpointF)
         }
         apiService.setHvacMode(body)
+    }
+
+    suspend fun setPresence(state: String): Result<Unit> = runCatching {
+        apiService.setPresence(mapOf("state" to state))
+    }
+
+    suspend fun setTemperatureBands(bands: TemperatureBands): Result<Unit> = runCatching {
+        val body = buildJsonObject {
+            put("temperature_bands", buildJsonObject {
+                put("heat_on_temp_f", bands.heatOnTempF)
+                put("heat_off_temp_f", bands.heatOffTempF)
+                put("cool_off_temp_f", bands.coolOffTempF)
+                put("cool_on_temp_f", bands.coolOnTempF)
+            })
+        }
+        val response = apiService.setTemperatureBands(body)
+        val savedBands = response.temperatureBands ?: bands
+        _status.value = _status.value?.let { currentStatus ->
+            currentStatus.copy(
+                hvac = currentStatus.hvac.copy(temperatureBands = savedBands),
+            )
+        }
     }
 
     suspend fun getSessions(days: Int = 7): Result<SessionsResponse> = runCatching {
