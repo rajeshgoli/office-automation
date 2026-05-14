@@ -30,6 +30,12 @@ interface ApiService {
     @POST("hvac")
     suspend fun setHvacMode(@Body body: JsonObject): JsonObject
 
+    @POST("presence")
+    suspend fun setPresence(@Body body: Map<String, String>): JsonObject
+
+    @POST("hvac/temperature-bands")
+    suspend fun setTemperatureBands(@Body body: JsonObject): JsonObject
+
     @GET("history/sessions")
     suspend fun getSessions(@Query("days") days: Int = 7): SessionsResponse
 

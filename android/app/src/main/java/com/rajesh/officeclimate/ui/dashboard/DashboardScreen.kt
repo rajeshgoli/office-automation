@@ -268,8 +268,11 @@ fun DashboardScreen(
             QuickControls(
                 status = currentStatus,
                 controlLoading = controlLoading,
+                onPresenceState = viewModel::setPresence,
                 onErvSpeed = viewModel::setErvSpeed,
                 onHvacMode = viewModel::setHvacMode,
+                onTemperatureBandAction = viewModel::updateTemperatureBand,
+                onTemperatureBandReset = viewModel::resetTemperatureBands,
             )
 
             Spacer(Modifier.height(16.dp))

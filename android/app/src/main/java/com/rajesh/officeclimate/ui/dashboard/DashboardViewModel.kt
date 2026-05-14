@@ -6,6 +6,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.rajesh.officeclimate.data.model.AppNotification
 import com.rajesh.officeclimate.data.model.ApiStatus
+import com.rajesh.officeclimate.data.model.TemperatureBands
 import com.rajesh.officeclimate.data.repository.AppUpdateRepository
 import com.rajesh.officeclimate.data.repository.AvailableAppUpdate
 import com.rajesh.officeclimate.data.repository.ClimateRepository
@@ -83,6 +84,45 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun setPresence(state: String) {
+        _controlLoading.value = "presence"
+        viewModelScope.launch {
+            climateRepo.setPresence(state)
+                .onFailure { e ->
+                    Log.e("DashboardVM", "Presence control failed", e)
+                    _controlError.value = "Presence command failed: ${e.message}"
+                }
+            _controlLoading.value = null
+        }
+    }
+
+    fun updateTemperatureBand(band: String, action: String, delta: Int) {
+        val currentBands = status.value?.hvac?.temperatureBands ?: return
+        val nextBands = adjustTemperatureBands(currentBands, band, action, delta)
+        _controlLoading.value = "bands_$band"
+        viewModelScope.launch {
+            climateRepo.setTemperatureBands(nextBands)
+                .onFailure { e ->
+                    Log.e("DashboardVM", "Temperature band update failed", e)
+                    _controlError.value = "Band update failed: ${e.message}"
+                }
+            _controlLoading.value = null
+        }
+    }
+
+    fun resetTemperatureBands() {
+        val defaults = status.value?.hvac?.temperatureBandDefaults ?: return
+        _controlLoading.value = "bands_reset"
+        viewModelScope.launch {
+            climateRepo.setTemperatureBands(defaults)
+                .onFailure { e ->
+                    Log.e("DashboardVM", "Temperature band reset failed", e)
+                    _controlError.value = "Band reset failed: ${e.message}"
+                }
+            _controlLoading.value = null
+        }
+    }
+
     fun dismissUpdateBanner() {
         val update = _updateBannerState.value.update ?: return
         viewModelScope.launch {
@@ -155,5 +195,54 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     override fun onCleared() {
         super.onCleared()
         climateRepo.stop()
+    }
+
+    private fun adjustTemperatureBands(
+        bands: TemperatureBands,
+        band: String,
+        action: String,
+        delta: Int,
+    ): TemperatureBands {
+        var heatOn = bands.heatOnTempF
+        var heatOff = bands.heatOffTempF
+        var coolOff = bands.coolOffTempF
+        var coolOn = bands.coolOnTempF
+
+        if (band == "heat") {
+            if (action == "shift") {
+                heatOn += delta
+                heatOff += delta
+            } else {
+                heatOn -= delta
+                heatOff += delta
+            }
+            heatOn = heatOn.coerceIn(45, 85)
+            heatOff = heatOff.coerceIn(46, 90)
+            if (heatOff <= heatOn) {
+                heatOff = (heatOn + 1).coerceIn(46, 90)
+                heatOn = (heatOff - 1).coerceIn(45, 85)
+            }
+        } else {
+            if (action == "shift") {
+                coolOff += delta
+                coolOn += delta
+            } else {
+                coolOff -= delta
+                coolOn += delta
+            }
+            coolOff = coolOff.coerceIn(55, 95)
+            coolOn = coolOn.coerceIn(56, 100)
+            if (coolOn <= coolOff) {
+                coolOn = (coolOff + 1).coerceIn(56, 100)
+                coolOff = (coolOn - 1).coerceIn(55, 95)
+            }
+        }
+
+        return TemperatureBands(
+            heatOnTempF = heatOn,
+            heatOffTempF = heatOff,
+            coolOffTempF = coolOff,
+            coolOnTempF = coolOn,
+        )
     }
 }
