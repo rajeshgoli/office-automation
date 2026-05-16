@@ -99,6 +99,7 @@ class ThresholdsConfig:
     co2_rate_quiet_threshold: float = 0.5    # 0.5-2 ppm/min → QUIET (1/1)
                                               # < 0.5 ppm/min for 10 min → OFF (plateau)
     co2_turbo_duration_minutes: int = 30     # Force TURBO for first N minutes after departure
+    min_away_seconds_before_erv: int = 60    # Hold ERV off after AWAY transition for N seconds; rides out brief door-open false positives
 
     # tVOC AWAY mode ventilation (similar to CO2 adaptive control)
     # NOTE: tVOC is IGNORED when PRESENT - only triggers ventilation when AWAY

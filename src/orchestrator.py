@@ -829,6 +829,17 @@ class Orchestrator:
                     logger.error("ERV OFF failed (present air quality OK)")
 
         elif state == OccupancyState.AWAY:
+            # Settle window: roughly 1 in 3 historical AWAY transitions were
+            # false positives (door cycled, user still here) and got reversed
+            # within seconds. Hold ERV at its prior state for the first N
+            # seconds of AWAY so we don't fire TURBO on those.
+            settle_seconds = self.config.thresholds.min_away_seconds_before_erv
+            if settle_seconds > 0 and self._away_start_time is not None:
+                elapsed = (datetime.now() - self._away_start_time).total_seconds()
+                if elapsed < settle_seconds:
+                    self._schedule_task(self._evaluate_hvac_state, context="erv_hvac_coordination")
+                    return
+
             # AWAY mode: aggressive ventilation with adaptive speed control
             # Both CO2 > 500 and tVOC > 200 trigger ventilation
             # Periodic stale-air flush also runs while continuously closed.
@@ -1336,6 +1347,9 @@ class Orchestrator:
                 interval = timedelta(hours=max(1, self.config.thresholds.away_stale_flush_interval_hours))
                 first_due = self._room_closed_since + interval
                 self._away_stale_flush_next_due_at = now if now >= first_due else first_due
+            settle_seconds = self.config.thresholds.min_away_seconds_before_erv
+            if settle_seconds > 0:
+                logger.info(f"AWAY settle window: holding ERV for {settle_seconds}s before ventilating")
             logger.info(f"TURBO mode for {self.config.thresholds.co2_turbo_duration_minutes} min, then adaptive")
 
         # Clear AWAY mode state on arrival
