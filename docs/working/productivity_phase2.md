@@ -121,7 +121,7 @@ CREATE INDEX IF NOT EXISTS idx_session_output_start ON session_output(start_time
 CREATE INDEX IF NOT EXISTS idx_session_output_project ON session_output(project);
 ```
 
-No expression indexes — Mac Mini runs SQLite on High Sierra which doesn't support them.
+No expression indexes — the production SQLite build doesn't support them.
 
 `tool_counts` and `languages` are stored as JSON strings (matching the source format). `is_human_session` is 0 or 1.
 

@@ -52,5 +52,9 @@ docs/tuya-local-key-private.md
 # Session logs / local-only docs
 roadmap.md
 
+# Host-specific (contain hostname / OS / hardware fingerprint)
+CLAUDE.md
+collect_and_push.sh
+
 # Claude settings (may contain local IPs)
 .claude/
