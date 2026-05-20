@@ -102,7 +102,7 @@ Locked behind Google OAuth with an email allowlist. JWT tokens. No "admin / admi
 
 ## What it runs on
 
-- **A Mac Mini.** Anything that can run Python 3.10 and stay awake. Mine is a 2014 Mac Mini on macOS High Sierra. It has been running for months.
+- **A Mac Mini.** Anything that can run Python 3.10 and stay awake. Has been running quietly for months.
 - **A Cloudflare tunnel** for remote access (or skip it and stay on LAN).
 - **A small React dashboard** served from the same orchestrator.
 
