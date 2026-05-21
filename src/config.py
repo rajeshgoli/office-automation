@@ -90,6 +90,7 @@ class ThresholdsConfig:
     co2_plateau_rate_threshold: float = 0.5  # ppm/min - slower than this = plateau
     co2_plateau_window_minutes: int = 10     # sustained slow rate for this long
     co2_plateau_min_co2: int = 600           # don't declare plateau above this (safety, allows winter ~490ppm + margin)
+    co2_plateau_release_delta_ppm: int = 100 # release plateau when CO2 climbs above learned baseline by this much
     co2_history_size: int = 40               # CO2 readings in sliding window (20 min at 30s intervals)
 
     # Adaptive ERV speed control (AWAY mode)
@@ -100,6 +101,7 @@ class ThresholdsConfig:
                                               # < 0.5 ppm/min for 10 min → OFF (plateau)
     co2_turbo_duration_minutes: int = 30     # Force TURBO for first N minutes after departure
     min_away_seconds_before_erv: int = 60    # Hold ERV off after AWAY transition for N seconds; rides out brief door-open false positives
+    erv_min_dwell_seconds: int = 180         # Minimum interval between automated ERV speed changes within a stable presence state
 
     # tVOC AWAY mode ventilation (similar to CO2 adaptive control)
     # NOTE: tVOC is IGNORED when PRESENT - only triggers ventilation when AWAY
