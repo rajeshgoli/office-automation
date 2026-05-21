@@ -11,7 +11,8 @@ Always start with Path A. Drop to Path B only if the diagnostic in step 4 says s
 
 - Local control fails with Err 914 (“Check device key or version”).
 - Dashboard or automations can’t turn on the ERV but the Smart Life app still works locally.
-- The device firmware was updated (most common trigger for key rotation).
+- The device firmware was updated.
+- Orchestrator (or another local Tuya client) issued a rapid burst of commands that the device interpreted as adversarial. This is what happened on 2026-05-21 and is fixed by issue #59.
 
 ## ERV Hardware (Site-Specific)
 
@@ -223,13 +224,14 @@ Tuya cloud projects need devices linked via the IoT Platform asset model. Don't 
 
 ## Prevention
 
-The 914 error is almost always triggered by an ERV firmware OTA. To minimize occurrences:
+Known Err 914 triggers for this ERV:
 
-- **Disable auto firmware updates on the ERV** in Smart Life device settings if the toggle exists (look for "Check for firmware updates" or similar).
+- **Firmware OTA** — disabling auto firmware updates in Smart Life is still useful if the toggle exists (look for "Check for firmware updates" or similar), though we have not confirmed that Smart Life reliably honors it.
+- **Command burst from a misbehaving local client** — the orchestrator-side cause from 2026-05-21 was fixed in issue #59 with CO2 plateau latching and a minimum ERV dwell timer.
 - **Alert on 914** in the orchestrator logs so you catch the rotation immediately, not days/weeks later when CO2 is high and the dashboard is silent.
 
 ## Notes
 
-- Local keys can change after re-pair, factory reset, or firmware OTA.
+- Local keys can change after re-pair, factory reset, firmware OTA, or after the device interprets local Tuya traffic as adversarial (see issue #59 for one observed example).
 - Keep local keys private (don’t commit them to Git). `docs/tuya-local-key-private.md` is gitignored for this.
 - Site-specific values (device ID, server IP, repo path on server, last-known UID) live in `docs/tuya-local-key-private.md`. The UID can shift between installs (saw `u0_a166` and `u0_a167` on consecutive installs in the same session).

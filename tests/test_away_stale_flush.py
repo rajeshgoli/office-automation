@@ -179,6 +179,7 @@ def test_stale_flush_repeats_every_8_hours_at_medium():
     assert orchestrator._erv_speed == "medium"
 
     # Flush window ended; next schedule not due yet -> ERV turns off.
+    orchestrator._erv_speed_changed_at = datetime.now() - timedelta(minutes=4)
     orchestrator._away_stale_flush_active_until = datetime.now() - timedelta(seconds=1)
     orchestrator._away_stale_flush_next_due_at = datetime.now() + timedelta(hours=1)
     orchestrator._evaluate_erv_state()
@@ -186,6 +187,7 @@ def test_stale_flush_repeats_every_8_hours_at_medium():
     assert orchestrator._erv_speed == "off"
 
     # Next stale cycle due -> flush starts again.
+    orchestrator._erv_speed_changed_at = datetime.now() - timedelta(minutes=4)
     orchestrator._away_stale_flush_next_due_at = datetime.now() - timedelta(seconds=1)
     orchestrator._evaluate_erv_state()
     assert orchestrator._erv_running is True
@@ -259,6 +261,7 @@ def test_stale_flush_never_overrides_more_aggressive_co2_speed():
         tvoc_away_enabled=False,
         co2_adaptive_speed_enabled=True,
         co2_turbo_duration_minutes=30,
+        min_away_seconds_before_erv=0,
     )
     orchestrator = _build_orchestrator(thresholds)
     orchestrator.state_machine.state = OccupancyState.AWAY

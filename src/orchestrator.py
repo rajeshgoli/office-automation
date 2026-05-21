@@ -132,6 +132,7 @@ class Orchestrator:
         # Track if ERV is currently running and at what speed
         self._erv_running: bool = False
         self._erv_speed: str = "off"  # "off", "quiet", "medium", "turbo"
+        self._erv_speed_changed_at: Optional[datetime] = None
 
         # CO2 plateau detection state (AWAY mode optimization)
         self._co2_history: deque[tuple[datetime, int]] = deque(
@@ -211,6 +212,10 @@ class Orchestrator:
         self._default_hvac_temperature_bands = get_default_temperature_bands(config.thresholds)
         self._load_hvac_temperature_bands()
         self.erv.on_health_event(self._handle_erv_health_event)
+
+    def _now(self) -> datetime:
+        """Return current local time; tests can override this for deterministic timing."""
+        return datetime.now()
 
     def _get_hvac_temperature_bands(self) -> dict[str, int]:
         """Return the active HVAC temperature hysteresis bands."""
@@ -296,7 +301,7 @@ class Orchestrator:
         """Translate ERV control health transitions into in-app notifications."""
         event_type = event.get("type")
         if event_type == "erv_local_key_invalid":
-            created_at = event.get("started_at") or datetime.now().isoformat()
+            created_at = event.get("started_at") or self._now().isoformat()
             self._erv_control_notification = {
                 "id": f"erv_local_key_invalid:{created_at}",
                 "type": "erv_local_key_invalid",
@@ -310,7 +315,7 @@ class Orchestrator:
             logger.error("ERV local key invalid; notifying Android app")
             self.db.log_device_event("erv", "local_key_invalid", "Pioneer ECOasis 150", details=event)
         elif event_type == "erv_local_key_recovered":
-            created_at = event.get("recovered_at") or datetime.now().isoformat()
+            created_at = event.get("recovered_at") or self._now().isoformat()
             self._erv_control_notification = {
                 "id": f"erv_local_key_recovered:{created_at}",
                 "type": "erv_local_key_recovered",
@@ -382,12 +387,12 @@ class Orchestrator:
 
         # Update tVOC history for AWAY mode adaptive control
         if reading.tvoc is not None:
-            now = datetime.now()
+            now = self._now()
             self._tvoc_away_history.append((now, reading.tvoc))
 
         # Update CO2 history for plateau detection
         if reading.co2_ppm is not None:
-            now = datetime.now()
+            now = self._now()
             self._co2_history.append((now, reading.co2_ppm))
 
         # Update state machine with CO2 reading
@@ -402,7 +407,7 @@ class Orchestrator:
 
     def _check_manual_override_expiry(self):
         """Check if manual overrides have expired and clear them."""
-        now = datetime.now()
+        now = self._now()
         if self._manual_erv_override and self._manual_erv_override_at:
             elapsed = (now - self._manual_erv_override_at).total_seconds()
             if elapsed > self._manual_override_timeout:
@@ -429,7 +434,7 @@ class Orchestrator:
 
     def _update_room_closed_tracking(self, now: Optional[datetime] = None, mark_state_known: bool = False):
         """Track continuous closed period and clear stale-flush timers on open events."""
-        now = now or datetime.now()
+        now = now or self._now()
         if mark_state_known:
             self._room_closed_state_known = True
 
@@ -471,7 +476,7 @@ class Orchestrator:
             self._away_stale_flush_next_due_at = None
             return False
 
-        now = now or datetime.now()
+        now = now or self._now()
 
         # Keep closed/open tracking current before making decisions.
         self._update_room_closed_tracking(now)
@@ -546,13 +551,40 @@ class Orchestrator:
         if not self.config.thresholds.co2_plateau_enabled:
             return False
 
+        current_co2 = self._co2_history[-1][1] if self._co2_history else None
+
+        # Defensive cleanup for partially reset plateau state.
+        if self._plateau_detected and self._outdoor_co2_baseline is None:
+            logger.warning("CO2 plateau state had no baseline; resetting and recomputing")
+            self._plateau_detected = False
+
+        # Sticky plateau: once outdoor baseline is learned, stay off through
+        # sensor noise until CO2 climbs meaningfully above that baseline.
+        if self._plateau_detected and self._outdoor_co2_baseline is not None:
+            if current_co2 is None:
+                return True
+
+            release_threshold = (
+                self._outdoor_co2_baseline +
+                self.config.thresholds.co2_plateau_release_delta_ppm
+            )
+            if current_co2 < release_threshold:
+                return True
+
+            logger.info(
+                "CO2 plateau released: %sppm >= %sppm baseline+delta",
+                current_co2,
+                release_threshold,
+            )
+            self._plateau_detected = False
+            self._outdoor_co2_baseline = None
+
         # Need enough data to calculate rate over window
         min_readings = max(20, int(self.config.thresholds.co2_plateau_window_minutes * 2))
         if len(self._co2_history) < min_readings:
             return False
 
         # Safety: Don't declare plateau if CO2 is still high
-        current_co2 = self._co2_history[-1][1]
         if current_co2 > self.config.thresholds.co2_plateau_min_co2:
             return False
 
@@ -568,6 +600,7 @@ class Orchestrator:
         if is_plateau:
             # Remember this as outdoor baseline
             self._outdoor_co2_baseline = current_co2
+            self._plateau_detected = True
             logger.info(f"CO2 plateau detected at {current_co2}ppm (rate: {rate:.2f} ppm/min, "
                        f"outdoor baseline learned)")
 
@@ -584,15 +617,18 @@ class Orchestrator:
 
         # Check for plateau first
         if self._detect_co2_plateau():
-            logger.info(f"CO2 plateau detected at {co2}ppm, stopping ERV (outdoor baseline: {self._outdoor_co2_baseline}ppm)")
-            self._plateau_detected = True
+            logger.debug(
+                "CO2 plateau active at %sppm, stopping ERV (outdoor baseline: %sppm)",
+                co2,
+                self._outdoor_co2_baseline,
+            )
             return "off"
 
         # Force TURBO for first N minutes after departure
         # This ensures aggressive initial purge before switching to adaptive
         turbo_duration = self.config.thresholds.co2_turbo_duration_minutes
         if self._away_start_time:
-            minutes_away = (datetime.now() - self._away_start_time).total_seconds() / 60.0
+            minutes_away = (self._now() - self._away_start_time).total_seconds() / 60.0
             if minutes_away < turbo_duration:
                 return "turbo"  # Still in initial TURBO window
 
@@ -693,7 +729,7 @@ class Orchestrator:
         # Force TURBO for first N minutes after departure (same as CO2)
         turbo_duration = self.config.thresholds.co2_turbo_duration_minutes
         if self._away_start_time:
-            minutes_away = (datetime.now() - self._away_start_time).total_seconds() / 60.0
+            minutes_away = (self._now() - self._away_start_time).total_seconds() / 60.0
             if minutes_away < turbo_duration:
                 return "turbo"  # Still in initial TURBO window
 
@@ -723,7 +759,60 @@ class Orchestrator:
             # Approaching plateau
             return "quiet"
 
-    def _evaluate_erv_state(self):
+    def _initial_away_turbo_active(self, now: Optional[datetime] = None) -> bool:
+        """True while a new AWAY state is in its configured initial TURBO window."""
+        if self._away_start_time is None:
+            return False
+        now = now or self._now()
+        minutes_away = (now - self._away_start_time).total_seconds() / 60.0
+        return minutes_away < self.config.thresholds.co2_turbo_duration_minutes
+
+    def _apply_erv_speed(
+        self,
+        target_speed: str,
+        fan_speed: Optional[FanSpeed],
+        reason: str,
+        co2: Optional[int],
+        bypass_dwell: bool = False,
+    ) -> bool:
+        """Apply an ERV speed change with dwell protection and consistent logging."""
+        if target_speed not in ("off", "quiet", "medium", "turbo"):
+            raise ValueError(f"Invalid ERV target speed: {target_speed}")
+        if target_speed != "off" and fan_speed is None:
+            raise ValueError(f"fan_speed is required for ERV target speed: {target_speed}")
+
+        now = self._now()
+        last_changed_at = getattr(self, "_erv_speed_changed_at", None)
+        dwell_seconds = self.config.thresholds.erv_min_dwell_seconds
+        if not bypass_dwell and last_changed_at is not None and dwell_seconds > 0:
+            elapsed = (now - last_changed_at).total_seconds()
+            if elapsed < dwell_seconds:
+                logger.info(
+                    "ERV transition to %s suppressed by dwell (%.0fs < %ss, reason=%s)",
+                    target_speed,
+                    elapsed,
+                    dwell_seconds,
+                    reason,
+                )
+                return False
+
+        if target_speed == "off":
+            logger.info(f"ACTION: ERV OFF ({reason})")
+            ok = self.erv.turn_off()
+        else:
+            logger.info(f"ACTION: ERV {target_speed.upper()} ({reason})")
+            ok = self.erv.turn_on(fan_speed)
+
+        if ok:
+            self._erv_running = target_speed != "off"
+            self._erv_speed = target_speed
+            self._erv_speed_changed_at = now
+            self.db.log_climate_action("erv", target_speed, co2_ppm=co2, reason=reason)
+        else:
+            logger.error(f"ERV {target_speed.upper()} failed ({reason})")
+        return ok
+
+    def _evaluate_erv_state(self, bypass_dwell: bool = False):
         """Evaluate whether ERV should be on or off based on current state.
 
         Priority:
@@ -736,6 +825,7 @@ class Orchestrator:
         self._check_manual_override_expiry()
 
         state = self.state_machine.state
+        now = self._now()
 
         # Get CO2 and tVOC readings from Qingping
         reading = self.qingping.latest_reading
@@ -745,15 +835,15 @@ class Orchestrator:
         # Safety: window/door open = ERV off (overrides everything including manual)
         if self.state_machine.sensors.window_open or self.state_machine.sensors.door_open:
             if self._erv_running:
-                logger.info("ACTION: ERV OFF (window/door open)")
-                ok = self.erv.turn_off()
+                ok = self._apply_erv_speed(
+                    "off",
+                    None,
+                    "safety_interlock",
+                    co2,
+                    bypass_dwell=True,
+                )
                 if ok:
-                    self._erv_running = False
-                    self._erv_speed = "off"
                     self._tvoc_away_ventilation_active = False
-                    self.db.log_climate_action("erv", "off", co2_ppm=co2, reason="safety_interlock")
-                else:
-                    logger.error("ERV OFF failed (safety interlock)")
             return
 
         # Manual override takes priority over automation
@@ -761,24 +851,24 @@ class Orchestrator:
             target_speed = self._manual_erv_speed
             if target_speed == "off":
                 if self._erv_running:
-                    logger.info("ACTION: ERV OFF (manual override)")
-                    ok = self.erv.turn_off()
-                    if ok:
-                        self._erv_running = False
-                        self._erv_speed = "off"
-                    else:
-                        logger.error("ERV OFF failed (manual override)")
+                    self._apply_erv_speed(
+                        "off",
+                        None,
+                        "manual_override",
+                        co2,
+                        bypass_dwell=True,
+                    )
             else:
                 speed_map = {"quiet": FanSpeed.QUIET, "medium": FanSpeed.MEDIUM, "turbo": FanSpeed.TURBO}
                 fan_speed = speed_map.get(target_speed, FanSpeed.QUIET)
                 if not self._erv_running or self._erv_speed != target_speed:
-                    logger.info(f"ACTION: ERV {target_speed.upper()} (manual override)")
-                    ok = self.erv.turn_on(fan_speed)
-                    if ok:
-                        self._erv_running = True
-                        self._erv_speed = target_speed
-                    else:
-                        logger.error(f"ERV {target_speed.upper()} failed (manual override)")
+                    self._apply_erv_speed(
+                        target_speed,
+                        fan_speed,
+                        "manual_override",
+                        co2,
+                        bypass_dwell=True,
+                    )
             return  # Skip automation logic when manual override is active
 
         # CO2 hysteresis: ON at 2000, OFF at 1800 (200ppm dead band)
@@ -799,34 +889,33 @@ class Orchestrator:
             if co2_critical_on:
                 # CO2 >= 2000 - turn on QUIET
                 if not self._erv_running or self._erv_speed != "quiet":
-                    logger.info(f"ACTION: ERV QUIET (CO2 critical: {co2}ppm)")
-                    ok = self.erv.turn_on(FanSpeed.QUIET)
-                    if ok:
-                        self._erv_running = True
-                        self._erv_speed = "quiet"
-                        self.db.log_climate_action("erv", "quiet", co2_ppm=co2, reason=f"present_co2_critical_{co2}ppm")
-                    else:
-                        logger.error("ERV QUIET failed (present CO2 critical)")
+                    self._apply_erv_speed(
+                        "quiet",
+                        FanSpeed.QUIET,
+                        f"present_co2_critical_{co2}ppm",
+                        co2,
+                        bypass_dwell=True,
+                    )
             elif self._erv_running and self._erv_speed == "quiet":
                 # Running QUIET mode, check hysteresis before turning off
                 if co2_critical_off:
-                    logger.info(f"ACTION: ERV OFF (CO2 dropped to {co2}ppm, below {self.config.thresholds.co2_critical_ppm - self.config.thresholds.co2_critical_hysteresis_ppm}ppm)")
-                    ok = self.erv.turn_off()
-                    if ok:
-                        self._erv_running = False
-                        self._erv_speed = "off"
-                    else:
-                        logger.error("ERV OFF failed (present hysteresis)")
+                    self._apply_erv_speed(
+                        "off",
+                        None,
+                        f"present_co2_hysteresis_{co2}ppm",
+                        co2,
+                        bypass_dwell=bypass_dwell,
+                    )
                 # else: stay in hysteresis band (1800-2000), keep running
             elif self._erv_running:
                 # Turn off if running for any other reason
-                logger.info("ACTION: ERV OFF (present, air quality OK)")
-                ok = self.erv.turn_off()
-                if ok:
-                    self._erv_running = False
-                    self._erv_speed = "off"
-                else:
-                    logger.error("ERV OFF failed (present air quality OK)")
+                self._apply_erv_speed(
+                    "off",
+                    None,
+                    "present_air_quality_ok",
+                    co2,
+                    bypass_dwell=bypass_dwell,
+                )
 
         elif state == OccupancyState.AWAY:
             # Settle window: roughly 1 in 3 historical AWAY transitions were
@@ -835,7 +924,7 @@ class Orchestrator:
             # seconds of AWAY so we don't fire TURBO on those.
             settle_seconds = self.config.thresholds.min_away_seconds_before_erv
             if settle_seconds > 0 and self._away_start_time is not None:
-                elapsed = (datetime.now() - self._away_start_time).total_seconds()
+                elapsed = (now - self._away_start_time).total_seconds()
                 if elapsed < settle_seconds:
                     self._schedule_task(self._evaluate_hvac_state, context="erv_hvac_coordination")
                     return
@@ -845,7 +934,7 @@ class Orchestrator:
             # Periodic stale-air flush also runs while continuously closed.
             # Use the most aggressive speed among CO2, tVOC, and stale flush needs.
 
-            stale_flush_active = self._is_away_stale_flush_active(datetime.now())
+            stale_flush_active = self._is_away_stale_flush_active(now)
             stale_adaptive_speed = self._stale_flush_speed() if stale_flush_active else None
 
             # Get adaptive speeds for both CO2 and tVOC
@@ -885,14 +974,13 @@ class Orchestrator:
                     (tvoc_adaptive_speed == "off" or not self._tvoc_away_ventilation_active)):
                 if self._erv_running:
                     reason = "co2_plateau" if self._plateau_detected else "targets_reached"
-                    logger.info(f"ACTION: ERV OFF ({reason}: CO2={co2}ppm, tVOC={tvoc})")
-                    ok = self.erv.turn_off()
-                    if ok:
-                        self._erv_running = False
-                        self._erv_speed = "off"
-                        self.db.log_climate_action("erv", "off", co2_ppm=co2, reason=reason)
-                    else:
-                        logger.error(f"ERV OFF failed (away {reason})")
+                    self._apply_erv_speed(
+                        "off",
+                        None,
+                        reason,
+                        co2,
+                        bypass_dwell=bypass_dwell,
+                    )
             elif co2_priority >= 0 or tvoc_priority >= 0 or stale_priority >= 0:
                 # Pick the more aggressive speed
                 candidates = [
@@ -917,52 +1005,46 @@ class Orchestrator:
                     fan_speed = speed_map[target_speed]
 
                     if not self._erv_running or self._erv_speed != target_speed:
-                        if source == "stale":
-                            logger.info(f"ACTION: ERV {target_speed.upper()} (away, stale-air periodic flush)")
-                        else:
-                            co2_rate = self._calculate_co2_rate_of_change()
-                            tvoc_rate = self._calculate_tvoc_rate_of_change()
-                            rate_str = f"CO2:{co2_rate:.2f}/min" if co2_rate else ""
-                            if tvoc_rate:
-                                rate_str += f" tVOC:{tvoc_rate:.2f}/min" if rate_str else f"tVOC:{tvoc_rate:.2f}/min"
-                            logger.info(f"ACTION: ERV {target_speed.upper()} (away, adaptive: {trigger}, {rate_str})")
-                        ok = self.erv.turn_on(fan_speed)
-                        if ok:
-                            self._erv_running = True
-                            self._erv_speed = target_speed
-                            self.db.log_climate_action("erv", target_speed, co2_ppm=co2, reason=reason)
-                        else:
-                            logger.error(f"ERV {target_speed.upper()} failed (away adaptive)")
+                        initial_away_turbo = (
+                            source == "co2" and
+                            target_speed == "turbo" and
+                            self._initial_away_turbo_active(now)
+                        )
+                        self._apply_erv_speed(
+                            target_speed,
+                            fan_speed,
+                            reason,
+                            co2,
+                            bypass_dwell=bypass_dwell or initial_away_turbo,
+                        )
             elif not co2_needs_refresh and not self._tvoc_away_ventilation_active and stale_priority < 0:
                 # Nothing needs ventilation
                 if self._erv_running:
-                    logger.info(f"ACTION: ERV OFF (air quality OK: CO2={co2}ppm, tVOC={tvoc})")
-                    ok = self.erv.turn_off()
-                    if ok:
-                        self._erv_running = False
-                        self._erv_speed = "off"
-                        self.db.log_climate_action("erv", "off", co2_ppm=co2, reason="air_quality_ok")
-                    else:
-                        logger.error("ERV OFF failed (away air quality OK)")
+                    self._apply_erv_speed(
+                        "off",
+                        None,
+                        "air_quality_ok",
+                        co2,
+                        bypass_dwell=bypass_dwell,
+                    )
             else:
                 # Fall back to TURBO if adaptive not ready yet
                 if not self._erv_running or self._erv_speed != "turbo":
                     trigger = f"CO2={co2}ppm" if co2_needs_refresh else f"tVOC={tvoc}"
-                    logger.info(f"ACTION: ERV TURBO (away mode, {trigger})")
-                    ok = self.erv.turn_on(FanSpeed.TURBO)
-                    if ok:
-                        self._erv_running = True
-                        self._erv_speed = "turbo"
-                        self.db.log_climate_action("erv", "turbo", co2_ppm=co2, reason=f"away_refresh_{trigger}")
-                    else:
-                        logger.error("ERV TURBO failed (away refresh)")
+                    self._apply_erv_speed(
+                        "turbo",
+                        FanSpeed.TURBO,
+                        f"away_refresh_{trigger}",
+                        co2,
+                        bypass_dwell=bypass_dwell or self._initial_away_turbo_active(now),
+                    )
 
         # After ERV state changes, evaluate HVAC coordination
         self._schedule_task(self._evaluate_hvac_state, context="erv_hvac_coordination")
 
     def _is_within_occupancy_hours(self) -> bool:
         """Check if current time is within expected occupancy hours."""
-        now = datetime.now().time()
+        now = self._now().time()
         try:
             start = datetime.strptime(self.config.thresholds.expected_occupancy_start, "%H:%M").time()
             end = datetime.strptime(self.config.thresholds.expected_occupancy_end, "%H:%M").time()
@@ -1324,7 +1406,7 @@ class Orchestrator:
     def _on_state_change(self, old_state: OccupancyState, new_state: OccupancyState):
         """Handle occupancy state changes."""
         logger.info(f"=== STATE CHANGE: {old_state.value} → {new_state.value} ===")
-        now = datetime.now()
+        now = self._now()
 
         # Clear manual overrides - automation takes over on state change
         self._clear_manual_overrides(f"{old_state.value}→{new_state.value}")
@@ -1339,6 +1421,8 @@ class Orchestrator:
             logger.info("Clearing CO2/tVOC history for fresh adaptive calculation")
             self._co2_history.clear()
             self._tvoc_away_history.clear()
+            self._plateau_detected = False
+            self._outdoor_co2_baseline = None
             self._away_start_time = now
             self._away_stale_flush_active_until = None
             self._away_stale_flush_next_due_at = None
@@ -1363,10 +1447,11 @@ class Orchestrator:
                 self._tvoc_plateau_detected = False
 
         # Clear plateau detection state on arrival (start fresh CO2 refresh cycle)
-        if new_state == OccupancyState.PRESENT and self._plateau_detected:
-            logger.info("Clearing plateau state: user returned")
+        if new_state == OccupancyState.PRESENT:
+            if self._plateau_detected:
+                logger.info("Clearing plateau state: user returned")
             self._plateau_detected = False
-            # Keep outdoor baseline for reference
+            self._outdoor_co2_baseline = None
 
         # Log to database
         self.db.log_occupancy_change(
@@ -1376,7 +1461,7 @@ class Orchestrator:
         )
 
         # Evaluate ERV state based on new occupancy
-        self._evaluate_erv_state()
+        self._evaluate_erv_state(bypass_dwell=True)
 
         # Evaluate HVAC coordination
         self._schedule_task(self._evaluate_hvac_state, context="state_change_hvac_eval")
@@ -1519,31 +1604,27 @@ class Orchestrator:
             # Set manual override
             self._manual_erv_override = True
             self._manual_erv_speed = speed
-            self._manual_erv_override_at = datetime.now()
+            self._manual_erv_override_at = self._now()
 
             # Apply the change immediately
             if speed == "off":
-                logger.info("MANUAL: ERV OFF")
-                ok = self.erv.turn_off()
-                if ok:
-                    self._erv_running = False
-                    self._erv_speed = "off"
-                else:
-                    logger.error("Manual ERV OFF failed")
+                ok = self._apply_erv_speed(
+                    "off",
+                    None,
+                    "manual_override",
+                    co2,
+                    bypass_dwell=True,
+                )
             else:
                 speed_map = {"quiet": FanSpeed.QUIET, "medium": FanSpeed.MEDIUM, "turbo": FanSpeed.TURBO}
                 fan_speed = speed_map[speed]
-                logger.info(f"MANUAL: ERV {speed.upper()}")
-                ok = self.erv.turn_on(fan_speed)
-                if ok:
-                    self._erv_running = True
-                    self._erv_speed = speed
-                else:
-                    logger.error(f"Manual ERV {speed.upper()} failed")
-
-            # Log to database only on success
-            if ok:
-                self.db.log_climate_action("erv", speed, co2_ppm=co2, reason="manual_override")
+                ok = self._apply_erv_speed(
+                    speed,
+                    fan_speed,
+                    "manual_override",
+                    co2,
+                    bypass_dwell=True,
+                )
 
             # Broadcast status update
             await self._broadcast_status()
@@ -2914,7 +2995,13 @@ class Orchestrator:
         # Turn off ERV before stopping
         if self._erv_running:
             logger.info("Turning off ERV before shutdown...")
-            ok = self.erv.turn_off()
+            ok = self._apply_erv_speed(
+                "off",
+                None,
+                "shutdown",
+                None,
+                bypass_dwell=True,
+            )
             if not ok:
                 logger.error("ERV OFF failed during shutdown")
 

@@ -37,6 +37,8 @@ mitsubishi:
 thresholds:
   co2_critical_ppm: 2000      # ERV on even when present
   co2_refresh_target_ppm: 500  # Target for away-mode ventilation
+  co2_plateau_release_delta_ppm: 100 # Resume ventilation if CO2 climbs this far above learned outdoor baseline
+  erv_min_dwell_seconds: 180   # Minimum time between automated ERV speed changes within stable presence state
   hvac_heat_off_temp_f: 75     # Turn heat off at/above this Qingping temp
   hvac_heat_on_temp_f: 71      # Turn heat back on at/below this temp (hysteresis)
   hvac_cool_on_temp_f: 81      # Start cooling above this Qingping temp
