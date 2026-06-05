@@ -10,6 +10,7 @@ use serde::Deserialize;
 pub struct AppConfig {
     pub orchestrator: OrchestratorConfig,
     pub qingping: QingpingConfig,
+    pub yolink: YoLinkConfig,
     pub thresholds: ThresholdsConfig,
     pub runtime: RuntimeConfig,
 }
@@ -78,6 +79,36 @@ impl Default for QingpingConfig {
             mqtt_port: 1883,
             device_mac: None,
             report_interval: 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct YoLinkConfig {
+    pub uaid: String,
+    pub secret_key: String,
+    pub http_url: String,
+    pub mqtt_host: String,
+    pub mqtt_port: u16,
+    pub reconnect_delay_seconds: u64,
+}
+
+impl YoLinkConfig {
+    pub fn is_configured(&self) -> bool {
+        !self.uaid.trim().is_empty() && !self.secret_key.trim().is_empty()
+    }
+}
+
+impl Default for YoLinkConfig {
+    fn default() -> Self {
+        Self {
+            uaid: String::new(),
+            secret_key: String::new(),
+            http_url: "https://api.yosmart.com".to_string(),
+            mqtt_host: "api.yosmart.com".to_string(),
+            mqtt_port: 8003,
+            reconnect_delay_seconds: 5,
         }
     }
 }
@@ -190,6 +221,7 @@ pub struct RuntimeConfig {
 struct FileConfig {
     orchestrator: OrchestratorConfig,
     qingping: QingpingConfig,
+    yolink: YoLinkConfig,
     thresholds: ThresholdsConfig,
 }
 
@@ -234,6 +266,14 @@ impl AppConfig {
                 .with_context(|| format!("invalid OFFICE_AUTOMATE_MQTT_PORT value {port:?}"))?;
         }
 
+        if let Some(uaid) = env_lookup("OFFICE_AUTOMATE_YOLINK_UAID") {
+            file_config.yolink.uaid = uaid;
+        }
+
+        if let Some(secret_key) = env_lookup("OFFICE_AUTOMATE_YOLINK_SECRET_KEY") {
+            file_config.yolink.secret_key = secret_key;
+        }
+
         let runtime = RuntimeConfig {
             frontend_dist: root.join("frontend").join("dist"),
             root,
@@ -251,6 +291,7 @@ impl AppConfig {
         Ok(Self {
             orchestrator: file_config.orchestrator,
             qingping: file_config.qingping,
+            yolink: file_config.yolink,
             thresholds: file_config.thresholds,
             runtime,
         })
@@ -276,6 +317,9 @@ qingping:
   mqtt_port: 1883
   device_mac: "AA:BB:CC:DD:EE:FF"
   report_interval: 30
+yolink:
+  uaid: "yaml-uaid"
+  secret_key: "yaml-secret"
 thresholds:
   hvac_heat_on_temp_f: 70
   hvac_heat_off_temp_f: 74
@@ -290,6 +334,8 @@ thresholds:
             "OFFICE_AUTOMATE_DATA_DIR" => Some(temp_dir.path().join("db").display().to_string()),
             "OFFICE_AUTOMATE_MQTT_HOST" => Some("rust-broker".to_string()),
             "OFFICE_AUTOMATE_MQTT_PORT" => Some("2883".to_string()),
+            "OFFICE_AUTOMATE_YOLINK_UAID" => Some("env-uaid".to_string()),
+            "OFFICE_AUTOMATE_YOLINK_SECRET_KEY" => Some("env-secret".to_string()),
             "OFFICE_AUTOMATE_PUBLIC_URL" => Some("https://office.example.com".to_string()),
             _ => None,
         })
@@ -299,6 +345,13 @@ thresholds:
         assert_eq!(config.orchestrator.port, 9001);
         assert_eq!(config.qingping.mqtt_broker, "rust-broker");
         assert_eq!(config.qingping.mqtt_port, 2883);
+        assert_eq!(config.yolink.uaid, "env-uaid");
+        assert_eq!(config.yolink.secret_key, "env-secret");
+        assert_eq!(config.yolink.http_url, "https://api.yosmart.com");
+        assert_eq!(config.yolink.mqtt_host, "api.yosmart.com");
+        assert_eq!(config.yolink.mqtt_port, 8003);
+        assert_eq!(config.yolink.reconnect_delay_seconds, 5);
+        assert!(config.yolink.is_configured());
         assert_eq!(config.runtime.mqtt_host, "rust-broker");
         assert_eq!(config.runtime.mqtt_port, 2883);
         assert_eq!(config.runtime.data_dir, temp_dir.path().join("db"));
