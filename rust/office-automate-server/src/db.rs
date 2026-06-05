@@ -1,7 +1,8 @@
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::config::AppConfig;
 
@@ -133,6 +134,60 @@ pub fn migrate_database(database_path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn get_setting<T>(database_path: &Path, key: &str) -> Result<Option<T>>
+where
+    T: DeserializeOwned,
+{
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = ?",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .with_context(|| format!("failed to read app setting {key}"))?;
+
+    value
+        .map(|value| {
+            serde_json::from_str(&value)
+                .with_context(|| format!("invalid JSON in app setting {key}"))
+        })
+        .transpose()
+}
+
+pub fn set_setting<T>(database_path: &Path, key: &str, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    if let Some(parent) = database_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create data directory {}", parent.display()))?;
+    }
+
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let encoded = serde_json::to_string(value)
+        .with_context(|| format!("failed to encode app setting {key}"))?;
+    let updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    connection
+        .execute(
+            r#"
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            "#,
+            params![key, encoded, updated_at],
+        )
+        .with_context(|| format!("failed to write app setting {key}"))?;
+
+    Ok(())
+}
+
 fn ensure_column(
     connection: &Connection,
     table_name: &str,
@@ -227,5 +282,25 @@ mod tests {
                 (450, 21.0, 45.0, 1, 2, 3, 36, "qingping"),
             )
             .expect("insert sensor reading with noise_db");
+    }
+
+    #[test]
+    fn app_settings_round_trip_json_values() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+
+        let value = serde_json::json!({
+            "heat_on_temp_f": 70,
+            "heat_off_temp_f": 74,
+            "cool_off_temp_f": 78,
+            "cool_on_temp_f": 82,
+        });
+        set_setting(&db_path, "hvac_temperature_bands", &value).expect("write setting");
+
+        let stored: serde_json::Value = get_setting(&db_path, "hvac_temperature_bands")
+            .expect("read setting")
+            .expect("value");
+        assert_eq!(stored, value);
     }
 }

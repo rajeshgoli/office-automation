@@ -21,6 +21,13 @@ pub struct Status {
 
 impl Status {
     pub fn read_only_default(config: &AppConfig) -> Self {
+        Self::read_only_with_temperature_bands(config, TemperatureBands::from_config(config))
+    }
+
+    pub fn read_only_with_temperature_bands(
+        config: &AppConfig,
+        temperature_bands: TemperatureBands,
+    ) -> Self {
         let sensors = SensorsStatus::default();
 
         Self {
@@ -41,7 +48,7 @@ impl Status {
                 ..ErvStatus::default()
             },
             hvac: HvacStatus {
-                temperature_bands: TemperatureBands::from_config(config),
+                temperature_bands,
                 temperature_band_defaults: TemperatureBands::from_config(config),
                 ..HvacStatus::default()
             },

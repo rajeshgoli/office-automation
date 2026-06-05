@@ -1,4 +1,8 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -26,14 +30,19 @@ use crate::{
     artifacts::{ArtifactStore, is_valid_artifact_hash},
     auth::{AuthManager, AuthenticatedUser, HttpAuthMode, WebSocketAuth, bearer_token},
     config::AppConfig,
+    db,
     status::{Status, TemperatureBands},
 };
+
+const HVAC_TEMPERATURE_BANDS_SETTING: &str = "hvac_temperature_bands";
 
 #[derive(Clone)]
 struct AppState {
     config: AppConfig,
     auth: AuthManager,
     artifacts: ArtifactStore,
+    temperature_bands: Arc<RwLock<TemperatureBands>>,
+    temperature_band_defaults: TemperatureBands,
 }
 
 pub fn app(config: AppConfig) -> Router {
@@ -41,15 +50,20 @@ pub fn app(config: AppConfig) -> Router {
 }
 
 pub fn try_app(config: AppConfig) -> Result<Router> {
+    db::migrate_database(&config.runtime.database_path)?;
     let auth = AuthManager::new(&config.orchestrator)?;
     let artifacts = ArtifactStore::new(
         config.runtime.artifacts_dir.clone(),
         config.runtime.legacy_apk_path.clone(),
     );
+    let temperature_band_defaults = TemperatureBands::from_config(&config);
+    let temperature_bands = load_hvac_temperature_bands(&config, temperature_band_defaults);
     let state = AppState {
         config,
         auth,
         artifacts,
+        temperature_bands: Arc::new(RwLock::new(temperature_bands)),
+        temperature_band_defaults,
     };
 
     let cors = CorsLayer::new()
@@ -222,7 +236,7 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 }
 
 async fn status(State(state): State<AppState>) -> Json<Status> {
-    Json(Status::read_only_default(&state.config))
+    Json(status_for_state(&state))
 }
 
 async fn websocket(
@@ -298,8 +312,7 @@ async fn close_ws(socket: &mut WebSocket, reason: &str) {
 }
 
 async fn send_status(socket: &mut WebSocket, state: &AppState) -> Result<(), axum::Error> {
-    let status = serde_json::to_string(&Status::read_only_default(&state.config))
-        .expect("status serializes");
+    let status = serde_json::to_string(&status_for_state(state)).expect("status serializes");
     socket.send(Message::Text(status.into())).await
 }
 
@@ -383,7 +396,7 @@ async fn hvac(Json(payload): Json<HvacRequest>) -> Response {
 }
 
 async fn hvac_temperature_bands(State(state): State<AppState>) -> Json<Value> {
-    temperature_bands_response(TemperatureBands::from_config(&state.config), &state.config)
+    temperature_bands_response(active_temperature_bands(&state), &state)
 }
 
 #[derive(Debug, Deserialize)]
@@ -414,15 +427,62 @@ async fn update_hvac_temperature_bands(
             .into_response();
     }
 
-    temperature_bands_response(bands, &state.config).into_response()
+    if let Err(error) = db::set_setting(
+        &state.config.runtime.database_path,
+        HVAC_TEMPERATURE_BANDS_SETTING,
+        &bands,
+    ) {
+        tracing::error!("failed to persist HVAC temperature bands: {error:#}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "error": "Failed to persist temperature bands"})),
+        )
+            .into_response();
+    }
+
+    *state
+        .temperature_bands
+        .write()
+        .expect("temperature band lock poisoned") = bands;
+
+    temperature_bands_response(active_temperature_bands(&state), &state).into_response()
 }
 
-fn temperature_bands_response(bands: TemperatureBands, config: &AppConfig) -> Json<Value> {
+fn temperature_bands_response(bands: TemperatureBands, state: &AppState) -> Json<Value> {
     Json(json!({
         "ok": true,
         "temperature_bands": bands,
-        "temperature_band_defaults": TemperatureBands::from_config(config),
+        "temperature_band_defaults": state.temperature_band_defaults,
     }))
+}
+
+fn load_hvac_temperature_bands(config: &AppConfig, defaults: TemperatureBands) -> TemperatureBands {
+    match db::get_setting::<TemperatureBands>(
+        &config.runtime.database_path,
+        HVAC_TEMPERATURE_BANDS_SETTING,
+    ) {
+        Ok(Some(bands)) if validate_temperature_bands(bands).is_ok() => bands,
+        Ok(Some(bands)) => {
+            tracing::warn!("ignoring invalid stored HVAC temperature bands: {bands:?}");
+            defaults
+        }
+        Ok(None) => defaults,
+        Err(error) => {
+            tracing::warn!("failed to load HVAC temperature bands: {error:#}");
+            defaults
+        }
+    }
+}
+
+fn active_temperature_bands(state: &AppState) -> TemperatureBands {
+    *state
+        .temperature_bands
+        .read()
+        .expect("temperature band lock poisoned")
+}
+
+fn status_for_state(state: &AppState) -> Status {
+    Status::read_only_with_temperature_bands(&state.config, active_temperature_bands(state))
 }
 
 fn validate_temperature_bands(bands: TemperatureBands) -> Result<(), &'static str> {
@@ -969,6 +1029,71 @@ mod tests {
         assert!(value.get("erv").is_some());
         assert!(value.get("hvac").is_some());
         assert!(value["erv"]["control"].get("last_local_ok_at").is_some());
+    }
+
+    #[tokio::test]
+    async fn hvac_temperature_band_updates_persist_for_get_and_status() {
+        let config = test_config();
+        let payload = json!({
+            "temperature_bands": {
+                "heat_on_temp_f": 69,
+                "heat_off_temp_f": 73,
+                "cool_off_temp_f": 79,
+                "cool_on_temp_f": 83,
+            }
+        });
+
+        let response = app(config.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/hvac/temperature-bands")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app(config.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/hvac/temperature-bands")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["temperature_bands"]["heat_on_temp_f"], 69);
+        assert_eq!(value["temperature_bands"]["cool_on_temp_f"], 83);
+
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["hvac"]["temperature_bands"]["heat_on_temp_f"], 69);
+        assert_eq!(value["hvac"]["temperature_bands"]["cool_on_temp_f"], 83);
+        assert_eq!(
+            value["hvac"]["temperature_band_defaults"]["heat_on_temp_f"],
+            71
+        );
     }
 
     #[tokio::test]
