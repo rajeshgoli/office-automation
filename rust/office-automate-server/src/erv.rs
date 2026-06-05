@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
 use serde_json::{Map, Value, json};
-use tokio::{task::JoinHandle, time};
+use tokio::{sync::broadcast, task::JoinHandle, time};
 
 use crate::{
     config::{AppConfig, ErvConfig},
@@ -94,6 +94,7 @@ impl ErvStatusReader for RustuyaErvStatusReader {
 pub struct ErvState {
     inner: Arc<RwLock<ErvInner>>,
     database_path: PathBuf,
+    status_broadcast: Arc<RwLock<Option<broadcast::Sender<()>>>>,
 }
 
 #[derive(Debug, Default)]
@@ -108,7 +109,15 @@ impl ErvState {
         Self {
             inner: Arc::default(),
             database_path,
+            status_broadcast: Arc::default(),
         }
+    }
+
+    pub fn set_status_broadcast(&self, sender: broadcast::Sender<()>) {
+        *self
+            .status_broadcast
+            .write()
+            .expect("ERV broadcast lock poisoned") = Some(sender);
     }
 
     pub async fn refresh_with<R>(&self, config: &ErvConfig, reader: &R) -> Result<ErvDeviceStatus>
@@ -117,12 +126,16 @@ impl ErvState {
     {
         match reader.read_status(config).await {
             Ok(status) => {
-                self.record_local_success(status.clone());
+                if self.record_local_success(status.clone()) {
+                    self.notify_status();
+                }
                 Ok(status)
             }
             Err(error) => {
                 let message = format!("{error:#}");
-                self.record_local_failure(&message);
+                if self.record_local_failure(&message) {
+                    self.notify_status();
+                }
                 Err(error)
             }
         }
@@ -146,10 +159,11 @@ impl ErvState {
         }
     }
 
-    fn record_local_success(&self, device_status: ErvDeviceStatus) {
+    fn record_local_success(&self, device_status: ErvDeviceStatus) -> bool {
         let now = local_iso_now();
-        let (was_invalid, invalid_since) = {
+        let (status_changed, was_invalid, invalid_since) = {
             let mut inner = self.inner.write().expect("ERV state lock poisoned");
+            let status_changed = inner.latest_status.as_ref() != Some(&device_status);
             let was_invalid = inner.control.local_key_invalid;
             let invalid_since = inner.control.local_key_invalid_since.clone();
 
@@ -166,7 +180,7 @@ impl ErvState {
                 inner.notification = Some(recovered_notification(&now));
             }
 
-            (was_invalid, invalid_since)
+            (status_changed, was_invalid, invalid_since)
         };
 
         if was_invalid {
@@ -179,9 +193,10 @@ impl ErvState {
                 }),
             );
         }
+        status_changed || was_invalid
     }
 
-    fn record_local_failure(&self, message: &str) {
+    fn record_local_failure(&self, message: &str) -> bool {
         let now = local_iso_now();
         let mut invalid_event = None;
         {
@@ -192,7 +207,7 @@ impl ErvState {
 
             if !is_local_key_error(message) {
                 inner.control.consecutive_local_key_errors = 0;
-                return;
+                return false;
             }
 
             inner.control.consecutive_local_key_errors += 1;
@@ -214,7 +229,21 @@ impl ErvState {
 
         if let Some(event) = invalid_event {
             self.log_health_event("local_key_invalid", event);
+            return true;
         }
+        false
+    }
+
+    fn notify_status(&self) {
+        let Some(sender) = self
+            .status_broadcast
+            .read()
+            .expect("ERV broadcast lock poisoned")
+            .clone()
+        else {
+            return;
+        };
+        let _ = sender.send(());
     }
 
     fn log_health_event(&self, event: &str, details: Value) {
@@ -493,6 +522,51 @@ mod tests {
             .expect("query")
             .expect("event");
         assert_eq!(latest, "local_key_invalid");
+    }
+
+    #[tokio::test]
+    async fn local_status_change_notifies_status_broadcast() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(4);
+        state.set_status_broadcast(sender);
+        let reader = FakeErvReader::new(vec![Ok(medium_status())]);
+
+        state
+            .refresh_with(&test_config(), &reader)
+            .await
+            .expect("success");
+
+        tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("broadcast timeout")
+            .expect("broadcast message");
+    }
+
+    #[tokio::test]
+    async fn local_key_invalid_transition_notifies_status_broadcast() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(4);
+        state.set_status_broadcast(sender);
+        let reader = FakeErvReader::new(
+            (0..LOCAL_KEY_ERROR_THRESHOLD)
+                .map(|_| bail!("Check device key or version (Error 914)"))
+                .collect(),
+        );
+
+        for _ in 0..LOCAL_KEY_ERROR_THRESHOLD {
+            assert!(state.refresh_with(&test_config(), &reader).await.is_err());
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("broadcast timeout")
+            .expect("broadcast message");
     }
 
     #[tokio::test]
