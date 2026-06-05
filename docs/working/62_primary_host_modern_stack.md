@@ -127,7 +127,7 @@ This section is the parity contract for the Rust port. The Rust server should ex
 | Status `hvac` object | Contains `mode`, `setpoint_c`, `suspended`, `temperature_bands`, `temperature_band_defaults`. | Preserve. Temperature-band values remain Fahrenheit integer fields. |
 | Status `manual_override` object | Contains `erv`, `erv_speed`, `erv_expires_in`, `hvac`, `hvac_mode`, `hvac_setpoint_f`, `hvac_expires_in`. | Preserve with integer seconds remaining or null. |
 | Status `notifications` array | Contains app notification objects with fields such as `id`, `type`, `severity`, `title`, `message`, `created_at`, `active`, `runbook_path`. Currently used for ERV control health notification. | Preserve notification shape and broadcast updates over WebSocket. |
-| `GET /ws` | WebSocket sends a full status JSON immediately, then broadcasts the same status shape on changes. Text message `ping` returns text `pong`. If OAuth is enabled and client is not trusted, the Python server expects the first text message to be `{"type":"auth","token":"..."}` within 10 seconds; invalid auth closes with code 4001. | Preserve full-status message shape and `ping`/`pong`. Support both existing auth styles: browser first-message auth and Android `Authorization: Bearer <jwt>` on the upgrade request. Keep trusted-network bypass and close code 4001 for auth failure during compatibility. |
+| `GET /ws` | For OAuth-enabled non-trusted clients, current Python prepares the WebSocket, waits up to 10 seconds for first-message auth `{"type":"auth","token":"..."}`, then adds the client and sends the initial full status. Trusted-network clients bypass auth and receive initial status immediately. Text message `ping` returns text `pong`. Current web sends first-message auth. Current Android sends `Authorization: Bearer <jwt>` on the upgrade request, which Python does not accept today. | Preserve full-status message shape and `ping`/`pong`. Never send initial status before successful first-message auth, successful upgrade-header auth, or trusted-network bypass. Support both browser first-message auth and Android `Authorization: Bearer <jwt>` upgrade-header auth during compatibility. Keep trusted-network bypass and close code 4001 for auth failure. |
 
 ### Control And Configuration Routes
 
@@ -273,10 +273,14 @@ Cutover steps:
 1. Build `office-automate-server`.
 2. Start `office-automate-server serve` with MQTT enabled in shadow/read-only mode if supported.
 3. Subscribe through the server's smoke command to the expected sensor topic pattern.
-4. Reconfigure the air-quality device to publish to `OFFICE_AUTOMATE_MQTT_HOST`.
-5. Confirm live reports arrive at the embedded broker.
-6. Confirm fresh sensor readings are visible through the server API.
-7. Disable the legacy broker only after fresh readings are visible through the Rust server API.
+4. Choose one safe air-quality feed strategy before touching the Qingping device config:
+   - **Bridge/mirror strategy:** keep the device publishing to the legacy broker while a bridge mirrors `qingping/{DEVICE_MAC}/up` into the Rust embedded broker, or mirror Rust broker messages back to the legacy broker. The currently active climate controller must continue receiving fresh readings.
+   - **Atomic switch strategy:** keep the device on the legacy broker until the same cutover window that disables Python active control and enables Rust active control.
+5. Do not point Qingping exclusively at the Rust embedded broker while Python remains the active climate controller unless Python also receives mirrored fresh readings.
+6. Confirm live reports arrive at the Rust embedded broker.
+7. Confirm fresh sensor readings are visible through the Rust server API.
+8. Confirm the currently active climate controller, Python before cutover or Rust after cutover, has a recent air-quality `last_update` before automation remains enabled.
+9. Disable the legacy broker only after Rust is the active controller and fresh readings are visible through the Rust server API.
 
 ## Backend Cutover
 
@@ -357,14 +361,14 @@ Do not decommission the legacy gateway until all gates pass:
 | Gate | Check |
 | --- | --- |
 | API live | `/status` returns 200 from `office-automate-server`. |
-| Fresh sensors | air-quality `last_update` is recent. |
+| Fresh sensors | air-quality `last_update` is recent on the currently active climate controller, not only on the Rust shadow server. |
 | Presence live | internal Rust poller sees primary-host keyboard/display activity. |
 | ERV safe | local control succeeds and no local-key-invalid alert is active. |
 | HVAC readable | HVAC status polling succeeds. |
 | Door/window/motion live | YoLink events or restored state match reality. |
 | MQTT live | embedded broker receives sensor reports after device reconfiguration. |
 | Remote access | public URL reaches `office-automate-server` through Cloudflare Tunnel and OAuth works. |
-| Mobile/PWA | mobile app or PWA reads status and can apply manual controls. |
+| Mobile/PWA | mobile app and PWA read status, receive WebSocket status after auth, and can apply manual controls over the Cloudflare public URL and trusted local URL. |
 | Interface parity | Every route and protocol listed in "Current External Interface Map" either matches the Python behavior or is explicitly marked do-not-port. |
 | Telemetry | leverage endpoints show nonzero recent data after collector run. |
 | Artifacts | app artifact endpoint serves latest metadata and download. |
