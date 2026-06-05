@@ -124,6 +124,7 @@ pub struct MitsubishiConfig {
     pub password: Option<String>,
     pub device_serial: Option<String>,
     pub ip: Option<String>,
+    pub active_control_enabled: bool,
     pub base_url: String,
     pub poll_interval_seconds: u64,
     pub status_timeout_seconds: u64,
@@ -155,6 +156,7 @@ impl Default for MitsubishiConfig {
             password: None,
             device_serial: None,
             ip: None,
+            active_control_enabled: false,
             base_url: "https://app-prod.kumocloud.com".to_string(),
             poll_interval_seconds: 600,
             status_timeout_seconds: 10,
@@ -239,6 +241,7 @@ pub struct ThresholdsConfig {
     pub hvac_critical_temp_f: i64,
     pub hvac_heat_on_temp_f: i64,
     pub hvac_heat_off_temp_f: i64,
+    pub hvac_cool_setpoint_f: i64,
     pub hvac_cool_off_temp_f: i64,
     pub hvac_cool_on_temp_f: i64,
     pub away_stale_flush_enabled: bool,
@@ -282,6 +285,7 @@ impl Default for ThresholdsConfig {
             hvac_critical_temp_f: 55,
             hvac_heat_on_temp_f: 71,
             hvac_heat_off_temp_f: 75,
+            hvac_cool_setpoint_f: 78,
             hvac_cool_off_temp_f: 78,
             hvac_cool_on_temp_f: 81,
             away_stale_flush_enabled: true,
@@ -383,6 +387,11 @@ impl AppConfig {
             file_config.mitsubishi.base_url = base_url;
         }
 
+        if let Some(enabled) = env_lookup("OFFICE_AUTOMATE_KUMO_ACTIVE_CONTROL_ENABLED") {
+            file_config.mitsubishi.active_control_enabled =
+                parse_bool_env("OFFICE_AUTOMATE_KUMO_ACTIVE_CONTROL_ENABLED", &enabled)?;
+        }
+
         if let Some(ip) = env_lookup("OFFICE_AUTOMATE_ERV_IP") {
             file_config.erv.ip = ip;
         }
@@ -468,6 +477,7 @@ erv:
 thresholds:
   hvac_heat_on_temp_f: 70
   hvac_heat_off_temp_f: 74
+  hvac_cool_setpoint_f: 77
   hvac_cool_off_temp_f: 79
   hvac_cool_on_temp_f: 82
 "#,
@@ -485,6 +495,7 @@ thresholds:
             "OFFICE_AUTOMATE_KUMO_PASSWORD" => Some("env-kumo-pass".to_string()),
             "OFFICE_AUTOMATE_KUMO_DEVICE_SERIAL" => Some("env-kumo-serial".to_string()),
             "OFFICE_AUTOMATE_KUMO_BASE_URL" => Some("https://kumo.example.test".to_string()),
+            "OFFICE_AUTOMATE_KUMO_ACTIVE_CONTROL_ENABLED" => Some("true".to_string()),
             "OFFICE_AUTOMATE_ERV_IP" => Some("192.0.2.11".to_string()),
             "OFFICE_AUTOMATE_ERV_DEVICE_ID" => Some("env-erv-device".to_string()),
             "OFFICE_AUTOMATE_ERV_LOCAL_KEY" => Some("env-erv-key".to_string()),
@@ -513,6 +524,7 @@ thresholds:
             Some("env-kumo-serial")
         );
         assert_eq!(config.mitsubishi.base_url, "https://kumo.example.test");
+        assert!(config.mitsubishi.active_control_enabled);
         assert_eq!(config.mitsubishi.poll_interval_seconds, 600);
         assert!(config.mitsubishi.is_configured());
         assert_eq!(config.erv.device_type, "tuya");
@@ -547,6 +559,7 @@ thresholds:
             Some("https://office.example.com")
         );
         assert_eq!(config.thresholds.hvac_heat_on_temp_f, 70);
+        assert_eq!(config.thresholds.hvac_cool_setpoint_f, 77);
         assert_eq!(config.thresholds.hvac_cool_on_temp_f, 82);
     }
 }
