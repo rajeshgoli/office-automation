@@ -714,7 +714,9 @@ async fn qingping_interval(Json(payload): Json<QingpingIntervalRequest>) -> Resp
 #[derive(Debug, Deserialize)]
 struct HistoryQuery {
     hours: Option<i64>,
+    days: Option<i64>,
     limit: Option<i64>,
+    bucket_minutes: Option<i64>,
 }
 
 fn clamp(value: Option<i64>, default: i64, min: i64, max: i64) -> i64 {
@@ -748,49 +750,143 @@ async fn history(State(state): State<AppState>, Query(query): Query<HistoryQuery
     .into_response()
 }
 
-async fn history_sessions() -> Response {
-    history_not_implemented("history sessions")
+async fn history_sessions(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    let days = clamp(query.days, 7, 1, 30);
+    match db::read_office_sessions(&state.config.runtime.database_path, days) {
+        Ok(payload) => Json(json!({"ok": true, "days": days, "sessions": payload["sessions"], "summary": payload["summary"]})).into_response(),
+        Err(error) => history_error("history/sessions", error),
+    }
 }
 
-async fn history_co2_ohlc() -> Response {
-    history_not_implemented("CO2 OHLC history")
+async fn history_co2_ohlc(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    let hours = clamp(query.hours, 24, 1, 168);
+    let bucket_minutes = query
+        .bucket_minutes
+        .unwrap_or(default_co2_bucket(hours))
+        .max(1);
+    match db::read_co2_ohlc(&state.config.runtime.database_path, hours, bucket_minutes) {
+        Ok(payload) => Json(json!({"ok": true, "hours": hours, "bucket_minutes": payload["bucket_minutes"], "candles": payload["candles"]})).into_response(),
+        Err(error) => history_error("history/co2-ohlc", error),
+    }
 }
 
-async fn history_temperature() -> Response {
-    history_not_implemented("temperature history")
+async fn history_temperature(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    let hours = clamp(query.hours, 24, 1, 168);
+    let bucket_minutes = query
+        .bucket_minutes
+        .unwrap_or(default_temperature_bucket(hours))
+        .max(1);
+    match db::read_temperature_history(&state.config.runtime.database_path, hours, bucket_minutes) {
+        Ok(payload) => Json(json!({"ok": true, "hours": hours, "bucket_minutes": payload["bucket_minutes"], "points": payload["points"]})).into_response(),
+        Err(error) => history_error("history/temperature", error),
+    }
 }
 
-async fn history_daily_stats() -> Response {
-    history_not_implemented("daily stats history")
+async fn history_daily_stats(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    let days = clamp(query.days, 7, 1, 30);
+    match db::read_daily_stats(&state.config.runtime.database_path, days) {
+        Ok(stats) => Json(json!({"ok": true, "days": days, "stats": stats})).into_response(),
+        Err(error) => history_error("history/daily-stats", error),
+    }
 }
 
-async fn history_openings() -> Response {
-    history_not_implemented("opening history")
+async fn history_openings(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    let days = clamp(query.days, 7, 1, 30);
+    match db::read_openings(&state.config.runtime.database_path, days) {
+        Ok(days) => Json(json!({"ok": true, "days": days})).into_response(),
+        Err(error) => history_error("history/openings", error),
+    }
 }
 
-async fn history_orchestration() -> Response {
-    history_not_implemented("orchestration history")
+async fn history_orchestration(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    let days = clamp(query.days, 7, 1, 30);
+    match db::read_orchestration_activity(&state.config.runtime.database_path, days) {
+        Ok(days) => Json(json!({"ok": true, "days": days})).into_response(),
+        Err(error) => history_error("history/orchestration", error),
+    }
 }
 
-async fn history_project_focus() -> Response {
-    history_not_implemented("project focus history")
+async fn history_project_focus(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    let days = clamp(query.days, 7, 1, 30);
+    match db::read_project_focus(&state.config.runtime.database_path, days) {
+        Ok(days) => Json(json!({"ok": true, "days": days})).into_response(),
+        Err(error) => history_error("history/project-focus", error),
+    }
 }
 
-async fn history_leverage() -> Response {
-    history_not_implemented("leverage history")
+async fn history_leverage(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    let days = clamp(query.days, 7, 1, 30);
+    match db::read_leverage_history(&state.config.runtime.database_path, days) {
+        Ok(payload) => Json(json!({"ok": true, "days": payload["days"], "week": payload["week"]}))
+            .into_response(),
+        Err(error) => history_error("history/leverage", error),
+    }
 }
 
-async fn history_project_leverage() -> Response {
-    history_not_implemented("project leverage history")
+async fn history_project_leverage(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    let days = clamp(query.days, 7, 1, 30);
+    match db::read_project_leverage(&state.config.runtime.database_path, days) {
+        Ok(payload) => Json(json!({"ok": true, "projects": payload["projects"]})).into_response(),
+        Err(error) => history_error("history/project-leverage", error),
+    }
 }
 
-fn history_not_implemented(name: &str) -> Response {
+fn default_co2_bucket(hours: i64) -> i64 {
+    if hours <= 1 {
+        5
+    } else if hours <= 6 {
+        15
+    } else if hours <= 24 {
+        60
+    } else {
+        240
+    }
+}
+
+fn default_temperature_bucket(hours: i64) -> i64 {
+    if hours <= 1 {
+        5
+    } else if hours <= 6 {
+        15
+    } else if hours <= 24 {
+        30
+    } else {
+        120
+    }
+}
+
+fn history_error(route: &str, error: anyhow::Error) -> Response {
+    tracing::error!("failed to read {route}: {error:#}");
     (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "ok": false,
-            "error": format!("{name} is not implemented in the Rust compatibility server yet"),
-        })),
+        StatusCode::BAD_REQUEST,
+        Json(json!({"ok": false, "error": error.to_string()})),
     )
         .into_response()
 }
@@ -1668,19 +1764,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn secondary_history_routes_fail_loudly_until_ported() {
-        for path in [
-            "/history/sessions?days=7",
-            "/history/co2-ohlc?hours=24",
-            "/history/temperature?hours=24",
-            "/history/daily-stats?days=7",
-            "/history/openings?days=7",
-            "/history/orchestration?days=7",
-            "/history/project-focus?days=7",
-            "/history/leverage?days=7",
-            "/history/project-leverage?days=7",
+    async fn secondary_history_routes_return_compatible_payloads() {
+        let config = test_config();
+        db::migrate_database(&config.runtime.database_path).expect("migration");
+        let connection =
+            rusqlite::Connection::open(&config.runtime.database_path).expect("open database");
+        let now = chrono::Local::now().naive_local();
+        let today = now.date();
+        let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        let present_at = today
+            .and_hms_opt(9, 0, 0)
+            .expect("present timestamp")
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let away_at = today
+            .and_hms_opt(12, 0, 0)
+            .expect("away timestamp")
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let open_at = today
+            .and_hms_opt(10, 0, 0)
+            .expect("open timestamp")
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let close_at = today
+            .and_hms_opt(10, 15, 0)
+            .expect("close timestamp")
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        connection
+            .execute(
+                "INSERT INTO occupancy_log (timestamp, state) VALUES (?, ?), (?, ?)",
+                (&present_at, "present", &away_at, "away"),
+            )
+            .expect("insert occupancy");
+        connection
+            .execute(
+                "INSERT INTO sensor_readings (timestamp, co2_ppm, temp_c, source) VALUES (?, ?, ?, ?)",
+                (&timestamp, 900, 22.0, "qingping"),
+            )
+            .expect("insert sensor");
+        connection
+            .execute(
+                "INSERT INTO device_events (timestamp, device_type, event) VALUES (?, ?, ?), (?, ?, ?)",
+                (&open_at, "door", "open", &close_at, "door", "closed"),
+            )
+            .expect("insert device events");
+        connection
+            .execute(
+                "INSERT INTO climate_actions (timestamp, system, action) VALUES (?, ?, ?), (?, ?, ?)",
+                (&present_at, "erv", "quiet", &away_at, "erv", "off"),
+            )
+            .expect("insert climate");
+        connection
+            .execute(
+                "INSERT INTO orchestration_activity (timestamp, tool, project, session_id) VALUES (?, ?, ?, ?)",
+                (&timestamp, "codex", "fractal-1234-work", "session-1"),
+            )
+            .expect("insert orchestration");
+        connection
+            .execute(
+                "INSERT INTO github_prs (repo, pr_number, title, state, created_at, merged_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "rajeshgoli/office-automation",
+                    83,
+                    "Port HTTP contracts",
+                    "MERGED",
+                    &timestamp,
+                    &timestamp,
+                ),
+            )
+            .expect("insert pr");
+        connection
+            .execute(
+                "INSERT INTO project_leverage (date, project, metric, value) VALUES (?, ?, ?, ?)",
+                (today.to_string(), "session-manager", "sm_dispatches", 2.0),
+            )
+            .expect("insert project leverage");
+
+        let service = app(config);
+        for (path, checks) in [
+            (
+                "/history/sessions?days=1",
+                vec![("sessions", "array"), ("summary", "object")],
+            ),
+            (
+                "/history/co2-ohlc?hours=1&bucket_minutes=60",
+                vec![("candles", "array"), ("bucket_minutes", "number")],
+            ),
+            (
+                "/history/temperature?hours=1&bucket_minutes=60",
+                vec![("points", "array"), ("bucket_minutes", "number")],
+            ),
+            (
+                "/history/daily-stats?days=1",
+                vec![("stats", "array"), ("days", "number")],
+            ),
+            ("/history/openings?days=1", vec![("days", "array")]),
+            ("/history/orchestration?days=1", vec![("days", "array")]),
+            ("/history/project-focus?days=1", vec![("days", "array")]),
+            (
+                "/history/leverage?days=1",
+                vec![("days", "array"), ("week", "object")],
+            ),
+            (
+                "/history/project-leverage?days=1",
+                vec![("projects", "object")],
+            ),
         ] {
-            let response = app(test_config())
+            let response = service
+                .clone()
                 .oneshot(
                     HttpRequest::builder()
                         .uri(path)
@@ -1690,19 +1883,20 @@ mod tests {
                 .await
                 .expect("response");
 
-            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
             let body = to_bytes(response.into_body(), usize::MAX)
                 .await
                 .expect("read body");
             let value: Value = serde_json::from_slice(&body).expect("json body");
-            assert_eq!(value["ok"], false, "{path}");
-            assert!(
-                value["error"]
-                    .as_str()
-                    .expect("error")
-                    .contains("not implemented"),
-                "{path}"
-            );
+            assert_eq!(value["ok"], true, "{path}");
+            for (field, kind) in checks {
+                match kind {
+                    "array" => assert!(value[field].is_array(), "{path} {field}"),
+                    "object" => assert!(value[field].is_object(), "{path} {field}"),
+                    "number" => assert!(value[field].is_number(), "{path} {field}"),
+                    _ => unreachable!("unknown kind"),
+                }
+            }
         }
     }
 
