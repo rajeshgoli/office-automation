@@ -358,8 +358,8 @@ mod tests {
     use super::*;
     use crate::{
         config::{
-            ErvConfig, OrchestratorConfig, QingpingConfig, RuntimeConfig, ThresholdsConfig,
-            YoLinkConfig,
+            ErvConfig, MitsubishiConfig, OrchestratorConfig, QingpingConfig, RuntimeConfig,
+            ThresholdsConfig, YoLinkConfig,
         },
         db,
         erv::BoxFutureResult,
@@ -440,6 +440,7 @@ mod tests {
                 verify_delay_seconds: 0,
                 ..ErvConfig::default()
             },
+            mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
             runtime: RuntimeConfig {
                 root: root.clone(),

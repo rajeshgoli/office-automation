@@ -39,6 +39,7 @@ use crate::{
     erv::{
         ERV_MANUAL_OVERRIDE_SECONDS, ErvFanSpeed, ErvSpeedWriter, ErvState, RustuyaErvSpeedWriter,
     },
+    hvac::HvacState,
     mqtt,
     policy::ErvPolicyState,
     qingping::QingpingState,
@@ -60,6 +61,7 @@ struct AppState {
     status_broadcast: broadcast::Sender<()>,
     qingping: QingpingState,
     erv: ErvState,
+    hvac: HvacState,
     erv_automation: ErvPolicyCoordinator,
 }
 
@@ -78,7 +80,15 @@ fn try_app_with_qingping(config: AppConfig, qingping: QingpingState) -> Result<R
     )));
     let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
     let erv_state = ErvState::new(config.runtime.database_path.clone());
-    try_app_with_state(config, qingping, state_machine, yolink, erv_state)
+    let hvac_state = HvacState::default();
+    try_app_with_state(
+        config,
+        qingping,
+        state_machine,
+        yolink,
+        erv_state,
+        hvac_state,
+    )
 }
 
 fn try_app_with_state(
@@ -87,6 +97,7 @@ fn try_app_with_state(
     state_machine: Arc<RwLock<StateMachine>>,
     yolink: YoLinkState,
     erv_state: ErvState,
+    hvac_state: HvacState,
 ) -> Result<Router> {
     try_app_with_erv_writer(
         config,
@@ -94,6 +105,7 @@ fn try_app_with_state(
         state_machine,
         yolink,
         erv_state,
+        hvac_state,
         Arc::new(RustuyaErvSpeedWriter),
     )
 }
@@ -104,6 +116,7 @@ fn try_app_with_erv_writer(
     state_machine: Arc<RwLock<StateMachine>>,
     yolink: YoLinkState,
     erv_state: ErvState,
+    hvac_state: HvacState,
     erv_writer: Arc<dyn ErvSpeedWriter>,
 ) -> Result<Router> {
     try_app_with_erv_writer_and_coordinator(
@@ -112,6 +125,7 @@ fn try_app_with_erv_writer(
         state_machine,
         yolink,
         erv_state,
+        hvac_state,
         erv_writer,
     )
     .map(|(router, _)| router)
@@ -123,6 +137,7 @@ fn try_app_with_erv_writer_and_coordinator(
     state_machine: Arc<RwLock<StateMachine>>,
     yolink: YoLinkState,
     erv_state: ErvState,
+    hvac_state: HvacState,
     erv_writer: Arc<dyn ErvSpeedWriter>,
 ) -> Result<(Router, ErvPolicyCoordinator)> {
     db::migrate_database(&config.runtime.database_path)?;
@@ -157,6 +172,7 @@ fn try_app_with_erv_writer_and_coordinator(
         status_broadcast,
         qingping,
         erv: erv_state,
+        hvac: hvac_state,
         erv_automation: erv_automation.clone(),
     };
 
@@ -230,12 +246,14 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     )));
     let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
     let erv_state = ErvState::new(config.runtime.database_path.clone());
+    let hvac_state = HvacState::default();
     let (app, erv_automation) = try_app_with_erv_writer_and_coordinator(
         config.clone(),
         qingping.clone(),
         state_machine,
         yolink.clone(),
         erv_state.clone(),
+        hvac_state.clone(),
         Arc::new(RustuyaErvSpeedWriter),
     )
     .context("failed to build HTTP app")?;
@@ -259,6 +277,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             .context("failed to start MQTT ingress")?;
     let _yolink_task = yolink::start_yolink_client(&config, yolink, Some(erv_automation.clone()));
     let _erv_task = crate::erv::start_erv_status_poll(&config, erv_state);
+    let _hvac_task = crate::hvac::start_hvac_status_poll(&config, hvac_state);
 
     tracing::info!("office-automate-server listening on {}", bind_address);
     axum::serve(
@@ -863,6 +882,7 @@ fn status_for_state(state: &AppState) -> Status {
     status.sensors.co2_ppm = state_status.sensors.co2_ppm;
     state.qingping.overlay_status(&mut status);
     state.erv.overlay_status(&mut status);
+    state.hvac.overlay_status(&mut status);
     status
 }
 
@@ -1456,12 +1476,14 @@ mod tests {
     use super::*;
     use crate::{
         config::{
-            ErvConfig, GoogleOAuthConfig, OrchestratorConfig, QingpingConfig, RuntimeConfig,
-            ThresholdsConfig, YoLinkConfig,
+            ErvConfig, GoogleOAuthConfig, MitsubishiConfig, OrchestratorConfig, QingpingConfig,
+            RuntimeConfig, ThresholdsConfig, YoLinkConfig,
         },
         erv::{BoxFutureResult, ErvDeviceStatus, parse_erv_status_payload},
+        hvac::parse_kumo_adapter_status,
     };
 
+    #[derive(Default)]
     struct FakeErvWriter {
         smoke_results: Mutex<VecDeque<Result<ErvDeviceStatus>>>,
         write_results: Mutex<VecDeque<Result<ErvDeviceStatus>>>,
@@ -1536,6 +1558,7 @@ mod tests {
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),
             erv: ErvConfig::default(),
+            mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
             runtime: RuntimeConfig {
                 root: root.clone(),
@@ -1628,8 +1651,36 @@ mod tests {
         )));
         let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
         let erv_state = ErvState::new(config.runtime.database_path.clone());
-        try_app_with_erv_writer(config, qingping, state_machine, yolink, erv_state, writer)
-            .expect("app")
+        try_app_with_erv_writer(
+            config,
+            qingping,
+            state_machine,
+            yolink,
+            erv_state,
+            HvacState::default(),
+            writer,
+        )
+        .expect("app")
+    }
+
+    fn app_with_hvac_state(config: AppConfig, hvac_state: HvacState) -> Router {
+        let qingping = QingpingState::default();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            unix_timestamp_now(),
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        try_app_with_erv_writer(
+            config,
+            qingping,
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+        )
+        .expect("app")
     }
 
     fn erv_status(speed: ErvFanSpeed) -> ErvDeviceStatus {
@@ -1726,6 +1777,40 @@ mod tests {
         assert_eq!(value["air_quality"]["tvoc"], 25);
         assert_eq!(value["air_quality"]["noise_db"], 37.0);
         assert_eq!(value["air_quality"]["last_update"], "2026-06-05T12:30:00");
+    }
+
+    #[tokio::test]
+    async fn status_route_reflects_latest_hvac_reading() {
+        let hvac_state = HvacState::default();
+        hvac_state.record_status(
+            parse_kumo_adapter_status(&json!({
+                "power": 1,
+                "operationMode": "cool",
+                "spHeat": 21.0,
+                "spCool": 25.5
+            }))
+            .expect("HVAC status"),
+        );
+
+        let response = app_with_hvac_state(test_config(), hvac_state)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(value["hvac"]["mode"], "cool");
+        assert_eq!(value["hvac"]["setpoint_c"], 25.5);
+        assert_eq!(value["hvac"]["temperature_bands"]["heat_on_temp_f"], 71);
     }
 
     #[tokio::test]

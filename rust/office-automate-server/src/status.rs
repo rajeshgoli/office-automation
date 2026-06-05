@@ -240,8 +240,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        ErvConfig, OrchestratorConfig, QingpingConfig, RuntimeConfig, ThresholdsConfig,
-        YoLinkConfig,
+        ErvConfig, MitsubishiConfig, OrchestratorConfig, QingpingConfig, RuntimeConfig,
+        ThresholdsConfig, YoLinkConfig,
     };
 
     fn test_config() -> AppConfig {
@@ -253,6 +253,7 @@ mod tests {
             },
             yolink: YoLinkConfig::default(),
             erv: ErvConfig::default(),
+            mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig {
                 hvac_heat_on_temp_f: 70,
                 hvac_heat_off_temp_f: 74,

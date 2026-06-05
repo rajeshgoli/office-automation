@@ -6,6 +6,7 @@ pub mod config;
 pub mod db;
 pub mod erv;
 pub mod http;
+pub mod hvac;
 pub mod mqtt;
 pub mod policy;
 pub mod qingping;

@@ -12,6 +12,7 @@ pub struct AppConfig {
     pub qingping: QingpingConfig,
     pub yolink: YoLinkConfig,
     pub erv: ErvConfig,
+    pub mitsubishi: MitsubishiConfig,
     pub thresholds: ThresholdsConfig,
     pub runtime: RuntimeConfig,
 }
@@ -110,6 +111,53 @@ impl Default for YoLinkConfig {
             mqtt_host: "api.yosmart.com".to_string(),
             mqtt_port: 8003,
             reconnect_delay_seconds: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MitsubishiConfig {
+    #[serde(rename = "type")]
+    pub device_type: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub device_serial: Option<String>,
+    pub ip: Option<String>,
+    pub base_url: String,
+    pub poll_interval_seconds: u64,
+    pub status_timeout_seconds: u64,
+}
+
+impl MitsubishiConfig {
+    pub fn is_configured(&self) -> bool {
+        self.device_type == "kumo"
+            && self
+                .username
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .password
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .device_serial
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+    }
+}
+
+impl Default for MitsubishiConfig {
+    fn default() -> Self {
+        Self {
+            device_type: "kumo".to_string(),
+            username: None,
+            password: None,
+            device_serial: None,
+            ip: None,
+            base_url: "https://app-prod.kumocloud.com".to_string(),
+            poll_interval_seconds: 600,
+            status_timeout_seconds: 10,
         }
     }
 }
@@ -266,6 +314,7 @@ struct FileConfig {
     qingping: QingpingConfig,
     yolink: YoLinkConfig,
     erv: ErvConfig,
+    mitsubishi: MitsubishiConfig,
     thresholds: ThresholdsConfig,
 }
 
@@ -318,6 +367,22 @@ impl AppConfig {
             file_config.yolink.secret_key = secret_key;
         }
 
+        if let Some(username) = env_lookup("OFFICE_AUTOMATE_KUMO_USERNAME") {
+            file_config.mitsubishi.username = Some(username);
+        }
+
+        if let Some(password) = env_lookup("OFFICE_AUTOMATE_KUMO_PASSWORD") {
+            file_config.mitsubishi.password = Some(password);
+        }
+
+        if let Some(serial) = env_lookup("OFFICE_AUTOMATE_KUMO_DEVICE_SERIAL") {
+            file_config.mitsubishi.device_serial = Some(serial);
+        }
+
+        if let Some(base_url) = env_lookup("OFFICE_AUTOMATE_KUMO_BASE_URL") {
+            file_config.mitsubishi.base_url = base_url;
+        }
+
         if let Some(ip) = env_lookup("OFFICE_AUTOMATE_ERV_IP") {
             file_config.erv.ip = ip;
         }
@@ -354,6 +419,7 @@ impl AppConfig {
             qingping: file_config.qingping,
             yolink: file_config.yolink,
             erv: file_config.erv,
+            mitsubishi: file_config.mitsubishi,
             thresholds: file_config.thresholds,
             runtime,
         })
@@ -390,6 +456,10 @@ qingping:
 yolink:
   uaid: "yaml-uaid"
   secret_key: "yaml-secret"
+mitsubishi:
+  username: "yaml-kumo-user"
+  password: "yaml-kumo-pass"
+  device_serial: "yaml-kumo-serial"
 erv:
   type: "tuya"
   ip: "192.0.2.10"
@@ -411,6 +481,10 @@ thresholds:
             "OFFICE_AUTOMATE_MQTT_PORT" => Some("2883".to_string()),
             "OFFICE_AUTOMATE_YOLINK_UAID" => Some("env-uaid".to_string()),
             "OFFICE_AUTOMATE_YOLINK_SECRET_KEY" => Some("env-secret".to_string()),
+            "OFFICE_AUTOMATE_KUMO_USERNAME" => Some("env-kumo-user".to_string()),
+            "OFFICE_AUTOMATE_KUMO_PASSWORD" => Some("env-kumo-pass".to_string()),
+            "OFFICE_AUTOMATE_KUMO_DEVICE_SERIAL" => Some("env-kumo-serial".to_string()),
+            "OFFICE_AUTOMATE_KUMO_BASE_URL" => Some("https://kumo.example.test".to_string()),
             "OFFICE_AUTOMATE_ERV_IP" => Some("192.0.2.11".to_string()),
             "OFFICE_AUTOMATE_ERV_DEVICE_ID" => Some("env-erv-device".to_string()),
             "OFFICE_AUTOMATE_ERV_LOCAL_KEY" => Some("env-erv-key".to_string()),
@@ -431,6 +505,16 @@ thresholds:
         assert_eq!(config.yolink.mqtt_port, 8003);
         assert_eq!(config.yolink.reconnect_delay_seconds, 5);
         assert!(config.yolink.is_configured());
+        assert_eq!(config.mitsubishi.device_type, "kumo");
+        assert_eq!(config.mitsubishi.username.as_deref(), Some("env-kumo-user"));
+        assert_eq!(config.mitsubishi.password.as_deref(), Some("env-kumo-pass"));
+        assert_eq!(
+            config.mitsubishi.device_serial.as_deref(),
+            Some("env-kumo-serial")
+        );
+        assert_eq!(config.mitsubishi.base_url, "https://kumo.example.test");
+        assert_eq!(config.mitsubishi.poll_interval_seconds, 600);
+        assert!(config.mitsubishi.is_configured());
         assert_eq!(config.erv.device_type, "tuya");
         assert_eq!(config.erv.ip, "192.0.2.11");
         assert_eq!(config.erv.device_id, "env-erv-device");

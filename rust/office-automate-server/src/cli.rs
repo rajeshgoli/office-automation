@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
-use crate::{config::AppConfig, db, erv, http};
+use crate::{config::AppConfig, db, erv, http, hvac};
 
 #[derive(Debug, Parser)]
 #[command(name = "office-automate-server")]
@@ -41,6 +41,8 @@ pub struct SmokeArgs {
 pub enum SmokeTarget {
     /// Verify local ERV read credential and connectivity.
     Erv,
+    /// Verify Mitsubishi Kumo HVAC status read.
+    Hvac,
 }
 
 pub async fn run_cli() -> Result<()> {
@@ -83,6 +85,13 @@ async fn run_smoke(config: &AppConfig, target: Option<SmokeTarget>) -> Result<()
                     .fan_speed
                     .map(|speed| speed.as_str())
                     .unwrap_or("unknown")
+            );
+        }
+        Some(SmokeTarget::Hvac) => {
+            let status = hvac::smoke_hvac(config).await?;
+            println!(
+                "HVAC Kumo status OK: mode={} setpoint_c={:.1}",
+                status.mode, status.setpoint_c
             );
         }
     }
@@ -142,6 +151,26 @@ mod tests {
             Command::Smoke(args) => {
                 assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
                 assert_eq!(args.target, Some(SmokeTarget::Erv));
+            }
+            other => panic!("expected smoke command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_smoke_hvac_command_with_config() {
+        let cli = Cli::try_parse_from([
+            "office-automate-server",
+            "smoke",
+            "--config",
+            "/tmp/office.yaml",
+            "hvac",
+        ])
+        .expect("smoke command should parse");
+
+        match cli.command {
+            Command::Smoke(args) => {
+                assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
+                assert_eq!(args.target, Some(SmokeTarget::Hvac));
             }
             other => panic!("expected smoke command, got {other:?}"),
         }
