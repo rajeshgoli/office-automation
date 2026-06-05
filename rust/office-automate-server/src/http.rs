@@ -155,7 +155,8 @@ async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    if should_skip_auth(request.method(), request.uri().path()) {
+    let auth_mode = state.auth.mode();
+    if should_skip_auth(request.method(), request.uri().path(), auth_mode) {
         return next.run(request).await;
     }
 
@@ -165,7 +166,6 @@ async fn auth_middleware(
         .map(|ConnectInfo(remote_addr)| *remote_addr);
     let headers = auth_headers_with_peer(request.headers(), remote_addr);
 
-    let auth_mode = state.auth.mode();
     if request.uri().path() == "/ws"
         && is_websocket_upgrade(&headers)
         && matches!(auth_mode, HttpAuthMode::OAuth | HttpAuthMode::Basic)
@@ -222,7 +222,7 @@ async fn auth_middleware(
     }
 }
 
-fn should_skip_auth(method: &Method, path: &str) -> bool {
+fn should_skip_auth(method: &Method, path: &str, auth_mode: HttpAuthMode) -> bool {
     if *method == Method::OPTIONS {
         return true;
     }
@@ -231,19 +231,16 @@ fn should_skip_auth(method: &Method, path: &str) -> bool {
         return true;
     }
 
-    if path == "/auth/login"
-        || path == "/auth/callback"
-        || path == "/auth/device/start"
-        || path == "/auth/device/poll"
-    {
-        return true;
-    }
-
-    path == "/"
-        || path == "/index.html"
-        || path.starts_with("/assets/")
-        || path.ends_with(".png")
-        || path.ends_with(".json")
+    matches!(auth_mode, HttpAuthMode::OAuth)
+        && (path == "/auth/login"
+            || path == "/auth/callback"
+            || path == "/auth/device/start"
+            || path == "/auth/device/poll"
+            || path == "/"
+            || path == "/index.html"
+            || path.starts_with("/assets/")
+            || path.ends_with(".png")
+            || path.ends_with(".json"))
 }
 
 fn artifact_upload_body_limit() -> usize {
@@ -997,11 +994,14 @@ async fn auth_callback(
             )
             .body(Body::empty())
             .expect("valid android redirect response"),
-        Ok(Some(login)) => Html(format!(
-            "<html><head><script>localStorage.setItem('auth_token', '{}');localStorage.setItem('user_email', '{}');window.location.href = '/';</script></head><body><p>Login successful! Redirecting...</p></body></html>",
-            login.jwt, login.email
-        ))
-        .into_response(),
+        Ok(Some(login)) => {
+            let token = script_json_string(&login.jwt);
+            let email = script_json_string(&login.email);
+            Html(format!(
+                "<html><head><script>localStorage.setItem('auth_token', {token});localStorage.setItem('user_email', {email});window.location.href = '/';</script></head><body><p>Login successful! Redirecting...</p></body></html>",
+            ))
+            .into_response()
+        }
         Ok(None) => (
             StatusCode::FORBIDDEN,
             Html("<html><body><h1>Login Failed</h1><p>Email not authorized</p></body></html>"),
@@ -1029,6 +1029,14 @@ fn escape_html_text(value: &str) -> String {
             _ => character.to_string(),
         })
         .collect()
+}
+
+fn script_json_string(value: &str) -> String {
+    serde_json::to_string(value)
+        .expect("string serializes")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
 }
 
 async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1347,6 +1355,56 @@ mod tests {
             .expect("read body");
         let value: Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(value["login_url"], "/auth/login");
+    }
+
+    #[tokio::test]
+    async fn basic_auth_protects_frontend_static_routes() {
+        let config = basic_config();
+        tokio::fs::create_dir_all(&config.runtime.frontend_dist)
+            .await
+            .expect("create dist");
+        tokio::fs::create_dir_all(config.runtime.frontend_dist.join("assets"))
+            .await
+            .expect("create assets");
+        tokio::fs::write(config.runtime.frontend_dist.join("index.html"), "dashboard")
+            .await
+            .expect("write index");
+        tokio::fs::write(
+            config.runtime.frontend_dist.join("assets/app.js"),
+            "console.log('dashboard')",
+        )
+        .await
+        .expect("write asset");
+
+        for path in ["/", "/index.html", "/assets/app.js", "/manifest.json"] {
+            let response = app(config.clone())
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(
+                response.headers().get(header::WWW_AUTHENTICATE),
+                Some(&"Basic realm=\"Office Climate\"".parse().expect("header"))
+            );
+        }
+
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/")
+                    .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1740,6 +1798,23 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).expect("utf8");
         assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;&amp;&quot;&#39;"));
         assert!(!body.contains("<script>"));
+    }
+
+    #[test]
+    fn script_json_string_round_trips_and_escapes_script_delimiters() {
+        let value = "quote'\"\\</script><script>&";
+        let literal = script_json_string(value);
+
+        assert_eq!(
+            serde_json::from_str::<String>(&literal).expect("json string"),
+            value
+        );
+        assert!(literal.contains("\\\""));
+        assert!(literal.contains("\\\\"));
+        assert!(literal.contains("\\u003c/script\\u003e"));
+        assert!(literal.contains("\\u0026"));
+        assert!(!literal.contains("</script>"));
+        assert!(!literal.contains("<script>"));
     }
 
     #[tokio::test]
