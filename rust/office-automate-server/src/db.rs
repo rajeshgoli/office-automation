@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -11,6 +11,29 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use crate::config::AppConfig;
+
+const SESSION_OUTPUT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS session_output (
+    session_id TEXT PRIMARY KEY,
+    project TEXT NOT NULL DEFAULT 'unknown',
+    start_time DATETIME NOT NULL,
+    duration_minutes INTEGER NOT NULL DEFAULT 0,
+    lines_added INTEGER NOT NULL DEFAULT 0,
+    lines_removed INTEGER NOT NULL DEFAULT 0,
+    files_modified INTEGER NOT NULL DEFAULT 0,
+    git_commits INTEGER NOT NULL DEFAULT 0,
+    git_pushes INTEGER NOT NULL DEFAULT 0,
+    user_message_count INTEGER NOT NULL DEFAULT 0,
+    assistant_message_count INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    tool_counts TEXT,
+    languages TEXT,
+    is_human_session INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_session_output_start ON session_output(start_time);
+CREATE INDEX IF NOT EXISTS idx_session_output_project ON session_output(project);
+"#;
 
 pub fn migrate(config: &AppConfig) -> Result<()> {
     migrate_database(&config.runtime.database_path)
@@ -720,29 +743,50 @@ pub fn read_leverage_history(database_path: &Path, days: i64) -> Result<Value> {
     let now = Local::now().naive_local();
     let labels = day_labels(now.date(), days);
     let cutoff = format_timestamp(day_start(now.date() - Duration::days(days - 1)));
+    let orchestration_datetime = sqlite_local_datetime_expr("timestamp");
+    let orchestration_date = format!("date({orchestration_datetime})");
+    let pr_created_datetime = sqlite_local_datetime_expr("created_at");
+    let pr_created_date = format!("date({pr_created_datetime})");
+    let pr_merged_datetime = sqlite_local_datetime_expr("merged_at");
+    let pr_merged_date = format!("date({pr_merged_datetime})");
     let mut grouped = labels
         .iter()
         .map(|date| (date.clone(), LeverageDay::new(date)))
         .collect::<BTreeMap<_, _>>();
 
-    for (date, prompts, sessions) in query_count_rows(
-        &connection,
-        "date(timestamp)",
-        "orchestration_activity",
-        "timestamp >= ?",
-        &cutoff,
-        Some("COUNT(*)"),
-        Some("COUNT(DISTINCT session_id)"),
-    )? {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {orchestration_date} AS date, COUNT(*) AS prompts, COUNT(DISTINCT session_id) AS sessions \
+         FROM orchestration_activity WHERE {orchestration_datetime} >= ? GROUP BY {orchestration_date}"
+    ))?;
+    let rows = statement.query_map(params![cutoff], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (date, prompts, sessions) = row?;
         if let Some(day) = grouped.get_mut(&date) {
             day.prompts = prompts;
             day.sessions = sessions;
         }
     }
 
-    let mut statement = connection.prepare(
-        "SELECT date(created_at) AS date, COUNT(*) AS count FROM github_prs WHERE created_at >= ? GROUP BY date(created_at)",
-    )?;
+    for row in read_leverage_session_rows(&connection, database_path, &cutoff)? {
+        if let Some(day) = grouped.get_mut(&row.date) {
+            day.lines_added = row.lines_added;
+            day.lines_removed = row.lines_removed;
+            day.files_modified = row.files_modified;
+            day.commits = row.commits;
+            day.duration_minutes = row.duration_minutes;
+        }
+    }
+
+    let mut statement = connection.prepare(&format!(
+        "SELECT {pr_created_date} AS date, COUNT(*) AS count \
+         FROM github_prs WHERE {pr_created_datetime} >= ? GROUP BY {pr_created_date}"
+    ))?;
     let rows = statement.query_map(params![cutoff], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
@@ -753,9 +797,10 @@ pub fn read_leverage_history(database_path: &Path, days: i64) -> Result<Value> {
         }
     }
 
-    let mut statement = connection.prepare(
-        "SELECT date(merged_at) AS date, COUNT(*) AS count, SUM((julianday(merged_at) - julianday(created_at)) * 24.0) AS hours FROM github_prs WHERE merged_at IS NOT NULL AND merged_at >= ? GROUP BY date(merged_at)",
-    )?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT {pr_merged_date} AS date, COUNT(*) AS count, SUM((julianday(merged_at) - julianday(created_at)) * 24.0) AS hours \
+         FROM github_prs WHERE merged_at IS NOT NULL AND {pr_merged_datetime} >= ? GROUP BY {pr_merged_date}"
+    ))?;
     let rows = statement.query_map(params![cutoff], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -782,6 +827,99 @@ pub fn read_leverage_history(database_path: &Path, days: i64) -> Result<Value> {
         .collect::<Vec<_>>();
 
     Ok(json!({"days": days_payload, "week": week.into_value()}))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LeverageSessionRow {
+    date: String,
+    lines_added: i64,
+    lines_removed: i64,
+    files_modified: i64,
+    commits: i64,
+    duration_minutes: i64,
+}
+
+fn read_leverage_session_rows(
+    connection: &Connection,
+    database_path: &Path,
+    cutoff: &str,
+) -> Result<Vec<LeverageSessionRow>> {
+    let telemetry_path = telemetry_database_path(database_path);
+    ensure_telemetry_database(&telemetry_path)?;
+    let telemetry_path = telemetry_path.to_string_lossy().to_string();
+    connection
+        .execute("ATTACH DATABASE ? AS telemetry", params![telemetry_path])
+        .context("failed to attach telemetry database")?;
+
+    let result = query_attached_leverage_session_rows(connection, cutoff);
+    let detach_result = connection
+        .execute_batch("DETACH DATABASE telemetry")
+        .context("failed to detach telemetry database");
+
+    match (result, detach_result) {
+        (Ok(rows), Ok(())) => Ok(rows),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn query_attached_leverage_session_rows(
+    connection: &Connection,
+    cutoff: &str,
+) -> Result<Vec<LeverageSessionRow>> {
+    let session_datetime = sqlite_local_datetime_expr("start_time");
+    let session_date = format!("date({session_datetime})");
+    let mut statement = connection.prepare(&format!(
+        "SELECT {session_date} AS date, \
+                SUM(lines_added) AS lines_added, \
+                SUM(lines_removed) AS lines_removed, \
+                SUM(files_modified) AS files_modified, \
+                SUM(git_commits) AS commits, \
+                SUM(duration_minutes) AS duration_minutes \
+         FROM telemetry.session_output \
+         WHERE {session_datetime} >= ? \
+         GROUP BY {session_date}"
+    ))?;
+    let rows = statement.query_map(params![cutoff], |row| {
+        Ok(LeverageSessionRow {
+            date: row.get(0)?,
+            lines_added: row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
+            lines_removed: row.get::<_, Option<i64>>(2)?.unwrap_or_default(),
+            files_modified: row.get::<_, Option<i64>>(3)?.unwrap_or_default(),
+            commits: row.get::<_, Option<i64>>(4)?.unwrap_or_default(),
+            duration_minutes: row.get::<_, Option<i64>>(5)?.unwrap_or_default(),
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read leverage session rows")
+}
+
+fn telemetry_database_path(database_path: &Path) -> PathBuf {
+    database_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("telemetry.db")
+}
+
+fn ensure_telemetry_database(database_path: &Path) -> Result<()> {
+    if let Some(parent) = database_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create telemetry data directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let connection = Connection::open(database_path).with_context(|| {
+        format!(
+            "failed to open telemetry SQLite database {}",
+            database_path.display()
+        )
+    })?;
+    connection
+        .execute_batch(SESSION_OUTPUT_SCHEMA)
+        .context("failed to apply telemetry SQLite schema")
 }
 
 pub fn read_project_leverage(database_path: &Path, days: i64) -> Result<Value> {
@@ -938,6 +1076,14 @@ fn parse_timestamp(value: &str) -> Option<NaiveDateTime> {
         })
 }
 
+fn sqlite_local_datetime_expr(column: &str) -> String {
+    let has_explicit_timezone =
+        format!("({column} LIKE '%Z' OR {column} LIKE '%+__:__' OR {column} LIKE '%-__:__')");
+    format!(
+        "CASE WHEN {has_explicit_timezone} THEN datetime({column}, 'localtime') ELSE datetime({column}) END"
+    )
+}
+
 fn format_timestamp(value: NaiveDateTime) -> String {
     value.format("%Y-%m-%d %H:%M:%S").to_string()
 }
@@ -1028,31 +1174,6 @@ fn query_sensor_points(
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .context("failed to read sensor points")
-}
-
-fn query_count_rows(
-    connection: &Connection,
-    date_expr: &'static str,
-    table: &'static str,
-    where_clause: &'static str,
-    parameter: &str,
-    first_count: Option<&'static str>,
-    second_count: Option<&'static str>,
-) -> Result<Vec<(String, i64, i64)>> {
-    let first_count = first_count.unwrap_or("COUNT(*)");
-    let second_count = second_count.unwrap_or("0");
-    let mut statement = connection.prepare(&format!(
-        "SELECT {date_expr} AS date, {first_count} AS first_count, {second_count} AS second_count FROM {table} WHERE {where_clause} GROUP BY {date_expr}"
-    ))?;
-    let rows = statement.query_map(params![parameter], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-        ))
-    })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .context("failed to read count rows")
 }
 
 fn durations_from_state_table(
@@ -1566,6 +1687,84 @@ mod tests {
             .expect("read setting")
             .expect("value");
         assert_eq!(stored, value);
+    }
+
+    #[test]
+    fn leverage_history_aggregates_session_output_metrics() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+
+        let today = Local::now().naive_local().date();
+        let timestamp = format_timestamp(day_start(today) + Duration::hours(10));
+        {
+            let connection = Connection::open(&db_path).expect("open database");
+            connection
+                .execute(
+                    "INSERT INTO orchestration_activity (timestamp, tool, project, session_id) VALUES (?, ?, ?, ?), (?, ?, ?, ?)",
+                    (
+                        &timestamp,
+                        "claude",
+                        "office-automate",
+                        "session-1",
+                        &timestamp,
+                        "codex",
+                        "office-automate",
+                        "session-2",
+                    ),
+                )
+                .expect("insert orchestration rows");
+        }
+
+        let telemetry_path = telemetry_database_path(&db_path);
+        ensure_telemetry_database(&telemetry_path).expect("telemetry schema");
+        {
+            let connection = Connection::open(&telemetry_path).expect("open telemetry database");
+            connection
+                .execute(
+                    "INSERT INTO session_output \
+                     (session_id, project, start_time, duration_minutes, lines_added, lines_removed, files_modified, git_commits) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "session-1",
+                        "office-automate",
+                        &timestamp,
+                        30,
+                        150,
+                        20,
+                        4,
+                        5,
+                        "session-2",
+                        "office-automate",
+                        &timestamp,
+                        20,
+                        50,
+                        30,
+                        2,
+                        3,
+                    ),
+                )
+                .expect("insert session output rows");
+        }
+
+        let payload = read_leverage_history(&db_path, 1).expect("leverage history");
+
+        assert_eq!(payload["days"][0]["date"], today.to_string());
+        assert_eq!(payload["days"][0]["prompts"], 2);
+        assert_eq!(payload["days"][0]["sessions"], 2);
+        assert_eq!(payload["days"][0]["lines_added"], 200);
+        assert_eq!(payload["days"][0]["lines_removed"], 50);
+        assert_eq!(payload["days"][0]["lines_changed"], 250);
+        assert_eq!(payload["days"][0]["files_modified"], 6);
+        assert_eq!(payload["days"][0]["commits"], 8);
+        assert_eq!(payload["days"][0]["lines_per_prompt"], 125.0);
+        assert_eq!(payload["days"][0]["commits_per_prompt"], 4.0);
+        assert_eq!(payload["days"][0]["lines_per_session_minute"], 5.0);
+        assert_eq!(payload["week"]["lines_added"], 200);
+        assert_eq!(payload["week"]["lines_removed"], 50);
+        assert_eq!(payload["week"]["files_modified"], 6);
+        assert_eq!(payload["week"]["commits"], 8);
+        assert_eq!(payload["week"]["lines_per_session_minute"], 5.0);
     }
 
     #[test]
