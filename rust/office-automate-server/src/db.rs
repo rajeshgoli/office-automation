@@ -1,8 +1,9 @@
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, types::ValueRef};
 use serde::{Serialize, de::DeserializeOwned};
+use serde_json::Value;
 
 use crate::config::AppConfig;
 
@@ -188,6 +189,135 @@ where
     Ok(())
 }
 
+pub fn log_occupancy_change(
+    database_path: &Path,
+    state: &str,
+    trigger: Option<&str>,
+    co2_ppm: Option<i64>,
+    details: Option<&Value>,
+) -> Result<()> {
+    if let Some(parent) = database_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create data directory {}", parent.display()))?;
+    }
+
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let details = details
+        .map(serde_json::to_string)
+        .transpose()
+        .context("failed to encode occupancy details")?;
+
+    connection
+        .execute(
+            r#"
+            INSERT INTO occupancy_log (timestamp, state, trigger, co2_ppm, details)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+            params![timestamp, state, trigger, co2_ppm, details],
+        )
+        .context("failed to insert occupancy log")?;
+
+    Ok(())
+}
+
+pub fn log_device_event(
+    database_path: &Path,
+    device_type: &str,
+    event: &str,
+    device_name: Option<&str>,
+    details: Option<&Value>,
+) -> Result<()> {
+    if let Some(parent) = database_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create data directory {}", parent.display()))?;
+    }
+
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let details = details
+        .map(serde_json::to_string)
+        .transpose()
+        .context("failed to encode device event details")?;
+
+    connection
+        .execute(
+            r#"
+            INSERT INTO device_events (timestamp, device_type, device_name, event, details)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+            params![timestamp, device_type, device_name, event, details],
+        )
+        .context("failed to insert device event")?;
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryRows {
+    pub sensor_readings: Vec<Value>,
+    pub occupancy_history: Vec<Value>,
+    pub device_events: Vec<Value>,
+    pub climate_actions: Vec<Value>,
+}
+
+pub fn read_history(database_path: &Path, hours: i64, limit: i64) -> Result<HistoryRows> {
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let since = (chrono::Local::now() - chrono::Duration::hours(hours))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+
+    Ok(HistoryRows {
+        sensor_readings: recent_rows(&connection, "sensor_readings", &since, limit)?,
+        occupancy_history: recent_rows(&connection, "occupancy_log", &since, limit)?,
+        device_events: recent_rows(&connection, "device_events", &since, limit)?,
+        climate_actions: recent_rows(&connection, "climate_actions", &since, limit)?,
+    })
+}
+
+fn recent_rows(
+    connection: &Connection,
+    table_name: &'static str,
+    since: &str,
+    limit: i64,
+) -> Result<Vec<Value>> {
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT * FROM {table_name} WHERE timestamp > ? ORDER BY timestamp DESC LIMIT ?"
+        ))
+        .with_context(|| format!("failed to prepare history query for {table_name}"))?;
+    let columns = statement
+        .column_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let rows = statement
+        .query_map(params![since, limit], |row| {
+            let mut object = serde_json::Map::new();
+            for (index, column) in columns.iter().enumerate() {
+                object.insert(column.clone(), sqlite_value_to_json(row.get_ref(index)?));
+            }
+            Ok(Value::Object(object))
+        })
+        .with_context(|| format!("failed to query history rows for {table_name}"))?;
+
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .with_context(|| format!("failed to read history rows for {table_name}"))
+}
+
+fn sqlite_value_to_json(value: ValueRef<'_>) -> Value {
+    match value {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(value) => Value::from(value),
+        ValueRef::Real(value) => Value::from(value),
+        ValueRef::Text(value) => Value::from(String::from_utf8_lossy(value).to_string()),
+        ValueRef::Blob(value) => Value::from(String::from_utf8_lossy(value).to_string()),
+    }
+}
+
 fn ensure_column(
     connection: &Connection,
     table_name: &str,
@@ -302,5 +432,33 @@ mod tests {
             .expect("read setting")
             .expect("value");
         assert_eq!(stored, value);
+    }
+
+    #[test]
+    fn logs_presence_and_reads_history_rows() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+
+        log_device_event(
+            &db_path,
+            "presence",
+            "manual_present",
+            Some("Dashboard"),
+            Some(&serde_json::json!({"state": "present"})),
+        )
+        .expect("log device");
+        log_occupancy_change(&db_path, "present", Some("manual"), Some(500), None)
+            .expect("log occupancy");
+
+        let history = read_history(&db_path, 1, 100).expect("history");
+
+        assert_eq!(history.device_events.len(), 1);
+        assert_eq!(history.device_events[0]["device_type"], "presence");
+        assert_eq!(history.device_events[0]["event"], "manual_present");
+        assert_eq!(history.occupancy_history.len(), 1);
+        assert_eq!(history.occupancy_history[0]["state"], "present");
+        assert_eq!(history.occupancy_history[0]["trigger"], "manual");
+        assert_eq!(history.occupancy_history[0]["co2_ppm"], 500);
     }
 }

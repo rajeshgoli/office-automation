@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::Component,
     sync::{Arc, RwLock},
     time::Duration,
@@ -35,6 +35,7 @@ use crate::{
     auth::{AuthManager, AuthenticatedUser, HttpAuthMode, WebSocketAuth, bearer_token},
     config::AppConfig,
     db,
+    state::{StateMachine, StateTransition},
     status::{Status, TemperatureBands},
 };
 
@@ -47,6 +48,7 @@ struct AppState {
     artifacts: ArtifactStore,
     temperature_bands: Arc<RwLock<TemperatureBands>>,
     temperature_band_defaults: TemperatureBands,
+    state_machine: Arc<RwLock<StateMachine>>,
 }
 
 pub fn app(config: AppConfig) -> Router {
@@ -62,12 +64,14 @@ pub fn try_app(config: AppConfig) -> Result<Router> {
     );
     let temperature_band_defaults = TemperatureBands::from_config(&config);
     let temperature_bands = load_hvac_temperature_bands(&config, temperature_band_defaults);
+    let state_machine = StateMachine::from_thresholds(&config.thresholds, unix_timestamp_now());
     let state = AppState {
         config,
         auth,
         artifacts,
         temperature_bands: Arc::new(RwLock::new(temperature_bands)),
         temperature_band_defaults,
+        state_machine: Arc::new(RwLock::new(state_machine)),
     };
 
     let cors = CorsLayer::new()
@@ -245,13 +249,35 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 
 fn auth_headers_with_peer(headers: &HeaderMap, remote_addr: Option<SocketAddr>) -> HeaderMap {
     let mut headers = headers.clone();
+    let forwarded_for = forwarded_for_ip(&headers);
     headers.remove("x-forwarded-for");
-    if let Some(remote_addr) = remote_addr {
-        if let Ok(value) = remote_addr.ip().to_string().parse() {
+
+    let client_ip = match remote_addr {
+        Some(remote_addr) if remote_addr.ip().is_loopback() => {
+            forwarded_for.or_else(|| Some(remote_addr.ip()))
+        }
+        Some(remote_addr) => Some(remote_addr.ip()),
+        None => None,
+    };
+
+    if let Some(client_ip) = client_ip {
+        if let Ok(value) = client_ip.to_string().parse() {
             headers.insert("x-forwarded-for", value);
         }
     }
     headers
+}
+
+fn forwarded_for_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    headers
+        .get("x-forwarded-for")?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 async fn status(State(state): State<AppState>) -> Json<Status> {
@@ -330,6 +356,10 @@ async fn send_status(socket: &mut WebSocket, state: &AppState) -> Result<(), axu
     socket.send(Message::Text(status.into())).await
 }
 
+fn unix_timestamp_now() -> f64 {
+    chrono::Local::now().timestamp_millis() as f64 / 1_000.0
+}
+
 #[derive(Debug, Deserialize)]
 struct OccupancyRequest {
     last_active_timestamp: f64,
@@ -337,9 +367,35 @@ struct OccupancyRequest {
     external_monitor: bool,
 }
 
-async fn occupancy(Json(payload): Json<OccupancyRequest>) -> Json<Value> {
-    let _ = (payload.last_active_timestamp, payload.external_monitor);
-    Json(json!({"ok": true, "state": "away", "erv_should_run": false}))
+async fn occupancy(
+    State(state): State<AppState>,
+    Json(payload): Json<OccupancyRequest>,
+) -> Response {
+    let now = unix_timestamp_now();
+    let (transition, state_name, erv_should_run) = {
+        let mut machine = state
+            .state_machine
+            .write()
+            .expect("state machine lock poisoned");
+        let transition = machine.update_mac_occupancy(
+            payload.last_active_timestamp,
+            payload.external_monitor,
+            now,
+        );
+        let status = machine.status_at(now);
+        (transition, status.state, status.erv_should_run)
+    };
+
+    if let Err(error) = log_state_transition(&state, transition, "mac_activity") {
+        tracing::error!("failed to log occupancy transition: {error:#}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "error": "Failed to persist occupancy update"})),
+        )
+            .into_response();
+    }
+
+    Json(json!({"ok": true, "state": state_name, "erv_should_run": erv_should_run})).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -347,18 +403,71 @@ struct PresenceRequest {
     state: String,
 }
 
-async fn presence(Json(payload): Json<PresenceRequest>) -> Response {
+async fn presence(State(state): State<AppState>, Json(payload): Json<PresenceRequest>) -> Response {
     match payload.state.as_str() {
-        "present" => {
-            Json(json!({"ok": true, "state": "present", "is_present": true})).into_response()
+        "present" | "away" => {
+            let requested_state = payload.state.as_str();
+            let now = unix_timestamp_now();
+            let present = requested_state == "present";
+            let (transition, state_name, is_present) = {
+                let mut machine = state
+                    .state_machine
+                    .write()
+                    .expect("state machine lock poisoned");
+                let transition = machine.set_manual_presence(present, now);
+                let status = machine.status_at(now);
+                (transition, status.state, status.is_present)
+            };
+
+            if let Err(error) = db::log_device_event(
+                &state.config.runtime.database_path,
+                "presence",
+                &format!("manual_{requested_state}"),
+                Some("Dashboard"),
+                None,
+            )
+            .and_then(|_| log_state_transition(&state, transition, "manual"))
+            {
+                tracing::error!("failed to persist manual presence update: {error:#}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"ok": false, "error": "Failed to persist presence update"})),
+                )
+                    .into_response();
+            }
+
+            Json(json!({"ok": true, "state": state_name, "is_present": is_present})).into_response()
         }
-        "away" => Json(json!({"ok": true, "state": "away", "is_present": false})).into_response(),
         _ => (
             StatusCode::BAD_REQUEST,
             Json(json!({"ok": false, "error": "state must be present or away"})),
         )
             .into_response(),
     }
+}
+
+fn log_state_transition(
+    state: &AppState,
+    transition: Option<StateTransition>,
+    trigger: &str,
+) -> Result<()> {
+    let Some(transition) = transition else {
+        return Ok(());
+    };
+
+    let co2_ppm = state
+        .state_machine
+        .read()
+        .expect("state machine lock poisoned")
+        .sensors
+        .co2_ppm;
+    db::log_occupancy_change(
+        &state.config.runtime.database_path,
+        transition.new_state.as_str(),
+        Some(trigger),
+        Some(co2_ppm),
+        Some(&json!({"old_state": transition.old_state.as_str()})),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -496,7 +605,34 @@ fn active_temperature_bands(state: &AppState) -> TemperatureBands {
 }
 
 fn status_for_state(state: &AppState) -> Status {
-    Status::read_only_with_temperature_bands(&state.config, active_temperature_bands(state))
+    let mut status =
+        Status::read_only_with_temperature_bands(&state.config, active_temperature_bands(state));
+    let now = unix_timestamp_now();
+    let state_status = {
+        let mut machine = state
+            .state_machine
+            .write()
+            .expect("state machine lock poisoned");
+        machine.advance_timers(now);
+        machine.status_at(now)
+    };
+
+    status.state = state_status.state;
+    status.is_present = state_status.is_present;
+    status.presence_signal_active = state_status.presence_signal_active;
+    status.safety_interlock = state_status.safety_interlock;
+    status.erv_should_run = state_status.erv_should_run;
+    status.verifying_departure = state_status.verifying_departure;
+    status.in_door_open_mode = state_status.in_door_open_mode;
+    status.sensors.mac_last_active = state_status.sensors.mac_last_active;
+    status.sensors.mac_active =
+        state_status.sensors.external_monitor && state_status.sensors.mac_last_active > 0.0;
+    status.sensors.external_monitor = state_status.sensors.external_monitor;
+    status.sensors.motion_detected = state_status.sensors.motion_detected;
+    status.sensors.door_open = state_status.sensors.door_open;
+    status.sensors.window_open = state_status.sensors.window_open;
+    status.sensors.co2_ppm = state_status.sensors.co2_ppm;
+    status
 }
 
 fn validate_temperature_bands(bands: TemperatureBands) -> Result<(), &'static str> {
@@ -554,16 +690,31 @@ fn clamp(value: Option<i64>, default: i64, min: i64, max: i64) -> i64 {
     value.unwrap_or(default).clamp(min, max)
 }
 
-async fn history(Query(query): Query<HistoryQuery>) -> Json<Value> {
+async fn history(State(state): State<AppState>, Query(query): Query<HistoryQuery>) -> Response {
+    let hours = clamp(query.hours, 24, 1, 168);
+    let limit = clamp(query.limit, 1000, 10, 10000);
+    let history = match db::read_history(&state.config.runtime.database_path, hours, limit) {
+        Ok(history) => history,
+        Err(error) => {
+            tracing::error!("failed to read history: {error:#}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
     Json(json!({
         "ok": true,
-        "hours": clamp(query.hours, 24, 1, 168),
-        "sensor_readings": [],
-        "occupancy_history": [],
-        "device_events": [],
-        "climate_actions": [],
-        "limit": clamp(query.limit, 1000, 10, 10000),
+        "hours": hours,
+        "sensor_readings": history.sensor_readings,
+        "occupancy_history": history.occupancy_history,
+        "device_events": history.device_events,
+        "climate_actions": history.climate_actions,
+        "limit": limit,
     }))
+    .into_response()
 }
 
 async fn history_sessions(Query(query): Query<HistoryQuery>) -> Json<Value> {
@@ -1191,6 +1342,149 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn oauth_loopback_proxy_preserves_forwarded_client_for_trusted_networks() {
+        let response = app(oauth_config())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .header("x-forwarded-for", "198.51.100.24")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app(oauth_config())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn presence_route_updates_status_and_history() {
+        let service = app(test_config());
+        let response = service
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/presence")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"state":"present"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["state"], "present");
+        assert_eq!(value["is_present"], true);
+
+        let response = service
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["state"], "present");
+        assert_eq!(value["is_present"], true);
+        assert_eq!(value["sensors"]["motion_detected"], true);
+
+        let response = service
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/history?hours=1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["device_events"][0]["device_type"], "presence");
+        assert_eq!(value["device_events"][0]["event"], "manual_present");
+        assert_eq!(value["occupancy_history"][0]["state"], "present");
+        assert_eq!(value["occupancy_history"][0]["trigger"], "manual");
+    }
+
+    #[tokio::test]
+    async fn history_route_queries_persisted_rows() {
+        let config = test_config();
+        db::migrate_database(&config.runtime.database_path).expect("migration");
+        let connection =
+            rusqlite::Connection::open(&config.runtime.database_path).expect("open database");
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        connection
+            .execute(
+                r#"
+                INSERT INTO sensor_readings (timestamp, co2_ppm, temp_c, source)
+                VALUES (?, ?, ?, ?)
+                "#,
+                (&timestamp, 612, 22.5, "qingping"),
+            )
+            .expect("insert sensor");
+        connection
+            .execute(
+                r#"
+                INSERT INTO climate_actions (timestamp, system, action, setpoint, co2_ppm, reason)
+                VALUES (?, ?, ?, ?, ?, ?)
+                "#,
+                (&timestamp, "erv", "turbo", Option::<f64>::None, 612, "test"),
+            )
+            .expect("insert climate action");
+
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/history?hours=1&limit=10")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(value["sensor_readings"][0]["co2_ppm"], 612);
+        assert_eq!(value["sensor_readings"][0]["temp_c"], 22.5);
+        assert_eq!(value["sensor_readings"][0]["source"], "qingping");
+        assert_eq!(value["climate_actions"][0]["system"], "erv");
+        assert_eq!(value["climate_actions"][0]["action"], "turbo");
+        assert_eq!(value["climate_actions"][0]["reason"], "test");
     }
 
     #[tokio::test]
