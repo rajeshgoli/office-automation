@@ -34,7 +34,8 @@ use crate::{
     artifacts::{ArtifactStore, is_valid_artifact_hash},
     auth::{AuthManager, AuthenticatedUser, HttpAuthMode, WebSocketAuth, bearer_token},
     config::AppConfig,
-    db,
+    db, mqtt,
+    qingping::QingpingState,
     state::{StateMachine, StateTransition},
     status::{Status, TemperatureBands},
 };
@@ -50,6 +51,7 @@ struct AppState {
     temperature_band_defaults: TemperatureBands,
     state_machine: Arc<RwLock<StateMachine>>,
     status_broadcast: broadcast::Sender<()>,
+    qingping: QingpingState,
 }
 
 pub fn app(config: AppConfig) -> Router {
@@ -57,6 +59,10 @@ pub fn app(config: AppConfig) -> Router {
 }
 
 pub fn try_app(config: AppConfig) -> Result<Router> {
+    try_app_with_qingping(config, QingpingState::default())
+}
+
+fn try_app_with_qingping(config: AppConfig, qingping: QingpingState) -> Result<Router> {
     db::migrate_database(&config.runtime.database_path)?;
     let auth = AuthManager::new(&config.orchestrator)?;
     let artifacts = ArtifactStore::new(
@@ -75,6 +81,7 @@ pub fn try_app(config: AppConfig) -> Result<Router> {
         temperature_band_defaults,
         state_machine: Arc::new(RwLock::new(state_machine)),
         status_broadcast,
+        qingping,
     };
 
     let cors = CorsLayer::new()
@@ -138,13 +145,16 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let listener = TcpListener::bind(&bind_address)
         .await
         .with_context(|| format!("failed to bind HTTP listener at {bind_address}"))?;
+    let qingping = QingpingState::default();
+    let app = try_app_with_qingping(config.clone(), qingping.clone())
+        .context("failed to build HTTP app")?;
+    let _mqtt_runtime =
+        mqtt::start_qingping_ingress(&config, qingping).context("failed to start MQTT ingress")?;
 
     tracing::info!("office-automate-server listening on {}", bind_address);
     axum::serve(
         listener,
-        try_app(config)
-            .context("failed to build HTTP app")?
-            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await
     .context("HTTP server failed")
@@ -665,6 +675,7 @@ fn status_for_state(state: &AppState) -> Status {
     status.sensors.door_open = state_status.sensors.door_open;
     status.sensors.window_open = state_status.sensors.window_open;
     status.sensors.co2_ppm = state_status.sensors.co2_ppm;
+    state.qingping.overlay_status(&mut status);
     status
 }
 
@@ -1343,6 +1354,50 @@ mod tests {
         assert!(value.get("erv").is_some());
         assert!(value.get("hvac").is_some());
         assert!(value["erv"]["control"].get("last_local_ok_at").is_some());
+    }
+
+    #[tokio::test]
+    async fn status_route_reflects_latest_qingping_reading() {
+        let qingping = QingpingState::default();
+        qingping.apply_reading(crate::qingping::QingpingReading {
+            device_name: "Qingping Air Monitor".to_string(),
+            mac_hint: "AABBCCDDEEFF".to_string(),
+            temp_c: Some(22.5),
+            humidity: Some(45.0),
+            co2_ppm: Some(640),
+            pm25: Some(3),
+            pm10: Some(4),
+            tvoc: Some(25),
+            noise_db: Some(37),
+            timestamp: "2026-06-05T12:30:00".to_string(),
+            raw_data: "{}".to_string(),
+        });
+
+        let response = try_app_with_qingping(test_config(), qingping)
+            .expect("app")
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(value["sensors"]["co2_ppm"], 640);
+        assert_eq!(value["air_quality"]["co2_ppm"], 640);
+        assert_eq!(value["air_quality"]["temp_c"], 22.5);
+        assert_eq!(value["air_quality"]["humidity"], 45.0);
+        assert_eq!(value["air_quality"]["pm25"], 3.0);
+        assert_eq!(value["air_quality"]["tvoc"], 25);
+        assert_eq!(value["air_quality"]["noise_db"], 37.0);
+        assert_eq!(value["air_quality"]["last_update"], "2026-06-05T12:30:00");
     }
 
     #[tokio::test]
