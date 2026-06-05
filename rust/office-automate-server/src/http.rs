@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     path::Component,
     sync::{Arc, RwLock},
     time::Duration,
@@ -151,20 +152,16 @@ async fn auth_middleware(
         return next.run(request).await;
     }
 
-    let mut headers = request.headers().clone();
-    if !headers.contains_key("x-forwarded-for") {
-        if let Some(ConnectInfo(remote_addr)) = request
-            .extensions()
-            .get::<ConnectInfo<std::net::SocketAddr>>()
-        {
-            if let Ok(value) = remote_addr.ip().to_string().parse() {
-                headers.insert("x-forwarded-for", value);
-            }
-        }
-    }
+    let remote_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(remote_addr)| *remote_addr);
+    let headers = auth_headers_with_peer(request.headers(), remote_addr);
 
     let auth_mode = state.auth.mode();
-    if is_websocket_upgrade(&headers) && auth_mode == HttpAuthMode::OAuth {
+    if is_websocket_upgrade(&headers)
+        && matches!(auth_mode, HttpAuthMode::OAuth | HttpAuthMode::Basic)
+    {
         return next.run(request).await;
     }
 
@@ -246,6 +243,17 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
 }
 
+fn auth_headers_with_peer(headers: &HeaderMap, remote_addr: Option<SocketAddr>) -> HeaderMap {
+    let mut headers = headers.clone();
+    headers.remove("x-forwarded-for");
+    if let Some(remote_addr) = remote_addr {
+        if let Ok(value) = remote_addr.ip().to_string().parse() {
+            headers.insert("x-forwarded-for", value);
+        }
+    }
+    headers
+}
+
 async fn status(State(state): State<AppState>) -> Json<Status> {
     Json(status_for_state(&state))
 }
@@ -256,12 +264,7 @@ async fn websocket(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let mut auth_headers = headers.clone();
-    if !auth_headers.contains_key("x-forwarded-for") {
-        if let Ok(value) = remote_addr.ip().to_string().parse() {
-            auth_headers.insert("x-forwarded-for", value);
-        }
-    }
+    let auth_headers = auth_headers_with_peer(&headers, Some(remote_addr));
     let mode = state.auth.websocket_auth(&auth_headers);
     ws.on_upgrade(move |socket| websocket_session(socket, state, mode))
 }
@@ -1160,7 +1163,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn basic_auth_websocket_requires_credentials_before_upgrade() {
+    async fn oauth_trusted_network_ignores_client_supplied_forwarded_for() {
+        let config = AppConfig {
+            orchestrator: OrchestratorConfig {
+                google_oauth: Some(GoogleOAuthConfig {
+                    client_id: "client".to_string(),
+                    client_secret: "secret".to_string(),
+                    allowed_emails: vec!["engineer@rajeshgo.li".to_string()],
+                    jwt_secret: Some("test-secret".to_string()),
+                    trusted_networks: vec!["203.0.113.0/24".to_string()],
+                    ..GoogleOAuthConfig::default()
+                }),
+                ..OrchestratorConfig::default()
+            },
+            ..test_config()
+        };
+
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .header("x-forwarded-for", "203.0.113.7")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn basic_auth_websocket_matches_python_upgrade_bypass() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("addr");
         let server = tokio::spawn(async move {
@@ -1172,24 +1206,9 @@ mod tests {
             .expect("server");
         });
 
-        let error = connect_async(format!("ws://{address}/ws"))
+        let (mut ws, _) = connect_async(format!("ws://{address}/ws"))
             .await
-            .expect_err("unauthenticated websocket should fail");
-        match error {
-            tokio_tungstenite::tungstenite::Error::Http(response) => {
-                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-            }
-            other => panic!("expected HTTP upgrade error, got {other:?}"),
-        }
-
-        let mut request = format!("ws://{address}/ws")
-            .into_client_request()
-            .expect("request");
-        request.headers_mut().insert(
-            header::AUTHORIZATION,
-            "Basic dXNlcjpwYXNz".parse().expect("header"),
-        );
-        let (mut ws, _) = connect_async(request).await.expect("authenticated connect");
+            .expect("connect");
         let message = timeout(Duration::from_secs(1), ws.next())
             .await
             .expect("status timeout")

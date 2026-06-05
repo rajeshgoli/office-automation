@@ -248,18 +248,18 @@ impl ArtifactStore {
             ));
         }
 
+        let artifact_hash = format!("{:x}", sha256.finalize())[..8].to_string();
+        let hashed_path = self.hashed_path(app, &artifact_hash);
+        if !hashed_path.exists() {
+            copy_file_atomically(&temp_path, &hashed_path).await?;
+        }
+
         let latest_path = self.latest_path(app);
         fs::rename(&temp_path, &latest_path)
             .await
             .map_err(|error| {
                 ArtifactError::Internal(anyhow!(error).context("replace latest artifact"))
             })?;
-
-        let artifact_hash = format!("{:x}", sha256.finalize())[..8].to_string();
-        let hashed_path = self.hashed_path(app, &artifact_hash);
-        if !hashed_path.exists() {
-            copy_file_atomically(&latest_path, &hashed_path).await?;
-        }
 
         let metadata = ArtifactMetadata {
             artifact_hash,
