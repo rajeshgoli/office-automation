@@ -714,9 +714,7 @@ async fn qingping_interval(Json(payload): Json<QingpingIntervalRequest>) -> Resp
 #[derive(Debug, Deserialize)]
 struct HistoryQuery {
     hours: Option<i64>,
-    days: Option<i64>,
     limit: Option<i64>,
-    bucket_minutes: Option<i64>,
 }
 
 fn clamp(value: Option<i64>, default: i64, min: i64, max: i64) -> i64 {
@@ -750,77 +748,51 @@ async fn history(State(state): State<AppState>, Query(query): Query<HistoryQuery
     .into_response()
 }
 
-async fn history_sessions(Query(query): Query<HistoryQuery>) -> Json<Value> {
-    Json(json!({"ok": true, "days": clamp(query.days, 7, 1, 30), "sessions": [], "summary": {}}))
+async fn history_sessions() -> Response {
+    history_not_implemented("history sessions")
 }
 
-async fn history_co2_ohlc(Query(query): Query<HistoryQuery>) -> Json<Value> {
-    let hours = clamp(query.hours, 24, 1, 168);
-    Json(json!({
-        "ok": true,
-        "hours": hours,
-        "bucket_minutes": query.bucket_minutes.unwrap_or(default_co2_bucket(hours)),
-        "candles": [],
-    }))
+async fn history_co2_ohlc() -> Response {
+    history_not_implemented("CO2 OHLC history")
 }
 
-async fn history_temperature(Query(query): Query<HistoryQuery>) -> Json<Value> {
-    let hours = clamp(query.hours, 24, 1, 168);
-    Json(json!({
-        "ok": true,
-        "hours": hours,
-        "bucket_minutes": query.bucket_minutes.unwrap_or(default_temperature_bucket(hours)),
-        "points": [],
-    }))
+async fn history_temperature() -> Response {
+    history_not_implemented("temperature history")
 }
 
-async fn history_daily_stats(Query(query): Query<HistoryQuery>) -> Json<Value> {
-    Json(json!({"ok": true, "days": clamp(query.days, 7, 1, 30), "stats": []}))
+async fn history_daily_stats() -> Response {
+    history_not_implemented("daily stats history")
 }
 
-async fn history_openings(Query(query): Query<HistoryQuery>) -> Json<Value> {
-    Json(json!({"ok": true, "days": [], "requested_days": clamp(query.days, 7, 1, 30)}))
+async fn history_openings() -> Response {
+    history_not_implemented("opening history")
 }
 
-async fn history_orchestration(Query(query): Query<HistoryQuery>) -> Json<Value> {
-    Json(json!({"ok": true, "days": [], "requested_days": clamp(query.days, 7, 1, 30)}))
+async fn history_orchestration() -> Response {
+    history_not_implemented("orchestration history")
 }
 
-async fn history_project_focus(Query(query): Query<HistoryQuery>) -> Json<Value> {
-    Json(json!({"ok": true, "days": [], "requested_days": clamp(query.days, 7, 1, 30)}))
+async fn history_project_focus() -> Response {
+    history_not_implemented("project focus history")
 }
 
-async fn history_leverage(Query(query): Query<HistoryQuery>) -> Json<Value> {
-    Json(json!({"ok": true, "days": [], "week": {}, "requested_days": clamp(query.days, 7, 1, 30)}))
+async fn history_leverage() -> Response {
+    history_not_implemented("leverage history")
 }
 
-async fn history_project_leverage(Query(query): Query<HistoryQuery>) -> Json<Value> {
-    let _ = clamp(query.days, 7, 1, 30);
-    Json(json!({"ok": true, "projects": {}}))
+async fn history_project_leverage() -> Response {
+    history_not_implemented("project leverage history")
 }
 
-fn default_co2_bucket(hours: i64) -> i64 {
-    if hours <= 6 {
-        5
-    } else if hours <= 24 {
-        15
-    } else if hours <= 72 {
-        60
-    } else {
-        240
-    }
-}
-
-fn default_temperature_bucket(hours: i64) -> i64 {
-    if hours <= 6 {
-        5
-    } else if hours <= 24 {
-        15
-    } else if hours <= 72 {
-        30
-    } else {
-        120
-    }
+fn history_not_implemented(name: &str) -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "ok": false,
+            "error": format!("{name} is not implemented in the Rust compatibility server yet"),
+        })),
+    )
+        .into_response()
 }
 
 async fn deploy_app(
@@ -1693,6 +1665,45 @@ mod tests {
         assert_eq!(value["climate_actions"][0]["system"], "erv");
         assert_eq!(value["climate_actions"][0]["action"], "turbo");
         assert_eq!(value["climate_actions"][0]["reason"], "test");
+    }
+
+    #[tokio::test]
+    async fn secondary_history_routes_fail_loudly_until_ported() {
+        for path in [
+            "/history/sessions?days=7",
+            "/history/co2-ohlc?hours=24",
+            "/history/temperature?hours=24",
+            "/history/daily-stats?days=7",
+            "/history/openings?days=7",
+            "/history/orchestration?days=7",
+            "/history/project-focus?days=7",
+            "/history/leverage?days=7",
+            "/history/project-leverage?days=7",
+        ] {
+            let response = app(test_config())
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            let value: Value = serde_json::from_slice(&body).expect("json body");
+            assert_eq!(value["ok"], false, "{path}");
+            assert!(
+                value["error"]
+                    .as_str()
+                    .expect("error")
+                    .contains("not implemented"),
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]
