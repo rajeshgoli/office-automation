@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params, types::ValueRef};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
-use crate::config::AppConfig;
+use crate::{config::AppConfig, qingping::QingpingReading};
 
 const SESSION_OUTPUT_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS session_output (
@@ -213,6 +213,38 @@ where
             params![key, encoded, updated_at],
         )
         .with_context(|| format!("failed to write app setting {key}"))?;
+
+    Ok(())
+}
+
+pub fn insert_sensor_reading(database_path: &Path, reading: &QingpingReading) -> Result<()> {
+    if let Some(parent) = database_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create data directory {}", parent.display()))?;
+    }
+
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO sensor_readings
+                (timestamp, co2_ppm, temp_c, humidity, pm25, pm10, tvoc, noise_db, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                reading.database_timestamp(),
+                reading.co2_ppm,
+                reading.temp_c,
+                reading.humidity,
+                reading.pm25,
+                reading.pm10,
+                reading.tvoc,
+                reading.noise_db,
+                "qingping",
+            ],
+        )
+        .context("failed to insert Qingping sensor reading")?;
 
     Ok(())
 }
@@ -1793,5 +1825,67 @@ mod tests {
         assert_eq!(history.occupancy_history[0]["state"], "present");
         assert_eq!(history.occupancy_history[0]["trigger"], "manual");
         assert_eq!(history.occupancy_history[0]["co2_ppm"], 500);
+    }
+
+    #[test]
+    fn inserts_qingping_sensor_readings() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+
+        let reading = QingpingReading {
+            device_name: "Qingping Air Monitor".to_string(),
+            mac_hint: "AABBCCDDEEFF".to_string(),
+            temp_c: Some(22.5),
+            humidity: Some(45.0),
+            co2_ppm: Some(620),
+            pm25: Some(3),
+            pm10: Some(4),
+            tvoc: Some(25),
+            noise_db: Some(37),
+            timestamp: "2026-06-05T12:05:00".to_string(),
+            raw_data: "{}".to_string(),
+        };
+
+        insert_sensor_reading(&db_path, &reading).expect("insert reading");
+
+        let connection = Connection::open(&db_path).expect("open database");
+        let row = connection
+            .query_row(
+                r#"
+                SELECT timestamp, co2_ppm, temp_c, humidity, pm25, pm10, tvoc, noise_db, source
+                FROM sensor_readings
+                "#,
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, f64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                },
+            )
+            .expect("read inserted row");
+
+        assert_eq!(
+            row,
+            (
+                "2026-06-05 12:05:00".to_string(),
+                620,
+                22.5,
+                45.0,
+                3,
+                4,
+                25,
+                37,
+                "qingping".to_string()
+            )
+        );
     }
 }
