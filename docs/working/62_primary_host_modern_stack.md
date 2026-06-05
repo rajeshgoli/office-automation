@@ -123,7 +123,7 @@ This section is the parity contract for the Rust port. The Rust server should ex
 | `GET /status` | Returns the full live status object. Top-level fields include `state`, `is_present`, `presence_signal_active`, `safety_interlock`, `erv_should_run`, `verifying_departure`, `in_door_open_mode`, `sensors`, `air_quality`, `erv`, `hvac`, `manual_override`, and `notifications`. | Preserve field names and compatible nullability. Add fields only in a backward-compatible way. |
 | Status `sensors` object | Current Python sends `mac_last_active`, `external_monitor`, `motion_detected`, `door_open`, `window_open`, `co2_ppm`. Web and Android client models also mention `mac_active`, but that key is absent from the current server payload and is therefore treated as missing/default today. | Preserve current keys. Adding `mac_active` is backward-compatible, but it must not replace `mac_last_active` during compatibility. |
 | Status `air_quality` object | Contains `co2_ppm`, `temp_c`, `humidity`, `pm25`, `pm10`, `tvoc`, `noise_db`, `last_update`, `report_interval`, `interval_configured`. | Preserve. `last_update` remains ISO timestamp string or null. |
-| Status `erv` object | Contains `running`, `tvoc_ventilation`, `speed`, `tvoc_plateau`, `tvoc_baseline`, stale-flush fields, `room_closed_since`, and `control` health object from the ERV client. | Preserve at least all current keys used by clients: `running`, `speed`, plus health/notification semantics for local-key invalid alerts. |
+| Status `erv` object | Contains `running`, `tvoc_ventilation`, `speed`, `tvoc_plateau`, `tvoc_baseline`, `away_stale_flush_enabled`, `away_stale_flush_active`, `away_stale_flush_active_until`, `away_stale_flush_next_due_at`, `room_closed_since`, and `control`. Current `control` fields are `last_ok_at`, `last_local_ok_at`, `last_error`, `last_error_at`, `using_cloud`, `local_key_invalid`, `local_key_invalid_since`, and `consecutive_local_key_errors`. | Preserve the full current `erv` object and full `erv.control` object unless a future spec explicitly marks a field do-not-port. These fields are operator-visible health and safety signals, not just client decoration. |
 | Status `hvac` object | Contains `mode`, `setpoint_c`, `suspended`, `temperature_bands`, `temperature_band_defaults`. | Preserve. Temperature-band values remain Fahrenheit integer fields. |
 | Status `manual_override` object | Contains `erv`, `erv_speed`, `erv_expires_in`, `hvac`, `hvac_mode`, `hvac_setpoint_f`, `hvac_expires_in`. | Preserve with integer seconds remaining or null. |
 | Status `notifications` array | Contains app notification objects with fields such as `id`, `type`, `severity`, `title`, `message`, `created_at`, `active`, `runbook_path`. Currently used for ERV control health notification. | Preserve notification shape and broadcast updates over WebSocket. |
@@ -387,16 +387,21 @@ Presence and telemetry rollback are lower risk than climate-control rollback. Cl
 1. Create the Rust workspace and `office-automate-server` binary.
 2. Port config loading, SQLite migrations, and read-only `/status` parity first.
 3. Port state machine and write parity tests against the current Python behavior.
-4. Port sensor clients and embedded MQTT ingress.
-5. Port ERV/HVAC control with smoke commands before enabling writes.
-6. Port OAuth, WebSocket, static frontend serving, and app artifact endpoints.
-7. Add HTTP/JSON/WebSocket parity tests against the interface map before client cutover.
-8. Port telemetry/project-leverage collectors as binary subcommands.
-9. Add launchd templates for server, collectors, and Cloudflare Tunnel.
-10. Run shadow-mode validation against copied data and live read-only device checks.
-11. Cut over backend and embedded MQTT once ERV local control is valid on the primary host.
-12. Remove legacy rsync/push jobs.
-13. Decommission legacy launchd jobs after a rollback window.
+4. Port HTTP/JSON/WebSocket/OAuth/static/artifact contracts with parity tests against the interface map.
+5. Port embedded MQTT broker and Qingping passive ingestion.
+6. Port YoLink passive sensor inventory, restored state, and event handling.
+7. Port ERV read/health/smoke support, including full `erv.control` status parity, with no active writes enabled.
+8. Port ERV active write control behind explicit smoke gates and a config-controlled active-control enable flag.
+9. Port HVAC status/read behavior and temperature-band persistence with no active writes enabled.
+10. Port HVAC active write control behind explicit smoke gates and a config-controlled active-control enable flag.
+11. Port internal presence poller and compatibility `/occupancy`.
+12. Port telemetry/project-leverage collectors as binary subcommands.
+13. Add launchd templates for server, collectors, and Cloudflare Tunnel.
+14. Run migration/snapshot dry-runs against copied data and artifacts.
+15. Run shadow-mode validation against copied data and live read-only device checks.
+16. Cut over backend and embedded MQTT only after ERV and HVAC write gates are validated.
+17. Validate rollback from the Rust-written state back to the legacy gateway.
+18. Remove legacy rsync/push jobs and decommission legacy launchd jobs after a rollback window.
 
 ## Risks
 
@@ -421,12 +426,20 @@ Presence and telemetry rollback are lower risk than climate-control rollback. Cl
 
 **Epic.** This should be split before implementation because it crosses infrastructure, device configuration, climate-control safety, telemetry pipelines, and legacy decommissioning. Proposed implementation tickets:
 
-1. Rust backend workspace, config, DB migrations, and status API.
-2. State machine and climate-policy parity port.
-3. Embedded MQTT ingress and air-quality sensor handling.
-4. Device clients: ERV, HVAC, YoLink, and Qingping parity.
-5. Auth, WebSocket, frontend/static, and artifact endpoints.
-6. Internal Rust presence poller and compatibility `/occupancy`.
-7. Telemetry/project-leverage subcommands.
-8. Primary-host launchd templates and Cloudflare Tunnel setup.
-9. Data/secret migration, backend cutover, and rollback validation.
+1. Rust backend workspace, config loading, DB migrations, and read-only status API.
+2. State machine and climate-policy parity tests, with no device writes.
+3. HTTP/JSON/WebSocket/OAuth/static/artifact contract parity from the interface map.
+4. Embedded MQTT broker plus Qingping passive ingestion and interval-command path.
+5. YoLink passive sensor inventory, restored state, MQTT event handling, and reconnect behavior.
+6. ERV read/health/smoke parity, including full `erv.control` status shape and local-key-invalid notification state, with active writes disabled.
+7. ERV active write control for manual and automated speed changes, enabled only after smoke checks and behind an explicit active-control gate.
+8. HVAC status/read parity and temperature-band persistence, with active writes disabled.
+9. HVAC active write control for mode/setpoint changes, enabled only after smoke checks and behind an explicit active-control gate.
+10. Internal Rust presence poller plus compatibility `/occupancy` route.
+11. Telemetry and project-leverage collector subcommands.
+12. Primary-host launchd templates and Cloudflare Tunnel service setup.
+13. Data, secret, artifact, and credential migration dry-run with pre-cutover snapshots.
+14. Shadow-mode validation against copied data and live read-only dependencies.
+15. Backend/MQTT cutover execution with one active climate controller.
+16. Rollback validation from Rust-written state back to the legacy gateway.
+17. Legacy rsync/push cleanup and legacy launchd decommissioning after the rollback window.
