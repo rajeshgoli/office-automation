@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::Component,
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -941,7 +942,7 @@ async fn spa_fallback(State(state): State<AppState>, Path(path): Path<String>) -
 
 async fn serve_static_or_index(state: &AppState, path: &str) -> Response {
     let requested = state.config.runtime.frontend_dist.join(path);
-    let target = if requested.exists() && requested.is_file() {
+    let target = if is_safe_spa_path(path) && requested.exists() && requested.is_file() {
         requested
     } else {
         state.config.runtime.frontend_dist.join("index.html")
@@ -954,6 +955,12 @@ async fn serve_static_or_index(state: &AppState, path: &str) -> Response {
             .expect("static response"),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+fn is_safe_spa_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .components()
+        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
 #[cfg(test)]
@@ -1460,5 +1467,38 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_rejects_parent_directory_traversal() {
+        let config = test_config();
+        tokio::fs::create_dir_all(&config.runtime.frontend_dist)
+            .await
+            .expect("create frontend dist");
+        tokio::fs::write(
+            config.runtime.frontend_dist.join("index.html"),
+            b"spa-index",
+        )
+        .await
+        .expect("write index");
+        tokio::fs::write(config.runtime.root.join("secret.txt"), b"secret")
+            .await
+            .expect("write escaped file");
+
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/%2e%2e/secret.txt")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert_eq!(&body[..], b"spa-index");
     }
 }
