@@ -326,6 +326,7 @@ impl ErvPolicyState {
                 let mut co2_speed = None;
                 let mut co2_fallback_turbo = false;
                 let mut tvoc_speed = None;
+                let latest_tvoc = input.tvoc.or_else(|| self.latest_tvoc());
 
                 if co2_needs_refresh {
                     co2_speed =
@@ -340,12 +341,8 @@ impl ErvPolicyState {
                     if tvoc_at_target && self.tvoc_away_ventilation_active {
                         self.tvoc_away_ventilation_active = false;
                         self.tvoc_plateau_detected = false;
-                    } else {
-                        tvoc_speed = self.adaptive_tvoc_speed(
-                            thresholds,
-                            input.tvoc.expect("tVOC required while clearing"),
-                            now,
-                        );
+                    } else if let Some(tvoc) = latest_tvoc {
+                        tvoc_speed = self.adaptive_tvoc_speed(thresholds, tvoc, now);
                         if !self.tvoc_away_ventilation_active && tvoc_needs_clearing {
                             self.tvoc_away_ventilation_active = true;
                         }
@@ -391,7 +388,7 @@ impl ErvPolicyState {
                             }
                         }
                         AwaySource::Tvoc => {
-                            let tvoc = input.tvoc.expect("tVOC source selected");
+                            let tvoc = latest_tvoc.expect("tVOC source selected");
                             format!("away_adaptive_{}_tVOC={tvoc}", target_speed.as_str())
                         }
                         AwaySource::Stale => {
@@ -448,6 +445,10 @@ impl ErvPolicyState {
 
     fn tvoc_rate_of_change(&self) -> Option<f64> {
         rate_of_change(&self.tvoc_history)
+    }
+
+    fn latest_tvoc(&self) -> Option<i64> {
+        self.tvoc_history.back().map(|sample| sample.value)
     }
 
     fn detect_co2_plateau(&mut self, thresholds: &ThresholdsConfig) -> bool {
@@ -1025,6 +1026,51 @@ mod tests {
                 bypass_dwell: false,
             }
         );
+        assert!(policy.tvoc_away_ventilation_active);
+    }
+
+    #[test]
+    fn active_tvoc_ventilation_tolerates_missing_tvoc_reading() {
+        let thresholds = ThresholdsConfig {
+            min_away_seconds_before_erv: 0,
+            away_stale_flush_enabled: false,
+            ..ThresholdsConfig::default()
+        };
+        let mut policy = ErvPolicyState::new(&thresholds);
+        policy.away_start_at = Some(0.0);
+        policy.record_reading(
+            &thresholds,
+            1_900.0,
+            AirQualityReading {
+                co2_ppm: Some(450),
+                tvoc: Some(250),
+                temp_c: None,
+            },
+        );
+
+        let decision = policy.decide_erv(&thresholds, away_input(Some(450), Some(250)), 1_900.0);
+        assert_eq!(
+            decision,
+            ErvDecision::SetSpeed {
+                target_speed: VentilationSpeed::Turbo,
+                reason: "away_refresh_tVOC=250".to_string(),
+                bypass_dwell: false,
+            }
+        );
+        assert!(policy.tvoc_away_ventilation_active);
+
+        let decision = policy.decide_erv(
+            &thresholds,
+            ErvPolicyInput {
+                current_running: true,
+                current_speed: VentilationSpeed::Turbo,
+                tvoc: None,
+                ..away_input(Some(450), None)
+            },
+            1_930.0,
+        );
+
+        assert_eq!(decision, ErvDecision::NoChange);
         assert!(policy.tvoc_away_ventilation_active);
     }
 
