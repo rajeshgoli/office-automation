@@ -849,8 +849,13 @@ async fn deploy_app(
 }
 
 async fn latest_app_artifact(State(state): State<AppState>, Path(app): Path<String>) -> Response {
-    let Ok(Some(metadata)) = state.artifacts.read_metadata(&app).await else {
-        return StatusCode::NOT_FOUND.into_response();
+    let metadata = match state.artifacts.read_metadata(&app).await {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::error!("artifact metadata read failed: {error:#}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
 
     if !is_valid_artifact_hash(&metadata.artifact_hash) {
@@ -1885,6 +1890,30 @@ mod tests {
             response.headers().get(header::CONTENT_DISPOSITION).unwrap(),
             "attachment; filename=office-climate.apk"
         );
+    }
+
+    #[tokio::test]
+    async fn latest_artifact_surfaces_malformed_metadata_as_server_error() {
+        let config = test_config();
+        let app_dir = config.runtime.artifacts_dir.join("office-climate");
+        tokio::fs::create_dir_all(&app_dir)
+            .await
+            .expect("create app dir");
+        tokio::fs::write(app_dir.join("meta.json"), "{not json")
+            .await
+            .expect("write malformed metadata");
+
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/apps/office-climate/latest.apk")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
