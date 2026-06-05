@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
-use crate::{config::AppConfig, db, http};
+use crate::{config::AppConfig, db, erv, http};
 
 #[derive(Debug, Parser)]
 #[command(name = "office-automate-server")]
@@ -19,12 +19,28 @@ pub enum Command {
     Serve(ConfigArgs),
     /// Create or upgrade the SQLite schema.
     Migrate(ConfigArgs),
+    /// Run local dependency checks without changing device state.
+    Smoke(SmokeArgs),
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
 pub struct ConfigArgs {
     #[arg(long, env = "OFFICE_AUTOMATE_CONFIG")]
     pub config: PathBuf,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct SmokeArgs {
+    #[arg(long, env = "OFFICE_AUTOMATE_CONFIG")]
+    pub config: PathBuf,
+    #[command(subcommand)]
+    pub target: Option<SmokeTarget>,
+}
+
+#[derive(Debug, Subcommand, Clone, Copy, PartialEq, Eq)]
+pub enum SmokeTarget {
+    /// Verify local ERV read credential and connectivity.
+    Erv,
 }
 
 pub async fn run_cli() -> Result<()> {
@@ -49,7 +65,29 @@ pub async fn run(cli: Cli) -> Result<()> {
             db::migrate(&config)?;
             Ok(())
         }
+        Command::Smoke(args) => {
+            let config = AppConfig::load(&args.config)?;
+            run_smoke(&config, args.target).await
+        }
     }
+}
+
+async fn run_smoke(config: &AppConfig, target: Option<SmokeTarget>) -> Result<()> {
+    match target {
+        Some(SmokeTarget::Erv) | None => {
+            let status = erv::smoke_erv(config).await?;
+            println!(
+                "ERV local status OK: running={} speed={}",
+                status.power,
+                status
+                    .fan_speed
+                    .map(|speed| speed.as_str())
+                    .unwrap_or("unknown")
+            );
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -86,6 +124,26 @@ mod tests {
         match cli.command {
             Command::Migrate(args) => assert_eq!(args.config, PathBuf::from("/tmp/office.yaml")),
             other => panic!("expected migrate command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_smoke_erv_command_with_config() {
+        let cli = Cli::try_parse_from([
+            "office-automate-server",
+            "smoke",
+            "--config",
+            "/tmp/office.yaml",
+            "erv",
+        ])
+        .expect("smoke command should parse");
+
+        match cli.command {
+            Command::Smoke(args) => {
+                assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
+                assert_eq!(args.target, Some(SmokeTarget::Erv));
+            }
+            other => panic!("expected smoke command, got {other:?}"),
         }
     }
 }

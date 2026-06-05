@@ -34,7 +34,9 @@ use crate::{
     artifacts::{ArtifactStore, is_valid_artifact_hash},
     auth::{AuthManager, AuthenticatedUser, HttpAuthMode, WebSocketAuth, bearer_token},
     config::AppConfig,
-    db, mqtt,
+    db,
+    erv::ErvState,
+    mqtt,
     qingping::QingpingState,
     state::{StateMachine, StateTransition},
     status::{Status, TemperatureBands},
@@ -53,6 +55,7 @@ struct AppState {
     state_machine: Arc<RwLock<StateMachine>>,
     status_broadcast: broadcast::Sender<()>,
     qingping: QingpingState,
+    erv: ErvState,
 }
 
 pub fn app(config: AppConfig) -> Router {
@@ -69,7 +72,8 @@ fn try_app_with_qingping(config: AppConfig, qingping: QingpingState) -> Result<R
         unix_timestamp_now(),
     )));
     let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
-    try_app_with_state(config, qingping, state_machine, yolink)
+    let erv_state = ErvState::new(config.runtime.database_path.clone());
+    try_app_with_state(config, qingping, state_machine, yolink, erv_state)
 }
 
 fn try_app_with_state(
@@ -77,6 +81,7 @@ fn try_app_with_state(
     qingping: QingpingState,
     state_machine: Arc<RwLock<StateMachine>>,
     yolink: YoLinkState,
+    erv_state: ErvState,
 ) -> Result<Router> {
     db::migrate_database(&config.runtime.database_path)?;
     let auth = AuthManager::new(&config.orchestrator)?;
@@ -88,6 +93,7 @@ fn try_app_with_state(
     let temperature_bands = load_hvac_temperature_bands(&config, temperature_band_defaults);
     let (status_broadcast, _) = broadcast::channel(32);
     yolink.set_status_broadcast(status_broadcast.clone());
+    erv_state.set_status_broadcast(status_broadcast.clone());
     yolink.restore_from_database(unix_timestamp_now())?;
     let state = AppState {
         config,
@@ -98,6 +104,7 @@ fn try_app_with_state(
         state_machine,
         status_broadcast,
         qingping,
+        erv: erv_state,
     };
 
     let cors = CorsLayer::new()
@@ -167,16 +174,19 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         unix_timestamp_now(),
     )));
     let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+    let erv_state = ErvState::new(config.runtime.database_path.clone());
     let app = try_app_with_state(
         config.clone(),
         qingping.clone(),
         state_machine,
         yolink.clone(),
+        erv_state.clone(),
     )
     .context("failed to build HTTP app")?;
     let _mqtt_runtime =
         mqtt::start_qingping_ingress(&config, qingping).context("failed to start MQTT ingress")?;
     let _yolink_task = yolink::start_yolink_client(&config, yolink);
+    let _erv_task = crate::erv::start_erv_status_poll(&config, erv_state);
 
     tracing::info!("office-automate-server listening on {}", bind_address);
     axum::serve(
@@ -703,6 +713,7 @@ fn status_for_state(state: &AppState) -> Status {
     status.sensors.window_open = state_status.sensors.window_open;
     status.sensors.co2_ppm = state_status.sensors.co2_ppm;
     state.qingping.overlay_status(&mut status);
+    state.erv.overlay_status(&mut status);
     status
 }
 
@@ -1287,8 +1298,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        GoogleOAuthConfig, OrchestratorConfig, QingpingConfig, RuntimeConfig, ThresholdsConfig,
-        YoLinkConfig,
+        ErvConfig, GoogleOAuthConfig, OrchestratorConfig, QingpingConfig, RuntimeConfig,
+        ThresholdsConfig, YoLinkConfig,
     };
 
     fn test_config() -> AppConfig {
@@ -1298,6 +1309,7 @@ mod tests {
             orchestrator: OrchestratorConfig::default(),
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),
+            erv: ErvConfig::default(),
             thresholds: ThresholdsConfig::default(),
             runtime: RuntimeConfig {
                 root: root.clone(),

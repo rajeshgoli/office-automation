@@ -11,6 +11,7 @@ pub struct AppConfig {
     pub orchestrator: OrchestratorConfig,
     pub qingping: QingpingConfig,
     pub yolink: YoLinkConfig,
+    pub erv: ErvConfig,
     pub thresholds: ThresholdsConfig,
     pub runtime: RuntimeConfig,
 }
@@ -109,6 +110,44 @@ impl Default for YoLinkConfig {
             mqtt_host: "api.yosmart.com".to_string(),
             mqtt_port: 8003,
             reconnect_delay_seconds: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ErvConfig {
+    #[serde(rename = "type")]
+    pub device_type: String,
+    pub ip: String,
+    pub device_id: String,
+    pub local_key: String,
+    pub version: String,
+    pub port: u16,
+    pub status_timeout_seconds: u64,
+    pub poll_interval_seconds: u64,
+}
+
+impl ErvConfig {
+    pub fn is_configured(&self) -> bool {
+        self.device_type == "tuya"
+            && !self.ip.trim().is_empty()
+            && !self.device_id.trim().is_empty()
+            && !self.local_key.trim().is_empty()
+    }
+}
+
+impl Default for ErvConfig {
+    fn default() -> Self {
+        Self {
+            device_type: "tuya".to_string(),
+            ip: String::new(),
+            device_id: String::new(),
+            local_key: String::new(),
+            version: "3.4".to_string(),
+            port: 6668,
+            status_timeout_seconds: 5,
+            poll_interval_seconds: 60,
         }
     }
 }
@@ -222,6 +261,7 @@ struct FileConfig {
     orchestrator: OrchestratorConfig,
     qingping: QingpingConfig,
     yolink: YoLinkConfig,
+    erv: ErvConfig,
     thresholds: ThresholdsConfig,
 }
 
@@ -274,6 +314,18 @@ impl AppConfig {
             file_config.yolink.secret_key = secret_key;
         }
 
+        if let Some(ip) = env_lookup("OFFICE_AUTOMATE_ERV_IP") {
+            file_config.erv.ip = ip;
+        }
+
+        if let Some(device_id) = env_lookup("OFFICE_AUTOMATE_ERV_DEVICE_ID") {
+            file_config.erv.device_id = device_id;
+        }
+
+        if let Some(local_key) = env_lookup("OFFICE_AUTOMATE_ERV_LOCAL_KEY") {
+            file_config.erv.local_key = local_key;
+        }
+
         let runtime = RuntimeConfig {
             frontend_dist: root.join("frontend").join("dist"),
             root,
@@ -292,6 +344,7 @@ impl AppConfig {
             orchestrator: file_config.orchestrator,
             qingping: file_config.qingping,
             yolink: file_config.yolink,
+            erv: file_config.erv,
             thresholds: file_config.thresholds,
             runtime,
         })
@@ -320,6 +373,11 @@ qingping:
 yolink:
   uaid: "yaml-uaid"
   secret_key: "yaml-secret"
+erv:
+  type: "tuya"
+  ip: "192.0.2.10"
+  device_id: "yaml-erv-device"
+  local_key: "yaml-erv-key"
 thresholds:
   hvac_heat_on_temp_f: 70
   hvac_heat_off_temp_f: 74
@@ -336,6 +394,9 @@ thresholds:
             "OFFICE_AUTOMATE_MQTT_PORT" => Some("2883".to_string()),
             "OFFICE_AUTOMATE_YOLINK_UAID" => Some("env-uaid".to_string()),
             "OFFICE_AUTOMATE_YOLINK_SECRET_KEY" => Some("env-secret".to_string()),
+            "OFFICE_AUTOMATE_ERV_IP" => Some("192.0.2.11".to_string()),
+            "OFFICE_AUTOMATE_ERV_DEVICE_ID" => Some("env-erv-device".to_string()),
+            "OFFICE_AUTOMATE_ERV_LOCAL_KEY" => Some("env-erv-key".to_string()),
             "OFFICE_AUTOMATE_PUBLIC_URL" => Some("https://office.example.com".to_string()),
             _ => None,
         })
@@ -352,6 +413,13 @@ thresholds:
         assert_eq!(config.yolink.mqtt_port, 8003);
         assert_eq!(config.yolink.reconnect_delay_seconds, 5);
         assert!(config.yolink.is_configured());
+        assert_eq!(config.erv.device_type, "tuya");
+        assert_eq!(config.erv.ip, "192.0.2.11");
+        assert_eq!(config.erv.device_id, "env-erv-device");
+        assert_eq!(config.erv.local_key, "env-erv-key");
+        assert_eq!(config.erv.version, "3.4");
+        assert_eq!(config.erv.port, 6668);
+        assert!(config.erv.is_configured());
         assert_eq!(config.runtime.mqtt_host, "rust-broker");
         assert_eq!(config.runtime.mqtt_port, 2883);
         assert_eq!(config.runtime.data_dir, temp_dir.path().join("db"));

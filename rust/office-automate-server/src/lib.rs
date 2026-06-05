@@ -3,6 +3,7 @@ pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod db;
+pub mod erv;
 pub mod http;
 pub mod mqtt;
 pub mod policy;
