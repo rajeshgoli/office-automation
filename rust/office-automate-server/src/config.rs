@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AppConfig {
     pub orchestrator: OrchestratorConfig,
     pub qingping: QingpingConfig,
@@ -50,28 +50,90 @@ impl Default for QingpingConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ThresholdsConfig {
+    pub motion_timeout_seconds: u64,
+    pub departure_verification_seconds: u64,
+    pub door_open_threshold_minutes: u64,
+    pub door_open_away_timeout_minutes: u64,
     pub co2_critical_ppm: i64,
+    pub co2_critical_hysteresis_ppm: i64,
     pub co2_refresh_target_ppm: i64,
+    pub co2_plateau_enabled: bool,
+    pub co2_plateau_rate_threshold: f64,
+    pub co2_plateau_window_minutes: u64,
+    pub co2_plateau_min_co2: i64,
+    pub co2_plateau_release_delta_ppm: i64,
+    pub co2_history_size: usize,
+    pub co2_adaptive_speed_enabled: bool,
+    pub co2_rate_turbo_threshold: f64,
+    pub co2_rate_medium_threshold: f64,
+    pub co2_rate_quiet_threshold: f64,
+    pub co2_turbo_duration_minutes: u64,
+    pub min_away_seconds_before_erv: u64,
+    pub erv_min_dwell_seconds: u64,
+    pub tvoc_away_enabled: bool,
+    pub tvoc_away_threshold: i64,
+    pub tvoc_away_target: i64,
+    pub tvoc_away_history_size: usize,
+    pub tvoc_plateau_rate_threshold: f64,
+    pub tvoc_rate_turbo_threshold: f64,
+    pub tvoc_rate_medium_threshold: f64,
+    pub tvoc_rate_quiet_threshold: f64,
+    pub hvac_min_temp_f: i64,
+    pub hvac_critical_temp_f: i64,
     pub hvac_heat_on_temp_f: i64,
     pub hvac_heat_off_temp_f: i64,
     pub hvac_cool_off_temp_f: i64,
     pub hvac_cool_on_temp_f: i64,
     pub away_stale_flush_enabled: bool,
+    pub away_stale_flush_interval_hours: u64,
+    pub away_stale_flush_duration_minutes: u64,
+    pub away_stale_flush_speed: String,
 }
 
 impl Default for ThresholdsConfig {
     fn default() -> Self {
         Self {
+            motion_timeout_seconds: 60,
+            departure_verification_seconds: 10,
+            door_open_threshold_minutes: 5,
+            door_open_away_timeout_minutes: 5,
             co2_critical_ppm: 2000,
+            co2_critical_hysteresis_ppm: 200,
             co2_refresh_target_ppm: 500,
+            co2_plateau_enabled: true,
+            co2_plateau_rate_threshold: 0.5,
+            co2_plateau_window_minutes: 10,
+            co2_plateau_min_co2: 600,
+            co2_plateau_release_delta_ppm: 100,
+            co2_history_size: 40,
+            co2_adaptive_speed_enabled: true,
+            co2_rate_turbo_threshold: 8.0,
+            co2_rate_medium_threshold: 2.0,
+            co2_rate_quiet_threshold: 0.5,
+            co2_turbo_duration_minutes: 30,
+            min_away_seconds_before_erv: 60,
+            erv_min_dwell_seconds: 180,
+            tvoc_away_enabled: true,
+            tvoc_away_threshold: 200,
+            tvoc_away_target: 40,
+            tvoc_away_history_size: 40,
+            tvoc_plateau_rate_threshold: 0.3,
+            tvoc_rate_turbo_threshold: 5.0,
+            tvoc_rate_medium_threshold: 1.5,
+            tvoc_rate_quiet_threshold: 0.3,
+            hvac_min_temp_f: 68,
+            hvac_critical_temp_f: 55,
             hvac_heat_on_temp_f: 71,
             hvac_heat_off_temp_f: 75,
             hvac_cool_off_temp_f: 78,
             hvac_cool_on_temp_f: 81,
             away_stale_flush_enabled: true,
+            away_stale_flush_interval_hours: 8,
+            away_stale_flush_duration_minutes: 30,
+            away_stale_flush_speed: "medium".to_string(),
         }
     }
 }
