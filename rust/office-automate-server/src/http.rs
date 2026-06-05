@@ -165,7 +165,7 @@ async fn auth_middleware(
     let auth_mode = state.auth.mode();
     if request.uri().path() == "/ws"
         && is_websocket_upgrade(&headers)
-        && matches!(auth_mode, HttpAuthMode::OAuth | HttpAuthMode::Basic)
+        && matches!(auth_mode, HttpAuthMode::OAuth)
     {
         return next.run(request).await;
     }
@@ -1512,7 +1512,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn basic_auth_websocket_matches_python_upgrade_bypass() {
+    async fn basic_auth_websocket_requires_credentials_before_upgrade() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("addr");
         let server = tokio::spawn(async move {
@@ -1524,9 +1524,19 @@ mod tests {
             .expect("server");
         });
 
-        let (mut ws, _) = connect_async(format!("ws://{address}/ws"))
+        let unauthenticated = connect_async(format!("ws://{address}/ws"))
             .await
-            .expect("connect");
+            .expect_err("unauthenticated websocket should fail");
+        assert!(unauthenticated.to_string().contains("401"));
+
+        let mut request = format!("ws://{address}/ws")
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Basic dXNlcjpwYXNz".parse().expect("header"),
+        );
+        let (mut ws, _) = connect_async(request).await.expect("connect");
         let message = timeout(Duration::from_secs(1), ws.next())
             .await
             .expect("status timeout")
