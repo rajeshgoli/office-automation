@@ -9,7 +9,8 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{
-        ConnectInfo, Extension, Multipart, Path, Query, Request, State, WebSocketUpgrade,
+        ConnectInfo, DefaultBodyLimit, Extension, Multipart, Path, Query, Request, State,
+        WebSocketUpgrade,
         ws::{CloseFrame, Message, WebSocket},
     },
     http::{HeaderMap, Method, StatusCode, header},
@@ -27,6 +28,7 @@ use tower_http::{
 };
 
 use crate::{
+    artifacts::ARTIFACT_MAX_SIZE_BYTES,
     artifacts::{ArtifactStore, is_valid_artifact_hash},
     auth::{AuthManager, AuthenticatedUser, HttpAuthMode, WebSocketAuth, bearer_token},
     config::AppConfig,
@@ -96,7 +98,10 @@ pub fn try_app(config: AppConfig) -> Result<Router> {
         .route("/history/project-focus", get(history_project_focus))
         .route("/history/leverage", get(history_leverage))
         .route("/history/project-leverage", get(history_project_leverage))
-        .route("/deploy/{app}", post(deploy_app))
+        .route(
+            "/deploy/{app}",
+            post(deploy_app).layer(DefaultBodyLimit::max(artifact_upload_body_limit())),
+        )
         .route("/apps/{app}/latest.apk", get(latest_app_artifact))
         .route("/apps/{app}/{artifact_file}", get(hashed_app_artifact))
         .route("/apps/{app}/meta.json", get(app_artifact_meta))
@@ -141,7 +146,7 @@ async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    if should_skip_auth(request.method(), request.uri().path(), request.headers()) {
+    if should_skip_auth(request.method(), request.uri().path()) {
         return next.run(request).await;
     }
 
@@ -157,7 +162,12 @@ async fn auth_middleware(
         }
     }
 
-    match state.auth.mode() {
+    let auth_mode = state.auth.mode();
+    if is_websocket_upgrade(&headers) && auth_mode == HttpAuthMode::OAuth {
+        return next.run(request).await;
+    }
+
+    match auth_mode {
         HttpAuthMode::Open => next.run(request).await,
         HttpAuthMode::OAuth => {
             if state.auth.is_trusted_request(&headers) {
@@ -200,12 +210,8 @@ async fn auth_middleware(
     }
 }
 
-fn should_skip_auth(method: &Method, path: &str, headers: &HeaderMap) -> bool {
+fn should_skip_auth(method: &Method, path: &str) -> bool {
     if *method == Method::OPTIONS {
-        return true;
-    }
-
-    if is_websocket_upgrade(headers) {
         return true;
     }
 
@@ -226,6 +232,10 @@ fn should_skip_auth(method: &Method, path: &str, headers: &HeaderMap) -> bool {
         || path.starts_with("/assets/")
         || path.ends_with(".png")
         || path.ends_with(".json")
+}
+
+fn artifact_upload_body_limit() -> usize {
+    (ARTIFACT_MAX_SIZE_BYTES + 1024 * 1024) as usize
 }
 
 fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
@@ -772,7 +782,8 @@ async fn auth_callback(
         return (
             StatusCode::BAD_REQUEST,
             Html(format!(
-                "<html><body><h1>Login Failed</h1><p>{error}</p></body></html>"
+                "<html><body><h1>Login Failed</h1><p>{}</p></body></html>",
+                escape_html_text(error)
             )),
         )
             .into_response();
@@ -813,6 +824,20 @@ async fn auth_callback(
             (StatusCode::INTERNAL_SERVER_ERROR, "OAuth callback failed").into_response()
         }
     }
+}
+
+fn escape_html_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '&' => "&amp;".to_string(),
+            '<' => "&lt;".to_string(),
+            '>' => "&gt;".to_string(),
+            '"' => "&quot;".to_string(),
+            '\'' => "&#39;".to_string(),
+            _ => character.to_string(),
+        })
+        .collect()
 }
 
 async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -989,6 +1014,17 @@ mod tests {
         }
     }
 
+    fn basic_config() -> AppConfig {
+        AppConfig {
+            orchestrator: OrchestratorConfig {
+                auth_username: Some("user".to_string()),
+                auth_password: Some("pass".to_string()),
+                ..OrchestratorConfig::default()
+            },
+            ..test_config()
+        }
+    }
+
     fn multipart_body(boundary: &str, bytes: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(
@@ -1117,6 +1153,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn basic_auth_websocket_requires_credentials_before_upgrade() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app(basic_config()).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("server");
+        });
+
+        let error = connect_async(format!("ws://{address}/ws"))
+            .await
+            .expect_err("unauthenticated websocket should fail");
+        match error {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+            other => panic!("expected HTTP upgrade error, got {other:?}"),
+        }
+
+        let mut request = format!("ws://{address}/ws")
+            .into_client_request()
+            .expect("request");
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Basic dXNlcjpwYXNz".parse().expect("header"),
+        );
+        let (mut ws, _) = connect_async(request).await.expect("authenticated connect");
+        let message = timeout(Duration::from_secs(1), ws.next())
+            .await
+            .expect("status timeout")
+            .expect("message")
+            .expect("message ok");
+        assert!(
+            message
+                .into_text()
+                .expect("text")
+                .contains("\"state\":\"away\"")
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_escapes_error_text() {
+        let response = app(oauth_config())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/auth/callback?error=%3Cscript%3Ealert(1)%3C%2Fscript%3E%26%22%27")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;&amp;&quot;&#39;"));
+        assert!(!body.contains("<script>"));
+    }
+
+    #[tokio::test]
     async fn artifact_upload_and_download_preserve_metadata_and_headers() {
         let config = oauth_config();
         let token = AuthManager::new(&config.orchestrator)
@@ -1184,6 +1287,39 @@ mod tests {
             response.headers().get(header::CONTENT_DISPOSITION).unwrap(),
             "attachment; filename=office-climate.apk"
         );
+    }
+
+    #[tokio::test]
+    async fn artifact_upload_accepts_apks_larger_than_axum_default_body_limit() {
+        let config = oauth_config();
+        let token = AuthManager::new(&config.orchestrator)
+            .expect("auth")
+            .generate_jwt("engineer@rajeshgo.li")
+            .expect("token");
+        let boundary = "large-upload-boundary";
+        let bytes = vec![b'a'; 3 * 1024 * 1024];
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/deploy/office-climate")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(multipart_body(boundary, &bytes)))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["size_bytes"], bytes.len());
     }
 
     #[tokio::test]
