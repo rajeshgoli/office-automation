@@ -163,7 +163,8 @@ async fn auth_middleware(
     let headers = auth_headers_with_peer(request.headers(), remote_addr);
 
     let auth_mode = state.auth.mode();
-    if is_websocket_upgrade(&headers)
+    if request.uri().path() == "/ws"
+        && is_websocket_upgrade(&headers)
         && matches!(auth_mode, HttpAuthMode::OAuth | HttpAuthMode::Basic)
     {
         return next.run(request).await;
@@ -1311,6 +1312,29 @@ mod tests {
             .expect("read body");
         let value: Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(value["login_url"], "/auth/login");
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_header_does_not_bypass_non_ws_route_auth() {
+        let boundary = "deploy-boundary";
+        let body = multipart_body(boundary, b"apk-bytes");
+        let response = app(oauth_config())
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/deploy/office-climate")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .header(header::UPGRADE, "websocket")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
