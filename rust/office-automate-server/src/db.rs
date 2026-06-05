@@ -800,6 +800,15 @@ pub fn read_openings(database_path: &Path, days: i64) -> Result<Vec<Value>> {
 }
 
 pub fn read_leverage_history(database_path: &Path, days: i64) -> Result<Value> {
+    let telemetry_path = telemetry_database_path(database_path);
+    read_leverage_history_with_telemetry(database_path, &telemetry_path, days)
+}
+
+pub fn read_leverage_history_with_telemetry(
+    database_path: &Path,
+    telemetry_database_path: &Path,
+    days: i64,
+) -> Result<Value> {
     let connection = Connection::open(database_path)
         .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
     let now = Local::now().naive_local();
@@ -835,7 +844,7 @@ pub fn read_leverage_history(database_path: &Path, days: i64) -> Result<Value> {
         }
     }
 
-    for row in read_leverage_session_rows(&connection, database_path, &cutoff)? {
+    for row in read_leverage_session_rows(&connection, telemetry_database_path, &cutoff)? {
         if let Some(day) = grouped.get_mut(&row.date) {
             day.lines_added = row.lines_added;
             day.lines_removed = row.lines_removed;
@@ -903,12 +912,11 @@ struct LeverageSessionRow {
 
 fn read_leverage_session_rows(
     connection: &Connection,
-    database_path: &Path,
+    telemetry_database_path: &Path,
     cutoff: &str,
 ) -> Result<Vec<LeverageSessionRow>> {
-    let telemetry_path = telemetry_database_path(database_path);
-    ensure_telemetry_database(&telemetry_path)?;
-    let telemetry_path = telemetry_path.to_string_lossy().to_string();
+    ensure_telemetry_database(telemetry_database_path)?;
+    let telemetry_path = telemetry_database_path.to_string_lossy().to_string();
     connection
         .execute("ATTACH DATABASE ? AS telemetry", params![telemetry_path])
         .context("failed to attach telemetry database")?;
@@ -956,14 +964,14 @@ fn query_attached_leverage_session_rows(
         .context("failed to read leverage session rows")
 }
 
-fn telemetry_database_path(database_path: &Path) -> PathBuf {
+pub fn telemetry_database_path(database_path: &Path) -> PathBuf {
     database_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("telemetry.db")
 }
 
-fn ensure_telemetry_database(database_path: &Path) -> Result<()> {
+pub fn ensure_telemetry_database(database_path: &Path) -> Result<()> {
     if let Some(parent) = database_path.parent() {
         fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -982,6 +990,125 @@ fn ensure_telemetry_database(database_path: &Path) -> Result<()> {
     connection
         .execute_batch(SESSION_OUTPUT_SCHEMA)
         .context("failed to apply telemetry SQLite schema")
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionOutputRow {
+    pub session_id: String,
+    pub project: String,
+    pub start_time: String,
+    pub duration_minutes: i64,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    pub files_modified: i64,
+    pub git_commits: i64,
+    pub git_pushes: i64,
+    pub user_message_count: i64,
+    pub assistant_message_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub tool_counts: Option<String>,
+    pub languages: Option<String>,
+    pub is_human_session: bool,
+}
+
+pub fn upsert_collector_session_output_rows(
+    telemetry_database_path: &Path,
+    rows: &[SessionOutputRow],
+) -> Result<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    ensure_telemetry_database(telemetry_database_path)?;
+    let mut connection = Connection::open(telemetry_database_path).with_context(|| {
+        format!(
+            "failed to open telemetry SQLite database {}",
+            telemetry_database_path.display()
+        )
+    })?;
+    let transaction = connection.transaction()?;
+    {
+        let mut statement = transaction.prepare(
+            "INSERT INTO session_output (
+                session_id, project, start_time, duration_minutes, lines_added, lines_removed,
+                files_modified, git_commits, git_pushes, user_message_count,
+                assistant_message_count, input_tokens, output_tokens, tool_counts, languages,
+                is_human_session
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                project = excluded.project,
+                start_time = excluded.start_time,
+                duration_minutes = excluded.duration_minutes,
+                lines_added = excluded.lines_added,
+                lines_removed = excluded.lines_removed,
+                files_modified = excluded.files_modified,
+                git_commits = excluded.git_commits,
+                git_pushes = excluded.git_pushes,
+                tool_counts = excluded.tool_counts,
+                is_human_session = excluded.is_human_session
+            WHERE session_output.user_message_count = 0
+              AND session_output.assistant_message_count = 0
+              AND session_output.input_tokens = 0
+              AND session_output.output_tokens = 0",
+        )?;
+        for row in rows {
+            statement.execute(params![
+                row.session_id,
+                row.project,
+                row.start_time,
+                row.duration_minutes,
+                row.lines_added,
+                row.lines_removed,
+                row.files_modified,
+                row.git_commits,
+                row.git_pushes,
+                row.user_message_count,
+                row.assistant_message_count,
+                row.input_tokens,
+                row.output_tokens,
+                row.tool_counts,
+                row.languages,
+                if row.is_human_session { 1 } else { 0 },
+            ])?;
+        }
+    }
+    transaction.commit()?;
+    Ok(rows.len())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectLeverageRow {
+    pub date: String,
+    pub project: String,
+    pub metric: String,
+    pub value: f64,
+}
+
+pub fn upsert_project_leverage_rows(
+    database_path: &Path,
+    rows: &[ProjectLeverageRow],
+) -> Result<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    migrate_database(database_path)?;
+    let mut connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let transaction = connection.transaction()?;
+    {
+        let mut statement = transaction.prepare(
+            "INSERT INTO project_leverage (date, project, metric, value)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(date, project, metric) DO UPDATE SET value = excluded.value",
+        )?;
+        for row in rows {
+            statement.execute(params![row.date, row.project, row.metric, row.value])?;
+        }
+    }
+    transaction.commit()?;
+    Ok(rows.len())
 }
 
 pub fn read_project_leverage(database_path: &Path, days: i64) -> Result<Value> {
@@ -1404,7 +1531,7 @@ impl ProjectFocusItem {
     }
 }
 
-fn normalize_project_name(project: &str) -> String {
+pub(crate) fn normalize_project_name(project: &str) -> String {
     let basename = project
         .trim()
         .replace('\\', "/")
@@ -1845,6 +1972,45 @@ mod tests {
         assert_eq!(payload["week"]["files_modified"], 6);
         assert_eq!(payload["week"]["commits"], 8);
         assert_eq!(payload["week"]["lines_per_session_minute"], 5.0);
+    }
+
+    #[test]
+    fn leverage_history_reads_configured_telemetry_database() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        let telemetry_path = temp_dir.path().join("custom").join("telemetry.sqlite");
+        migrate_database(&db_path).expect("migration");
+        ensure_telemetry_database(&telemetry_path).expect("telemetry schema");
+
+        let today = Local::now().naive_local().date();
+        let timestamp = format_timestamp(day_start(today) + Duration::hours(10));
+        {
+            let connection = Connection::open(&telemetry_path).expect("open telemetry database");
+            connection
+                .execute(
+                    "INSERT INTO session_output \
+                     (session_id, project, start_time, duration_minutes, lines_added, lines_removed, files_modified, git_commits) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "session-1",
+                        "office-automate",
+                        &timestamp,
+                        10,
+                        40,
+                        2,
+                        1,
+                        3,
+                    ),
+                )
+                .expect("insert session output row");
+        }
+
+        let payload = read_leverage_history_with_telemetry(&db_path, &telemetry_path, 1)
+            .expect("leverage history");
+
+        assert_eq!(payload["days"][0]["lines_added"], 40);
+        assert_eq!(payload["days"][0]["lines_removed"], 2);
+        assert_eq!(payload["week"]["commits"], 3);
     }
 
     #[test]

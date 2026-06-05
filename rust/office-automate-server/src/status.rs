@@ -241,7 +241,7 @@ mod tests {
     use super::*;
     use crate::config::{
         ErvConfig, MitsubishiConfig, OrchestratorConfig, PresenceConfig, QingpingConfig,
-        RuntimeConfig, ThresholdsConfig, YoLinkConfig,
+        RuntimeConfig, TelemetryConfig, ThresholdsConfig, YoLinkConfig,
     };
 
     fn test_config() -> AppConfig {
@@ -263,6 +263,7 @@ mod tests {
                 away_stale_flush_enabled: false,
                 ..ThresholdsConfig::default()
             },
+            telemetry: TelemetryConfig::default(),
             runtime: RuntimeConfig {
                 root: PathBuf::from("/tmp/office"),
                 config_path: PathBuf::from("/tmp/office/config.yaml"),
@@ -275,6 +276,10 @@ mod tests {
                 public_url: None,
                 mqtt_host: "127.0.0.1".to_string(),
                 mqtt_port: 1883,
+                telemetry_db_path: PathBuf::from("/tmp/office/data/telemetry.db"),
+                tool_usage_db_path: PathBuf::from("/tmp/office/data/tool_usage.db"),
+                engram_db_path: PathBuf::from("/tmp/office/data/engram_state.db"),
+                engram_registry_path: PathBuf::from("/tmp/office/data/engram_concept_registry.md"),
             },
         }
     }

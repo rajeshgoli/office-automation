@@ -705,7 +705,7 @@ mod tests {
     use crate::{
         config::{
             ErvConfig, MitsubishiConfig, OrchestratorConfig, PresenceConfig, QingpingConfig,
-            RuntimeConfig, ThresholdsConfig,
+            RuntimeConfig, TelemetryConfig, ThresholdsConfig,
         },
         db::migrate_database,
         erv::{ErvDeviceStatus, ErvFanSpeed, ErvSpeedWriter, ErvState},
@@ -810,6 +810,7 @@ mod tests {
                 erv_min_dwell_seconds: 0,
                 ..ThresholdsConfig::default()
             },
+            telemetry: TelemetryConfig::default(),
             runtime: RuntimeConfig {
                 root: root.clone(),
                 config_path: root.join("config.yaml"),
@@ -822,6 +823,10 @@ mod tests {
                 public_url: None,
                 mqtt_host: "127.0.0.1".to_string(),
                 mqtt_port: 1883,
+                telemetry_db_path: root.join("telemetry.db"),
+                tool_usage_db_path: root.join("tool-usage.db"),
+                engram_db_path: root.join("engram.db"),
+                engram_registry_path: root.join("engram-registry.json"),
             },
         }
     }

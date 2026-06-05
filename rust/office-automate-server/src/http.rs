@@ -1648,7 +1648,11 @@ async fn history_leverage(
     Query(query): Query<HistoryQuery>,
 ) -> Response {
     let days = clamp(query.days, 7, 1, 30);
-    match db::read_leverage_history(&state.config.runtime.database_path, days) {
+    match db::read_leverage_history_with_telemetry(
+        &state.config.runtime.database_path,
+        &state.config.runtime.telemetry_db_path,
+        days,
+    ) {
         Ok(payload) => Json(json!({"ok": true, "days": payload["days"], "week": payload["week"]}))
             .into_response(),
         Err(error) => history_error("history/leverage", error),
@@ -2236,6 +2240,7 @@ mod tests {
             erv: ErvConfig::default(),
             mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
+            telemetry: crate::config::TelemetryConfig::default(),
             runtime: RuntimeConfig {
                 root: root.clone(),
                 config_path: root.join("config.yaml"),
@@ -2248,6 +2253,10 @@ mod tests {
                 public_url: None,
                 mqtt_host: "127.0.0.1".to_string(),
                 mqtt_port: 1883,
+                telemetry_db_path: root.join("data/telemetry.db"),
+                tool_usage_db_path: root.join("data/tool_usage.db"),
+                engram_db_path: root.join("data/engram_state.db"),
+                engram_registry_path: root.join("data/engram_concept_registry.md"),
             },
         }
     }

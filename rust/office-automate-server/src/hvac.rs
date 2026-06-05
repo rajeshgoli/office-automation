@@ -913,6 +913,7 @@ mod tests {
             erv: crate::config::ErvConfig::default(),
             mitsubishi: crate::config::MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
+            telemetry: crate::config::TelemetryConfig::default(),
             runtime: crate::config::RuntimeConfig {
                 root: "/tmp/office".into(),
                 config_path: "/tmp/office/config.yaml".into(),
@@ -925,6 +926,10 @@ mod tests {
                 public_url: None,
                 mqtt_host: "127.0.0.1".to_string(),
                 mqtt_port: 1883,
+                telemetry_db_path: "/tmp/office/data/telemetry.db".into(),
+                tool_usage_db_path: "/tmp/office/data/tool_usage.db".into(),
+                engram_db_path: "/tmp/office/data/engram_state.db".into(),
+                engram_registry_path: "/tmp/office/data/engram_concept_registry.md".into(),
             },
         });
         hvac.overlay_status(&mut status);
