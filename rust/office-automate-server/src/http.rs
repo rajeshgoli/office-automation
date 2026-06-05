@@ -165,7 +165,7 @@ async fn auth_middleware(
     let auth_mode = state.auth.mode();
     if request.uri().path() == "/ws"
         && is_websocket_upgrade(&headers)
-        && matches!(auth_mode, HttpAuthMode::OAuth)
+        && matches!(auth_mode, HttpAuthMode::OAuth | HttpAuthMode::Basic)
     {
         return next.run(request).await;
     }
@@ -199,7 +199,13 @@ async fn auth_middleware(
         }
         HttpAuthMode::Basic => {
             if state.auth.verify_basic_header(&headers) {
-                return next.run(request).await;
+                let mut response = next.run(request).await;
+                if let Some(cookie) = state.auth.issue_basic_websocket_cookie() {
+                    if let Ok(cookie) = cookie.parse() {
+                        response.headers_mut().insert(header::SET_COOKIE, cookie);
+                    }
+                }
+                return response;
             }
 
             let mut response =
@@ -297,6 +303,11 @@ async fn websocket(
 }
 
 async fn websocket_session(mut socket: WebSocket, state: AppState, auth_mode: WebSocketAuth) {
+    if auth_mode == WebSocketAuth::Reject {
+        close_ws(&mut socket, "Authentication required").await;
+        return;
+    }
+
     if auth_mode == WebSocketAuth::FirstMessage {
         match timeout(Duration::from_secs(10), socket.recv()).await {
             Ok(Some(Ok(Message::Text(message)))) => {
@@ -1512,22 +1523,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn basic_auth_websocket_requires_credentials_before_upgrade() {
+    async fn basic_auth_websocket_requires_header_or_session_cookie() {
+        let service = app(basic_config());
+        let response = service
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let websocket_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("basic websocket cookie")
+            .to_str()
+            .expect("cookie")
+            .split(';')
+            .next()
+            .expect("cookie pair")
+            .to_string();
+
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("addr");
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                app(basic_config()).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                service.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .await
             .expect("server");
         });
 
-        let unauthenticated = connect_async(format!("ws://{address}/ws"))
+        let (mut unauthenticated, _) = connect_async(format!("ws://{address}/ws"))
             .await
-            .expect_err("unauthenticated websocket should fail");
-        assert!(unauthenticated.to_string().contains("401"));
+            .expect("unauthenticated websocket should upgrade for close frame");
+        let close = timeout(Duration::from_secs(1), unauthenticated.next())
+            .await
+            .expect("close timeout")
+            .expect("close message")
+            .expect("close ok");
+        assert!(matches!(close, TungsteniteMessage::Close(_)));
 
         let mut request = format!("ws://{address}/ws")
             .into_client_request()
@@ -1537,6 +1577,25 @@ mod tests {
             "Basic dXNlcjpwYXNz".parse().expect("header"),
         );
         let (mut ws, _) = connect_async(request).await.expect("connect");
+        let message = timeout(Duration::from_secs(1), ws.next())
+            .await
+            .expect("status timeout")
+            .expect("message")
+            .expect("message ok");
+        assert!(
+            message
+                .into_text()
+                .expect("text")
+                .contains("\"state\":\"away\"")
+        );
+
+        let mut request = format!("ws://{address}/ws")
+            .into_client_request()
+            .expect("request");
+        request
+            .headers_mut()
+            .insert(header::COOKIE, websocket_cookie.parse().expect("cookie"));
+        let (mut ws, _) = connect_async(request).await.expect("connect with cookie");
         let message = timeout(Duration::from_secs(1), ws.next())
             .await
             .expect("status timeout")

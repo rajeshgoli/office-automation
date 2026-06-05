@@ -24,6 +24,8 @@ const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
 const GOOGLE_TOKENINFO_URL: &str = "https://oauth2.googleapis.com/tokeninfo";
 const OAUTH_SCOPE: &str = "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
+const BASIC_WS_COOKIE: &str = "office_basic_ws";
+const BASIC_WS_COOKIE_MAX_AGE_SECONDS: i64 = 600;
 
 #[derive(Clone)]
 pub struct AuthManager {
@@ -36,6 +38,7 @@ struct AuthInner {
     pending_oauth: RwLock<HashMap<String, PendingOAuthState>>,
     device_flows: RwLock<HashMap<String, DeviceFlowState>>,
     invalidated_tokens: RwLock<HashSet<String>>,
+    basic_ws_tokens: RwLock<HashMap<String, chrono::DateTime<Utc>>>,
     client: Client,
 }
 
@@ -80,7 +83,9 @@ pub enum HttpAuthMode {
 pub enum WebSocketAuth {
     TrustedNetwork,
     UpgradeBearer,
+    UpgradeBasic,
     FirstMessage,
+    Reject,
     Open,
 }
 
@@ -144,6 +149,7 @@ impl AuthManager {
                 pending_oauth: RwLock::new(HashMap::new()),
                 device_flows: RwLock::new(HashMap::new()),
                 invalidated_tokens: RwLock::new(HashSet::new()),
+                basic_ws_tokens: RwLock::new(HashMap::new()),
                 client: Client::builder()
                     .timeout(Duration::from_secs(10))
                     .build()
@@ -218,6 +224,45 @@ impl AuthManager {
         username == credentials.username && password == credentials.password
     }
 
+    pub fn issue_basic_websocket_cookie(&self) -> Option<String> {
+        self.inner.basic.as_ref()?;
+        let token = random_url_token(32);
+        let expires_at = Utc::now() + TimeDelta::seconds(BASIC_WS_COOKIE_MAX_AGE_SECONDS);
+        let mut tokens = self
+            .inner
+            .basic_ws_tokens
+            .write()
+            .expect("basic websocket token lock");
+        prune_expired_tokens(&mut tokens);
+        tokens.insert(token.clone(), expires_at);
+        Some(format!(
+            "{BASIC_WS_COOKIE}={token}; Max-Age={BASIC_WS_COOKIE_MAX_AGE_SECONDS}; Path=/ws; HttpOnly; SameSite=Lax"
+        ))
+    }
+
+    pub fn verify_basic_websocket_auth(&self, headers: &HeaderMap) -> bool {
+        self.verify_basic_header(headers) || self.verify_basic_websocket_cookie(headers)
+    }
+
+    fn verify_basic_websocket_cookie(&self, headers: &HeaderMap) -> bool {
+        if self.inner.basic.is_none() {
+            return false;
+        }
+        let Some(token) = cookie_value(headers, BASIC_WS_COOKIE) else {
+            return false;
+        };
+        let now = Utc::now();
+        let mut tokens = self
+            .inner
+            .basic_ws_tokens
+            .write()
+            .expect("basic websocket token lock");
+        prune_expired_tokens_at(&mut tokens, now);
+        tokens
+            .get(token)
+            .is_some_and(|expires_at| *expires_at > now)
+    }
+
     pub fn verify_jwt(&self, token: &str) -> Option<String> {
         if self
             .inner
@@ -273,6 +318,12 @@ impl AuthManager {
                 return WebSocketAuth::UpgradeBearer;
             }
             WebSocketAuth::FirstMessage
+        } else if self.basic_enabled() {
+            if self.verify_basic_websocket_auth(headers) {
+                WebSocketAuth::UpgradeBasic
+            } else {
+                WebSocketAuth::Reject
+            }
         } else {
             WebSocketAuth::Open
         }
@@ -599,6 +650,26 @@ fn header_to_str(value: &HeaderValue) -> Option<&str> {
     value.to_str().ok()
 }
 
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(header::COOKIE)
+        .and_then(header_to_str)?
+        .split(';')
+        .filter_map(|cookie| cookie.trim().split_once('='))
+        .find_map(|(cookie_name, value)| (cookie_name == name).then_some(value))
+}
+
+fn prune_expired_tokens(tokens: &mut HashMap<String, chrono::DateTime<Utc>>) {
+    prune_expired_tokens_at(tokens, Utc::now());
+}
+
+fn prune_expired_tokens_at(
+    tokens: &mut HashMap<String, chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) {
+    tokens.retain(|_, expires_at| *expires_at > now);
+}
+
 fn generate_pkce_pair() -> (String, String) {
     let code_verifier = random_url_token(32);
     let challenge = Sha256::digest(code_verifier.as_bytes());
@@ -713,5 +784,27 @@ mod tests {
         );
 
         assert!(manager.verify_basic_header(&headers));
+    }
+
+    #[test]
+    fn basic_websocket_cookie_is_issued_and_verified() {
+        let manager = AuthManager::new(&OrchestratorConfig {
+            auth_username: Some("admin".to_string()),
+            auth_password: Some("secret".to_string()),
+            ..OrchestratorConfig::default()
+        })
+        .expect("auth");
+
+        let cookie = manager
+            .issue_basic_websocket_cookie()
+            .expect("basic websocket cookie");
+        let cookie_pair = cookie.split(';').next().expect("cookie pair");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(cookie_pair).expect("cookie"),
+        );
+
+        assert!(manager.verify_basic_websocket_auth(&headers));
     }
 }
