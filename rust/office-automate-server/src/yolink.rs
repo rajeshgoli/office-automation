@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::task::JoinHandle;
+use tokio::{sync::broadcast, task::JoinHandle};
 
 use crate::{
     config::{AppConfig, YoLinkConfig},
@@ -109,6 +109,7 @@ pub struct YoLinkState {
     inner: Arc<RwLock<YoLinkInner>>,
     state_machine: Arc<RwLock<StateMachine>>,
     database_path: PathBuf,
+    status_broadcast: Arc<RwLock<Option<broadcast::Sender<()>>>>,
 }
 
 #[derive(Debug, Default)]
@@ -132,7 +133,15 @@ impl YoLinkState {
             inner: Arc::default(),
             state_machine,
             database_path,
+            status_broadcast: Arc::default(),
         }
+    }
+
+    pub fn set_status_broadcast(&self, sender: broadcast::Sender<()>) {
+        *self
+            .status_broadcast
+            .write()
+            .expect("yolink broadcast lock poisoned") = Some(sender);
     }
 
     pub fn apply_devices(&self, devices: Vec<YoLinkDevice>) {
@@ -243,6 +252,7 @@ impl YoLinkState {
             Some(&device_name),
             Some(&event_data),
         )?;
+        self.notify_status();
 
         Ok(Some(YoLinkAppliedEvent {
             device_type: device_type.to_string(),
@@ -311,6 +321,18 @@ impl YoLinkState {
         status.sensors.door_open = machine_status.sensors.door_open;
         status.sensors.window_open = machine_status.sensors.window_open;
     }
+
+    fn notify_status(&self) {
+        let Some(sender) = self
+            .status_broadcast
+            .read()
+            .expect("yolink broadcast lock poisoned")
+            .clone()
+        else {
+            return;
+        };
+        let _ = sender.send(());
+    }
 }
 
 pub struct YoLinkCloudClient {
@@ -338,11 +360,11 @@ impl YoLinkCloudClient {
         let response: Value = self
             .http
             .post(format!("{}/open/yolink/token", self.config.http_url))
-            .json(&json!({
-                "grant_type": "client_credentials",
-                "client_id": self.config.uaid,
-                "client_secret": self.config.secret_key,
-            }))
+            .form(&[
+                ("grant_type", "client_credentials"),
+                ("client_id", self.config.uaid.as_str()),
+                ("client_secret", self.config.secret_key.as_str()),
+            ])
             .send()
             .await
             .context("failed to call YoLink auth endpoint")?
@@ -553,6 +575,7 @@ mod tests {
         db::migrate_database,
         state::{OccupancyState, StateConfig},
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_state(database_path: PathBuf) -> YoLinkState {
         YoLinkState::new(
@@ -637,6 +660,81 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn authenticates_with_form_encoded_token_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind auth server");
+        let address = listener.local_addr().expect("auth server address");
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept auth request");
+            let mut buffer = vec![0_u8; 4096];
+            let mut read = 0_usize;
+            loop {
+                let n = stream
+                    .read(&mut buffer[read..])
+                    .await
+                    .expect("read auth request");
+                if n == 0 {
+                    break;
+                }
+                read += n;
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                if let Some(header_end) = request.find("\r\n\r\n") {
+                    let content_length = request
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or_default();
+                    if read >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                if read == buffer.len() {
+                    buffer.resize(buffer.len() * 2, 0);
+                }
+            }
+
+            let request = String::from_utf8(buffer[..read].to_vec()).expect("utf8 request");
+            request_tx.send(request).expect("send captured request");
+            let body = r#"{"access_token":"token-123"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write auth response");
+        });
+
+        let client = YoLinkCloudClient::new(YoLinkConfig {
+            uaid: "client id".to_string(),
+            secret_key: "secret/key".to_string(),
+            http_url: format!("http://{address}"),
+            ..YoLinkConfig::default()
+        });
+
+        let token = client.authenticate().await.expect("authenticate");
+        assert_eq!(token, "token-123");
+        let request = request_rx.await.expect("captured request");
+        let lower_request = request.to_ascii_lowercase();
+        assert!(request.starts_with("POST /open/yolink/token HTTP/1.1"));
+        assert!(lower_request.contains("content-type: application/x-www-form-urlencoded"));
+        let body = request.split("\r\n\r\n").nth(1).expect("request body");
+        assert!(body.contains("grant_type=client_credentials"));
+        assert!(body.contains("client_id=client+id"));
+        assert!(body.contains("client_secret=secret%2Fkey"));
+
+        server.await.expect("auth server task");
+    }
+
     #[test]
     fn classifies_devices_by_python_name_rules() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -712,6 +810,33 @@ mod tests {
             db::get_latest_device_state(&db_path, "motion").expect("motion state"),
             Some("detected".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn applying_report_notifies_status_broadcast() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+        let yolink = test_state(db_path);
+        yolink.apply_devices(sample_devices());
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(4);
+        yolink.set_status_broadcast(sender);
+
+        let applied = yolink
+            .apply_report(
+                YoLinkReport {
+                    device_id: "door-1".to_string(),
+                    data: json!({"state": "open"}),
+                },
+                1_010.0,
+            )
+            .expect("apply report");
+
+        assert!(applied.is_some());
+        tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("broadcast timeout")
+            .expect("broadcast received");
     }
 
     #[test]

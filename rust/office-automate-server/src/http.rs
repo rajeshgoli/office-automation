@@ -87,6 +87,7 @@ fn try_app_with_state(
     let temperature_band_defaults = TemperatureBands::from_config(&config);
     let temperature_bands = load_hvac_temperature_bands(&config, temperature_band_defaults);
     let (status_broadcast, _) = broadcast::channel(32);
+    yolink.set_status_broadcast(status_broadcast.clone());
     yolink.restore_from_database(unix_timestamp_now())?;
     let state = AppState {
         config,
