@@ -122,9 +122,11 @@ pub struct ErvConfig {
     pub ip: String,
     pub device_id: String,
     pub local_key: String,
+    pub active_control_enabled: bool,
     pub version: String,
     pub port: u16,
     pub status_timeout_seconds: u64,
+    pub verify_delay_seconds: u64,
     pub poll_interval_seconds: u64,
 }
 
@@ -144,9 +146,11 @@ impl Default for ErvConfig {
             ip: String::new(),
             device_id: String::new(),
             local_key: String::new(),
+            active_control_enabled: false,
             version: "3.4".to_string(),
             port: 6668,
             status_timeout_seconds: 5,
+            verify_delay_seconds: 1,
             poll_interval_seconds: 60,
         }
     }
@@ -326,6 +330,11 @@ impl AppConfig {
             file_config.erv.local_key = local_key;
         }
 
+        if let Some(enabled) = env_lookup("OFFICE_AUTOMATE_ERV_ACTIVE_CONTROL_ENABLED") {
+            file_config.erv.active_control_enabled =
+                parse_bool_env("OFFICE_AUTOMATE_ERV_ACTIVE_CONTROL_ENABLED", &enabled)?;
+        }
+
         let runtime = RuntimeConfig {
             frontend_dist: root.join("frontend").join("dist"),
             root,
@@ -348,6 +357,14 @@ impl AppConfig {
             thresholds: file_config.thresholds,
             runtime,
         })
+    }
+}
+
+fn parse_bool_env(name: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!("invalid {name} value {value:?}; expected true/false"),
     }
 }
 
@@ -397,6 +414,7 @@ thresholds:
             "OFFICE_AUTOMATE_ERV_IP" => Some("192.0.2.11".to_string()),
             "OFFICE_AUTOMATE_ERV_DEVICE_ID" => Some("env-erv-device".to_string()),
             "OFFICE_AUTOMATE_ERV_LOCAL_KEY" => Some("env-erv-key".to_string()),
+            "OFFICE_AUTOMATE_ERV_ACTIVE_CONTROL_ENABLED" => Some("true".to_string()),
             "OFFICE_AUTOMATE_PUBLIC_URL" => Some("https://office.example.com".to_string()),
             _ => None,
         })
@@ -417,6 +435,7 @@ thresholds:
         assert_eq!(config.erv.ip, "192.0.2.11");
         assert_eq!(config.erv.device_id, "env-erv-device");
         assert_eq!(config.erv.local_key, "env-erv-key");
+        assert!(config.erv.active_control_enabled);
         assert_eq!(config.erv.version, "3.4");
         assert_eq!(config.erv.port, 6668);
         assert!(config.erv.is_configured());

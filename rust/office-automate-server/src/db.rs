@@ -315,6 +315,36 @@ pub fn log_device_event(
     Ok(())
 }
 
+pub fn log_climate_action(
+    database_path: &Path,
+    system: &str,
+    action: &str,
+    setpoint: Option<f64>,
+    co2_ppm: Option<i64>,
+    reason: Option<&str>,
+) -> Result<()> {
+    if let Some(parent) = database_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create data directory {}", parent.display()))?;
+    }
+
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    connection
+        .execute(
+            r#"
+            INSERT INTO climate_actions (timestamp, system, action, setpoint, co2_ppm, reason)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+            params![timestamp, system, action, setpoint, co2_ppm, reason],
+        )
+        .with_context(|| format!("failed to log {system} climate action"))?;
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryRows {
     pub sensor_readings: Vec<Value>,

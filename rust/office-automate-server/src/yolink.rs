@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use tokio::{sync::broadcast, task::JoinHandle};
 
 use crate::{
+    automation::ErvPolicyCoordinator,
     config::{AppConfig, YoLinkConfig},
     db,
     state::{StateMachine, StateTransition},
@@ -520,7 +521,11 @@ pub fn reconnect_delay(config: &YoLinkConfig) -> Duration {
     Duration::from_secs(config.reconnect_delay_seconds.max(1))
 }
 
-pub fn start_yolink_client(config: &AppConfig, yolink: YoLinkState) -> Option<JoinHandle<()>> {
+pub fn start_yolink_client(
+    config: &AppConfig,
+    yolink: YoLinkState,
+    erv_automation: Option<ErvPolicyCoordinator>,
+) -> Option<JoinHandle<()>> {
     if !config.yolink.is_configured() {
         tracing::warn!("YoLink credentials are not configured; client not started");
         return None;
@@ -529,7 +534,9 @@ pub fn start_yolink_client(config: &AppConfig, yolink: YoLinkState) -> Option<Jo
     let config = config.clone();
     Some(tokio::spawn(async move {
         loop {
-            if let Err(error) = run_yolink_client_once(&config, yolink.clone()).await {
+            if let Err(error) =
+                run_yolink_client_once(&config, yolink.clone(), erv_automation.clone()).await
+            {
                 tracing::warn!("YoLink client stopped: {error:#}");
             }
             tokio::time::sleep(reconnect_delay(&config.yolink)).await;
@@ -537,11 +544,22 @@ pub fn start_yolink_client(config: &AppConfig, yolink: YoLinkState) -> Option<Jo
     }))
 }
 
-async fn run_yolink_client_once(config: &AppConfig, yolink: YoLinkState) -> Result<()> {
+async fn run_yolink_client_once(
+    config: &AppConfig,
+    yolink: YoLinkState,
+    erv_automation: Option<ErvPolicyCoordinator>,
+) -> Result<()> {
     let cloud = YoLinkCloudClient::new(config.yolink.clone());
     let (access_token, home_id) = initialize_yolink_inventory(&cloud, &yolink).await?;
     yolink.restore_from_database(chrono::Local::now().timestamp_millis() as f64 / 1_000.0)?;
-    listen_yolink_mqtt(&config.yolink, &access_token, &home_id, yolink).await
+    listen_yolink_mqtt(
+        &config.yolink,
+        &access_token,
+        &home_id,
+        yolink,
+        erv_automation,
+    )
+    .await
 }
 
 async fn listen_yolink_mqtt(
@@ -549,6 +567,7 @@ async fn listen_yolink_mqtt(
     access_token: &str,
     home_id: &str,
     yolink: YoLinkState,
+    erv_automation: Option<ErvPolicyCoordinator>,
 ) -> Result<()> {
     let mut options = MqttOptions::new(
         "office-automate-yolink",
@@ -571,8 +590,47 @@ async fn listen_yolink_mqtt(
                 match parse_mqtt_report_payload(&publish.payload) {
                     Ok(Some(report)) => {
                         let now = chrono::Local::now().timestamp_millis() as f64 / 1_000.0;
-                        if let Err(error) = yolink.apply_report(report, now) {
-                            tracing::warn!("failed to apply YoLink report: {error:#}");
+                        if let Some(erv_automation) = &erv_automation {
+                            match erv_automation
+                                .update_state_and_maybe_evaluate(|| {
+                                    let applied = yolink
+                                        .apply_report(report, now)
+                                        .context("failed to apply YoLink report")?;
+                                    let Some(applied) = applied else {
+                                        return Ok((None, None, now, false, false));
+                                    };
+                                    let bypass_dwell = applied.transition.is_some();
+                                    Ok((
+                                        Some(applied.device_type),
+                                        applied.transition,
+                                        now,
+                                        bypass_dwell,
+                                        true,
+                                    ))
+                                })
+                                .await
+                            {
+                                Ok(Some(_)) | Ok(None) => {}
+                                Err(error)
+                                    if error
+                                        .to_string()
+                                        .contains("failed to apply YoLink report") =>
+                                {
+                                    tracing::warn!("failed to apply YoLink report: {error:#}")
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "ERV automated policy apply failed after YoLink update: {error:#}"
+                                    );
+                                }
+                            }
+                        } else {
+                            match yolink.apply_report(report, now) {
+                                Ok(Some(_)) | Ok(None) => {}
+                                Err(error) => {
+                                    tracing::warn!("failed to apply YoLink report: {error:#}")
+                                }
+                            }
                         }
                     }
                     Ok(None) => {}

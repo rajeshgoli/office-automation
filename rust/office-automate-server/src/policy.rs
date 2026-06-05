@@ -150,6 +150,11 @@ impl ErvPolicyState {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn air_quality_sample_counts(&self) -> (usize, usize) {
+        (self.co2_history.len(), self.tvoc_history.len())
+    }
+
     pub fn on_occupancy_transition(
         &mut self,
         thresholds: &ThresholdsConfig,
