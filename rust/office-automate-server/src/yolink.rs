@@ -489,14 +489,31 @@ pub fn parse_devices(value: &Value) -> Result<Vec<YoLinkDevice>> {
 
 pub fn parse_mqtt_report_payload(payload: &[u8]) -> serde_json::Result<Option<YoLinkReport>> {
     let value: Value = serde_json::from_slice(payload)?;
-    let Some(device_id) = value.get("deviceId").and_then(Value::as_str) else {
+    let data = value.get("data").cloned().unwrap_or_else(|| json!({}));
+    if let Some(device_id) = value.get("deviceId").and_then(Value::as_str) {
+        return Ok(Some(YoLinkReport {
+            device_id: device_id.to_string(),
+            data,
+        }));
+    }
+
+    let Some(device_id) = data.get("deviceId").and_then(Value::as_str) else {
         return Ok(None);
     };
-    let data = value.get("data").cloned().unwrap_or_else(|| json!({}));
     Ok(Some(YoLinkReport {
         device_id: device_id.to_string(),
-        data,
+        data: normalize_report_data(data),
     }))
+}
+
+fn normalize_report_data(data: Value) -> Value {
+    let Some(state) = data.get("state") else {
+        return data;
+    };
+    if state.as_str().is_some() {
+        return data;
+    }
+    state.clone()
 }
 
 pub fn reconnect_delay(config: &YoLinkConfig) -> Duration {
@@ -759,6 +776,16 @@ mod tests {
 
         assert_eq!(report.device_id, "door-1");
         assert_eq!(report.data["state"], "open");
+
+        let documented_report = parse_mqtt_report_payload(
+            br#"{"event":"DoorSensor.Report","data":{"deviceId":"door-1","state":{"state":"open","battery":4}}}"#,
+        )
+        .expect("parse documented")
+        .expect("documented report");
+        assert_eq!(documented_report.device_id, "door-1");
+        assert_eq!(documented_report.data["state"], "open");
+        assert_eq!(documented_report.data["battery"], 4);
+
         assert_eq!(
             parse_mqtt_report_payload(br#"{"data":{"state":"open"}}"#).expect("parse"),
             None
