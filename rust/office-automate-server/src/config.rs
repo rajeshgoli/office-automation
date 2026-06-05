@@ -19,6 +19,9 @@ pub struct AppConfig {
 pub struct OrchestratorConfig {
     pub host: String,
     pub port: u16,
+    pub auth_username: Option<String>,
+    pub auth_password: Option<String>,
+    pub google_oauth: Option<GoogleOAuthConfig>,
 }
 
 impl Default for OrchestratorConfig {
@@ -26,6 +29,35 @@ impl Default for OrchestratorConfig {
         Self {
             host: "0.0.0.0".to_string(),
             port: 8080,
+            auth_username: None,
+            auth_password: None,
+            google_oauth: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GoogleOAuthConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    pub allowed_emails: Vec<String>,
+    pub token_expiry_days: i64,
+    pub device_flow_enabled: bool,
+    pub jwt_secret: Option<String>,
+    pub trusted_networks: Vec<String>,
+}
+
+impl Default for GoogleOAuthConfig {
+    fn default() -> Self {
+        Self {
+            client_id: String::new(),
+            client_secret: String::new(),
+            allowed_emails: Vec::new(),
+            token_expiry_days: 7,
+            device_flow_enabled: true,
+            jwt_secret: None,
+            trusted_networks: Vec::new(),
         }
     }
 }
@@ -144,6 +176,9 @@ pub struct RuntimeConfig {
     pub config_path: PathBuf,
     pub data_dir: PathBuf,
     pub database_path: PathBuf,
+    pub frontend_dist: PathBuf,
+    pub artifacts_dir: PathBuf,
+    pub legacy_apk_path: PathBuf,
     pub base_url: Option<String>,
     pub public_url: Option<String>,
     pub mqtt_host: String,
@@ -200,9 +235,12 @@ impl AppConfig {
         }
 
         let runtime = RuntimeConfig {
+            frontend_dist: root.join("frontend").join("dist"),
             root,
             config_path: config_path.to_path_buf(),
             database_path: data_dir.join("office_climate.db"),
+            artifacts_dir: data_dir.join("apps"),
+            legacy_apk_path: data_dir.join("app-debug.apk"),
             data_dir,
             base_url: env_lookup("OFFICE_AUTOMATE_BASE_URL"),
             public_url: env_lookup("OFFICE_AUTOMATE_PUBLIC_URL"),
@@ -267,6 +305,18 @@ thresholds:
         assert_eq!(
             config.runtime.database_path,
             temp_dir.path().join("db").join("office_climate.db")
+        );
+        assert_eq!(
+            config.runtime.frontend_dist,
+            temp_dir.path().join("root").join("frontend").join("dist")
+        );
+        assert_eq!(
+            config.runtime.artifacts_dir,
+            temp_dir.path().join("db").join("apps")
+        );
+        assert_eq!(
+            config.runtime.legacy_apk_path,
+            temp_dir.path().join("db").join("app-debug.apk")
         );
         assert_eq!(
             config.runtime.public_url.as_deref(),

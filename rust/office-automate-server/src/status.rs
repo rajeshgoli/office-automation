@@ -182,7 +182,7 @@ pub struct TemperatureBands {
 }
 
 impl TemperatureBands {
-    fn from_config(config: &AppConfig) -> Self {
+    pub fn from_config(config: &AppConfig) -> Self {
         Self {
             heat_on_temp_f: config.thresholds.hvac_heat_on_temp_f,
             heat_off_temp_f: config.thresholds.hvac_heat_off_temp_f,
@@ -254,6 +254,9 @@ mod tests {
                 config_path: PathBuf::from("/tmp/office/config.yaml"),
                 data_dir: PathBuf::from("/tmp/office/data"),
                 database_path: PathBuf::from("/tmp/office/data/office_climate.db"),
+                frontend_dist: PathBuf::from("/tmp/office/frontend/dist"),
+                artifacts_dir: PathBuf::from("/tmp/office/data/apps"),
+                legacy_apk_path: PathBuf::from("/tmp/office/data/app-debug.apk"),
                 base_url: None,
                 public_url: None,
                 mqtt_host: "127.0.0.1".to_string(),
