@@ -9,6 +9,7 @@ pub mod http;
 pub mod hvac;
 pub mod mqtt;
 pub mod policy;
+pub mod presence;
 pub mod qingping;
 pub mod state;
 pub mod status;

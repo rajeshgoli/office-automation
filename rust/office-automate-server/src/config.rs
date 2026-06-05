@@ -9,12 +9,31 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppConfig {
     pub orchestrator: OrchestratorConfig,
+    pub presence: PresenceConfig,
     pub qingping: QingpingConfig,
     pub yolink: YoLinkConfig,
     pub erv: ErvConfig,
     pub mitsubishi: MitsubishiConfig,
     pub thresholds: ThresholdsConfig,
     pub runtime: RuntimeConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PresenceConfig {
+    pub enabled: bool,
+    pub poll_interval_seconds: u64,
+    pub command_timeout_seconds: u64,
+}
+
+impl Default for PresenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_seconds: 5,
+            command_timeout_seconds: 10,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -319,6 +338,7 @@ pub struct RuntimeConfig {
 #[serde(default)]
 struct FileConfig {
     orchestrator: OrchestratorConfig,
+    presence: PresenceConfig,
     qingping: QingpingConfig,
     yolink: YoLinkConfig,
     erv: ErvConfig,
@@ -413,6 +433,25 @@ impl AppConfig {
                 parse_bool_env("OFFICE_AUTOMATE_ERV_ACTIVE_CONTROL_ENABLED", &enabled)?;
         }
 
+        if let Some(enabled) = env_lookup("OFFICE_AUTOMATE_PRESENCE_ENABLED") {
+            file_config.presence.enabled =
+                parse_bool_env("OFFICE_AUTOMATE_PRESENCE_ENABLED", &enabled)?;
+        }
+
+        if let Some(seconds) = env_lookup("OFFICE_AUTOMATE_PRESENCE_POLL_INTERVAL_SECONDS") {
+            file_config.presence.poll_interval_seconds = seconds.parse().with_context(|| {
+                format!("invalid OFFICE_AUTOMATE_PRESENCE_POLL_INTERVAL_SECONDS value {seconds:?}")
+            })?;
+        }
+
+        if let Some(seconds) = env_lookup("OFFICE_AUTOMATE_PRESENCE_COMMAND_TIMEOUT_SECONDS") {
+            file_config.presence.command_timeout_seconds = seconds.parse().with_context(|| {
+                format!(
+                    "invalid OFFICE_AUTOMATE_PRESENCE_COMMAND_TIMEOUT_SECONDS value {seconds:?}"
+                )
+            })?;
+        }
+
         let runtime = RuntimeConfig {
             frontend_dist: root.join("frontend").join("dist"),
             root,
@@ -429,6 +468,7 @@ impl AppConfig {
 
         Ok(Self {
             orchestrator: file_config.orchestrator,
+            presence: file_config.presence,
             qingping: file_config.qingping,
             yolink: file_config.yolink,
             erv: file_config.erv,
@@ -461,6 +501,8 @@ mod tests {
 orchestrator:
   host: "127.0.0.1"
   port: 9001
+presence:
+  poll_interval_seconds: 7
 qingping:
   mqtt_broker: "legacy-broker"
   mqtt_port: 1883
@@ -506,6 +548,8 @@ thresholds:
             "OFFICE_AUTOMATE_ERV_DEVICE_ID" => Some("env-erv-device".to_string()),
             "OFFICE_AUTOMATE_ERV_LOCAL_KEY" => Some("env-erv-key".to_string()),
             "OFFICE_AUTOMATE_ERV_ACTIVE_CONTROL_ENABLED" => Some("true".to_string()),
+            "OFFICE_AUTOMATE_PRESENCE_ENABLED" => Some("true".to_string()),
+            "OFFICE_AUTOMATE_PRESENCE_COMMAND_TIMEOUT_SECONDS" => Some("3".to_string()),
             "OFFICE_AUTOMATE_PUBLIC_URL" => Some("https://office.example.com".to_string()),
             _ => None,
         })
@@ -513,6 +557,9 @@ thresholds:
 
         assert_eq!(config.orchestrator.host, "127.0.0.1");
         assert_eq!(config.orchestrator.port, 9001);
+        assert!(config.presence.enabled);
+        assert_eq!(config.presence.poll_interval_seconds, 7);
+        assert_eq!(config.presence.command_timeout_seconds, 3);
         assert_eq!(config.qingping.mqtt_broker, "rust-broker");
         assert_eq!(config.qingping.mqtt_port, 2883);
         assert_eq!(config.yolink.uaid, "env-uaid");

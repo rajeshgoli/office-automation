@@ -907,6 +907,7 @@ mod tests {
 
         let mut status = Status::read_only_default(&crate::config::AppConfig {
             orchestrator: crate::config::OrchestratorConfig::default(),
+            presence: crate::config::PresenceConfig::default(),
             qingping: crate::config::QingpingConfig::default(),
             yolink: crate::config::YoLinkConfig::default(),
             erv: crate::config::ErvConfig::default(),

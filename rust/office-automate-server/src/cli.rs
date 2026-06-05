@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
-use crate::{config::AppConfig, db, erv, http, hvac};
+use crate::{config::AppConfig, db, erv, http, hvac, presence};
 
 #[derive(Debug, Parser)]
 #[command(name = "office-automate-server")]
@@ -43,6 +43,8 @@ pub enum SmokeTarget {
     Erv,
     /// Verify Mitsubishi Kumo HVAC status read.
     Hvac,
+    /// Verify macOS keyboard/display presence signals.
+    Presence,
 }
 
 pub async fn run_cli() -> Result<()> {
@@ -95,6 +97,13 @@ async fn run_smoke(config: &AppConfig, target: Option<SmokeTarget>) -> Result<()
                     status.mode, status.setpoint_c
                 );
             }
+            SmokeTarget::Presence => {
+                let status = presence::smoke_presence(config).await?;
+                println!(
+                    "Presence signals OK: idle_seconds={:.1} external_monitor={} display_count={}",
+                    status.idle_seconds, status.external_monitor, status.display_count
+                );
+            }
         }
     }
 
@@ -105,7 +114,8 @@ fn smoke_targets(target: Option<SmokeTarget>) -> &'static [SmokeTarget] {
     match target {
         Some(SmokeTarget::Erv) => &[SmokeTarget::Erv],
         Some(SmokeTarget::Hvac) => &[SmokeTarget::Hvac],
-        None => &[SmokeTarget::Erv, SmokeTarget::Hvac],
+        Some(SmokeTarget::Presence) => &[SmokeTarget::Presence],
+        None => &[SmokeTarget::Erv, SmokeTarget::Hvac, SmokeTarget::Presence],
     }
 }
 
@@ -201,8 +211,28 @@ mod tests {
                 assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
                 assert_eq!(
                     smoke_targets(args.target),
-                    &[SmokeTarget::Erv, SmokeTarget::Hvac]
+                    &[SmokeTarget::Erv, SmokeTarget::Hvac, SmokeTarget::Presence]
                 );
+            }
+            other => panic!("expected smoke command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_smoke_presence_command_with_config() {
+        let cli = Cli::try_parse_from([
+            "office-automate-server",
+            "smoke",
+            "--config",
+            "/tmp/office.yaml",
+            "presence",
+        ])
+        .expect("smoke command should parse");
+
+        match cli.command {
+            Command::Smoke(args) => {
+                assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
+                assert_eq!(args.target, Some(SmokeTarget::Presence));
             }
             other => panic!("expected smoke command, got {other:?}"),
         }

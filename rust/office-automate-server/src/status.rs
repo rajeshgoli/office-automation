@@ -240,13 +240,14 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        ErvConfig, MitsubishiConfig, OrchestratorConfig, QingpingConfig, RuntimeConfig,
-        ThresholdsConfig, YoLinkConfig,
+        ErvConfig, MitsubishiConfig, OrchestratorConfig, PresenceConfig, QingpingConfig,
+        RuntimeConfig, ThresholdsConfig, YoLinkConfig,
     };
 
     fn test_config() -> AppConfig {
         AppConfig {
             orchestrator: OrchestratorConfig::default(),
+            presence: PresenceConfig::default(),
             qingping: QingpingConfig {
                 report_interval: 45,
                 ..QingpingConfig::default()
