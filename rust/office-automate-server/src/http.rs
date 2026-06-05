@@ -22,7 +22,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, time::timeout};
+use tokio::{net::TcpListener, sync::broadcast, time::timeout};
 use tower_http::{
     cors::{Any, CorsLayer},
     services::ServeDir,
@@ -49,6 +49,7 @@ struct AppState {
     temperature_bands: Arc<RwLock<TemperatureBands>>,
     temperature_band_defaults: TemperatureBands,
     state_machine: Arc<RwLock<StateMachine>>,
+    status_broadcast: broadcast::Sender<()>,
 }
 
 pub fn app(config: AppConfig) -> Router {
@@ -65,6 +66,7 @@ pub fn try_app(config: AppConfig) -> Result<Router> {
     let temperature_band_defaults = TemperatureBands::from_config(&config);
     let temperature_bands = load_hvac_temperature_bands(&config, temperature_band_defaults);
     let state_machine = StateMachine::from_thresholds(&config.thresholds, unix_timestamp_now());
+    let (status_broadcast, _) = broadcast::channel(32);
     let state = AppState {
         config,
         auth,
@@ -72,6 +74,7 @@ pub fn try_app(config: AppConfig) -> Result<Router> {
         temperature_bands: Arc::new(RwLock::new(temperature_bands)),
         temperature_band_defaults,
         state_machine: Arc::new(RwLock::new(state_machine)),
+        status_broadcast,
     };
 
     let cors = CorsLayer::new()
@@ -260,9 +263,7 @@ fn auth_headers_with_peer(headers: &HeaderMap, remote_addr: Option<SocketAddr>) 
     headers.remove("x-forwarded-for");
 
     let client_ip = match remote_addr {
-        Some(remote_addr) if remote_addr.ip().is_loopback() => {
-            forwarded_for.or_else(|| Some(remote_addr.ip()))
-        }
+        Some(remote_addr) if remote_addr.ip().is_loopback() => forwarded_for,
         Some(remote_addr) => Some(remote_addr.ip()),
         None => None,
     };
@@ -335,20 +336,36 @@ async fn websocket_session(mut socket: WebSocket, state: AppState, auth_mode: We
         }
     }
 
+    let mut status_updates = state.status_broadcast.subscribe();
+
     if send_status(&mut socket, &state).await.is_err() {
         return;
     }
 
-    while let Some(message) = socket.recv().await {
-        match message {
-            Ok(Message::Text(text)) if text == "ping" => {
-                let _ = socket.send(Message::Text("pong".into())).await;
+    loop {
+        tokio::select! {
+            message = socket.recv() => {
+                match message {
+                    Some(Ok(Message::Text(text))) if text == "ping" => {
+                        let _ = socket.send(Message::Text("pong".into())).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        tracing::debug!("websocket receive error: {error}");
+                        break;
+                    }
+                }
             }
-            Ok(Message::Close(_)) => break,
-            Ok(_) => {}
-            Err(error) => {
-                tracing::debug!("websocket receive error: {error}");
-                break;
+            update = status_updates.recv() => {
+                match update {
+                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if send_status(&mut socket, &state).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
         }
     }
@@ -366,6 +383,10 @@ async fn close_ws(socket: &mut WebSocket, reason: &str) {
 async fn send_status(socket: &mut WebSocket, state: &AppState) -> Result<(), axum::Error> {
     let status = serde_json::to_string(&status_for_state(state)).expect("status serializes");
     socket.send(Message::Text(status.into())).await
+}
+
+fn broadcast_status(state: &AppState) {
+    let _ = state.status_broadcast.send(());
 }
 
 fn unix_timestamp_now() -> f64 {
@@ -407,6 +428,7 @@ async fn occupancy(
             .into_response();
     }
 
+    broadcast_status(&state);
     Json(json!({"ok": true, "state": state_name, "erv_should_run": erv_should_run})).into_response()
 }
 
@@ -448,6 +470,7 @@ async fn presence(State(state): State<AppState>, Json(payload): Json<PresenceReq
                     .into_response();
             }
 
+            broadcast_status(&state);
             Json(json!({"ok": true, "state": state_name, "is_present": is_present})).into_response()
         }
         _ => (
@@ -580,6 +603,7 @@ async fn update_hvac_temperature_bands(
         .write()
         .expect("temperature band lock poisoned") = bands;
 
+    broadcast_status(&state);
     temperature_bands_response(active_temperature_bands(&state), &state).into_response()
 }
 
@@ -1380,7 +1404,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_loopback_proxy_preserves_forwarded_client_for_trusted_networks() {
+    async fn oauth_loopback_proxy_requires_forwarded_client_for_trusted_networks() {
         let response = app(oauth_config())
             .oneshot(
                 HttpRequest::builder()
@@ -1399,6 +1423,34 @@ mod tests {
             .oneshot(
                 HttpRequest::builder()
                     .uri("/status")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let config = AppConfig {
+            orchestrator: OrchestratorConfig {
+                google_oauth: Some(GoogleOAuthConfig {
+                    client_id: "client".to_string(),
+                    client_secret: "secret".to_string(),
+                    allowed_emails: vec!["engineer@rajeshgo.li".to_string()],
+                    jwt_secret: Some("test-secret".to_string()),
+                    trusted_networks: vec!["203.0.113.0/24".to_string()],
+                    ..GoogleOAuthConfig::default()
+                }),
+                ..OrchestratorConfig::default()
+            },
+            ..test_config()
+        };
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .header("x-forwarded-for", "203.0.113.7")
                     .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))))
                     .body(Body::empty())
                     .expect("request"),
@@ -1470,6 +1522,64 @@ mod tests {
         assert_eq!(value["device_events"][0]["event"], "manual_present");
         assert_eq!(value["occupancy_history"][0]["state"], "present");
         assert_eq!(value["occupancy_history"][0]["trigger"], "manual");
+    }
+
+    #[tokio::test]
+    async fn websocket_broadcasts_manual_presence_updates() {
+        let service = app(test_config());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server_service = service.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                server_service.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("server");
+        });
+
+        let (mut ws, _) = connect_async(format!("ws://{address}/ws"))
+            .await
+            .expect("connect");
+        let initial = timeout(Duration::from_secs(1), ws.next())
+            .await
+            .expect("initial timeout")
+            .expect("initial message")
+            .expect("initial ok");
+        assert!(
+            initial
+                .into_text()
+                .expect("text")
+                .contains("\"state\":\"away\"")
+        );
+
+        let response = service
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/presence")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"state":"present"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let update = timeout(Duration::from_secs(1), ws.next())
+            .await
+            .expect("update timeout")
+            .expect("update message")
+            .expect("update ok");
+        assert!(
+            update
+                .into_text()
+                .expect("text")
+                .contains("\"state\":\"present\"")
+        );
+
+        server.abort();
     }
 
     #[tokio::test]
