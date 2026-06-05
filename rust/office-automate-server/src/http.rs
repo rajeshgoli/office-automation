@@ -38,6 +38,7 @@ use crate::{
     qingping::QingpingState,
     state::{StateMachine, StateTransition},
     status::{Status, TemperatureBands},
+    yolink::{self, YoLinkState},
 };
 
 const HVAC_TEMPERATURE_BANDS_SETTING: &str = "hvac_temperature_bands";
@@ -63,6 +64,20 @@ pub fn try_app(config: AppConfig) -> Result<Router> {
 }
 
 fn try_app_with_qingping(config: AppConfig, qingping: QingpingState) -> Result<Router> {
+    let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+        &config.thresholds,
+        unix_timestamp_now(),
+    )));
+    let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+    try_app_with_state(config, qingping, state_machine, yolink)
+}
+
+fn try_app_with_state(
+    config: AppConfig,
+    qingping: QingpingState,
+    state_machine: Arc<RwLock<StateMachine>>,
+    yolink: YoLinkState,
+) -> Result<Router> {
     db::migrate_database(&config.runtime.database_path)?;
     let auth = AuthManager::new(&config.orchestrator)?;
     let artifacts = ArtifactStore::new(
@@ -71,15 +86,16 @@ fn try_app_with_qingping(config: AppConfig, qingping: QingpingState) -> Result<R
     );
     let temperature_band_defaults = TemperatureBands::from_config(&config);
     let temperature_bands = load_hvac_temperature_bands(&config, temperature_band_defaults);
-    let state_machine = StateMachine::from_thresholds(&config.thresholds, unix_timestamp_now());
     let (status_broadcast, _) = broadcast::channel(32);
+    yolink.set_status_broadcast(status_broadcast.clone());
+    yolink.restore_from_database(unix_timestamp_now())?;
     let state = AppState {
         config,
         auth,
         artifacts,
         temperature_bands: Arc::new(RwLock::new(temperature_bands)),
         temperature_band_defaults,
-        state_machine: Arc::new(RwLock::new(state_machine)),
+        state_machine,
         status_broadcast,
         qingping,
     };
@@ -146,10 +162,21 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind HTTP listener at {bind_address}"))?;
     let qingping = QingpingState::default();
-    let app = try_app_with_qingping(config.clone(), qingping.clone())
-        .context("failed to build HTTP app")?;
+    let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+        &config.thresholds,
+        unix_timestamp_now(),
+    )));
+    let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+    let app = try_app_with_state(
+        config.clone(),
+        qingping.clone(),
+        state_machine,
+        yolink.clone(),
+    )
+    .context("failed to build HTTP app")?;
     let _mqtt_runtime =
         mqtt::start_qingping_ingress(&config, qingping).context("failed to start MQTT ingress")?;
+    let _yolink_task = yolink::start_yolink_client(&config, yolink);
 
     tracing::info!("office-automate-server listening on {}", bind_address);
     axum::serve(
@@ -1261,6 +1288,7 @@ mod tests {
     use super::*;
     use crate::config::{
         GoogleOAuthConfig, OrchestratorConfig, QingpingConfig, RuntimeConfig, ThresholdsConfig,
+        YoLinkConfig,
     };
 
     fn test_config() -> AppConfig {
@@ -1269,6 +1297,7 @@ mod tests {
         AppConfig {
             orchestrator: OrchestratorConfig::default(),
             qingping: QingpingConfig::default(),
+            yolink: YoLinkConfig::default(),
             thresholds: ThresholdsConfig::default(),
             runtime: RuntimeConfig {
                 root: root.clone(),
@@ -1398,6 +1427,56 @@ mod tests {
         assert_eq!(value["air_quality"]["tvoc"], 25);
         assert_eq!(value["air_quality"]["noise_db"], 37.0);
         assert_eq!(value["air_quality"]["last_update"], "2026-06-05T12:30:00");
+    }
+
+    #[tokio::test]
+    async fn status_route_restores_yolink_device_state_from_database() {
+        let config = test_config();
+        db::migrate_database(&config.runtime.database_path).expect("migration");
+        db::log_device_event(
+            &config.runtime.database_path,
+            "door",
+            "open",
+            Some("Office Door"),
+            None,
+        )
+        .expect("log door");
+        db::log_device_event(
+            &config.runtime.database_path,
+            "window",
+            "closed",
+            Some("Office Window"),
+            None,
+        )
+        .expect("log window");
+        db::log_device_event(
+            &config.runtime.database_path,
+            "motion",
+            "detected",
+            Some("Office Motion"),
+            None,
+        )
+        .expect("log motion");
+
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(value["sensors"]["door_open"], true);
+        assert_eq!(value["sensors"]["window_open"], false);
+        assert_eq!(value["sensors"]["motion_detected"], true);
     }
 
     #[tokio::test]

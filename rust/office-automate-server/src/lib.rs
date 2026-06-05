@@ -9,5 +9,6 @@ pub mod policy;
 pub mod qingping;
 pub mod state;
 pub mod status;
+pub mod yolink;
 
 pub use cli::run_cli;

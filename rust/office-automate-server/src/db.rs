@@ -1097,6 +1097,24 @@ fn sqlite_value_to_json(value: ValueRef<'_>) -> Value {
     }
 }
 
+pub fn get_latest_device_state(database_path: &Path, device_type: &str) -> Result<Option<String>> {
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    connection
+        .query_row(
+            r#"
+            SELECT event FROM device_events
+            WHERE device_type = ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 1
+            "#,
+            params![device_type],
+            |row| row.get(0),
+        )
+        .optional()
+        .with_context(|| format!("failed to read latest {device_type} device state"))
+}
+
 fn parse_timestamp(value: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
         .ok()
@@ -1887,5 +1905,42 @@ mod tests {
                 "qingping".to_string()
             )
         );
+    }
+
+    #[test]
+    fn logs_and_reads_latest_device_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+
+        log_device_event(
+            &db_path,
+            "door",
+            "open",
+            Some("Office Door"),
+            Some(&serde_json::json!({"state": "open"})),
+        )
+        .expect("log open");
+        log_device_event(&db_path, "door", "closed", Some("Office Door"), None)
+            .expect("log closed");
+
+        assert_eq!(
+            get_latest_device_state(&db_path, "door").expect("latest"),
+            Some("closed".to_string())
+        );
+        assert_eq!(
+            get_latest_device_state(&db_path, "window").expect("missing"),
+            None
+        );
+
+        let connection = Connection::open(&db_path).expect("open database");
+        let details: Option<String> = connection
+            .query_row(
+                "SELECT details FROM device_events WHERE event = 'open'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read details");
+        assert_eq!(details, Some(r#"{"state":"open"}"#.to_string()));
     }
 }
