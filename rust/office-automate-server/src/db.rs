@@ -30,6 +30,7 @@ pub fn migrate_database(database_path: &Path) -> Result<()> {
                 pm25 INTEGER,
                 pm10 INTEGER,
                 tvoc INTEGER,
+                noise_db INTEGER,
                 source TEXT DEFAULT 'qingping'
             );
             CREATE INDEX IF NOT EXISTS idx_sensor_timestamp ON sensor_readings(timestamp);
@@ -122,6 +123,38 @@ pub fn migrate_database(database_path: &Path) -> Result<()> {
         )
         .context("failed to apply SQLite migrations")?;
 
+    ensure_column(
+        &connection,
+        "sensor_readings",
+        "noise_db",
+        "ALTER TABLE sensor_readings ADD COLUMN noise_db INTEGER",
+    )?;
+
+    Ok(())
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table_name: &str,
+    column_name: &str,
+    alter_sql: &str,
+) -> Result<()> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table_name})"))
+        .with_context(|| format!("failed to inspect table {table_name}"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .with_context(|| format!("failed to read columns for table {table_name}"))?;
+
+    for column in columns {
+        if column? == column_name {
+            return Ok(());
+        }
+    }
+
+    connection
+        .execute(alter_sql, [])
+        .with_context(|| format!("failed to add column {column_name} to table {table_name}"))?;
     Ok(())
 }
 
@@ -153,5 +186,46 @@ mod tests {
 
         assert_eq!(table_count, 1);
         assert_eq!(migration_count, 1);
+    }
+
+    #[test]
+    fn migration_adds_noise_db_to_legacy_sensor_table() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+
+        {
+            let connection = Connection::open(&db_path).expect("open database");
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TABLE sensor_readings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        co2_ppm INTEGER,
+                        temp_c REAL,
+                        humidity REAL,
+                        pm25 INTEGER,
+                        pm10 INTEGER,
+                        tvoc INTEGER,
+                        source TEXT DEFAULT 'qingping'
+                    );
+                    "#,
+                )
+                .expect("create legacy sensor table");
+        }
+
+        migrate_database(&db_path).expect("migration");
+
+        let connection = Connection::open(&db_path).expect("open migrated database");
+        connection
+            .execute(
+                r#"
+                INSERT INTO sensor_readings
+                    (co2_ppm, temp_c, humidity, pm25, pm10, tvoc, noise_db, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+                (450, 21.0, 45.0, 1, 2, 3, 36, "qingping"),
+            )
+            .expect("insert sensor reading with noise_db");
     }
 }
