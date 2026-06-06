@@ -159,14 +159,17 @@ pub(crate) const PUBLIC_ACCESS_PROBES: &[PublicAccessProbe] = &[
 ];
 
 pub(crate) fn validate_http_startup_config(config: &AppConfig) -> Result<()> {
+    validate_http_startup_config_for_public_url(config, config.runtime.public_url.as_deref())
+}
+
+pub(crate) fn validate_http_startup_config_for_public_url(
+    config: &AppConfig,
+    public_url: Option<&str>,
+) -> Result<()> {
     let host = config.orchestrator.host.trim();
     let is_loopback = is_loopback_bind_host(host);
     let auth_mode = configured_http_auth_mode(config);
-    let public_url_configured = config
-        .runtime
-        .public_url
-        .as_deref()
-        .is_some_and(|public_url| !public_url.trim().is_empty());
+    let public_url_configured = public_url.is_some_and(|public_url| !public_url.trim().is_empty());
 
     if !is_loopback && auth_mode == HttpAuthMode::Open {
         anyhow::bail!(
