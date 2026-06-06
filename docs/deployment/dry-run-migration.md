@@ -25,7 +25,7 @@ The Office Automate config should point at the production candidate data files:
 - legacy APK path if still used
 - OAuth, ERV, and HVAC credential material
 
-Cloudflare Tunnel credentials stay in the `cloudflared` config and credential file, not in Office Automate templates. If the Cloudflare config uses a relative `credentials-file` path with subdirectories, the snapshot preserves that same relative path under `cloudflared/` so the copied config can be used for rollback rehearsal.
+Cloudflare Tunnel credentials stay in the `cloudflared` config and credential file, not in Office Automate templates. The copied Cloudflare config rewrites `credentials-file` to the credential copy under `cloudflared/`, preserving relative subdirectories when present, so rollback rehearsal does not depend on the original host path.
 
 ## Snapshot Command
 
@@ -45,7 +45,9 @@ The command creates:
 $OFFICE_AUTOMATE_SNAPSHOT_DIR/office-automate-precutover-YYYYMMDD-HHMMSS/
 ```
 
-The snapshot contains copied config/data inputs, cloudflared config and tunnel credential file, plus `manifest.json`. The office climate database is copied first and schema migration is run only against the copied database. The source database is not modified by the snapshot command.
+The snapshot contains copied config/data inputs, rewritten cloudflared config and tunnel credential file, `restore-env.sh`, and `manifest.json`. The office climate database is copied first and schema migration is run only against the copied database. The source database is not modified by the snapshot command.
+
+`restore-env.sh` exports the effective runtime paths and environment-backed deployment values used during validation, including device credentials when those values were present in the merged config. Keep the snapshot directory private; the file is written with owner-only permissions on Unix.
 
 ## Validations
 
@@ -59,6 +61,7 @@ The snapshot command validates:
 - Artifact metadata under the configured artifacts directory, including hash shape and referenced APK files.
 - Presence or absence of OAuth, ERV, and HVAC credential material without printing secret values.
 - Cloudflare Tunnel config readability, readable `credentials-file`, required tunnel credential JSON fields, at least one ingress rule, and copied tunnel config/credential files in the snapshot.
+- Effective restore environment written to `restore-env.sh`.
 
 For an extra cloudflared-native syntax check, run:
 
@@ -73,11 +76,13 @@ If `cloudflared tunnel ingress validate` is unavailable in the installed version
 
 Treat the generated snapshot directory as the rollback source for the cutover window. Keep it on local storage that survives process restart and user logout.
 
-For rollback rehearsal, restore from the snapshot into a temporary directory, point a separate config at those restored files, and run:
+For rollback rehearsal, restore from the snapshot into a temporary directory, source the captured environment, and run:
 
 ```bash
-./target/release/office-automate-server migrate --config /absolute/path/to/restored-test-config.yaml
-./target/release/office-automate-server collect --config /absolute/path/to/restored-test-config.yaml telemetry --dry-run
+source /absolute/path/to/restored-snapshot/restore-env.sh
+./target/release/office-automate-server migrate --config "$OFFICE_AUTOMATE_CONFIG"
+./target/release/office-automate-server collect --config "$OFFICE_AUTOMATE_CONFIG" telemetry --dry-run
+cloudflared tunnel ingress validate --config "$CLOUDFLARED_CONFIG"
 ```
 
 Do not load launchd services during this ticket. Service bootstrap belongs to the later cutover ticket after the dry-run snapshot and validation output are reviewed.
