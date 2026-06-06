@@ -6,25 +6,25 @@ Office climate automation system for a backyard shed office. Coordinates smart d
 
 ## Key Components
 
-- `run.py` - Main entry point
-- `src/orchestrator.py` - Main coordinator + HTTP/WS server + OAuth endpoints
-- `src/state_machine.py` - PRESENT/AWAY state logic
-- `src/erv_client.py` - ERV control via Tuya local
-- `src/kumo_client.py` - Mitsubishi Kumo Cloud (HVAC)
-- `src/yolink_client.py` - YoLink cloud API (sensors)
-- `src/qingping_client.py` - Qingping MQTT client (air quality)
+- `rust/office-automate-server/` - Rust server, collectors, device clients, and CLI
+- `rust/office-automate-server/src/http.rs` - HTTP/WS server + OAuth endpoints
+- `rust/office-automate-server/src/state.rs` - PRESENT/AWAY state logic
+- `rust/office-automate-server/src/erv.rs` - ERV control via Tuya local
+- `rust/office-automate-server/src/hvac.rs` - Mitsubishi Kumo Cloud (HVAC)
+- `rust/office-automate-server/src/yolink.rs` - YoLink cloud API (sensors)
+- `rust/office-automate-server/src/qingping.rs` - Qingping MQTT client (air quality)
 - `frontend/` - React + Vite dashboard
+- `android/` - Android client
 
 ## Development
 
 ```bash
 # Backend
-source venv/bin/activate
-python run.py --port 9001
+cargo run --manifest-path rust/office-automate-server/Cargo.toml -- serve --config config.yaml
 
 # Frontend
 cd frontend
-VITE_API_PORT=9001 npm run dev -- --port 9002
+VITE_API_PORT=8080 npm run dev -- --port 9002
 ```
 
 ## Database
