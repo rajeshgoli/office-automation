@@ -136,17 +136,18 @@ pub fn create_pre_cutover_snapshot(
     if let Some(cloudflared_config_path) = cloudflared_config_path {
         let cloudflared_credentials =
             validate_cloudflared_config(cloudflared_config_path, &mut validations)?;
+        let cloudflared_credential_snapshot_path = snapshot_dir
+            .join("cloudflared")
+            .join(&cloudflared_credentials.snapshot_relative_path);
         write_cloudflared_snapshot_config(
             cloudflared_config_path,
             &snapshot_dir.join("cloudflared").join("config.yml"),
-            &cloudflared_credentials.snapshot_relative_path,
+            &cloudflared_credential_snapshot_path,
         )?;
         files_copied += 1;
         copy_file(
             &cloudflared_credentials.source_path,
-            &snapshot_dir
-                .join("cloudflared")
-                .join(&cloudflared_credentials.snapshot_relative_path),
+            &cloudflared_credential_snapshot_path,
         )?;
         files_copied += 1;
         validations.push(format!(
@@ -192,7 +193,10 @@ fn create_private_snapshot_dir(output_dir: &Path) -> Result<PathBuf> {
     for attempt in 0..SNAPSHOT_CREATE_ATTEMPTS {
         let snapshot_dir = unique_snapshot_dir(output_dir, attempt);
         match create_private_dir(&snapshot_dir) {
-            Ok(()) => return Ok(snapshot_dir),
+            Ok(()) => {
+                return fs::canonicalize(&snapshot_dir)
+                    .with_context(|| format!("failed to resolve {}", snapshot_dir.display()));
+            }
             Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(error)
@@ -1159,7 +1163,11 @@ mod tests {
         );
         assert_eq!(
             cloudflared_credentials_file(&report.snapshot_dir.join("cloudflared/config.yml")),
-            "office-tunnel.json"
+            report
+                .snapshot_dir
+                .join("cloudflared/office-tunnel.json")
+                .display()
+                .to_string()
         );
     }
 
@@ -1210,7 +1218,11 @@ mod tests {
         );
         assert_eq!(
             cloudflared_credentials_file(&report.snapshot_dir.join("cloudflared/config.yml")),
-            "creds/office-tunnel.json"
+            report
+                .snapshot_dir
+                .join("cloudflared/creds/office-tunnel.json")
+                .display()
+                .to_string()
         );
         assert!(report.validations.iter().any(|validation| {
             validation == "cloudflared config and credential file copied: creds/office-tunnel.json"
@@ -1264,7 +1276,11 @@ mod tests {
         );
         assert_eq!(
             cloudflared_credentials_file(&report.snapshot_dir.join("cloudflared/config.yml")),
-            "office-tunnel.json"
+            report
+                .snapshot_dir
+                .join("cloudflared/office-tunnel.json")
+                .display()
+                .to_string()
         );
         assert!(
             fs::read_to_string(report.snapshot_dir.join("restore-env.sh"))

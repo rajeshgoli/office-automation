@@ -27,7 +27,7 @@ The Office Automate config and environment should point at the production candid
 - legacy APK path if still used
 - OAuth, ERV, and HVAC credential material
 
-Cloudflare Tunnel credentials stay in the `cloudflared` config and credential file, not in Office Automate templates. The copied Cloudflare config rewrites `credentials-file` to the credential copy under `cloudflared/`, preserving relative subdirectories when present, so rollback rehearsal does not depend on the original host path.
+Cloudflare Tunnel credentials stay in the `cloudflared` config and credential file, not in Office Automate templates. The copied Cloudflare config rewrites `credentials-file` to an absolute credential copy path under the snapshot `cloudflared/` directory, preserving relative subdirectories when present, so rollback rehearsal does not depend on the original host path or current working directory.
 
 ## Snapshot Command
 
