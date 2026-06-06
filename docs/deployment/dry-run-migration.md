@@ -18,13 +18,14 @@ The Office Automate config should point at the production candidate data files:
 
 - `runtime.database_path`
 - telemetry DB path
-- tool usage DB path
+- project-leverage tool usage DB path
+- session telemetry tool usage DB path, when it differs from the project-leverage tool usage DB
 - Engram DB and registry paths
 - artifacts directory
 - legacy APK path if still used
 - OAuth, ERV, and HVAC credential material
 
-Cloudflare Tunnel credentials stay in the `cloudflared` config and credential file, not in Office Automate templates.
+Cloudflare Tunnel credentials stay in the `cloudflared` config and credential file, not in Office Automate templates. If the Cloudflare config uses a relative `credentials-file` path with subdirectories, the snapshot preserves that same relative path under `cloudflared/` so the copied config can be used for rollback rehearsal.
 
 ## Snapshot Command
 
@@ -53,7 +54,7 @@ The snapshot command validates:
 - Config file readability.
 - Rollback output directory writability.
 - Office climate DB readability, migration compatibility on the copied DB, and SQLite `quick_check`.
-- Optional telemetry, tool-usage, and Engram SQLite DBs with SQLite `quick_check` when present.
+- Optional telemetry, project-leverage tool usage, session telemetry tool usage, and Engram SQLite DBs with SQLite `quick_check` when present.
 - Optional Engram registry and legacy APK readability when present.
 - Artifact metadata under the configured artifacts directory, including hash shape and referenced APK files.
 - Presence or absence of OAuth, ERV, and HVAC credential material without printing secret values.

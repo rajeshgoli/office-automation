@@ -37,6 +37,12 @@ struct CloudflaredConfig {
     ingress: Option<Vec<serde_yaml::Value>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloudflaredCredentialSnapshot {
+    source_path: PathBuf,
+    snapshot_relative_path: PathBuf,
+}
+
 pub fn create_pre_cutover_snapshot(
     config: &AppConfig,
     config_path: &Path,
@@ -83,6 +89,18 @@ pub fn create_pre_cutover_snapshot(
         &snapshot_dir.join("tool_usage.db"),
         &mut validations,
     )?;
+    if config.runtime.session_tool_usage_db_path == config.runtime.tool_usage_db_path {
+        validations.push(
+            "session tool usage database shares project tool usage database snapshot".to_string(),
+        );
+    } else {
+        files_copied += copy_optional_sqlite(
+            "session tool usage database",
+            &config.runtime.session_tool_usage_db_path,
+            &snapshot_dir.join("session_tool_usage.db"),
+            &mut validations,
+        )?;
+    }
     files_copied += copy_optional_sqlite(
         "engram database",
         &config.runtime.engram_db_path,
@@ -110,16 +128,17 @@ pub fn create_pre_cutover_snapshot(
             &snapshot_dir.join("cloudflared").join("config.yml"),
         )?;
         files_copied += 1;
-        let credential_name = cloudflared_credentials
-            .file_name()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("credentials.json"));
         copy_file(
-            &cloudflared_credentials,
-            &snapshot_dir.join("cloudflared").join(credential_name),
+            &cloudflared_credentials.source_path,
+            &snapshot_dir
+                .join("cloudflared")
+                .join(&cloudflared_credentials.snapshot_relative_path),
         )?;
         files_copied += 1;
-        validations.push("cloudflared config and credential file copied".to_string());
+        validations.push(format!(
+            "cloudflared config and credential file copied: {}",
+            cloudflared_credentials.snapshot_relative_path.display()
+        ));
     } else {
         validations.push("cloudflared config validation skipped".to_string());
     }
@@ -206,7 +225,10 @@ fn validate_config_material(config: &AppConfig) -> Vec<String> {
     validations
 }
 
-fn validate_cloudflared_config(path: &Path, validations: &mut Vec<String>) -> Result<PathBuf> {
+fn validate_cloudflared_config(
+    path: &Path,
+    validations: &mut Vec<String>,
+) -> Result<CloudflaredCredentialSnapshot> {
     ensure_readable_file("cloudflared config", path)?;
     let contents =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -219,6 +241,7 @@ fn validate_cloudflared_config(path: &Path, validations: &mut Vec<String>) -> Re
             path.display()
         )
     })?;
+    let snapshot_relative_path = cloudflared_snapshot_credential_path(&credentials_file)?;
     let credentials_file = resolve_cloudflared_path(path, credentials_file);
     ensure_readable_file("cloudflared credentials file", &credentials_file)?;
     validate_cloudflared_credentials(&credentials_file)?;
@@ -239,7 +262,10 @@ fn validate_cloudflared_config(path: &Path, validations: &mut Vec<String>) -> Re
         "cloudflared ingress rules present: {}",
         ingress.len()
     ));
-    Ok(credentials_file)
+    Ok(CloudflaredCredentialSnapshot {
+        source_path: credentials_file,
+        snapshot_relative_path,
+    })
 }
 
 fn resolve_cloudflared_path(config_path: &Path, configured_path: PathBuf) -> PathBuf {
@@ -257,6 +283,43 @@ fn resolve_cloudflared_path(config_path: &Path, configured_path: PathBuf) -> Pat
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(configured_path)
+}
+
+fn cloudflared_snapshot_credential_path(configured_path: &Path) -> Result<PathBuf> {
+    if configured_path.is_absolute()
+        || configured_path
+            .to_str()
+            .is_some_and(|value| value.starts_with("~/"))
+    {
+        return configured_path
+            .file_name()
+            .map(PathBuf::from)
+            .context("cloudflared credentials-file has no filename");
+    }
+
+    let mut snapshot_path = PathBuf::new();
+    for component in configured_path.components() {
+        match component {
+            std::path::Component::Normal(value) => snapshot_path.push(value),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                bail!(
+                    "cloudflared credentials-file uses unsupported snapshot path component: {}",
+                    configured_path.display()
+                );
+            }
+        }
+    }
+
+    if snapshot_path.as_os_str().is_empty() {
+        bail!(
+            "cloudflared credentials-file has no snapshot filename: {}",
+            configured_path.display()
+        );
+    }
+    Ok(snapshot_path)
 }
 
 fn validate_cloudflared_credentials(path: &Path) -> Result<()> {
@@ -481,6 +544,16 @@ mod tests {
         }
     }
 
+    fn create_sqlite(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("sqlite parent");
+        }
+        let connection = Connection::open(path).expect("sqlite");
+        connection
+            .execute_batch("CREATE TABLE test_data (id INTEGER PRIMARY KEY);")
+            .expect("sqlite schema");
+    }
+
     #[test]
     fn snapshot_copies_config_database_artifacts_and_manifest() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -522,6 +595,45 @@ mod tests {
                 .iter()
                 .any(|validation| validation == "office database migrated on snapshot copy")
         );
+    }
+
+    #[test]
+    fn snapshot_copies_distinct_session_tool_usage_database() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path();
+        let config_path = root.join("config.yaml");
+        fs::write(&config_path, "orchestrator:\n  port: 9001\n").expect("config");
+        let database_path = root.join("data/office_climate.db");
+        fs::create_dir_all(database_path.parent().expect("db parent")).expect("data dir");
+        db::migrate_database(&database_path).expect("office db");
+
+        let mut config = test_config(root, config_path.clone(), database_path);
+        create_sqlite(&config.runtime.tool_usage_db_path);
+        create_sqlite(&config.runtime.session_tool_usage_db_path);
+
+        let report =
+            create_pre_cutover_snapshot(&config, &config_path, &root.join("snapshots"), None)
+                .expect("snapshot succeeds");
+
+        assert!(report.snapshot_dir.join("tool_usage.db").is_file());
+        assert!(report.snapshot_dir.join("session_tool_usage.db").is_file());
+        assert!(
+            report
+                .validations
+                .iter()
+                .any(|validation| validation == "session tool usage database quick_check ok")
+        );
+
+        config.runtime.session_tool_usage_db_path = config.runtime.tool_usage_db_path.clone();
+        let shared_report = create_pre_cutover_snapshot(
+            &config,
+            &config_path,
+            &root.join("shared-snapshots"),
+            None,
+        )
+        .expect("shared snapshot succeeds");
+        assert!(shared_report.validations.iter().any(|validation| validation
+            == "session tool usage database shares project tool usage database snapshot"));
     }
 
     #[test]
@@ -603,6 +715,56 @@ mod tests {
                 .join("cloudflared/office-tunnel.json")
                 .is_file()
         );
+    }
+
+    #[test]
+    fn snapshot_preserves_cloudflared_relative_credential_subdirectories() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path();
+        let config_path = root.join("config.yaml");
+        fs::write(&config_path, "orchestrator:\n  port: 9001\n").expect("config");
+        let database_path = root.join("data/office_climate.db");
+        fs::create_dir_all(database_path.parent().expect("db parent")).expect("data dir");
+        db::migrate_database(&database_path).expect("office db");
+
+        let cloudflared_dir = root.join("cloudflared");
+        fs::create_dir_all(cloudflared_dir.join("creds")).expect("cloudflared creds dir");
+        fs::write(
+            cloudflared_dir.join("creds/office-tunnel.json"),
+            r#"{"AccountTag":"account","TunnelID":"tunnel-id","TunnelSecret":"secret"}"#,
+        )
+        .expect("credentials");
+        let cloudflared_config = cloudflared_dir.join("config.yml");
+        fs::write(
+            &cloudflared_config,
+            "credentials-file: creds/office-tunnel.json\ningress:\n  - hostname: office.example.test\n    service: http://localhost:9001\n  - service: http_status:404\n",
+        )
+        .expect("cloudflared config");
+
+        let config = test_config(root, config_path.clone(), database_path);
+        let report = create_pre_cutover_snapshot(
+            &config,
+            &config_path,
+            &root.join("snapshots"),
+            Some(&cloudflared_config),
+        )
+        .expect("snapshot succeeds");
+
+        assert!(
+            report
+                .snapshot_dir
+                .join("cloudflared/creds/office-tunnel.json")
+                .is_file()
+        );
+        assert!(
+            !report
+                .snapshot_dir
+                .join("cloudflared/office-tunnel.json")
+                .exists()
+        );
+        assert!(report.validations.iter().any(|validation| {
+            validation == "cloudflared config and credential file copied: creds/office-tunnel.json"
+        }));
     }
 
     #[test]
