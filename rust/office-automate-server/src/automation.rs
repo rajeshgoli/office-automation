@@ -170,7 +170,29 @@ impl ErvPolicyCoordinator {
             );
     }
 
-    pub async fn apply_erv_speed(
+    pub async fn apply_manual_erv_speed(
+        &self,
+        speed: ErvFanSpeed,
+        co2_ppm: Option<i64>,
+    ) -> Result<ErvDeviceStatus> {
+        let _apply_guard = self.apply_lock.lock().await;
+        let previous_override = self
+            .erv
+            .replace_manual_override(speed, unix_timestamp_now());
+
+        match self
+            .apply_erv_speed(speed, "manual_override", co2_ppm)
+            .await
+        {
+            Ok(status) => Ok(status),
+            Err(error) => {
+                self.erv.restore_manual_override(previous_override);
+                Err(error)
+            }
+        }
+    }
+
+    async fn apply_erv_speed(
         &self,
         speed: ErvFanSpeed,
         reason: &str,
@@ -655,6 +677,64 @@ mod tests {
                 .air_quality_sample_counts(),
             (1, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn manual_erv_write_serializes_with_policy_evaluation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let mut config = test_config(database_path.clone());
+        config.thresholds.erv_min_dwell_seconds = 0;
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            1_000.0,
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .set_manual_presence(true, 1_001.0);
+        let qingping = QingpingState::default();
+        qingping.apply_reading(qingping_reading(450));
+        let erv = ErvState::new(database_path.clone());
+        let writer = Arc::new(
+            FakeErvWriter::new(vec![
+                Ok(erv_status(ErvFanSpeed::Medium)),
+                Ok(erv_status(ErvFanSpeed::Medium)),
+            ])
+            .with_set_delay(Duration::from_millis(25)),
+        );
+        erv.smoke_status_with(&config.erv, writer.as_ref())
+            .await
+            .expect("initial ERV status");
+        let policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
+        let (status_broadcast, _) = broadcast::channel(4);
+        let coordinator = ErvPolicyCoordinator::new(
+            config,
+            state_machine,
+            qingping,
+            erv.clone(),
+            policy,
+            writer.clone(),
+            status_broadcast,
+        );
+
+        let (manual, policy_eval) = tokio::join!(
+            coordinator.apply_manual_erv_speed(ErvFanSpeed::Turbo, Some(450)),
+            coordinator.evaluate_erv_policy(true)
+        );
+
+        manual.expect("manual write succeeds");
+        policy_eval.expect("policy evaluation succeeds");
+        assert_eq!(writer.writes(), vec![ErvFanSpeed::Turbo]);
+        assert_eq!(
+            erv.active_manual_override_speed(unix_timestamp_now()),
+            Some(ErvFanSpeed::Turbo)
+        );
+        let history = db::read_history(&database_path, 1, 10).expect("history");
+        assert_eq!(history.climate_actions.len(), 1);
+        assert_eq!(history.climate_actions[0]["action"], "turbo");
+        assert_eq!(history.climate_actions[0]["reason"], "manual_override");
     }
 
     #[tokio::test]

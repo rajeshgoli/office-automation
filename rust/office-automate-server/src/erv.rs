@@ -340,14 +340,32 @@ impl ErvState {
     }
 
     pub fn set_manual_override(&self, speed: ErvFanSpeed, now: f64) {
+        self.replace_manual_override(speed, now);
+    }
+
+    pub(crate) fn replace_manual_override(
+        &self,
+        speed: ErvFanSpeed,
+        now: f64,
+    ) -> Option<(ErvFanSpeed, f64)> {
         let manual_override = ErvManualOverride {
             speed,
             expires_at: now + ERV_MANUAL_OVERRIDE_SECONDS as f64,
         };
+        let mut inner = self.inner.write().expect("ERV state lock poisoned");
+        let previous = inner
+            .manual_override
+            .map(|manual_override| (manual_override.speed, manual_override.expires_at));
+        inner.manual_override = Some(manual_override);
+        previous
+    }
+
+    pub(crate) fn restore_manual_override(&self, previous: Option<(ErvFanSpeed, f64)>) {
+        let restored = previous.map(|(speed, expires_at)| ErvManualOverride { speed, expires_at });
         self.inner
             .write()
             .expect("ERV state lock poisoned")
-            .manual_override = Some(manual_override);
+            .manual_override = restored;
     }
 
     pub fn active_manual_override_speed(&self, now: f64) -> Option<ErvFanSpeed> {

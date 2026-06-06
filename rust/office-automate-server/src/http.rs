@@ -695,18 +695,12 @@ async fn erv(State(state): State<AppState>, Json(payload): Json<ErvRequest>) -> 
             .into_response();
     };
 
-    let now = unix_timestamp_now();
     match state
         .erv_automation
-        .apply_erv_speed(
-            speed,
-            "manual_override",
-            state.erv_automation.latest_co2_ppm(),
-        )
+        .apply_manual_erv_speed(speed, state.erv_automation.latest_co2_ppm())
         .await
     {
         Ok(status) => {
-            state.erv.set_manual_override(speed, now);
             broadcast_status(&state);
             Json(json!({
                 "ok": true,
