@@ -40,7 +40,10 @@ use crate::{
     erv::{
         ERV_MANUAL_OVERRIDE_SECONDS, ErvFanSpeed, ErvSpeedWriter, ErvState, RustuyaErvSpeedWriter,
     },
-    hvac::{HvacControlMode, HvacModeWriter, HvacRuntimeSnapshot, HvacState, KumoHvacModeWriter},
+    hvac::{
+        HvacControlMode, HvacModeCommand, HvacModeWriter, HvacRuntimeSnapshot, HvacState,
+        KumoHvacModeWriter,
+    },
     mqtt,
     policy::{ErvPolicyState, HvacBandAction, HvacMode, get_hvac_band_action},
     qingping::QingpingState,
@@ -840,6 +843,8 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
             .smoke_status_with(&state.config.mitsubishi, state.hvac_writer.as_ref())
             .await?;
         if let Some(previous_mode) = active_hvac_control_mode(&verified_status.mode) {
+            let previous_heat_setpoint_c = verified_status.heat_setpoint_c;
+            let previous_cool_setpoint_c = verified_status.cool_setpoint_c;
             apply_hvac_mode_after_verified_status(
                 state,
                 HvacControlMode::Off,
@@ -847,7 +852,12 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
                 "safety_interlock",
             )
             .await?;
-            state.hvac.set_suspended(true, Some(previous_mode));
+            state.hvac.set_suspended_with_setpoints(
+                true,
+                Some(previous_mode),
+                previous_heat_setpoint_c,
+                previous_cool_setpoint_c,
+            );
             state.hvac.set_temp_band_mode(None);
             state.hvac.clear_manual_override();
             broadcast_status(state);
@@ -890,6 +900,8 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
             .smoke_status_with(&state.config.mitsubishi, state.hvac_writer.as_ref())
             .await?;
         if let Some(previous_mode) = active_hvac_control_mode(&verified_status.mode) {
+            let previous_heat_setpoint_c = verified_status.heat_setpoint_c;
+            let previous_cool_setpoint_c = verified_status.cool_setpoint_c;
             let temp_label = temp_f.expect("ERV suspension temperature checked").round() as i64;
             apply_hvac_mode_after_verified_status(
                 state,
@@ -898,7 +910,12 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
                 &format!("erv_running_temp_{temp_label}F"),
             )
             .await?;
-            state.hvac.set_suspended(true, Some(previous_mode));
+            state.hvac.set_suspended_with_setpoints(
+                true,
+                Some(previous_mode),
+                previous_heat_setpoint_c,
+                previous_cool_setpoint_c,
+            );
             state.hvac.set_temp_band_mode(None);
             broadcast_status(state);
         }
@@ -934,16 +951,43 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
                 erv_snapshot.running,
                 within_occupancy_hours,
             ) {
-                let setpoint_c = match restore_mode {
-                    HvacControlMode::Heat => Some(hvac_snapshot.heat_setpoint_c.unwrap_or(22.0)),
-                    HvacControlMode::Cool => {
-                        Some(hvac_snapshot.cool_setpoint_c.unwrap_or_else(|| {
-                            fahrenheit_to_celsius(
-                                state.config.thresholds.hvac_cool_setpoint_f as f64,
-                            )
-                        }))
-                    }
-                    HvacControlMode::Auto => None,
+                let command = match restore_mode {
+                    HvacControlMode::Heat => HvacModeCommand::new(
+                        HvacControlMode::Heat,
+                        Some(
+                            hvac_snapshot
+                                .suspended_heat_setpoint_c
+                                .or(hvac_snapshot.heat_setpoint_c)
+                                .unwrap_or(22.0),
+                        ),
+                    ),
+                    HvacControlMode::Cool => HvacModeCommand::new(
+                        HvacControlMode::Cool,
+                        Some(
+                            hvac_snapshot
+                                .suspended_cool_setpoint_c
+                                .or(hvac_snapshot.cool_setpoint_c)
+                                .unwrap_or_else(|| {
+                                    fahrenheit_to_celsius(
+                                        state.config.thresholds.hvac_cool_setpoint_f as f64,
+                                    )
+                                }),
+                        ),
+                    ),
+                    HvacControlMode::Auto => HvacModeCommand::auto(
+                        hvac_snapshot
+                            .suspended_heat_setpoint_c
+                            .or(hvac_snapshot.heat_setpoint_c)
+                            .unwrap_or(22.0),
+                        hvac_snapshot
+                            .suspended_cool_setpoint_c
+                            .or(hvac_snapshot.cool_setpoint_c)
+                            .unwrap_or_else(|| {
+                                fahrenheit_to_celsius(
+                                    state.config.thresholds.hvac_cool_setpoint_f as f64,
+                                )
+                            }),
+                    ),
                     HvacControlMode::Off => unreachable!("restore mode is never off"),
                 };
                 let reason = if state_status.is_present {
@@ -951,7 +995,7 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
                 } else {
                     "erv_stopped_occupancy_hours"
                 };
-                apply_hvac_mode(state, restore_mode, setpoint_c, reason).await?;
+                apply_hvac_mode_command(state, command, reason).await?;
                 state.hvac.set_suspended(false, None);
                 state.hvac.set_temp_band_mode(None);
                 broadcast_status(state);
@@ -1029,6 +1073,22 @@ async fn apply_hvac_mode(
             state.hvac_writer.as_ref(),
             mode,
             setpoint_c,
+            reason,
+        )
+        .await
+}
+
+async fn apply_hvac_mode_command(
+    state: &AppState,
+    command: HvacModeCommand,
+    reason: &str,
+) -> Result<crate::hvac::HvacDeviceStatus> {
+    state
+        .hvac
+        .set_mode_command_with(
+            &state.config.mitsubishi,
+            state.hvac_writer.as_ref(),
+            command,
             reason,
         )
         .await
@@ -1979,7 +2039,7 @@ mod tests {
         smoke_results: Mutex<VecDeque<Result<HvacDeviceStatus>>>,
         write_results: Mutex<VecDeque<Result<HvacDeviceStatus>>>,
         smoke_calls: AtomicUsize,
-        write_modes: Mutex<Vec<(HvacControlMode, Option<f64>)>>,
+        write_commands: Mutex<Vec<HvacModeCommand>>,
     }
 
     impl FakeHvacWriter {
@@ -1991,7 +2051,7 @@ mod tests {
                 smoke_results: Mutex::new(smoke_results.into()),
                 write_results: Mutex::new(write_results.into()),
                 smoke_calls: AtomicUsize::new(0),
-                write_modes: Mutex::new(Vec::new()),
+                write_commands: Mutex::new(Vec::new()),
             }
         }
 
@@ -2000,9 +2060,18 @@ mod tests {
         }
 
         fn write_modes(&self) -> Vec<(HvacControlMode, Option<f64>)> {
-            self.write_modes
+            self.write_commands
                 .lock()
-                .expect("fake HVAC modes lock")
+                .expect("fake HVAC commands lock")
+                .iter()
+                .map(|command| (command.mode, command.setpoint_c))
+                .collect()
+        }
+
+        fn write_commands(&self) -> Vec<HvacModeCommand> {
+            self.write_commands
+                .lock()
+                .expect("fake HVAC commands lock")
                 .clone()
         }
     }
@@ -2028,10 +2097,18 @@ mod tests {
             mode: HvacControlMode,
             setpoint_c: Option<f64>,
         ) -> crate::hvac::BoxFutureResult<'a, HvacDeviceStatus> {
-            self.write_modes
+            self.set_mode_command(_config, HvacModeCommand::new(mode, setpoint_c))
+        }
+
+        fn set_mode_command<'a>(
+            &'a self,
+            _config: &'a MitsubishiConfig,
+            command: HvacModeCommand,
+        ) -> crate::hvac::BoxFutureResult<'a, HvacDeviceStatus> {
+            self.write_commands
                 .lock()
-                .expect("fake HVAC modes lock")
-                .push((mode, setpoint_c));
+                .expect("fake HVAC commands lock")
+                .push(command);
             let result = self
                 .write_results
                 .lock()
@@ -2196,6 +2273,16 @@ mod tests {
             }))
             .expect("HVAC auto status"),
         }
+    }
+
+    fn hvac_auto_status(heat_setpoint_c: f64, cool_setpoint_c: f64) -> HvacDeviceStatus {
+        parse_kumo_adapter_status(&json!({
+            "power": 1,
+            "operationMode": "auto",
+            "spHeat": heat_setpoint_c,
+            "spCool": cool_setpoint_c
+        }))
+        .expect("HVAC auto status")
     }
 
     fn office_door_device() -> yolink::YoLinkDevice {
@@ -3514,15 +3601,15 @@ mod tests {
         let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
         let erv_state = ErvState::new(config.runtime.database_path.clone());
         let hvac_state = HvacState::new(config.runtime.database_path.clone());
-        hvac_state.record_status(hvac_status(HvacControlMode::Auto, 22.0));
+        hvac_state.record_status(hvac_auto_status(20.0, 26.0));
         let writer = Arc::new(FakeHvacWriter::new(
             vec![
-                Ok(hvac_status(HvacControlMode::Auto, 22.0)),
+                Ok(hvac_auto_status(20.0, 26.0)),
                 Ok(hvac_status(HvacControlMode::Off, 22.0)),
             ],
             vec![
                 Ok(hvac_status(HvacControlMode::Off, 22.0)),
-                Ok(hvac_status(HvacControlMode::Auto, 22.0)),
+                Ok(hvac_auto_status(20.0, 26.0)),
             ],
         ));
         let qingping = qingping_with_temp(fahrenheit_to_celsius(72.0));
@@ -3551,8 +3638,11 @@ mod tests {
 
         assert_eq!(writer.smoke_calls(), 2);
         assert_eq!(
-            writer.write_modes(),
-            vec![(HvacControlMode::Off, None), (HvacControlMode::Auto, None),]
+            writer.write_commands(),
+            vec![
+                HvacModeCommand::new(HvacControlMode::Off, None),
+                HvacModeCommand::auto(20.0, 26.0),
+            ]
         );
         let snapshot = state.hvac.snapshot();
         assert_eq!(snapshot.mode, "auto");

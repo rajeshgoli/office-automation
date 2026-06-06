@@ -50,6 +50,34 @@ impl HvacControlMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HvacModeCommand {
+    pub mode: HvacControlMode,
+    pub setpoint_c: Option<f64>,
+    pub heat_setpoint_c: Option<f64>,
+    pub cool_setpoint_c: Option<f64>,
+}
+
+impl HvacModeCommand {
+    pub fn new(mode: HvacControlMode, setpoint_c: Option<f64>) -> Self {
+        Self {
+            mode,
+            setpoint_c,
+            heat_setpoint_c: None,
+            cool_setpoint_c: None,
+        }
+    }
+
+    pub fn auto(heat_setpoint_c: f64, cool_setpoint_c: f64) -> Self {
+        Self {
+            mode: HvacControlMode::Auto,
+            setpoint_c: None,
+            heat_setpoint_c: Some(heat_setpoint_c),
+            cool_setpoint_c: Some(cool_setpoint_c),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct HvacDeviceStatus {
     pub power: bool,
@@ -81,6 +109,14 @@ pub trait HvacModeWriter: Send + Sync {
         mode: HvacControlMode,
         setpoint_c: Option<f64>,
     ) -> BoxFutureResult<'a, HvacDeviceStatus>;
+
+    fn set_mode_command<'a>(
+        &'a self,
+        config: &'a MitsubishiConfig,
+        command: HvacModeCommand,
+    ) -> BoxFutureResult<'a, HvacDeviceStatus> {
+        self.set_mode(config, command.mode, command.setpoint_c)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -115,9 +151,17 @@ impl HvacModeWriter for KumoHvacModeWriter {
         mode: HvacControlMode,
         setpoint_c: Option<f64>,
     ) -> BoxFutureResult<'a, HvacDeviceStatus> {
+        self.set_mode_command(config, HvacModeCommand::new(mode, setpoint_c))
+    }
+
+    fn set_mode_command<'a>(
+        &'a self,
+        config: &'a MitsubishiConfig,
+        command: HvacModeCommand,
+    ) -> BoxFutureResult<'a, HvacDeviceStatus> {
         Box::pin(async move {
             let client = KumoClient::new(config)?;
-            client.send_mode_command(mode, setpoint_c).await?;
+            client.send_mode_command(command).await?;
             client.get_full_status().await
         })
     }
@@ -135,6 +179,8 @@ struct HvacInner {
     latest_status: Option<HvacDeviceStatus>,
     suspended: bool,
     last_mode: Option<String>,
+    suspended_heat_setpoint_c: Option<f64>,
+    suspended_cool_setpoint_c: Option<f64>,
     temp_band_mode: Option<String>,
     manual_override: Option<HvacManualOverride>,
 }
@@ -154,6 +200,8 @@ pub struct HvacRuntimeSnapshot {
     pub cool_setpoint_c: Option<f64>,
     pub suspended: bool,
     pub last_mode: Option<String>,
+    pub suspended_heat_setpoint_c: Option<f64>,
+    pub suspended_cool_setpoint_c: Option<f64>,
     pub temp_band_mode: Option<String>,
 }
 
@@ -199,9 +247,28 @@ impl HvacState {
     where
         W: HvacModeWriter + ?Sized,
     {
+        self.set_mode_command_with(
+            config,
+            writer,
+            HvacModeCommand::new(mode, setpoint_c),
+            reason,
+        )
+        .await
+    }
+
+    pub async fn set_mode_command_with<W>(
+        &self,
+        config: &MitsubishiConfig,
+        writer: &W,
+        command: HvacModeCommand,
+        reason: &str,
+    ) -> Result<HvacDeviceStatus>
+    where
+        W: HvacModeWriter + ?Sized,
+    {
         self.smoke_status_with(config, writer).await?;
-        let status = writer.set_mode(config, mode, setpoint_c).await?;
-        self.record_write_success(status.clone(), mode, setpoint_c, reason);
+        let status = writer.set_mode_command(config, command).await?;
+        self.record_write_success(status.clone(), command.mode, command.setpoint_c, reason);
         Ok(status)
     }
 
@@ -236,10 +303,29 @@ impl HvacState {
     where
         W: HvacModeWriter + ?Sized,
     {
+        self.set_mode_command_after_verified_status_with(
+            config,
+            writer,
+            HvacModeCommand::new(mode, setpoint_c),
+            reason,
+        )
+        .await
+    }
+
+    pub async fn set_mode_command_after_verified_status_with<W>(
+        &self,
+        config: &MitsubishiConfig,
+        writer: &W,
+        command: HvacModeCommand,
+        reason: &str,
+    ) -> Result<HvacDeviceStatus>
+    where
+        W: HvacModeWriter + ?Sized,
+    {
         validate_active_hvac_config(config)?;
 
-        let status = writer.set_mode(config, mode, setpoint_c).await?;
-        self.record_write_success(status.clone(), mode, setpoint_c, reason);
+        let status = writer.set_mode_command(config, command).await?;
+        self.record_write_success(status.clone(), command.mode, command.setpoint_c, reason);
         Ok(status)
     }
 
@@ -277,6 +363,8 @@ impl HvacState {
             cool_setpoint_c: latest.as_ref().and_then(|status| status.cool_setpoint_c),
             suspended: inner.suspended,
             last_mode: inner.last_mode.clone(),
+            suspended_heat_setpoint_c: inner.suspended_heat_setpoint_c,
+            suspended_cool_setpoint_c: inner.suspended_cool_setpoint_c,
             temp_band_mode: inner.temp_band_mode.clone(),
         }
     }
@@ -289,6 +377,8 @@ impl HvacState {
             started_at: unix_timestamp_now(),
         });
         inner.suspended = false;
+        inner.suspended_heat_setpoint_c = None;
+        inner.suspended_cool_setpoint_c = None;
         inner.last_mode = if mode == HvacControlMode::Off {
             None
         } else {
@@ -312,10 +402,27 @@ impl HvacState {
     }
 
     pub fn set_suspended(&self, suspended: bool, last_mode: Option<String>) {
+        self.set_suspended_with_setpoints(suspended, last_mode, None, None);
+    }
+
+    pub fn set_suspended_with_setpoints(
+        &self,
+        suspended: bool,
+        last_mode: Option<String>,
+        heat_setpoint_c: Option<f64>,
+        cool_setpoint_c: Option<f64>,
+    ) {
         let mut inner = self.inner.write().expect("HVAC state lock poisoned");
         inner.suspended = suspended;
         if let Some(last_mode) = last_mode {
             inner.last_mode = Some(last_mode);
+        }
+        if suspended {
+            inner.suspended_heat_setpoint_c = heat_setpoint_c;
+            inner.suspended_cool_setpoint_c = cool_setpoint_c;
+        } else {
+            inner.suspended_heat_setpoint_c = None;
+            inner.suspended_cool_setpoint_c = None;
         }
     }
 
@@ -528,12 +635,9 @@ impl KumoClient {
             .with_context(|| format!("Kumo GET {path} response is not JSON"))
     }
 
-    async fn send_mode_command(
-        &self,
-        mode: HvacControlMode,
-        setpoint_c: Option<f64>,
-    ) -> Result<Value> {
+    async fn send_mode_command(&self, command: HvacModeCommand) -> Result<Value> {
         let token = self.login().await?;
+        let mode = command.mode;
         let mut commands = serde_json::Map::new();
         commands.insert(
             "operationMode".to_string(),
@@ -543,15 +647,23 @@ impl KumoClient {
         match mode {
             HvacControlMode::Off => {}
             HvacControlMode::Heat => {
-                commands.insert("spHeat".to_string(), json!(setpoint_c.unwrap_or(22.0)));
+                commands.insert(
+                    "spHeat".to_string(),
+                    json!(command.setpoint_c.unwrap_or(22.0)),
+                );
             }
             HvacControlMode::Cool => {
-                commands.insert("spCool".to_string(), json!(setpoint_c.unwrap_or(22.0)));
+                commands.insert(
+                    "spCool".to_string(),
+                    json!(command.setpoint_c.unwrap_or(22.0)),
+                );
             }
             HvacControlMode::Auto => {
-                if let Some(setpoint_c) = setpoint_c {
-                    commands.insert("spHeat".to_string(), json!(setpoint_c));
-                    commands.insert("spCool".to_string(), json!(setpoint_c));
+                if let Some(heat_setpoint_c) = command.heat_setpoint_c.or(command.setpoint_c) {
+                    commands.insert("spHeat".to_string(), json!(heat_setpoint_c));
+                }
+                if let Some(cool_setpoint_c) = command.cool_setpoint_c.or(command.setpoint_c) {
+                    commands.insert("spCool".to_string(), json!(cool_setpoint_c));
                 }
             }
         }
