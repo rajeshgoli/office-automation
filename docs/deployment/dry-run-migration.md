@@ -10,13 +10,14 @@ Set deployment-specific paths outside the repo:
 
 ```bash
 export OFFICE_AUTOMATE_CONFIG="/absolute/path/to/office-automate.yaml"
+export OFFICE_AUTOMATE_DATA_DIR="/absolute/path/to/production-candidate-data"
 export OFFICE_AUTOMATE_SNAPSHOT_DIR="/absolute/path/to/rollback-snapshots"
 export CLOUDFLARED_CONFIG="/absolute/path/to/cloudflared/config.yml"
 ```
 
-The Office Automate config should point at the production candidate data files:
+The Office Automate config and environment should point at the production candidate data files:
 
-- `runtime.database_path`
+- Office climate DB at `$OFFICE_AUTOMATE_DATA_DIR/office_climate.db`
 - telemetry DB path
 - project-leverage tool usage DB path
 - session telemetry tool usage DB path, when it differs from the project-leverage tool usage DB
