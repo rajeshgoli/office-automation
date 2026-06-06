@@ -97,8 +97,6 @@ pub fn collect_session_telemetry(
 
     if !dry_run {
         db::upsert_collector_session_output_rows(telemetry_db_path, &rows)?;
-    } else {
-        db::ensure_telemetry_database(telemetry_db_path)?;
     }
 
     let synthetic_rows = rows
@@ -341,7 +339,7 @@ fn session_row(session: &SessionInfo, matched_commits: &[CommitStats]) -> Result
             .iter()
             .map(|commit| commit.files_changed)
             .sum(),
-        git_commits: session.git_commits.len() as i64,
+        git_commits: matched_commits.len() as i64,
         git_pushes: session
             .git_pushes
             .iter()
@@ -944,6 +942,18 @@ mod tests {
             &repo,
             "PreToolUse",
         );
+        insert_tool_usage(
+            &tool_db,
+            "session-1",
+            "claude-a1b2c3d4",
+            "office-automate",
+            "Bash",
+            None,
+            Some("git commit -m manual"),
+            "2026-03-27 11:00:00",
+            &repo,
+            "PreToolUse",
+        );
 
         let stats = collect_session_telemetry(
             &tool_db,
@@ -993,12 +1003,42 @@ mod tests {
         assert_eq!(rows[0].2, 1);
         assert_eq!(rows[0].3, 1);
         assert_eq!(rows[0].4, 1);
-        assert_eq!(rows[0].5.as_deref(), Some(r#"{"Bash":2,"Read":1}"#));
+        assert_eq!(rows[0].5.as_deref(), Some(r#"{"Bash":3,"Read":1}"#));
         assert_eq!(rows[0].6, 1);
         assert!(rows[1].0.starts_with("unattributed-office-automate-"));
         assert_eq!(rows[1].1, 1);
         assert_eq!(rows[1].3, 1);
         assert_eq!(rows[1].6, 0);
+    }
+
+    #[test]
+    fn collect_telemetry_dry_run_does_not_create_output_database() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let tool_db = temp_dir.path().join("tool_usage.db");
+        let telemetry_db = temp_dir.path().join("missing").join("telemetry.db");
+        create_tool_usage_db(&tool_db);
+
+        let stats = collect_session_telemetry(
+            &tool_db,
+            &telemetry_db,
+            &[],
+            30,
+            true,
+            parse_datetime("2026-03-28 12:00:00").expect("now"),
+        )
+        .expect("collect");
+
+        assert_eq!(
+            stats,
+            TelemetryCollectStats {
+                sessions: 0,
+                rows_written: 0,
+                synthetic_rows: 0,
+                matched_commits: 0,
+            }
+        );
+        assert!(!telemetry_db.exists());
+        assert!(!telemetry_db.parent().expect("parent").exists());
     }
 
     #[test]
