@@ -59,10 +59,12 @@ pub fn collect_telemetry(config: &AppConfig, dry_run: bool) -> Result<TelemetryC
     } else {
         config.telemetry.days
     };
-    collect_session_telemetry(
+    let worktree_map_path = config.runtime.data_dir.join("worktree_map.json");
+    collect_session_telemetry_with_worktree_map(
         &config.runtime.session_tool_usage_db_path,
         &config.runtime.telemetry_db_path,
         &config.telemetry.repos,
+        Some(worktree_map_path.as_path()),
         days,
         dry_run,
         Local::now().naive_local(),
@@ -77,8 +79,32 @@ pub fn collect_session_telemetry(
     dry_run: bool,
     now: NaiveDateTime,
 ) -> Result<TelemetryCollectStats> {
+    let fallback_worktree_map_path = telemetry_db_path
+        .parent()
+        .map(|parent| parent.join("worktree_map.json"));
+    collect_session_telemetry_with_worktree_map(
+        tool_usage_db_path,
+        telemetry_db_path,
+        repos,
+        fallback_worktree_map_path.as_deref(),
+        days,
+        dry_run,
+        now,
+    )
+}
+
+fn collect_session_telemetry_with_worktree_map(
+    tool_usage_db_path: &Path,
+    telemetry_db_path: &Path,
+    repos: &[PathBuf],
+    worktree_map_path: Option<&Path>,
+    days: u64,
+    dry_run: bool,
+    now: NaiveDateTime,
+) -> Result<TelemetryCollectStats> {
     let cutoff = now - Duration::days(days.max(1) as i64);
-    let sessions = build_session_index(tool_usage_db_path, cutoff)?;
+    let worktrees = WorktreeResolver::new(repos, worktree_map_path);
+    let sessions = build_session_index(tool_usage_db_path, cutoff, &worktrees)?;
     let commits_by_repo = collect_git_stats(repos, start_of_day(cutoff))?;
 
     let mut matched_hashes = HashSet::new();
@@ -136,6 +162,7 @@ pub fn collect_project_leverage(config: &AppConfig) -> Result<usize> {
 fn build_session_index(
     tool_usage_db_path: &Path,
     cutoff: NaiveDateTime,
+    worktrees: &WorktreeResolver,
 ) -> Result<BTreeMap<String, SessionInfo>> {
     if !tool_usage_db_path.exists() {
         tracing::warn!(
@@ -193,7 +220,7 @@ fn build_session_index(
         ) = row?;
         let timestamp = parse_datetime(&timestamp)?;
         let session_name = session_name.unwrap_or_else(|| session_id.clone());
-        let project_name = normalize_project_name(
+        let project_name = worktrees.normalize_project_name(
             project_name
                 .as_deref()
                 .or(cwd.as_deref())
@@ -217,7 +244,8 @@ fn build_session_index(
         let tool_name = tool_name.unwrap_or_else(|| "unknown".to_string());
         *session.tool_counts.entry(tool_name.clone()).or_insert(0) += 1;
         let bash_command = bash_command.unwrap_or_default().trim().to_string();
-        let repo = normalize_project_name(cwd.as_deref().unwrap_or(&session.project_name));
+        let repo =
+            worktrees.normalize_project_name(cwd.as_deref().unwrap_or(&session.project_name));
         if tool_name == "Bash" && bash_command.starts_with("git commit") {
             session.git_commits.push(GitCommand {
                 timestamp,
@@ -732,6 +760,117 @@ fn project_row(date: &str, project: &str, metric: &str, value: f64) -> ProjectLe
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct WorktreeResolver {
+    worktree_map: HashMap<String, String>,
+}
+
+impl WorktreeResolver {
+    fn new(repos: &[PathBuf], worktree_map_path: Option<&Path>) -> Self {
+        let mut worktree_map = HashMap::new();
+        if let Some(worktree_map_path) = worktree_map_path {
+            worktree_map.extend(load_worktree_map(worktree_map_path));
+        }
+
+        for repo in repos {
+            let Some(repo_name) = repo.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let worktrees_dir = repo.join(".git").join("worktrees");
+            let Ok(entries) = fs::read_dir(&worktrees_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                if let Some(name) = entry.file_name().to_str() {
+                    worktree_map
+                        .entry(name.to_string())
+                        .or_insert_with(|| repo_name.to_string());
+                }
+            }
+        }
+
+        Self { worktree_map }
+    }
+
+    fn normalize_project_name(&self, project: &str) -> String {
+        let normalized = project.trim().replace('\\', "/");
+        let normalized = normalized.trim_end_matches('/');
+        if normalized.is_empty() {
+            return "unknown".to_string();
+        }
+
+        if let Some(parent) = resolve_worktree_parent_from_disk(Path::new(normalized)) {
+            return normalize_project_name(&parent);
+        }
+
+        let basename = normalized.rsplit('/').next().unwrap_or(normalized);
+        if let Some(parent) = self.worktree_map.get(basename) {
+            return normalize_project_name(parent);
+        }
+
+        normalize_project_name(normalized)
+    }
+}
+
+fn load_worktree_map(path: &Path) -> HashMap<String, String> {
+    if !path.exists() {
+        return HashMap::new();
+    }
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            tracing::warn!("failed to read worktree map {}: {}", path.display(), error);
+            return HashMap::new();
+        }
+    };
+    match serde_json::from_str::<HashMap<String, String>>(&contents) {
+        Ok(map) => map,
+        Err(error) => {
+            tracing::warn!("failed to parse worktree map {}: {}", path.display(), error);
+            HashMap::new()
+        }
+    }
+}
+
+fn resolve_worktree_parent_from_disk(path: &Path) -> Option<String> {
+    for candidate in path.ancestors() {
+        let git_path = candidate.join(".git");
+        if git_path.is_file() {
+            let contents = fs::read_to_string(&git_path).ok()?;
+            let gitdir = contents
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("gitdir:").map(str::trim))?;
+            return repo_basename_from_gitdir(gitdir);
+        }
+        if git_path.is_dir() {
+            return candidate
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_string);
+        }
+    }
+    None
+}
+
+fn repo_basename_from_gitdir(gitdir: &str) -> Option<String> {
+    let normalized = gitdir.replace('\\', "/");
+    let parts: Vec<&str> = normalized.split('/').collect();
+    let git_index = parts.iter().position(|part| *part == ".git")?;
+    if git_index == 0 {
+        return None;
+    }
+    parts
+        .get(git_index - 1)
+        .filter(|value| !value.is_empty())
+        .map(|value| (*value).to_string())
+}
+
 fn table_exists(connection: &Connection, table_name: &str) -> Result<bool> {
     connection
         .query_row(
@@ -1063,6 +1202,113 @@ mod tests {
         );
         assert!(!telemetry_db.exists());
         assert!(!telemetry_db.parent().expect("parent").exists());
+    }
+
+    #[test]
+    fn collect_telemetry_matches_commits_from_git_worktrees() {
+        let (_temp_dir, repo) = init_repo();
+        let base_file = repo.join("README.md");
+        fs::write(&base_file, "base\n").expect("write base");
+        run_git(&repo, &["add", "README.md"], None);
+        run_git(
+            &repo,
+            &["commit", "-m", "base"],
+            Some("2026-01-01T09:00:00-08:00"),
+        );
+
+        let worktree = repo
+            .parent()
+            .expect("repo parent")
+            .join("office-automate-ticket-79");
+        let worktree_arg = worktree.to_str().expect("worktree path");
+        run_git(
+            &repo,
+            &["worktree", "add", "-b", "feature/ticket-79", worktree_arg],
+            None,
+        );
+
+        let tracked = worktree.join("tracked.py");
+        fs::write(&tracked, "print('from worktree')\n").expect("write tracked");
+        run_git(&worktree, &["add", "tracked.py"], None);
+        run_git(
+            &worktree,
+            &["commit", "-m", "worktree commit"],
+            Some("2026-03-27T09:00:10-07:00"),
+        );
+
+        let tool_db = repo.parent().expect("parent").join("tool_usage.db");
+        let telemetry_db = repo.parent().expect("parent").join("telemetry.db");
+        create_tool_usage_db(&tool_db);
+        insert_tool_usage(
+            &tool_db,
+            "session-worktree",
+            "claude-a1b2c3d4",
+            "office-automate-ticket-79",
+            "Bash",
+            None,
+            Some("git commit -m 'worktree commit'"),
+            "2026-03-27 09:00:00",
+            &worktree,
+            "PreToolUse",
+        );
+
+        let stats = collect_session_telemetry(
+            &tool_db,
+            &telemetry_db,
+            std::slice::from_ref(&repo),
+            30,
+            false,
+            parse_datetime("2026-03-28 12:00:00").expect("now"),
+        )
+        .expect("collect");
+
+        assert_eq!(
+            stats,
+            TelemetryCollectStats {
+                sessions: 1,
+                rows_written: 1,
+                synthetic_rows: 0,
+                matched_commits: 1,
+            }
+        );
+
+        let connection = Connection::open(&telemetry_db).expect("open telemetry");
+        let row: (String, i64, i64, i64) = connection
+            .query_row(
+                "SELECT project, lines_added, files_modified, git_commits
+                 FROM session_output
+                 WHERE session_id = 'session-worktree'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("session row");
+
+        assert_eq!(row, ("office-automate".to_string(), 1, 1, 1));
+    }
+
+    #[test]
+    fn worktree_resolver_uses_persisted_map_for_pruned_worktrees() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let worktree_map_path = temp_dir.path().join("worktree_map.json");
+        fs::write(
+            &worktree_map_path,
+            r#"{"1234-feature":"office-automate","fractal-1808-em":"fractal"}"#,
+        )
+        .expect("write map");
+        let resolver = WorktreeResolver::new(&[], Some(&worktree_map_path));
+
+        assert_eq!(
+            resolver.normalize_project_name("/Users/rajesh/worktrees/1234-feature"),
+            "office-automate"
+        );
+        assert_eq!(
+            resolver.normalize_project_name("1234-feature"),
+            "office-automate"
+        );
+        assert_eq!(
+            resolver.normalize_project_name("fractal-1808-em"),
+            "fractal"
+        );
     }
 
     #[test]
