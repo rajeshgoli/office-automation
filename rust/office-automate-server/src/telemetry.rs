@@ -82,6 +82,7 @@ pub fn collect_session_telemetry(
     let commits_by_repo = collect_git_stats(repos, start_of_day(cutoff))?;
 
     let mut matched_hashes = HashSet::new();
+    let mut unmatched_commit_commands: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut rows = Vec::new();
     for session in sessions.values() {
         let mut matched_commits = Vec::new();
@@ -89,12 +90,21 @@ pub fn collect_session_telemetry(
             if let Some(commit) = match_commit(command, &commits_by_repo, &matched_hashes) {
                 matched_hashes.insert(commit.commit_hash.clone());
                 matched_commits.push(commit);
+            } else {
+                let date = command.timestamp.date().to_string();
+                *unmatched_commit_commands
+                    .entry((command.repo.clone(), date))
+                    .or_insert(0) += 1;
             }
         }
         rows.push(session_row(session, &matched_commits)?);
     }
 
-    rows.extend(synthetic_rows(&commits_by_repo, &matched_hashes));
+    rows.extend(synthetic_rows(
+        &commits_by_repo,
+        &matched_hashes,
+        &unmatched_commit_commands,
+    ));
 
     if !dry_run {
         db::upsert_collector_session_output_rows(telemetry_db_path, &rows)?;
@@ -340,7 +350,7 @@ fn session_row(session: &SessionInfo, matched_commits: &[CommitStats]) -> Result
             .iter()
             .map(|commit| commit.files_changed)
             .sum(),
-        git_commits: matched_commits.len() as i64,
+        git_commits: session.git_commits.len() as i64,
         git_pushes: session
             .git_pushes
             .iter()
@@ -359,6 +369,7 @@ fn session_row(session: &SessionInfo, matched_commits: &[CommitStats]) -> Result
 fn synthetic_rows(
     commits_by_repo: &HashMap<String, Vec<CommitStats>>,
     matched_hashes: &HashSet<String>,
+    unmatched_commit_commands: &BTreeMap<(String, String), usize>,
 ) -> Vec<SessionOutputRow> {
     let mut grouped: BTreeMap<(String, String), Vec<CommitStats>> = BTreeMap::new();
     for (repo, commits) in commits_by_repo {
@@ -382,6 +393,11 @@ fn synthetic_rows(
                 .map(|commit| commit.author_date)
                 .min()
                 .expect("synthetic group has commits");
+            let command_claims = unmatched_commit_commands
+                .get(&(repo.clone(), date.clone()))
+                .copied()
+                .unwrap_or_default();
+            let git_commits = commits.len().saturating_sub(command_claims) as i64;
             SessionOutputRow {
                 session_id: format!("unattributed-{repo}-{date}"),
                 project: repo,
@@ -390,7 +406,7 @@ fn synthetic_rows(
                 lines_added: commits.iter().map(|commit| commit.insertions).sum(),
                 lines_removed: commits.iter().map(|commit| commit.deletions).sum(),
                 files_modified: commits.iter().map(|commit| commit.files_changed).sum(),
-                git_commits: commits.len() as i64,
+                git_commits,
                 git_pushes: 0,
                 user_message_count: 0,
                 assistant_message_count: 0,
@@ -1009,13 +1025,13 @@ mod tests {
         assert_eq!(rows[0].0, "session-1");
         assert_eq!(rows[0].1, 1);
         assert_eq!(rows[0].2, 1);
-        assert_eq!(rows[0].3, 1);
+        assert_eq!(rows[0].3, 2);
         assert_eq!(rows[0].4, 1);
         assert_eq!(rows[0].5.as_deref(), Some(r#"{"Bash":3,"Read":1}"#));
         assert_eq!(rows[0].6, 1);
         assert!(rows[1].0.starts_with("unattributed-office-automate-"));
         assert_eq!(rows[1].1, 1);
-        assert_eq!(rows[1].3, 1);
+        assert_eq!(rows[1].3, 0);
         assert_eq!(rows[1].6, 0);
     }
 
