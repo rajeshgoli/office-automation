@@ -793,7 +793,7 @@ async fn erv(State(state): State<AppState>, Json(payload): Json<ErvRequest>) -> 
 }
 
 async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
-    if !state.config.mitsubishi.active_control_enabled || state.hvac.manual_override_active() {
+    if !state.config.mitsubishi.active_control_enabled {
         return Ok(());
     }
 
@@ -805,6 +805,10 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
             .expect("state machine lock poisoned");
         machine.status_at(now)
     };
+    if !state_status.safety_interlock && state.hvac.manual_override_active() {
+        return Ok(());
+    }
+
     let hvac_snapshot = state.hvac.snapshot();
     let temp_f = state
         .qingping
@@ -829,6 +833,7 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
             .await?;
             state.hvac.set_suspended(true, Some(previous_mode));
             state.hvac.set_temp_band_mode(None);
+            state.hvac.clear_manual_override();
             broadcast_status(state);
         }
         return Ok(());
@@ -3281,6 +3286,52 @@ mod tests {
         assert_eq!(value["climate_actions"][0]["system"], "hvac");
         assert_eq!(value["climate_actions"][0]["action"], "off");
         assert_eq!(value["climate_actions"][0]["reason"], "safety_interlock");
+    }
+
+    #[tokio::test]
+    async fn automated_hvac_policy_safety_interlock_bypasses_manual_override() {
+        let config = configured_hvac_config(true);
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            now,
+        )));
+        {
+            let mut machine = state_machine.write().expect("state machine lock poisoned");
+            machine.set_manual_presence(true, now);
+            machine.update_door(true, now + 1.0);
+        }
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Heat, 22.0));
+        hvac_state.record_manual_override(HvacControlMode::Heat, 70.0);
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Heat, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+        ));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            QingpingState::default(),
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy applies safety off despite manual override");
+
+        assert_eq!(writer.smoke_calls(), 1);
+        assert_eq!(writer.write_modes(), vec![(HvacControlMode::Off, None)]);
+        assert!(!state.hvac.manual_override_active());
+        let snapshot = state.hvac.snapshot();
+        assert!(snapshot.suspended);
+        assert_eq!(snapshot.last_mode.as_deref(), Some("heat"));
     }
 
     #[tokio::test]
