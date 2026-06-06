@@ -28,8 +28,6 @@ export OFFICE_AUTOMATE_CUTOVER_LOG="/absolute/path/to/cutover-log.md"
 export OFFICE_AUTOMATE_MQTT_CUTOVER_STRATEGY="atomic-switch"
 ```
 
-Use `bridge-mirror` instead of `atomic-switch` only when the active climate controller continues receiving mirrored fresh Qingping readings for the whole transition.
-
 The Rust config used for the active cutover must have:
 
 ```yaml
@@ -61,7 +59,6 @@ export OFFICE_AUTOMATE_LEGACY_STOPPED_AT="$(date -Iseconds)"
 
 Apply the selected MQTT feed strategy:
 
-- `bridge-mirror`: keep Qingping publishing to the current active path while bridge/mirror forwarding proves Rust receives the same fresh `qingping/{DEVICE_MAC}/up` reports.
 - `atomic-switch`: move Qingping to the Rust embedded broker in the same window that Python active control stops and Rust active control starts.
 
 Start the Rust backend and Cloudflare Tunnel services with launchd or the equivalent foreground commands:

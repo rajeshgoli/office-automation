@@ -225,14 +225,12 @@ pub struct RollbackValidationArgs {
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum MqttCutoverStrategyArg {
-    BridgeMirror,
     AtomicSwitch,
 }
 
 impl From<MqttCutoverStrategyArg> for MqttCutoverStrategy {
     fn from(value: MqttCutoverStrategyArg) -> Self {
         match value {
-            MqttCutoverStrategyArg::BridgeMirror => Self::BridgeMirror,
             MqttCutoverStrategyArg::AtomicSwitch => Self::AtomicSwitch,
         }
     }
@@ -242,10 +240,8 @@ impl From<MqttCutoverStrategyArg> for MqttCutoverStrategy {
 pub enum MqttRollbackStateArg {
     /// Qingping never moved off the legacy-compatible MQTT path.
     NotMoved,
-    /// Qingping device or bridge was repointed to the legacy broker.
+    /// Qingping device was repointed to the legacy broker.
     RepointedLegacy,
-    /// Bridge/mirror forwarding keeps the legacy controller receiving fresh reports.
-    LegacyMirror,
 }
 
 impl From<MqttRollbackStateArg> for MqttRollbackState {
@@ -253,7 +249,6 @@ impl From<MqttRollbackStateArg> for MqttRollbackState {
         match value {
             MqttRollbackStateArg::NotMoved => Self::NotMoved,
             MqttRollbackStateArg::RepointedLegacy => Self::RepointedLegacy,
-            MqttRollbackStateArg::LegacyMirror => Self::LegacyMirror,
         }
     }
 }
