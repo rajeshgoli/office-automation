@@ -3,7 +3,7 @@ use std::{
     future::Future,
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -20,6 +20,8 @@ use crate::{
     state::{StateMachine, StateTransition},
     status::Status,
 };
+
+pub type DeviceIngressHook = Arc<dyn Fn(Option<StateTransition>) + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceType {
@@ -529,6 +531,7 @@ pub fn start_yolink_client(
     config: &AppConfig,
     yolink: YoLinkState,
     erv_automation: Option<ErvPolicyCoordinator>,
+    device_hook: Option<DeviceIngressHook>,
 ) -> Option<JoinHandle<()>> {
     if !config.yolink.is_configured() {
         tracing::warn!("YoLink credentials are not configured; client not started");
@@ -538,8 +541,13 @@ pub fn start_yolink_client(
     let config = config.clone();
     Some(tokio::spawn(async move {
         loop {
-            if let Err(error) =
-                run_yolink_client_once(&config, yolink.clone(), erv_automation.clone()).await
+            if let Err(error) = run_yolink_client_once(
+                &config,
+                yolink.clone(),
+                erv_automation.clone(),
+                device_hook.clone(),
+            )
+            .await
             {
                 tracing::warn!("YoLink client stopped: {error:#}");
             }
@@ -552,6 +560,7 @@ async fn run_yolink_client_once(
     config: &AppConfig,
     yolink: YoLinkState,
     erv_automation: Option<ErvPolicyCoordinator>,
+    device_hook: Option<DeviceIngressHook>,
 ) -> Result<()> {
     let cloud = YoLinkCloudClient::new(config.yolink.clone());
     let (access_token, home_id) = initialize_yolink_inventory(&cloud, &yolink).await?;
@@ -562,6 +571,7 @@ async fn run_yolink_client_once(
         &home_id,
         yolink,
         erv_automation,
+        device_hook,
     )
     .await
 }
@@ -572,6 +582,7 @@ async fn listen_yolink_mqtt(
     home_id: &str,
     yolink: YoLinkState,
     erv_automation: Option<ErvPolicyCoordinator>,
+    device_hook: Option<DeviceIngressHook>,
 ) -> Result<()> {
     let mut options = MqttOptions::new(
         "office-automate-yolink",
@@ -594,46 +605,21 @@ async fn listen_yolink_mqtt(
                 match parse_mqtt_report_payload(&publish.payload) {
                     Ok(Some(report)) => {
                         let now = chrono::Local::now().timestamp_millis() as f64 / 1_000.0;
-                        if let Some(erv_automation) = &erv_automation {
-                            match erv_automation
-                                .update_state_and_maybe_evaluate(|| {
-                                    let applied = yolink
-                                        .apply_report(report, now)
-                                        .context("failed to apply YoLink report")?;
-                                    let Some(applied) = applied else {
-                                        return Ok((None, None, now, false, false));
-                                    };
-                                    let bypass_dwell = applied.transition.is_some();
-                                    Ok((
-                                        Some(applied.device_type),
-                                        applied.transition,
-                                        now,
-                                        bypass_dwell,
-                                        true,
-                                    ))
-                                })
-                                .await
-                            {
-                                Ok(Some(_)) | Ok(None) => {}
-                                Err(error)
-                                    if error
-                                        .to_string()
-                                        .contains("failed to apply YoLink report") =>
-                                {
-                                    tracing::warn!("failed to apply YoLink report: {error:#}")
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        "ERV automated policy apply failed after YoLink update: {error:#}"
-                                    );
-                                }
-                            }
-                        } else {
-                            match yolink.apply_report(report, now) {
-                                Ok(Some(_)) | Ok(None) => {}
-                                Err(error) => {
-                                    tracing::warn!("failed to apply YoLink report: {error:#}")
-                                }
+                        if let Err(error) = apply_yolink_report_with_policy(
+                            &yolink,
+                            report,
+                            now,
+                            erv_automation.as_ref(),
+                            device_hook.as_ref(),
+                        )
+                        .await
+                        {
+                            if error.to_string().contains("failed to apply YoLink report") {
+                                tracing::warn!("failed to apply YoLink report: {error:#}")
+                            } else {
+                                tracing::warn!(
+                                    "ERV automated policy apply failed after YoLink update: {error:#}"
+                                );
                             }
                         }
                     }
@@ -646,15 +632,149 @@ async fn listen_yolink_mqtt(
     }
 }
 
+async fn apply_yolink_report_with_policy(
+    yolink: &YoLinkState,
+    report: YoLinkReport,
+    now: f64,
+    erv_automation: Option<&ErvPolicyCoordinator>,
+    device_hook: Option<&DeviceIngressHook>,
+) -> Result<()> {
+    if let Some(erv_automation) = erv_automation {
+        let report_transition = Arc::new(Mutex::new(None::<Option<StateTransition>>));
+        let report_transition_for_hook = report_transition.clone();
+        let policy_result = erv_automation
+            .update_state_and_maybe_evaluate(|| {
+                let applied = yolink
+                    .apply_report(report, now)
+                    .context("failed to apply YoLink report")?;
+                let Some(applied) = applied else {
+                    return Ok((None, None, now, false, false));
+                };
+                let transition = applied.transition;
+                *report_transition_for_hook
+                    .lock()
+                    .expect("report transition lock") = Some(transition);
+                let bypass_dwell = applied.transition.is_some();
+                Ok((
+                    Some((applied.device_type, transition)),
+                    transition,
+                    now,
+                    bypass_dwell,
+                    true,
+                ))
+            })
+            .await;
+        match policy_result {
+            Ok(applied) => {
+                if let Some((_device, transition)) = applied {
+                    if let Some(hook) = device_hook {
+                        hook(transition);
+                    }
+                }
+            }
+            Err(error) => {
+                let transition = *report_transition.lock().expect("report transition lock");
+                if let Some(transition) = transition {
+                    if let Some(hook) = device_hook {
+                        hook(transition);
+                    }
+                }
+                return Err(error);
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(applied) = yolink
+        .apply_report(report, now)
+        .context("failed to apply YoLink report")?
+    {
+        if let Some(hook) = device_hook {
+            hook(applied.transition);
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{collections::VecDeque, sync::Mutex};
+
     use super::*;
     use crate::{
-        config::ThresholdsConfig,
+        config::{
+            ErvConfig, MitsubishiConfig, OrchestratorConfig, QingpingConfig, RuntimeConfig,
+            ThresholdsConfig,
+        },
         db::migrate_database,
+        erv::{ErvDeviceStatus, ErvFanSpeed, ErvSpeedWriter, ErvState},
+        policy::ErvPolicyState,
+        qingping::QingpingState,
         state::{OccupancyState, StateConfig},
     };
+    use anyhow::Result;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct FakeErvWriter {
+        smoke_results: Mutex<VecDeque<Result<ErvDeviceStatus>>>,
+        write_results: Mutex<VecDeque<Result<ErvDeviceStatus>>>,
+        write_speeds: Mutex<Vec<ErvFanSpeed>>,
+    }
+
+    impl FakeErvWriter {
+        fn new(smoke_results: Vec<Result<ErvDeviceStatus>>) -> Self {
+            Self::with_write_results(smoke_results, Vec::new())
+        }
+
+        fn with_write_results(
+            smoke_results: Vec<Result<ErvDeviceStatus>>,
+            write_results: Vec<Result<ErvDeviceStatus>>,
+        ) -> Self {
+            Self {
+                smoke_results: Mutex::new(smoke_results.into()),
+                write_results: Mutex::new(write_results.into()),
+                write_speeds: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn write_speeds(&self) -> Vec<ErvFanSpeed> {
+            self.write_speeds.lock().expect("write speeds lock").clone()
+        }
+    }
+
+    impl ErvSpeedWriter for FakeErvWriter {
+        fn smoke_status<'a>(
+            &'a self,
+            _config: &'a ErvConfig,
+        ) -> crate::erv::BoxFutureResult<'a, ErvDeviceStatus> {
+            let result = self
+                .smoke_results
+                .lock()
+                .expect("smoke results lock")
+                .pop_front()
+                .unwrap_or_else(|| Ok(erv_status(ErvFanSpeed::Off)));
+            Box::pin(async move { result })
+        }
+
+        fn set_speed<'a>(
+            &'a self,
+            _config: &'a ErvConfig,
+            speed: ErvFanSpeed,
+        ) -> crate::erv::BoxFutureResult<'a, ErvDeviceStatus> {
+            self.write_speeds
+                .lock()
+                .expect("write speeds lock")
+                .push(speed);
+            let result = self
+                .write_results
+                .lock()
+                .expect("write results lock")
+                .pop_front()
+                .unwrap_or_else(|| Ok(erv_status(speed)));
+            Box::pin(async move { result })
+        }
+    }
 
     fn test_state(database_path: PathBuf) -> YoLinkState {
         YoLinkState::new(
@@ -664,6 +784,61 @@ mod tests {
             ))),
             database_path,
         )
+    }
+
+    fn test_config(database_path: PathBuf) -> AppConfig {
+        let root = database_path
+            .parent()
+            .expect("database parent")
+            .to_path_buf();
+        AppConfig {
+            orchestrator: OrchestratorConfig::default(),
+            qingping: QingpingConfig::default(),
+            yolink: YoLinkConfig::default(),
+            erv: ErvConfig {
+                device_type: "tuya".to_string(),
+                ip: "192.0.2.10".to_string(),
+                device_id: "device-id".to_string(),
+                local_key: "local-key".to_string(),
+                active_control_enabled: true,
+                verify_delay_seconds: 0,
+                ..ErvConfig::default()
+            },
+            mitsubishi: MitsubishiConfig::default(),
+            thresholds: ThresholdsConfig {
+                erv_min_dwell_seconds: 0,
+                ..ThresholdsConfig::default()
+            },
+            runtime: RuntimeConfig {
+                root: root.clone(),
+                config_path: root.join("config.yaml"),
+                data_dir: root.clone(),
+                database_path,
+                frontend_dist: root.join("frontend/dist"),
+                artifacts_dir: root.join("apps"),
+                legacy_apk_path: root.join("app-debug.apk"),
+                base_url: None,
+                public_url: None,
+                mqtt_host: "127.0.0.1".to_string(),
+                mqtt_port: 1883,
+            },
+        }
+    }
+
+    fn erv_status(speed: ErvFanSpeed) -> ErvDeviceStatus {
+        let (power, supply_speed, exhaust_speed) = match speed {
+            ErvFanSpeed::Off => (false, Some(1), Some(1)),
+            ErvFanSpeed::Quiet => (true, Some(1), Some(1)),
+            ErvFanSpeed::Medium => (true, Some(3), Some(2)),
+            ErvFanSpeed::Turbo => (true, Some(8), Some(8)),
+        };
+        ErvDeviceStatus {
+            power,
+            fan_speed: Some(speed),
+            supply_speed,
+            exhaust_speed,
+            raw_dps: json!({}),
+        }
     }
 
     fn sample_devices() -> Vec<YoLinkDevice> {
@@ -949,6 +1124,142 @@ mod tests {
             .await
             .expect("broadcast timeout")
             .expect("broadcast received");
+    }
+
+    #[tokio::test]
+    async fn device_hook_runs_after_erv_policy_update() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+        let config = test_config(db_path.clone());
+        let state_machine = Arc::new(RwLock::new(StateMachine::new(
+            StateConfig::from_thresholds(&config.thresholds),
+            1_000.0,
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), db_path.clone());
+        yolink.apply_devices(sample_devices());
+        let qingping = QingpingState::default();
+        let erv = ErvState::new(db_path);
+        let writer = Arc::new(FakeErvWriter::new(vec![Ok(erv_status(
+            ErvFanSpeed::Medium,
+        ))]));
+        let policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
+        let (status_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let coordinator = ErvPolicyCoordinator::new(
+            config,
+            state_machine,
+            qingping,
+            erv.clone(),
+            policy,
+            writer.clone(),
+            status_broadcast,
+        );
+        let hook_observations = Arc::new(Mutex::new(Vec::new()));
+        let hook: DeviceIngressHook = Arc::new({
+            let erv = erv.clone();
+            let hook_observations = hook_observations.clone();
+            move |transition| {
+                hook_observations
+                    .lock()
+                    .expect("hook observations lock")
+                    .push((transition, erv.snapshot().running));
+            }
+        });
+
+        apply_yolink_report_with_policy(
+            &yolink,
+            YoLinkReport {
+                device_id: "motion-1".to_string(),
+                data: json!({"state": "alert"}),
+            },
+            1_002.0,
+            Some(&coordinator),
+            Some(&hook),
+        )
+        .await
+        .expect("report applies with policy");
+
+        assert_eq!(writer.write_speeds(), vec![ErvFanSpeed::Off]);
+        assert_eq!(
+            *hook_observations.lock().expect("hook observations lock"),
+            vec![(
+                Some(StateTransition {
+                    old_state: OccupancyState::Away,
+                    new_state: OccupancyState::Present,
+                }),
+                false,
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn device_hook_runs_when_erv_policy_write_fails_after_report_applies() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+        let config = test_config(db_path.clone());
+        let state_machine = Arc::new(RwLock::new(StateMachine::new(
+            StateConfig::from_thresholds(&config.thresholds),
+            1_000.0,
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .set_manual_presence(true, 1_001.0);
+        let yolink = YoLinkState::new(state_machine.clone(), db_path.clone());
+        yolink.apply_devices(sample_devices());
+        let qingping = QingpingState::default();
+        let erv = ErvState::new(db_path);
+        let writer = Arc::new(FakeErvWriter::with_write_results(
+            vec![Ok(erv_status(ErvFanSpeed::Medium))],
+            vec![Err(anyhow::anyhow!("ERV write failed"))],
+        ));
+        let policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
+        let (status_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let coordinator = ErvPolicyCoordinator::new(
+            config,
+            state_machine.clone(),
+            qingping,
+            erv,
+            policy,
+            writer.clone(),
+            status_broadcast,
+        );
+        let hook_observations = Arc::new(Mutex::new(Vec::new()));
+        let hook: DeviceIngressHook = Arc::new({
+            let state_machine = state_machine.clone();
+            let hook_observations = hook_observations.clone();
+            move |_transition| {
+                let safety_interlock = state_machine
+                    .read()
+                    .expect("state machine lock poisoned")
+                    .status_at(1_002.0)
+                    .safety_interlock;
+                hook_observations
+                    .lock()
+                    .expect("hook observations lock")
+                    .push(safety_interlock);
+            }
+        });
+
+        let result = apply_yolink_report_with_policy(
+            &yolink,
+            YoLinkReport {
+                device_id: "door-1".to_string(),
+                data: json!({"state": "open"}),
+            },
+            1_002.0,
+            Some(&coordinator),
+            Some(&hook),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(writer.write_speeds(), vec![ErvFanSpeed::Off]);
+        assert_eq!(
+            *hook_observations.lock().expect("hook observations lock"),
+            vec![true]
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    path::PathBuf,
     pin::Pin,
     sync::{Arc, RwLock},
     time::Duration,
@@ -13,10 +14,69 @@ use tokio::{sync::broadcast, task::JoinHandle, time};
 
 use crate::{
     config::{AppConfig, MitsubishiConfig},
+    db,
     status::Status,
 };
 
 const KUMO_APP_VERSION: &str = "1297";
+pub const HVAC_MANUAL_OVERRIDE_SECONDS: i64 = 30 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvacControlMode {
+    Off,
+    Heat,
+    Cool,
+    Auto,
+}
+
+impl HvacControlMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Heat => "heat",
+            Self::Cool => "cool",
+            Self::Auto => "auto",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "heat" => Some(Self::Heat),
+            "cool" => Some(Self::Cool),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HvacModeCommand {
+    pub mode: HvacControlMode,
+    pub setpoint_c: Option<f64>,
+    pub heat_setpoint_c: Option<f64>,
+    pub cool_setpoint_c: Option<f64>,
+}
+
+impl HvacModeCommand {
+    pub fn new(mode: HvacControlMode, setpoint_c: Option<f64>) -> Self {
+        Self {
+            mode,
+            setpoint_c,
+            heat_setpoint_c: None,
+            cool_setpoint_c: None,
+        }
+    }
+
+    pub fn auto(heat_setpoint_c: f64, cool_setpoint_c: f64) -> Self {
+        Self {
+            mode: HvacControlMode::Auto,
+            setpoint_c: None,
+            heat_setpoint_c: Some(heat_setpoint_c),
+            cool_setpoint_c: Some(cool_setpoint_c),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HvacDeviceStatus {
@@ -37,6 +97,28 @@ pub trait HvacStatusReader: Send + Sync {
     ) -> BoxFutureResult<'a, HvacDeviceStatus>;
 }
 
+pub trait HvacModeWriter: Send + Sync {
+    fn smoke_status<'a>(
+        &'a self,
+        config: &'a MitsubishiConfig,
+    ) -> BoxFutureResult<'a, HvacDeviceStatus>;
+
+    fn set_mode<'a>(
+        &'a self,
+        config: &'a MitsubishiConfig,
+        mode: HvacControlMode,
+        setpoint_c: Option<f64>,
+    ) -> BoxFutureResult<'a, HvacDeviceStatus>;
+
+    fn set_mode_command<'a>(
+        &'a self,
+        config: &'a MitsubishiConfig,
+        command: HvacModeCommand,
+    ) -> BoxFutureResult<'a, HvacDeviceStatus> {
+        self.set_mode(config, command.mode, command.setpoint_c)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct KumoHvacStatusReader;
 
@@ -53,12 +135,85 @@ impl HvacStatusReader for KumoHvacStatusReader {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct KumoHvacModeWriter;
+
+impl HvacModeWriter for KumoHvacModeWriter {
+    fn smoke_status<'a>(
+        &'a self,
+        config: &'a MitsubishiConfig,
+    ) -> BoxFutureResult<'a, HvacDeviceStatus> {
+        KumoHvacStatusReader.read_status(config)
+    }
+
+    fn set_mode<'a>(
+        &'a self,
+        config: &'a MitsubishiConfig,
+        mode: HvacControlMode,
+        setpoint_c: Option<f64>,
+    ) -> BoxFutureResult<'a, HvacDeviceStatus> {
+        self.set_mode_command(config, HvacModeCommand::new(mode, setpoint_c))
+    }
+
+    fn set_mode_command<'a>(
+        &'a self,
+        config: &'a MitsubishiConfig,
+        command: HvacModeCommand,
+    ) -> BoxFutureResult<'a, HvacDeviceStatus> {
+        Box::pin(async move {
+            let client = KumoClient::new(config)?;
+            client.send_mode_command(command).await?;
+            client.get_full_status().await
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct HvacState {
-    inner: Arc<RwLock<Option<HvacDeviceStatus>>>,
+    inner: Arc<RwLock<HvacInner>>,
+    database_path: PathBuf,
     status_broadcast: Arc<RwLock<Option<broadcast::Sender<()>>>>,
 }
 
+#[derive(Debug, Default)]
+struct HvacInner {
+    latest_status: Option<HvacDeviceStatus>,
+    suspended: bool,
+    last_mode: Option<String>,
+    suspended_heat_setpoint_c: Option<f64>,
+    suspended_cool_setpoint_c: Option<f64>,
+    temp_band_mode: Option<String>,
+    manual_override: Option<HvacManualOverride>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HvacManualOverride {
+    mode: String,
+    setpoint_f: f64,
+    started_at: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HvacRuntimeSnapshot {
+    pub mode: String,
+    pub setpoint_c: f64,
+    pub heat_setpoint_c: Option<f64>,
+    pub cool_setpoint_c: Option<f64>,
+    pub suspended: bool,
+    pub last_mode: Option<String>,
+    pub suspended_heat_setpoint_c: Option<f64>,
+    pub suspended_cool_setpoint_c: Option<f64>,
+    pub temp_band_mode: Option<String>,
+}
+
 impl HvacState {
+    pub fn new(database_path: PathBuf) -> Self {
+        Self {
+            inner: Arc::default(),
+            database_path,
+            status_broadcast: Arc::default(),
+        }
+    }
+
     pub fn set_status_broadcast(&self, sender: broadcast::Sender<()>) {
         *self
             .status_broadcast
@@ -81,26 +236,278 @@ impl HvacState {
         Ok(status)
     }
 
+    pub async fn set_mode_with<W>(
+        &self,
+        config: &MitsubishiConfig,
+        writer: &W,
+        mode: HvacControlMode,
+        setpoint_c: Option<f64>,
+        reason: &str,
+    ) -> Result<HvacDeviceStatus>
+    where
+        W: HvacModeWriter + ?Sized,
+    {
+        self.set_mode_command_with(
+            config,
+            writer,
+            HvacModeCommand::new(mode, setpoint_c),
+            reason,
+        )
+        .await
+    }
+
+    pub async fn set_mode_command_with<W>(
+        &self,
+        config: &MitsubishiConfig,
+        writer: &W,
+        command: HvacModeCommand,
+        reason: &str,
+    ) -> Result<HvacDeviceStatus>
+    where
+        W: HvacModeWriter + ?Sized,
+    {
+        self.smoke_status_with(config, writer).await?;
+        let status = writer.set_mode_command(config, command).await?;
+        self.record_write_success(status.clone(), command.mode, command.setpoint_c, reason);
+        Ok(status)
+    }
+
+    pub async fn smoke_status_with<W>(
+        &self,
+        config: &MitsubishiConfig,
+        writer: &W,
+    ) -> Result<HvacDeviceStatus>
+    where
+        W: HvacModeWriter + ?Sized,
+    {
+        validate_active_hvac_config(config)?;
+
+        let smoke_status = writer
+            .smoke_status(config)
+            .await
+            .context("HVAC smoke check failed before active write")?;
+        if self.record_status(smoke_status.clone()) {
+            self.notify_status();
+        }
+        Ok(smoke_status)
+    }
+
+    pub async fn set_mode_after_verified_status_with<W>(
+        &self,
+        config: &MitsubishiConfig,
+        writer: &W,
+        mode: HvacControlMode,
+        setpoint_c: Option<f64>,
+        reason: &str,
+    ) -> Result<HvacDeviceStatus>
+    where
+        W: HvacModeWriter + ?Sized,
+    {
+        self.set_mode_command_after_verified_status_with(
+            config,
+            writer,
+            HvacModeCommand::new(mode, setpoint_c),
+            reason,
+        )
+        .await
+    }
+
+    pub async fn set_mode_command_after_verified_status_with<W>(
+        &self,
+        config: &MitsubishiConfig,
+        writer: &W,
+        command: HvacModeCommand,
+        reason: &str,
+    ) -> Result<HvacDeviceStatus>
+    where
+        W: HvacModeWriter + ?Sized,
+    {
+        validate_active_hvac_config(config)?;
+
+        let status = writer.set_mode_command(config, command).await?;
+        self.record_write_success(status.clone(), command.mode, command.setpoint_c, reason);
+        Ok(status)
+    }
+
     pub fn record_status(&self, status: HvacDeviceStatus) -> bool {
         let mut inner = self.inner.write().expect("HVAC state lock poisoned");
-        let changed = inner.as_ref() != Some(&status);
-        *inner = Some(status);
+        let mut changed = inner.latest_status.as_ref() != Some(&status);
+        if status.mode != "off" {
+            if inner.last_mode.as_deref() != Some(status.mode.as_str()) {
+                changed = true;
+            }
+            inner.last_mode = Some(status.mode.clone());
+            if inner.suspended
+                || inner.suspended_heat_setpoint_c.is_some()
+                || inner.suspended_cool_setpoint_c.is_some()
+            {
+                changed = true;
+            }
+            inner.suspended = false;
+            inner.suspended_heat_setpoint_c = None;
+            inner.suspended_cool_setpoint_c = None;
+        }
+        inner.latest_status = Some(status);
         changed
     }
 
     pub fn latest(&self) -> Option<HvacDeviceStatus> {
-        self.inner.read().expect("HVAC state lock poisoned").clone()
+        self.inner
+            .read()
+            .expect("HVAC state lock poisoned")
+            .latest_status
+            .clone()
+    }
+
+    pub fn snapshot(&self) -> HvacRuntimeSnapshot {
+        let inner = self.inner.read().expect("HVAC state lock poisoned");
+        let latest = inner.latest_status.clone();
+        HvacRuntimeSnapshot {
+            mode: latest
+                .as_ref()
+                .map(|status| status.mode.clone())
+                .unwrap_or_else(|| "off".to_string()),
+            setpoint_c: latest
+                .as_ref()
+                .map(|status| status.setpoint_c)
+                .unwrap_or(22.0),
+            heat_setpoint_c: latest.as_ref().and_then(|status| status.heat_setpoint_c),
+            cool_setpoint_c: latest.as_ref().and_then(|status| status.cool_setpoint_c),
+            suspended: inner.suspended,
+            last_mode: inner.last_mode.clone(),
+            suspended_heat_setpoint_c: inner.suspended_heat_setpoint_c,
+            suspended_cool_setpoint_c: inner.suspended_cool_setpoint_c,
+            temp_band_mode: inner.temp_band_mode.clone(),
+        }
+    }
+
+    pub fn record_manual_override(&self, mode: HvacControlMode, setpoint_f: f64) {
+        let mut inner = self.inner.write().expect("HVAC state lock poisoned");
+        inner.manual_override = Some(HvacManualOverride {
+            mode: mode.as_str().to_string(),
+            setpoint_f,
+            started_at: unix_timestamp_now(),
+        });
+        inner.suspended = false;
+        inner.suspended_heat_setpoint_c = None;
+        inner.suspended_cool_setpoint_c = None;
+        inner.last_mode = if mode == HvacControlMode::Off {
+            None
+        } else {
+            Some(mode.as_str().to_string())
+        };
+        inner.temp_band_mode = None;
+    }
+
+    pub fn manual_override_active(&self) -> bool {
+        let now = unix_timestamp_now();
+        let mut inner = self.inner.write().expect("HVAC state lock poisoned");
+        prune_expired_manual_override(&mut inner, now);
+        inner.manual_override.is_some()
+    }
+
+    pub fn clear_manual_override(&self) -> bool {
+        self.inner
+            .write()
+            .expect("HVAC state lock poisoned")
+            .manual_override
+            .take()
+            .is_some()
+    }
+
+    pub fn set_suspended(&self, suspended: bool, last_mode: Option<String>) {
+        self.set_suspended_with_setpoints(suspended, last_mode, None, None);
+    }
+
+    pub fn set_suspended_with_setpoints(
+        &self,
+        suspended: bool,
+        last_mode: Option<String>,
+        heat_setpoint_c: Option<f64>,
+        cool_setpoint_c: Option<f64>,
+    ) {
+        let mut inner = self.inner.write().expect("HVAC state lock poisoned");
+        inner.suspended = suspended;
+        if let Some(last_mode) = last_mode {
+            inner.last_mode = Some(last_mode);
+        }
+        if suspended {
+            inner.suspended_heat_setpoint_c = heat_setpoint_c;
+            inner.suspended_cool_setpoint_c = cool_setpoint_c;
+        } else {
+            inner.suspended_heat_setpoint_c = None;
+            inner.suspended_cool_setpoint_c = None;
+        }
+    }
+
+    pub fn set_temp_band_mode(&self, mode: Option<HvacControlMode>) {
+        self.inner
+            .write()
+            .expect("HVAC state lock poisoned")
+            .temp_band_mode = mode.map(|mode| mode.as_str().to_string());
     }
 
     pub fn overlay_status(&self, status: &mut Status) {
-        let Some(device_status) = self.latest() else {
-            return;
-        };
+        let now = unix_timestamp_now();
+        let mut inner = self.inner.write().expect("HVAC state lock poisoned");
+        prune_expired_manual_override(&mut inner, now);
 
-        status.hvac.mode = device_status.mode;
-        status.hvac.setpoint_c = device_status.setpoint_c;
+        if let Some(device_status) = &inner.latest_status {
+            status.hvac.mode = device_status.mode.clone();
+            status.hvac.setpoint_c = device_status.setpoint_c;
+        }
+        status.hvac.suspended = inner.suspended;
+
+        if let Some(manual_override) = &inner.manual_override {
+            let expires_in =
+                HVAC_MANUAL_OVERRIDE_SECONDS - (now - manual_override.started_at).floor() as i64;
+            status.manual_override.hvac = true;
+            status.manual_override.hvac_mode = Some(manual_override.mode.clone());
+            status.manual_override.hvac_setpoint_f = Some(manual_override.setpoint_f);
+            status.manual_override.hvac_expires_in = Some(expires_in.max(0));
+        }
     }
 
+    fn record_write_success(
+        &self,
+        device_status: HvacDeviceStatus,
+        mode: HvacControlMode,
+        setpoint_c: Option<f64>,
+        reason: &str,
+    ) {
+        if self.record_status(device_status) {
+            self.notify_status();
+        }
+        if let Err(error) = db::log_climate_action(
+            &self.database_path,
+            "hvac",
+            mode.as_str(),
+            setpoint_c,
+            None,
+            Some(reason),
+        ) {
+            tracing::warn!("failed to log HVAC climate action: {error:#}");
+        }
+    }
+}
+
+fn validate_active_hvac_config(config: &MitsubishiConfig) -> Result<()> {
+    if !config.active_control_enabled {
+        bail!("HVAC active control is disabled");
+    }
+    if !config.is_configured() {
+        bail!("Mitsubishi Kumo config is incomplete");
+    }
+    Ok(())
+}
+
+impl Default for HvacState {
+    fn default() -> Self {
+        Self::new(PathBuf::new())
+    }
+}
+
+impl HvacState {
     fn notify_status(&self) {
         let Some(sender) = self
             .status_broadcast
@@ -242,6 +649,64 @@ impl KumoClient {
             .with_context(|| format!("Kumo GET {path} response is not JSON"))
     }
 
+    async fn send_mode_command(&self, command: HvacModeCommand) -> Result<Value> {
+        let token = self.login().await?;
+        let mode = command.mode;
+        let mut commands = serde_json::Map::new();
+        commands.insert(
+            "operationMode".to_string(),
+            Value::String(mode.as_str().to_string()),
+        );
+
+        match mode {
+            HvacControlMode::Off => {}
+            HvacControlMode::Heat => {
+                commands.insert(
+                    "spHeat".to_string(),
+                    json!(command.setpoint_c.unwrap_or(22.0)),
+                );
+            }
+            HvacControlMode::Cool => {
+                commands.insert(
+                    "spCool".to_string(),
+                    json!(command.setpoint_c.unwrap_or(22.0)),
+                );
+            }
+            HvacControlMode::Auto => {
+                if let Some(heat_setpoint_c) = command.heat_setpoint_c.or(command.setpoint_c) {
+                    commands.insert("spHeat".to_string(), json!(heat_setpoint_c));
+                }
+                if let Some(cool_setpoint_c) = command.cool_setpoint_c.or(command.setpoint_c) {
+                    commands.insert("spCool".to_string(), json!(cool_setpoint_c));
+                }
+            }
+        }
+
+        let response = self
+            .http
+            .post(self.url("/v3/devices/send-command"))
+            .headers(kumo_headers())
+            .bearer_auth(token)
+            .json(&json!({
+                "deviceSerial": self.device_serial,
+                "commands": commands,
+            }))
+            .send()
+            .await
+            .context("failed to send Kumo command request")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            bail!("Kumo command failed: {status} - {text}");
+        }
+
+        response
+            .json()
+            .await
+            .context("Kumo command response is not JSON")
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
@@ -316,6 +781,20 @@ fn value_as_f64(value: &Value) -> Option<f64> {
     value
         .as_f64()
         .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+}
+
+fn prune_expired_manual_override(inner: &mut HvacInner, now: f64) {
+    let expired = inner
+        .manual_override
+        .as_ref()
+        .is_some_and(|manual| now - manual.started_at > HVAC_MANUAL_OVERRIDE_SECONDS as f64);
+    if expired {
+        inner.manual_override = None;
+    }
+}
+
+fn unix_timestamp_now() -> f64 {
+    Local::now().timestamp_millis() as f64 / 1_000.0
 }
 
 pub fn start_hvac_status_poll(config: &AppConfig, hvac: HvacState) -> Option<JoinHandle<()>> {
@@ -451,6 +930,27 @@ mod tests {
 
         assert_eq!(status.hvac.mode, "cool");
         assert_eq!(status.hvac.setpoint_c, 24.5);
+    }
+
+    #[test]
+    fn record_status_clears_stale_suspension_when_device_is_active() {
+        let hvac = HvacState::default();
+        let status = parse_kumo_adapter_status(&json!({
+            "power": 1,
+            "operationMode": "auto",
+            "spHeat": 20.0,
+            "spCool": 26.0
+        }))
+        .expect("status");
+        hvac.record_status(status.clone());
+        hvac.set_suspended_with_setpoints(true, Some("auto".to_string()), Some(20.0), Some(26.0));
+
+        assert!(hvac.record_status(status));
+        let snapshot = hvac.snapshot();
+        assert!(!snapshot.suspended);
+        assert_eq!(snapshot.last_mode.as_deref(), Some("auto"));
+        assert_eq!(snapshot.suspended_heat_setpoint_c, None);
+        assert_eq!(snapshot.suspended_cool_setpoint_c, None);
     }
 
     #[tokio::test]
