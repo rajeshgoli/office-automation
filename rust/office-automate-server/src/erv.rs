@@ -814,8 +814,8 @@ mod tests {
     use super::*;
     use crate::{
         config::{
-            AppConfig, ErvConfig, OrchestratorConfig, QingpingConfig, RuntimeConfig,
-            ThresholdsConfig, YoLinkConfig,
+            AppConfig, ErvConfig, MitsubishiConfig, OrchestratorConfig, QingpingConfig,
+            RuntimeConfig, ThresholdsConfig, YoLinkConfig,
         },
         db,
         status::Status,
@@ -937,6 +937,7 @@ mod tests {
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),
             erv,
+            mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
             runtime: RuntimeConfig {
                 root: PathBuf::from("/tmp/office"),
