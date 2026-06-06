@@ -1,0 +1,7 @@
+office_automate_edge_users = "{ __OFFICE_AUTOMATE_TUNNEL_USER__ __OFFICE_AUTOMATE_EDGE_USER__ }"
+office_automate_private_nets = "{ 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fc00::/7 fe80::/10 }"
+office_automate_origin_ports = "{ __OFFICE_AUTOMATE_ORIGIN_PORTS__ }"
+
+pass out quick on lo0 proto tcp user $office_automate_edge_users to 127.0.0.1 port $office_automate_origin_ports
+pass out quick on lo0 proto tcp user $office_automate_edge_users to ::1 port $office_automate_origin_ports
+block out quick proto { tcp udp } user $office_automate_edge_users to $office_automate_private_nets
