@@ -70,6 +70,22 @@ pub struct CutoverValidationOptions {
     pub max_air_quality_age_seconds: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackValidationOptions {
+    pub legacy_base_url: Option<String>,
+    pub legacy_public_url: Option<String>,
+    pub rust_base_url: Option<String>,
+    pub rust_public_url: Option<String>,
+    pub rust_stopped_at: String,
+    pub legacy_started_at: String,
+    pub mqtt_rollback_state: MqttRollbackState,
+    pub snapshot_dir: PathBuf,
+    pub restore_verification: RestoreVerification,
+    pub rollback_log: PathBuf,
+    pub manual_legacy_public_verified_at: Option<String>,
+    pub max_air_quality_age_seconds: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MqttCutoverStrategy {
     BridgeMirror,
@@ -81,6 +97,38 @@ impl MqttCutoverStrategy {
         match self {
             Self::BridgeMirror => "bridge-mirror",
             Self::AtomicSwitch => "atomic-switch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MqttRollbackState {
+    NotMoved,
+    RepointedLegacy,
+    LegacyMirror,
+}
+
+impl MqttRollbackState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotMoved => "not-moved",
+            Self::RepointedLegacy => "repointed-legacy",
+            Self::LegacyMirror => "legacy-mirror",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreVerification {
+    RestoredFromSnapshot,
+    VerifiedSafeNoRestore,
+}
+
+impl RestoreVerification {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RestoredFromSnapshot => "restored-from-snapshot",
+            Self::VerifiedSafeNoRestore => "verified-safe-no-restore",
         }
     }
 }
@@ -188,6 +236,23 @@ pub async fn run_cutover_validation(
     Ok(report)
 }
 
+pub async fn run_rollback_validation(
+    config: &AppConfig,
+    options: RollbackValidationOptions,
+) -> Result<ShadowValidationReport> {
+    let mut report = ShadowValidationReport { checks: Vec::new() };
+
+    validate_rollback_active_write_gates(config, &mut report)?;
+    validate_cutover_snapshot(&options.snapshot_dir, &mut report)?;
+    validate_rust_controller_stopped(&options, &mut report).await?;
+    validate_mqtt_rollback_state(config, options.mqtt_rollback_state, &mut report)?;
+    validate_restore_verification(options.restore_verification, &mut report)?;
+    validate_legacy_recovered_http_interfaces(config, &options, &mut report).await?;
+    write_rollback_log(config, &options, &report)?;
+
+    Ok(report)
+}
+
 fn validate_active_write_gates(
     config: &AppConfig,
     report: &mut ShadowValidationReport,
@@ -202,6 +267,24 @@ fn validate_active_write_gates(
     report.push_pass(
         "active-write-gates",
         "ERV and HVAC active-control flags are disabled",
+    );
+    Ok(())
+}
+
+fn validate_rollback_active_write_gates(
+    config: &AppConfig,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if config.erv.active_control_enabled {
+        bail!("rollback validation requires ERV active control disabled in Rust config");
+    }
+    if config.mitsubishi.active_control_enabled {
+        bail!("rollback validation requires HVAC active control disabled in Rust config");
+    }
+
+    report.push_pass(
+        "rust-active-write-gates-disabled",
+        "ERV and HVAC active-control flags are disabled before any Rust shadow follow-up",
     );
     Ok(())
 }
@@ -602,6 +685,209 @@ async fn validate_cutover_http_interfaces(
     Ok(())
 }
 
+async fn validate_rust_controller_stopped(
+    options: &RollbackValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if options.rust_stopped_at.trim().is_empty() {
+        bail!("rollback requires --rust-stopped-at after stopping office-automate-server");
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .context("failed to create Rust-controller rollback probe client")?;
+    let mut probed = false;
+
+    if let Some(rust_base_url) = options.rust_base_url.as_deref() {
+        validate_endpoint_absent(&client, rust_base_url, "local Rust /status").await?;
+        report.push_pass(
+            "rust-local-controller-stopped",
+            format!(
+                "operator recorded stopped_at={}; local Rust /status did not respond at {}",
+                options.rust_stopped_at, rust_base_url
+            ),
+        );
+        probed = true;
+    }
+
+    if let Some(rust_public_url) = options.rust_public_url.as_deref() {
+        validate_endpoint_absent(&client, rust_public_url, "public Rust /status").await?;
+        report.push_pass(
+            "rust-public-tunnel-stopped",
+            format!(
+                "operator recorded stopped_at={}; public Rust /status did not respond at {}",
+                options.rust_stopped_at, rust_public_url
+            ),
+        );
+        probed = true;
+    }
+
+    if !probed {
+        report.push_pass(
+            "rust-controller-stopped",
+            format!(
+                "operator recorded stopped_at={}; no Rust URL probe supplied",
+                options.rust_stopped_at
+            ),
+        );
+    }
+
+    Ok(())
+}
+
+async fn validate_endpoint_absent(
+    client: &reqwest::Client,
+    base_url: &str,
+    label: &str,
+) -> Result<()> {
+    let url = join_url(base_url, "/status")?;
+    match client.get(url).send().await {
+        Ok(response) => {
+            bail!(
+                "{label} still responded with {}; rollback must not leave Rust active",
+                response.status()
+            );
+        }
+        Err(_) => Ok(()),
+    }
+}
+
+fn validate_mqtt_rollback_state(
+    config: &AppConfig,
+    state: MqttRollbackState,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let device_mac = config
+        .qingping
+        .device_mac
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .context(
+            "rollback validation requires qingping.device_mac so the feed rollback can be audited",
+        )?;
+
+    let detail = match state {
+        MqttRollbackState::NotMoved => "Qingping feed never moved off the legacy-compatible path",
+        MqttRollbackState::RepointedLegacy => {
+            "Qingping device or bridge was repointed to the legacy broker"
+        }
+        MqttRollbackState::LegacyMirror => {
+            "bridge/mirror forwarding keeps the legacy controller receiving fresh reports"
+        }
+    };
+    report.push_pass(
+        "mqtt-feed-rollback",
+        format!("{detail}; device_mac={device_mac}"),
+    );
+    Ok(())
+}
+
+fn validate_restore_verification(
+    restore: RestoreVerification,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let detail = match restore {
+        RestoreVerification::RestoredFromSnapshot => {
+            "operator restored copied state from the pre-cutover snapshot"
+        }
+        RestoreVerification::VerifiedSafeNoRestore => {
+            "operator verified Rust-written state is legacy-compatible; no restore required"
+        }
+    };
+    report.push_pass("snapshot-restore-verification", detail);
+    Ok(())
+}
+
+async fn validate_legacy_recovered_http_interfaces(
+    config: &AppConfig,
+    options: &RollbackValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let legacy_base_url = options
+        .legacy_base_url
+        .as_deref()
+        .context("rollback validation requires --legacy-base-url")?;
+    if options.legacy_started_at.trim().is_empty() {
+        bail!("rollback requires --legacy-started-at after starting the legacy backend/tunnel");
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("failed to create rollback validation HTTP client")?;
+    let auth = interface_probe_auth(config)?;
+
+    let status = get_json(&client, legacy_base_url, "/status", Some(&auth)).await?;
+    validate_status_shape(&status)?;
+    validate_fresh_air_quality(&status, options.max_air_quality_age_seconds)?;
+    validate_legacy_climate_safety(&status)?;
+    report.push_pass(
+        "legacy-status-fresh",
+        format!(
+            "legacy /status recovered at {}; started_at={}",
+            legacy_base_url, options.legacy_started_at
+        ),
+    );
+
+    validate_websocket_interface(legacy_base_url, &auth, report).await?;
+
+    if let Some(legacy_public_url) = options.legacy_public_url.as_deref() {
+        validate_public_oauth_login(config, &client, legacy_public_url, report).await?;
+        if auth.supports_public_http_auth() {
+            let public_status =
+                get_json(&client, legacy_public_url, "/status", Some(&auth)).await?;
+            validate_status_shape(&public_status)?;
+            validate_fresh_air_quality(&public_status, options.max_air_quality_age_seconds)?;
+            validate_legacy_climate_safety(&public_status)?;
+            report.push_pass(
+                "legacy-cloudflare-public-status",
+                format!("legacy public URL returned fresh /status through Cloudflare Tunnel: {legacy_public_url}"),
+            );
+        } else if let Some(verified_at) = options.manual_legacy_public_verified_at.as_deref() {
+            if verified_at.trim().is_empty() {
+                bail!("manual legacy public verification timestamp cannot be empty");
+            }
+            report.push_pass(
+                "legacy-cloudflare-public-status",
+                format!(
+                    "manual browser/mobile legacy public verification recorded at {verified_at}; validation token unavailable"
+                ),
+            );
+        } else {
+            bail!(
+                "OAuth config has no jwt_secret, so protected legacy public /status cannot be authenticated non-interactively; supply --manual-legacy-public-verified-at after browser/mobile verification"
+            );
+        }
+    } else {
+        report.push_skip(
+            "legacy-cloudflare-public-status",
+            "no --legacy-public-url or OFFICE_AUTOMATE_LEGACY_PUBLIC_URL supplied",
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_legacy_climate_safety(status: &Value) -> Result<()> {
+    if !status
+        .get("safety_interlock")
+        .is_some_and(Value::is_boolean)
+    {
+        bail!("legacy /status safety_interlock is missing or not boolean");
+    }
+    let local_key_invalid = status
+        .get("erv")
+        .and_then(|erv| erv.get("control"))
+        .and_then(|control| control.get("local_key_invalid"))
+        .and_then(Value::as_bool)
+        .context("legacy /status missing erv.control.local_key_invalid")?;
+    if local_key_invalid {
+        bail!("legacy ERV local key is invalid after rollback");
+    }
+    Ok(())
+}
+
 async fn validate_public_oauth_login(
     config: &AppConfig,
     client: &reqwest::Client,
@@ -718,6 +1004,85 @@ fn write_cutover_log(
         format!(
             "failed to write cutover log {}",
             options.cutover_log.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn write_rollback_log(
+    config: &AppConfig,
+    options: &RollbackValidationOptions,
+    report: &ShadowValidationReport,
+) -> Result<()> {
+    if let Some(parent) = options
+        .rollback_log
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create rollback log directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let legacy_base_url = options.legacy_base_url.as_deref().unwrap_or("not supplied");
+    let legacy_public_url = options
+        .legacy_public_url
+        .as_deref()
+        .unwrap_or("not supplied");
+    let rust_base_url = options.rust_base_url.as_deref().unwrap_or("not supplied");
+    let rust_public_url = options.rust_public_url.as_deref().unwrap_or("not supplied");
+    let manifest = options.snapshot_dir.join("manifest.json");
+
+    let mut contents = String::new();
+    writeln!(&mut contents, "# Backend/MQTT Rollback Log\n")?;
+    writeln!(
+        &mut contents,
+        "| Field | Value |\n| --- | --- |\n| Generated at | {} |\n| Rust config | {} |\n| Legacy local URL | {} |\n| Legacy Cloudflare public URL | {} |\n| Rust local URL probe | {} |\n| Rust public URL probe | {} |\n| Rust stopped at | {} |\n| Legacy started at | {} |\n| MQTT rollback state | {} |\n| Restore verification | {} |\n| Rollback snapshot | {} |\n| Snapshot manifest | {} |\n| Rollback log | {} |",
+        markdown_cell(&Local::now().format("%Y-%m-%d %H:%M:%S %z").to_string()),
+        markdown_cell(&config.runtime.config_path.display().to_string()),
+        markdown_cell(legacy_base_url),
+        markdown_cell(legacy_public_url),
+        markdown_cell(rust_base_url),
+        markdown_cell(rust_public_url),
+        markdown_cell(&options.rust_stopped_at),
+        markdown_cell(&options.legacy_started_at),
+        options.mqtt_rollback_state.as_str(),
+        options.restore_verification.as_str(),
+        markdown_cell(&options.snapshot_dir.display().to_string()),
+        markdown_cell(&manifest.display().to_string()),
+        markdown_cell(&options.rollback_log.display().to_string()),
+    )?;
+
+    writeln!(&mut contents, "\n## Checks\n")?;
+    writeln!(&mut contents, "| Status | Check | Detail |")?;
+    writeln!(&mut contents, "| --- | --- | --- |")?;
+    for check in &report.checks {
+        writeln!(
+            &mut contents,
+            "| {} | {} | {} |",
+            check.status.as_str(),
+            markdown_cell(&check.name),
+            markdown_cell(&check.detail),
+        )?;
+    }
+
+    writeln!(&mut contents, "\n## Recovery State\n")?;
+    writeln!(
+        &mut contents,
+        "Legacy backend and Cloudflare Tunnel are the active climate-control path after this rollback validation."
+    )?;
+    writeln!(
+        &mut contents,
+        "Keep Rust active-control flags disabled before any later shadow-mode follow-up."
+    )?;
+
+    fs::write(&options.rollback_log, contents).with_context(|| {
+        format!(
+            "failed to write rollback log {}",
+            options.rollback_log.display()
         )
     })?;
     Ok(())
@@ -1049,8 +1414,7 @@ fn validate_fresh_air_quality(status: &Value, max_age_seconds: u64) -> Result<()
         .and_then(|air_quality| air_quality.get("last_update"))
         .and_then(Value::as_str)
         .context("/status air_quality.last_update is missing; Qingping shadow feed is not fresh")?;
-    let updated_at = NaiveDateTime::parse_from_str(last_update, "%Y-%m-%dT%H:%M:%S")
-        .with_context(|| format!("invalid air_quality.last_update {last_update:?}"))?;
+    let updated_at = parse_air_quality_last_update(last_update)?;
     let updated_at = Local
         .from_local_datetime(&updated_at)
         .single()
@@ -1067,6 +1431,15 @@ fn validate_fresh_air_quality(status: &Value, max_age_seconds: u64) -> Result<()
         );
     }
     Ok(())
+}
+
+fn parse_air_quality_last_update(last_update: &str) -> Result<NaiveDateTime> {
+    for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(parsed) = NaiveDateTime::parse_from_str(last_update, format) {
+            return Ok(parsed);
+        }
+    }
+    bail!("invalid air_quality.last_update {last_update:?}");
 }
 
 fn current_timestamp_seconds() -> f64 {
@@ -1200,6 +1573,29 @@ mod tests {
     }
 
     #[test]
+    fn rollback_validation_requires_inactive_write_gates() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        let mut config = test_config(&db_path);
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+
+        config.erv.active_control_enabled = true;
+        let error = validate_rollback_active_write_gates(&config, &mut report)
+            .expect_err("active ERV writes should fail rollback validation");
+        assert!(error.to_string().contains("ERV active control disabled"));
+
+        config.erv.active_control_enabled = false;
+        validate_rollback_active_write_gates(&config, &mut report)
+            .expect("inactive gates should pass");
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "rust-active-write-gates-disabled")
+        );
+    }
+
+    #[test]
     fn cutover_validation_requires_snapshot_manifest() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut report = ShadowValidationReport { checks: Vec::new() };
@@ -1240,6 +1636,31 @@ mod tests {
         assert!(error.to_string().contains("legacy-controller-stopped-at"));
     }
 
+    #[tokio::test]
+    async fn rollback_validation_requires_rust_stop_timestamp() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let options = RollbackValidationOptions {
+            legacy_base_url: Some("http://legacy.example.test".to_string()),
+            legacy_public_url: None,
+            rust_base_url: None,
+            rust_public_url: None,
+            rust_stopped_at: String::new(),
+            legacy_started_at: "2026-06-06T04:05:00-07:00".to_string(),
+            mqtt_rollback_state: MqttRollbackState::RepointedLegacy,
+            snapshot_dir: temp_dir.path().join("snapshot"),
+            restore_verification: RestoreVerification::RestoredFromSnapshot,
+            rollback_log: temp_dir.path().join("rollback.md"),
+            manual_legacy_public_verified_at: None,
+            max_air_quality_age_seconds: 300,
+        };
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+
+        let error = validate_rust_controller_stopped(&options, &mut report)
+            .await
+            .expect_err("empty timestamp should fail");
+        assert!(error.to_string().contains("rust-stopped-at"));
+    }
+
     #[test]
     fn cutover_validation_records_mqtt_strategy() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1264,6 +1685,80 @@ mod tests {
             .as_str();
         assert!(detail.contains("bridge/mirror strategy"));
         assert!(detail.contains("127.0.0.1:1883"));
+    }
+
+    #[test]
+    fn rollback_validation_records_mqtt_state_and_restore_decision() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        let mut config = test_config(&db_path);
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+
+        let error =
+            validate_mqtt_rollback_state(&config, MqttRollbackState::RepointedLegacy, &mut report)
+                .expect_err("missing device mac should fail");
+        assert!(error.to_string().contains("qingping.device_mac"));
+
+        config.qingping.device_mac = Some("AA:BB:CC:DD:EE:FF".to_string());
+        validate_mqtt_rollback_state(&config, MqttRollbackState::RepointedLegacy, &mut report)
+            .expect("mqtt rollback state passes");
+        validate_restore_verification(RestoreVerification::VerifiedSafeNoRestore, &mut report)
+            .expect("restore verification passes");
+
+        let mqtt_detail = report
+            .checks
+            .iter()
+            .find(|check| check.name == "mqtt-feed-rollback")
+            .expect("mqtt check")
+            .detail
+            .as_str();
+        assert!(mqtt_detail.contains("repointed"));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "snapshot-restore-verification")
+        );
+    }
+
+    #[test]
+    fn legacy_climate_safety_rejects_invalid_erv_key() {
+        let status = json!({
+            "state": "away",
+            "is_present": false,
+            "sensors": {},
+            "air_quality": {"last_update": "2026-06-06T04:00:00"},
+            "erv": {"control": {"local_key_invalid": true}},
+            "hvac": {},
+            "manual_override": {},
+            "safety_interlock": false
+        });
+
+        let error = validate_legacy_climate_safety(&status)
+            .expect_err("invalid ERV key should fail safety check");
+        assert!(error.to_string().contains("local key is invalid"));
+
+        let mut recovered = status;
+        recovered["erv"]["control"]["local_key_invalid"] = json!(false);
+        validate_legacy_climate_safety(&recovered).expect("recovered safety passes");
+    }
+
+    #[test]
+    fn air_quality_freshness_accepts_whole_and_fractional_local_timestamps() {
+        let whole_seconds = Local::now()
+            .naive_local()
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        let fractional_seconds = format!("{whole_seconds}.123456");
+
+        for last_update in [whole_seconds, fractional_seconds] {
+            let status = json!({
+                "air_quality": {"last_update": last_update},
+            });
+
+            validate_fresh_air_quality(&status, 60)
+                .expect("fresh air-quality timestamp should pass");
+        }
     }
 
     #[test]
@@ -1303,6 +1798,48 @@ mod tests {
         assert!(contents.contains("cloudflare-public-status"));
         assert!(contents.contains(&snapshot_dir.display().to_string()));
         assert!(contents.contains("Rollback sequence"));
+    }
+
+    #[test]
+    fn write_rollback_log_records_checks_and_recovery_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        let mut config = test_config(&db_path);
+        config.runtime.base_url = Some("http://127.0.0.1:9001".to_string());
+        let snapshot_dir = temp_dir.path().join("snapshot");
+        fs::create_dir(&snapshot_dir).expect("snapshot dir");
+        fs::write(snapshot_dir.join("manifest.json"), "{}").expect("manifest");
+        let options = RollbackValidationOptions {
+            legacy_base_url: Some("http://legacy.example.test".to_string()),
+            legacy_public_url: Some("https://office.example.test".to_string()),
+            rust_base_url: Some("http://127.0.0.1:9001".to_string()),
+            rust_public_url: None,
+            rust_stopped_at: "2026-06-06T04:00:00-07:00".to_string(),
+            legacy_started_at: "2026-06-06T04:05:00-07:00".to_string(),
+            mqtt_rollback_state: MqttRollbackState::RepointedLegacy,
+            snapshot_dir: snapshot_dir.clone(),
+            restore_verification: RestoreVerification::RestoredFromSnapshot,
+            rollback_log: temp_dir.path().join("logs").join("rollback.md"),
+            manual_legacy_public_verified_at: Some("2026-06-06T04:10:00-07:00".to_string()),
+            max_air_quality_age_seconds: 300,
+        };
+        let report = ShadowValidationReport {
+            checks: vec![ValidationCheck {
+                name: "legacy-status-fresh".to_string(),
+                status: ValidationStatus::Passed,
+                detail: "legacy /status recovered".to_string(),
+            }],
+        };
+
+        write_rollback_log(&config, &options, &report).expect("write log");
+
+        let contents = fs::read_to_string(&options.rollback_log).expect("log contents");
+        assert!(contents.contains("# Backend/MQTT Rollback Log"));
+        assert!(contents.contains("repointed-legacy"));
+        assert!(contents.contains("restored-from-snapshot"));
+        assert!(contents.contains("legacy-status-fresh"));
+        assert!(contents.contains(&snapshot_dir.display().to_string()));
+        assert!(contents.contains("Legacy backend and Cloudflare Tunnel are the active"));
     }
 
     #[test]
