@@ -81,6 +81,7 @@ Run cutover validation after Rust is the only active climate controller:
   cutover \
   --base-url "$OFFICE_AUTOMATE_CUTOVER_BASE_URL" \
   --public-url "$OFFICE_AUTOMATE_PUBLIC_URL" \
+  --cloudflared-config "$CLOUDFLARED_CONFIG" \
   --legacy-base-url "$OFFICE_AUTOMATE_LEGACY_BASE_URL" \
   --legacy-controller-stopped-at "$OFFICE_AUTOMATE_LEGACY_STOPPED_AT" \
   --mqtt-strategy "$OFFICE_AUTOMATE_MQTT_CUTOVER_STRATEGY" \
@@ -89,11 +90,22 @@ Run cutover validation after Rust is the only active climate controller:
   --max-air-quality-age-seconds 300
 ```
 
-If the OAuth config cannot mint a validation JWT, complete browser/PWA and mobile OAuth manually, then add:
+The validator always sends unauthenticated public probes first. Those probes must be blocked by Cloudflare Access before they reach origin, including `/auth/login`, `/auth/callback`, `/auth/device/start`, `/auth/device/poll`, static assets, `/apps/*`, `/apk`, `/deploy/*`, `/status`, and a real `/ws` WebSocket upgrade.
+
+For the authenticated public `/status` probe, either provide an operator-only Cloudflare Access service token:
+
+```bash
+export OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_CLIENT_ID="..."
+export OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_CLIENT_SECRET="..."
+```
+
+or complete browser/PWA and mobile verification through Cloudflare Access plus Office auth manually, then add:
 
 ```bash
 --manual-public-oauth-verified-at "$(date -Iseconds)"
 ```
+
+Do not use Android app credentials or bundled APK secrets for these operator validation headers.
 
 The command validates:
 
@@ -105,8 +117,9 @@ The command validates:
 - ERV, HVAC, and YoLink live read checks pass.
 - Local `/status` has fresh air-quality readings from the active Rust controller.
 - Local `/ws` returns the authenticated initial status frame.
-- Public `/auth/login` returns a Cloudflare-reachable OAuth start payload.
-- Public `/status` is fresh through Cloudflare when automated auth is possible, or manual OAuth verification is recorded.
+- The Cloudflare tunnel config publishes only the exact public hostname, routes it to a loopback/Unix origin, has no wildcard hostname/private-network route, and ends in `http_status:404`.
+- Unauthenticated public HTTP routes and `/ws` are blocked by Cloudflare Access before origin.
+- Public `/status` is fresh through Cloudflare Access and Office auth when automated service-token validation is possible, or manual Access plus Office verification is recorded.
 - The cutover log is written with timestamps, checks, and rollback point.
 
 ## Cutover Log

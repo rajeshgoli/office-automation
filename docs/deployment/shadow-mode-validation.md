@@ -73,8 +73,24 @@ Run the Rust validation command:
   shadow \
   --base-url "$OFFICE_AUTOMATE_SHADOW_BASE_URL" \
   --public-url "$OFFICE_AUTOMATE_SHADOW_PUBLIC_URL" \
+  --cloudflared-config "$CLOUDFLARED_CONFIG" \
   --max-air-quality-age-seconds 300
 ```
+
+When the public URL is supplied, the validator sends unauthenticated public probes that must be blocked by Cloudflare Access before origin. To also automate the authenticated public `/status` probe, provide an operator-only Cloudflare Access service token:
+
+```bash
+export OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_CLIENT_ID="..."
+export OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_CLIENT_SECRET="..."
+```
+
+If no service token is supplied, manually verify browser/PWA and mobile access through Cloudflare Access plus Office auth and add:
+
+```bash
+--manual-public-access-verified-at "$(date -Iseconds)"
+```
+
+Do not use Android app credentials or bundled APK secrets for these operator validation headers.
 
 The command validates:
 
@@ -88,9 +104,11 @@ The command validates:
 - `/status.air_quality.last_update` is fresh enough to prove Rust sees the shadow Qingping feed.
 - `/history`, `/history/project-leverage`, `/apps/office-climate/meta.json`, and `/auth/login` retain their expected interface behavior.
 - `/ws` accepts the configured auth mode and delivers the initial status frame.
-- The configured public URL reaches Rust through Cloudflare Tunnel when supplied.
+- The Cloudflare tunnel config publishes only the exact public hostname, routes it to a loopback/Unix origin, has no wildcard hostname/private-network route, and ends in `http_status:404` when supplied.
+- Unauthenticated public HTTP routes and `/ws` are blocked by Cloudflare Access before origin when a public URL is supplied.
+- Public `/status` reaches Rust through Cloudflare Access and Office auth when a service token or manual verification timestamp is supplied.
 
-For OAuth deployments, automated HTTP and WebSocket validation uses `google_oauth.jwt_secret` to mint a validation JWT for the first allowed email. If `jwt_secret` is intentionally omitted, the validator falls back to the first `trusted_networks` entry for the local shadow URL. In that fallback mode, protected public `/status` over Cloudflare is reported as a manual browser/mobile check because the validator cannot mint a portable token.
+For OAuth deployments, local automated HTTP and WebSocket validation uses `google_oauth.jwt_secret` to mint a validation JWT for the first allowed email. If `jwt_secret` is intentionally omitted, the validator falls back to the first `trusted_networks` entry for the local shadow URL. Do not use that trusted-network fallback as the public Cloudflare auth path.
 
 `--skip-live-devices` and `--skip-http-interface` are available for local development only. Do not use them for the final shadow validation gate.
 

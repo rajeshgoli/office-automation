@@ -58,6 +58,106 @@ use crate::{
     yolink::{self, YoLinkState},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicAccessProbeMethod {
+    Get,
+    Post,
+}
+
+impl PublicAccessProbeMethod {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PublicAccessProbe {
+    pub name: &'static str,
+    pub method: PublicAccessProbeMethod,
+    pub path: &'static str,
+}
+
+pub(crate) const PUBLIC_ACCESS_PROBES: &[PublicAccessProbe] = &[
+    PublicAccessProbe {
+        name: "root",
+        method: PublicAccessProbeMethod::Get,
+        path: "/",
+    },
+    PublicAccessProbe {
+        name: "index-html",
+        method: PublicAccessProbeMethod::Get,
+        path: "/index.html",
+    },
+    PublicAccessProbe {
+        name: "status",
+        method: PublicAccessProbeMethod::Get,
+        path: "/status",
+    },
+    PublicAccessProbe {
+        name: "auth-login",
+        method: PublicAccessProbeMethod::Get,
+        path: "/auth/login",
+    },
+    PublicAccessProbe {
+        name: "auth-callback",
+        method: PublicAccessProbeMethod::Get,
+        path: "/auth/callback",
+    },
+    PublicAccessProbe {
+        name: "auth-device-start",
+        method: PublicAccessProbeMethod::Post,
+        path: "/auth/device/start",
+    },
+    PublicAccessProbe {
+        name: "auth-device-poll",
+        method: PublicAccessProbeMethod::Post,
+        path: "/auth/device/poll",
+    },
+    PublicAccessProbe {
+        name: "assets",
+        method: PublicAccessProbeMethod::Get,
+        path: "/assets/app.js",
+    },
+    PublicAccessProbe {
+        name: "static-json",
+        method: PublicAccessProbeMethod::Get,
+        path: "/manifest.json",
+    },
+    PublicAccessProbe {
+        name: "static-png",
+        method: PublicAccessProbeMethod::Get,
+        path: "/favicon.png",
+    },
+    PublicAccessProbe {
+        name: "apps-metadata",
+        method: PublicAccessProbeMethod::Get,
+        path: "/apps/office-climate/meta.json",
+    },
+    PublicAccessProbe {
+        name: "apps-apk",
+        method: PublicAccessProbeMethod::Get,
+        path: "/apps/office-climate/latest.apk",
+    },
+    PublicAccessProbe {
+        name: "apps-hashed-apk",
+        method: PublicAccessProbeMethod::Get,
+        path: "/apps/office-climate/00000000.apk",
+    },
+    PublicAccessProbe {
+        name: "legacy-apk",
+        method: PublicAccessProbeMethod::Get,
+        path: "/apk",
+    },
+    PublicAccessProbe {
+        name: "deploy",
+        method: PublicAccessProbeMethod::Post,
+        path: "/deploy/office-climate",
+    },
+];
+
 const HVAC_TEMPERATURE_BANDS_SETTING: &str = "hvac_temperature_bands";
 
 #[derive(Clone)]
