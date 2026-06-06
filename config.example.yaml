@@ -60,10 +60,19 @@ orchestrator:
   # auth_password: "your_secure_password"
 
 telemetry:
+  days: 14
   repos:
-    - ~/Desktop/automation/office-automate
-    - ~/Desktop/automation/session-manager
-    - ~/Desktop/automation/taskbar
-    - ~/Desktop/fractal-market-simulator
-    - ~/Desktop/automation/social_media
-    - ~/Desktop/automation/backup-manager
+    - ~/projects/office-automate
+    - ~/projects/session-manager
+    - ~/projects/deskbar
+    - ~/projects/fractal-quant-algo
+    - ~/projects/fractal-algo-rust
+    - ~/projects/social_media
+    - ~/projects/backup-manager
+  codex_events_db: ~/.local/share/claude-sessions/codex_events.db
+  session_manager_sessions: ~/.local/share/claude-sessions/sessions.json
+  session_tool_usage_db: ~/.local/share/claude-sessions/tool_usage.db
+  tool_usage_db: ~/.local/share/claude-sessions/tool_usage.db
+  telemetry_db: data/telemetry.db
+  engram_db: data/engram_state.db
+  engram_registry: data/engram_concept_registry.md

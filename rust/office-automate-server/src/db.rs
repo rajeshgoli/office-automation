@@ -1543,6 +1543,7 @@ pub(crate) fn normalize_project_name(project: &str) -> String {
     match basename.as_str() {
         "" => "unknown".to_string(),
         "office-automation" | "claude-automate" => "office-automate".to_string(),
+        "taskbar" => "deskbar".to_string(),
         "financial-analysis" | "market generator" | "fms-branch" => "fractal".to_string(),
         "claude-session-manager" => "session-manager".to_string(),
         value if value == "fractal" || value.starts_with("fractal-") => "fractal".to_string(),
@@ -1808,6 +1809,20 @@ fn ensure_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_legacy_and_remote_project_names() {
+        assert_eq!(
+            normalize_project_name("office-automation"),
+            "office-automate"
+        );
+        assert_eq!(
+            normalize_project_name("/Users/rajesh/projects/taskbar"),
+            "deskbar"
+        );
+        assert_eq!(normalize_project_name("fractal-quant-algo"), "fractal");
+        assert_eq!(normalize_project_name("fractal-algo-rust"), "fractal");
+    }
 
     #[test]
     fn migration_is_idempotent() {
