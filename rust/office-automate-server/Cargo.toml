@@ -18,7 +18,7 @@ rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rumqttd = { version = "0.20", default-features = false }
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled"] }
 rustuya = "0.3.0-rc.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
