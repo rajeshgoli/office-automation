@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Local, Timelike};
 use reqwest::{Client, header};
 use serde_json::{Value, json};
-use tokio::{task::JoinHandle, time};
+use tokio::{sync::broadcast, task::JoinHandle, time};
 
 use crate::{
     config::{AppConfig, MitsubishiConfig},
@@ -55,9 +55,17 @@ impl HvacStatusReader for KumoHvacStatusReader {
 #[derive(Debug, Clone, Default)]
 pub struct HvacState {
     inner: Arc<RwLock<Option<HvacDeviceStatus>>>,
+    status_broadcast: Arc<RwLock<Option<broadcast::Sender<()>>>>,
 }
 
 impl HvacState {
+    pub fn set_status_broadcast(&self, sender: broadcast::Sender<()>) {
+        *self
+            .status_broadcast
+            .write()
+            .expect("HVAC broadcast lock poisoned") = Some(sender);
+    }
+
     pub async fn refresh_with<R>(
         &self,
         config: &MitsubishiConfig,
@@ -67,12 +75,17 @@ impl HvacState {
         R: HvacStatusReader + ?Sized,
     {
         let status = reader.read_status(config).await?;
-        self.record_status(status.clone());
+        if self.record_status(status.clone()) {
+            self.notify_status();
+        }
         Ok(status)
     }
 
-    pub fn record_status(&self, status: HvacDeviceStatus) {
-        *self.inner.write().expect("HVAC state lock poisoned") = Some(status);
+    pub fn record_status(&self, status: HvacDeviceStatus) -> bool {
+        let mut inner = self.inner.write().expect("HVAC state lock poisoned");
+        let changed = inner.as_ref() != Some(&status);
+        *inner = Some(status);
+        changed
     }
 
     pub fn latest(&self) -> Option<HvacDeviceStatus> {
@@ -86,6 +99,18 @@ impl HvacState {
 
         status.hvac.mode = device_status.mode;
         status.hvac.setpoint_c = device_status.setpoint_c;
+    }
+
+    fn notify_status(&self) {
+        let Some(sender) = self
+            .status_broadcast
+            .read()
+            .expect("HVAC broadcast lock poisoned")
+            .clone()
+        else {
+            return;
+        };
+        let _ = sender.send(());
     }
 }
 
@@ -332,6 +357,20 @@ mod tests {
     use super::*;
     use crate::{config::ThresholdsConfig, status::Status};
 
+    struct FakeHvacReader {
+        status: HvacDeviceStatus,
+    }
+
+    impl HvacStatusReader for FakeHvacReader {
+        fn read_status<'a>(
+            &'a self,
+            _config: &'a MitsubishiConfig,
+        ) -> BoxFutureResult<'a, HvacDeviceStatus> {
+            let status = self.status.clone();
+            Box::pin(async move { Ok(status) })
+        }
+    }
+
     #[test]
     fn parses_kumo_adapter_status_for_active_heat_and_cool() {
         let heat = parse_kumo_adapter_status(&json!({
@@ -411,5 +450,39 @@ mod tests {
 
         assert_eq!(status.hvac.mode, "cool");
         assert_eq!(status.hvac.setpoint_c, 24.5);
+    }
+
+    #[tokio::test]
+    async fn hvac_status_change_notifies_status_broadcast() {
+        let hvac = HvacState::default();
+        let (sender, mut receiver) = broadcast::channel(4);
+        hvac.set_status_broadcast(sender);
+        let config = MitsubishiConfig::default();
+
+        let cool = parse_kumo_adapter_status(&json!({
+            "power": 1,
+            "operationMode": "cool",
+            "spCool": 24.5
+        }))
+        .expect("cool status");
+        hvac.refresh_with(
+            &config,
+            &FakeHvacReader {
+                status: cool.clone(),
+            },
+        )
+        .await
+        .expect("refresh succeeds");
+
+        time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("broadcast timeout")
+            .expect("broadcast message");
+
+        hvac.refresh_with(&config, &FakeHvacReader { status: cool })
+            .await
+            .expect("refresh succeeds");
+
+        assert!(receiver.try_recv().is_err());
     }
 }

@@ -151,6 +151,7 @@ fn try_app_with_erv_writer_and_coordinator(
     let (status_broadcast, _) = broadcast::channel(32);
     yolink.set_status_broadcast(status_broadcast.clone());
     erv_state.set_status_broadcast(status_broadcast.clone());
+    hvac_state.set_status_broadcast(status_broadcast.clone());
     yolink.restore_from_database(unix_timestamp_now())?;
     let erv_policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
     let erv_automation = ErvPolicyCoordinator::new(
