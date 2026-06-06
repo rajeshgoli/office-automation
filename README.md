@@ -102,11 +102,11 @@ Locked behind Google OAuth with an email allowlist. JWT tokens. No "admin / admi
 
 ## What it runs on
 
-- **A Mac Mini.** Anything that can run Python 3.10 and stay awake. Has been running quietly for months.
+- **A Mac Mini.** Anything that can run the Rust server binary and stay awake. Has been running quietly for months.
 - **A Cloudflare tunnel** for remote access (or skip it and stay on LAN).
 - **A small React dashboard** served from the same orchestrator.
 
-That's it. No Kubernetes, no Docker, no Home Assistant. Three Launch Agents and a SQLite file.
+That's it. No Kubernetes, no Docker, no Home Assistant. A few LaunchAgents and a SQLite file.
 
 ---
 
