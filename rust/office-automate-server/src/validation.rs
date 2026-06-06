@@ -1336,7 +1336,12 @@ fn looks_like_office_origin_response(
     if headers
         .get(reqwest::header::WWW_AUTHENTICATE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("Office Automate"))
+        .is_some_and(|value| {
+            let challenge = value.to_ascii_lowercase();
+            challenge.contains("basic")
+                || challenge.contains("office automate")
+                || challenge.contains("office climate")
+        })
     {
         return true;
     }
@@ -2469,6 +2474,24 @@ mod tests {
         )
         .expect("Cloudflare Access redirect should pass");
 
+        let mut basic_challenge_headers = reqwest::header::HeaderMap::new();
+        basic_challenge_headers.insert(
+            reqwest::header::WWW_AUTHENTICATE,
+            reqwest::header::HeaderValue::from_static("Basic realm=\"Office Climate\""),
+        );
+        let error = validate_public_access_block_http_response(
+            "/status",
+            StatusCode::UNAUTHORIZED,
+            &basic_challenge_headers,
+            b"Authentication required",
+        )
+        .expect_err("Office Basic auth challenge should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("reached the Office Automate origin")
+        );
+
         let error = validate_public_access_block_http_response(
             "/status",
             StatusCode::UNAUTHORIZED,
@@ -2504,6 +2527,7 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         for path in [
             "/",
+            "/index.html",
             "/status",
             "/auth/login",
             "/auth/callback",

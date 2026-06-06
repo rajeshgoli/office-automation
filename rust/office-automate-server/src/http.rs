@@ -87,6 +87,11 @@ pub(crate) const PUBLIC_ACCESS_PROBES: &[PublicAccessProbe] = &[
         path: "/",
     },
     PublicAccessProbe {
+        name: "index-html",
+        method: PublicAccessProbeMethod::Get,
+        path: "/index.html",
+    },
+    PublicAccessProbe {
         name: "status",
         method: PublicAccessProbeMethod::Get,
         path: "/status",
