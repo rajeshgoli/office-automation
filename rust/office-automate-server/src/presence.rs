@@ -56,6 +56,7 @@ async fn run_command(program: &str, args: &[&str], command_timeout: Duration) ->
         command_timeout,
         Command::new(program)
             .args(args)
+            .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output(),
