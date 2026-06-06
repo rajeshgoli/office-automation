@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::Local;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, DatabaseName, OpenFlags};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -69,7 +69,11 @@ pub fn create_pre_cutover_snapshot(
     validations.extend(validate_config_material(config));
 
     let office_db_snapshot = snapshot_dir.join("office_climate.db");
-    copy_file(&config.runtime.database_path, &office_db_snapshot)?;
+    backup_sqlite(
+        "office database",
+        &config.runtime.database_path,
+        &office_db_snapshot,
+    )?;
     files_copied += 1;
     db::migrate_database(&office_db_snapshot).with_context(|| {
         format!(
@@ -120,7 +124,7 @@ pub fn create_pre_cutover_snapshot(
     files_copied += copy_optional_file(
         "legacy APK",
         &config.runtime.legacy_apk_path,
-        &snapshot_dir.join("legacy").join("office-climate.apk"),
+        &snapshot_dir.join("app-debug.apk"),
         &mut validations,
     )?;
     if let Some(cloudflared_config_path) = cloudflared_config_path {
@@ -149,10 +153,8 @@ pub fn create_pre_cutover_snapshot(
 
     if config.runtime.artifacts_dir.exists() {
         validate_artifact_metadata(&config.runtime.artifacts_dir, &mut validations)?;
-        files_copied += copy_dir_recursive(
-            &config.runtime.artifacts_dir,
-            &snapshot_dir.join("artifacts"),
-        )?;
+        files_copied +=
+            copy_dir_recursive(&config.runtime.artifacts_dir, &snapshot_dir.join("apps"))?;
     } else {
         validations.push(format!(
             "optional artifacts directory missing: {}",
@@ -603,10 +605,37 @@ fn copy_optional_sqlite(
     }
 
     ensure_readable_file(label, source)?;
-    copy_file(source, destination)?;
+    backup_sqlite(label, source, destination)?;
     quick_check_sqlite(label, destination)?;
     validations.push(format!("{label} quick_check ok"));
     Ok(1)
+}
+
+fn backup_sqlite(label: &str, source: &Path, destination: &Path) -> Result<()> {
+    ensure_readable_file(label, source)?;
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    if destination.exists() {
+        fs::remove_file(destination)
+            .with_context(|| format!("failed to replace {}", destination.display()))?;
+    }
+    let connection = Connection::open_with_flags(
+        source,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open {label}: {}", source.display()))?;
+    connection
+        .backup(DatabaseName::Main, destination, None)
+        .with_context(|| {
+            format!(
+                "failed to create consistent SQLite backup of {label}: {} -> {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    Ok(())
 }
 
 fn copy_optional_file(
@@ -785,6 +814,15 @@ mod tests {
             .expect("sqlite schema");
     }
 
+    fn read_test_value(path: &Path, id: i64) -> String {
+        let connection = Connection::open(path).expect("sqlite");
+        connection
+            .query_row("SELECT value FROM test_data WHERE id = ?", [id], |row| {
+                row.get(0)
+            })
+            .expect("test data value")
+    }
+
     fn cloudflared_credentials_file(path: &Path) -> String {
         let contents = fs::read_to_string(path).expect("cloudflared config contents");
         let config: serde_yaml::Value =
@@ -815,6 +853,7 @@ mod tests {
             r#"{"artifact_hash":"1a2b3c4d","uploaded_at":"2026-06-05T00:00:00Z","size_bytes":3,"uploaded_by":"test@example.com"}"#,
         )
         .expect("metadata");
+        fs::write(root.join("data/app-debug.apk"), b"legacy").expect("legacy apk");
 
         let config = test_config(root, config_path.clone(), database_path);
         let output_dir = root.join("snapshots");
@@ -826,11 +865,18 @@ mod tests {
         assert!(
             report
                 .snapshot_dir
-                .join("artifacts/office-climate/meta.json")
+                .join("apps/office-climate/meta.json")
                 .is_file()
         );
+        assert!(report.snapshot_dir.join("app-debug.apk").is_file());
+        assert!(
+            !report
+                .snapshot_dir
+                .join("legacy/office-climate.apk")
+                .exists()
+        );
         assert!(report.snapshot_dir.join("manifest.json").is_file());
-        assert!(report.files_copied >= 5);
+        assert!(report.files_copied >= 6);
         assert!(
             report
                 .validations
@@ -932,6 +978,27 @@ mod tests {
         .expect("shared snapshot succeeds");
         assert!(shared_report.validations.iter().any(|validation| validation
             == "session tool usage database shares project tool usage database snapshot"));
+    }
+
+    #[test]
+    fn sqlite_backup_includes_committed_wal_rows() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path();
+        let source = root.join("source.db");
+        let destination = root.join("snapshot/telemetry.db");
+        let source_connection = Connection::open(&source).expect("source sqlite");
+        source_connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE test_data (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO test_data (id, value) VALUES (7, 'committed-wal-row');",
+            )
+            .expect("wal sqlite");
+
+        backup_sqlite("source sqlite", &source, &destination).expect("sqlite backup");
+
+        assert_eq!(read_test_value(&destination, 7), "committed-wal-row");
     }
 
     #[test]
