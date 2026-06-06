@@ -5,6 +5,12 @@
   <key>Label</key>
   <string>com.office-automate.tunnel</string>
 
+  <key>UserName</key>
+  <string>__OFFICE_AUTOMATE_TUNNEL_USER__</string>
+
+  <key>GroupName</key>
+  <string>__OFFICE_AUTOMATE_TUNNEL_GROUP__</string>
+
   <key>ProgramArguments</key>
   <array>
     <string>__CLOUDFLARED_BIN__</string>
