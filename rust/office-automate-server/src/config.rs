@@ -43,6 +43,8 @@ pub struct TelemetryConfig {
     pub repos: Vec<PathBuf>,
     pub tool_usage_db: Option<PathBuf>,
     pub session_tool_usage_db: Option<PathBuf>,
+    pub codex_events_db: Option<PathBuf>,
+    pub session_manager_sessions: Option<PathBuf>,
     pub telemetry_db: Option<PathBuf>,
     pub engram_db: Option<PathBuf>,
     pub engram_registry: Option<PathBuf>,
@@ -489,6 +491,14 @@ impl AppConfig {
             file_config.telemetry.session_tool_usage_db = Some(PathBuf::from(path));
         }
 
+        if let Some(path) = env_lookup("OFFICE_AUTOMATE_CODEX_EVENTS_DB") {
+            file_config.telemetry.codex_events_db = Some(PathBuf::from(path));
+        }
+
+        if let Some(path) = env_lookup("OFFICE_AUTOMATE_SESSION_MANAGER_SESSIONS") {
+            file_config.telemetry.session_manager_sessions = Some(PathBuf::from(path));
+        }
+
         if let Some(path) = env_lookup("OFFICE_AUTOMATE_TELEMETRY_DB") {
             file_config.telemetry.telemetry_db = Some(PathBuf::from(path));
         }
@@ -512,6 +522,14 @@ impl AppConfig {
             .into_iter()
             .map(|path| expand_home_relative_path(path, home_dir.as_deref()))
             .collect();
+        file_config.telemetry.codex_events_db = file_config
+            .telemetry
+            .codex_events_db
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()));
+        file_config.telemetry.session_manager_sessions = file_config
+            .telemetry
+            .session_manager_sessions
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()));
 
         let telemetry_db_path = file_config
             .telemetry
@@ -692,6 +710,16 @@ thresholds:
                     .display()
                     .to_string(),
             ),
+            "OFFICE_AUTOMATE_CODEX_EVENTS_DB" => Some(
+                temp_dir
+                    .path()
+                    .join("codex_events.sqlite")
+                    .display()
+                    .to_string(),
+            ),
+            "OFFICE_AUTOMATE_SESSION_MANAGER_SESSIONS" => {
+                Some(temp_dir.path().join("sessions.json").display().to_string())
+            }
             "OFFICE_AUTOMATE_TELEMETRY_DB" => Some(
                 temp_dir
                     .path()
@@ -773,6 +801,14 @@ thresholds:
             temp_dir.path().join("session_tool_usage.sqlite")
         );
         assert_eq!(
+            config.telemetry.codex_events_db,
+            Some(temp_dir.path().join("codex_events.sqlite"))
+        );
+        assert_eq!(
+            config.telemetry.session_manager_sessions,
+            Some(temp_dir.path().join("sessions.json"))
+        );
+        assert_eq!(
             config.runtime.telemetry_db_path,
             temp_dir.path().join("telemetry.sqlite")
         );
@@ -810,6 +846,8 @@ thresholds:
 telemetry:
   repos:
     - "~/Desktop/automation/office-automate"
+  codex_events_db: "~/.local/share/claude-sessions/codex_events.db"
+  session_manager_sessions: "~/.local/share/claude-sessions/sessions.json"
 "#,
         )
         .expect("write config");
@@ -831,6 +869,26 @@ telemetry:
                 .join("share")
                 .join("claude-sessions")
                 .join("tool_usage.db")
+        );
+        assert_eq!(
+            config.telemetry.codex_events_db,
+            Some(
+                home_dir
+                    .join(".local")
+                    .join("share")
+                    .join("claude-sessions")
+                    .join("codex_events.db")
+            )
+        );
+        assert_eq!(
+            config.telemetry.session_manager_sessions,
+            Some(
+                home_dir
+                    .join(".local")
+                    .join("share")
+                    .join("claude-sessions")
+                    .join("sessions.json")
+            )
         );
         assert_eq!(
             config.runtime.tool_usage_db_path,

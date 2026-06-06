@@ -1,6 +1,7 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -15,6 +16,8 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Local, NaiveDateTime};
 use chrono_tz::America::Los_Angeles;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Deserialize;
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetryCollectStats {
@@ -53,6 +56,35 @@ struct CommitStats {
     deletions: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrchestrationActivityRow {
+    timestamp: String,
+    tool: String,
+    project: String,
+    session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexUserTurn {
+    cwd: Option<String>,
+    texts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SessionManagerState {
+    #[serde(default)]
+    sessions: Vec<SessionManagerSession>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SessionManagerSession {
+    id: String,
+    #[serde(default)]
+    working_dir: Option<String>,
+    #[serde(default)]
+    git_remote_url: Option<String>,
+}
+
 pub fn collect_telemetry(config: &AppConfig, dry_run: bool) -> Result<TelemetryCollectStats> {
     let days = if config.telemetry.days == 0 {
         2
@@ -60,6 +92,20 @@ pub fn collect_telemetry(config: &AppConfig, dry_run: bool) -> Result<TelemetryC
         config.telemetry.days
     };
     let worktree_map_path = config.runtime.data_dir.join("worktree_map.json");
+    if !dry_run {
+        if let Some(codex_events_db_path) = codex_events_db_path(config) {
+            let session_manager_sessions_path = session_manager_sessions_path(config);
+            import_codex_orchestration_activity(
+                &config.runtime.database_path,
+                &codex_events_db_path,
+                session_manager_sessions_path.as_deref(),
+                &config.telemetry.repos,
+                Some(worktree_map_path.as_path()),
+                days,
+                Local::now().naive_local(),
+            )?;
+        }
+    }
     collect_session_telemetry_with_worktree_map(
         &config.runtime.session_tool_usage_db_path,
         &config.runtime.telemetry_db_path,
@@ -69,6 +115,34 @@ pub fn collect_telemetry(config: &AppConfig, dry_run: bool) -> Result<TelemetryC
         dry_run,
         Local::now().naive_local(),
     )
+}
+
+fn codex_events_db_path(config: &AppConfig) -> Option<PathBuf> {
+    config.telemetry.codex_events_db.clone().or_else(|| {
+        env::var("HOME").ok().map(|home| {
+            PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("claude-sessions")
+                .join("codex_events.db")
+        })
+    })
+}
+
+fn session_manager_sessions_path(config: &AppConfig) -> Option<PathBuf> {
+    config
+        .telemetry
+        .session_manager_sessions
+        .clone()
+        .or_else(|| {
+            env::var("HOME").ok().map(|home| {
+                PathBuf::from(home)
+                    .join(".local")
+                    .join("share")
+                    .join("claude-sessions")
+                    .join("sessions.json")
+            })
+        })
 }
 
 pub fn collect_session_telemetry(
@@ -146,6 +220,348 @@ fn collect_session_telemetry_with_worktree_map(
         synthetic_rows,
         matched_commits: matched_hashes.len(),
     })
+}
+
+fn import_codex_orchestration_activity(
+    database_path: &Path,
+    codex_events_db_path: &Path,
+    session_manager_sessions_path: Option<&Path>,
+    repos: &[PathBuf],
+    worktree_map_path: Option<&Path>,
+    days: u64,
+    now: NaiveDateTime,
+) -> Result<usize> {
+    if !codex_events_db_path.exists() {
+        tracing::info!(
+            "skipping Codex orchestration import; DB not found at {}",
+            codex_events_db_path.display()
+        );
+        return Ok(0);
+    }
+
+    let codex_connection = Connection::open(codex_events_db_path).with_context(|| {
+        format!(
+            "failed to open Codex events SQLite database {}",
+            codex_events_db_path.display()
+        )
+    })?;
+    if !table_exists(&codex_connection, "codex_session_events")? {
+        tracing::info!(
+            "skipping Codex orchestration import; codex_session_events missing in {}",
+            codex_events_db_path.display()
+        );
+        return Ok(0);
+    }
+
+    let cutoff = start_of_day(now - Duration::days(days.max(1) as i64 - 1));
+    let cutoff_string = format_timestamp(cutoff);
+    let resolver = CodexProjectResolver::new(
+        &codex_connection,
+        repos,
+        worktree_map_path,
+        session_manager_sessions_path,
+    )?;
+    let mut statement = codex_connection.prepare(
+        "SELECT session_id, timestamp, payload_preview_json
+         FROM codex_session_events
+         WHERE event_type = 'codex_fork_op_submitted'
+         ORDER BY timestamp ASC",
+    )?;
+    let event_rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut rows = Vec::new();
+    for row in event_rows {
+        let (session_id, raw_timestamp, payload) = row?;
+        let timestamp = parse_datetime(&raw_timestamp)?;
+        if timestamp < cutoff {
+            continue;
+        }
+        let Some(turn) = parse_codex_user_turn(&payload) else {
+            continue;
+        };
+        if is_machine_generated_turn(&turn) {
+            continue;
+        }
+        rows.push(OrchestrationActivityRow {
+            timestamp: format_timestamp(timestamp),
+            tool: "codex".to_string(),
+            project: resolver.project_for_turn(&session_id, turn.cwd.as_deref()),
+            session_id,
+        });
+    }
+
+    replace_codex_orchestration_rows(database_path, &cutoff_string, &rows)?;
+    Ok(rows.len())
+}
+
+fn replace_codex_orchestration_rows(
+    database_path: &Path,
+    cutoff: &str,
+    rows: &[OrchestrationActivityRow],
+) -> Result<()> {
+    db::migrate_database(database_path)?;
+    let mut connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "DELETE FROM orchestration_activity WHERE tool = 'codex' AND timestamp >= ?",
+        params![cutoff],
+    )?;
+    {
+        let mut statement = transaction.prepare(
+            "INSERT INTO orchestration_activity (timestamp, tool, project, session_id)
+             VALUES (?, ?, ?, ?)",
+        )?;
+        for row in rows {
+            statement.execute(params![
+                row.timestamp,
+                row.tool,
+                row.project,
+                row.session_id
+            ])?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+struct CodexProjectResolver {
+    worktrees: WorktreeResolver,
+    session_projects: HashMap<String, String>,
+}
+
+impl CodexProjectResolver {
+    fn new(
+        codex_connection: &Connection,
+        repos: &[PathBuf],
+        worktree_map_path: Option<&Path>,
+        session_manager_sessions_path: Option<&Path>,
+    ) -> Result<Self> {
+        let worktrees = WorktreeResolver::new(repos, worktree_map_path);
+        let mut session_projects = HashMap::new();
+
+        if let Some(path) = session_manager_sessions_path {
+            session_projects.extend(load_session_manager_projects(path, &worktrees));
+        }
+        session_projects.extend(load_codex_session_start_projects(
+            codex_connection,
+            &worktrees,
+        )?);
+
+        Ok(Self {
+            worktrees,
+            session_projects,
+        })
+    }
+
+    fn project_for_turn(&self, session_id: &str, cwd: Option<&str>) -> String {
+        if let Some(cwd) = cwd {
+            return self.worktrees.normalize_project_name(cwd);
+        }
+        self.session_projects
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+}
+
+fn load_session_manager_projects(
+    path: &Path,
+    worktrees: &WorktreeResolver,
+) -> HashMap<String, String> {
+    if !path.exists() {
+        return HashMap::new();
+    }
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            tracing::warn!(
+                "failed to read session manager state {}: {}",
+                path.display(),
+                error
+            );
+            return HashMap::new();
+        }
+    };
+    let state = match serde_json::from_str::<SessionManagerState>(&contents) {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(
+                "failed to parse session manager state {}: {}",
+                path.display(),
+                error
+            );
+            return HashMap::new();
+        }
+    };
+    state
+        .sessions
+        .into_iter()
+        .filter_map(|session| {
+            let project = session
+                .git_remote_url
+                .as_deref()
+                .and_then(project_name_from_git_remote)
+                .or_else(|| {
+                    session
+                        .working_dir
+                        .as_deref()
+                        .map(|path| worktrees.normalize_project_name(path))
+                })?;
+            Some((session.id, project))
+        })
+        .collect()
+}
+
+fn load_codex_session_start_projects(
+    connection: &Connection,
+    worktrees: &WorktreeResolver,
+) -> Result<HashMap<String, String>> {
+    let mut statement = connection.prepare(
+        "SELECT session_id, payload_preview_json
+         FROM codex_session_events
+         WHERE event_type = 'codex_fork_session_start'
+         ORDER BY timestamp ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut projects = HashMap::new();
+    for row in rows {
+        let (session_id, payload) = row?;
+        let Some(cwd) = parse_codex_session_start_cwd(&payload) else {
+            continue;
+        };
+        projects
+            .entry(session_id)
+            .or_insert_with(|| worktrees.normalize_project_name(&cwd));
+    }
+    Ok(projects)
+}
+
+fn parse_codex_user_turn(payload: &str) -> Option<CodexUserTurn> {
+    let value = serde_json::from_str::<Value>(payload).ok()?;
+    parse_codex_user_turn_value(&value).or_else(|| {
+        let preview = value.get("preview").and_then(Value::as_str)?;
+        serde_json::from_str::<Value>(preview)
+            .ok()
+            .and_then(|preview_value| parse_codex_user_turn_value(&preview_value))
+            .or_else(|| parse_codex_user_turn_preview(preview))
+    })
+}
+
+fn parse_codex_user_turn_value(value: &Value) -> Option<CodexUserTurn> {
+    let turn = value.pointer("/payload/UserTurn")?;
+    let cwd = turn
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let texts = turn
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(CodexUserTurn { cwd, texts })
+}
+
+fn parse_codex_user_turn_preview(preview: &str) -> Option<CodexUserTurn> {
+    let cwd = extract_json_string_fields(preview, "cwd")
+        .into_iter()
+        .next();
+    let texts = extract_json_string_fields(preview, "text");
+    if cwd.is_none() && texts.is_empty() {
+        return None;
+    }
+    Some(CodexUserTurn { cwd, texts })
+}
+
+fn parse_codex_session_start_cwd(payload: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(payload).ok()?;
+    value
+        .pointer("/payload/cwd")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let preview = value.get("preview").and_then(Value::as_str)?;
+            serde_json::from_str::<Value>(preview)
+                .ok()
+                .and_then(|preview_value| {
+                    preview_value
+                        .pointer("/payload/cwd")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    extract_json_string_fields(preview, "cwd")
+                        .into_iter()
+                        .next()
+                })
+        })
+}
+
+fn is_machine_generated_turn(turn: &CodexUserTurn) -> bool {
+    turn.texts.is_empty()
+        || turn
+            .texts
+            .iter()
+            .all(|text| is_machine_generated_text(text))
+}
+
+fn is_machine_generated_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("[Input from:") || trimmed.starts_with("[sm")
+}
+
+fn extract_json_string_fields(haystack: &str, field: &str) -> Vec<String> {
+    let needle = format!("\"{field}\":\"");
+    let mut search_start = 0;
+    let mut values = Vec::new();
+    while let Some(relative_index) = haystack[search_start..].find(&needle) {
+        let start = search_start + relative_index + needle.len();
+        let Some((value, next_start)) = read_json_string_at(haystack, start) else {
+            break;
+        };
+        values.push(value);
+        search_start = next_start;
+    }
+    values
+}
+
+fn read_json_string_at(input: &str, start: usize) -> Option<(String, usize)> {
+    let mut escaped = false;
+    for (relative_index, character) in input[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '"' => {
+                let end = start + relative_index;
+                let raw = &input[start..end];
+                let parsed = serde_json::from_str::<String>(&format!("\"{raw}\""))
+                    .unwrap_or_else(|_| raw.to_string());
+                return Some((parsed, end + 1));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 pub fn collect_project_leverage(config: &AppConfig) -> Result<usize> {
@@ -268,7 +684,7 @@ fn collect_git_stats(
     repos: &[PathBuf],
     cutoff: NaiveDateTime,
 ) -> Result<HashMap<String, Vec<CommitStats>>> {
-    let mut commits_by_repo = HashMap::new();
+    let mut commits_by_repo: HashMap<String, Vec<CommitStats>> = HashMap::new();
     let cutoff_arg = format_timestamp(cutoff);
 
     for repo in repos {
@@ -297,11 +713,13 @@ fn collect_git_stats(
             );
         }
 
-        let repo_name = normalize_project_name(
-            repo.file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("unknown"),
-        );
+        let repo_name = canonical_project_name_for_path(repo).unwrap_or_else(|| {
+            normalize_project_name(
+                repo.file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("unknown"),
+            )
+        });
         let mut commits = Vec::new();
         let mut current: Option<CommitStats> = None;
         for raw_line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -339,7 +757,10 @@ fn collect_git_stats(
         if let Some(commit) = current {
             commits.push(commit);
         }
-        commits_by_repo.insert(repo_name, commits);
+        commits_by_repo
+            .entry(repo_name)
+            .or_default()
+            .extend(commits);
     }
 
     Ok(commits_by_repo)
@@ -763,6 +1184,7 @@ fn project_row(date: &str, project: &str, metric: &str, value: f64) -> ProjectLe
 #[derive(Debug, Clone, Default)]
 struct WorktreeResolver {
     worktree_map: HashMap<String, String>,
+    path_cache: RefCell<HashMap<String, String>>,
 }
 
 impl WorktreeResolver {
@@ -773,9 +1195,13 @@ impl WorktreeResolver {
         }
 
         for repo in repos {
-            let Some(repo_name) = repo.file_name().and_then(|value| value.to_str()) else {
-                continue;
-            };
+            let repo_name = canonical_project_name_for_path(repo).unwrap_or_else(|| {
+                normalize_project_name(
+                    repo.file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("unknown"),
+                )
+            });
             let worktrees_dir = repo.join(".git").join("worktrees");
             let Ok(entries) = fs::read_dir(&worktrees_dir) else {
                 continue;
@@ -790,12 +1216,15 @@ impl WorktreeResolver {
                 if let Some(name) = entry.file_name().to_str() {
                     worktree_map
                         .entry(name.to_string())
-                        .or_insert_with(|| repo_name.to_string());
+                        .or_insert_with(|| repo_name.clone());
                 }
             }
         }
 
-        Self { worktree_map }
+        Self {
+            worktree_map,
+            path_cache: RefCell::new(HashMap::new()),
+        }
     }
 
     fn normalize_project_name(&self, project: &str) -> String {
@@ -803,6 +1232,16 @@ impl WorktreeResolver {
         let normalized = normalized.trim_end_matches('/');
         if normalized.is_empty() {
             return "unknown".to_string();
+        }
+
+        if let Some(project) = self.path_cache.borrow().get(normalized).cloned() {
+            return project;
+        }
+        if let Some(project) = canonical_project_name_for_path(Path::new(normalized)) {
+            self.path_cache
+                .borrow_mut()
+                .insert(normalized.to_string(), project.clone());
+            return project;
         }
 
         if let Some(parent) = resolve_worktree_parent_from_disk(Path::new(normalized)) {
@@ -842,6 +1281,9 @@ fn resolve_worktree_parent_from_disk(path: &Path) -> Option<String> {
     for candidate in path.ancestors() {
         let git_path = candidate.join(".git");
         if git_path.is_file() {
+            if let Some(project) = canonical_project_name_for_path(candidate) {
+                return Some(project);
+            }
             let contents = fs::read_to_string(&git_path).ok()?;
             let gitdir = contents
                 .lines()
@@ -849,6 +1291,9 @@ fn resolve_worktree_parent_from_disk(path: &Path) -> Option<String> {
             return repo_basename_from_gitdir(gitdir);
         }
         if git_path.is_dir() {
+            if let Some(project) = canonical_project_name_for_path(candidate) {
+                return Some(project);
+            }
             return candidate
                 .file_name()
                 .and_then(|value| value.to_str())
@@ -869,6 +1314,77 @@ fn repo_basename_from_gitdir(gitdir: &str) -> Option<String> {
         .get(git_index - 1)
         .filter(|value| !value.is_empty())
         .map(|value| (*value).to_string())
+}
+
+fn canonical_project_name_for_path(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    let root = git_root_for_path(path)?;
+    if let Some(project) = git_remote_for_path(&root)
+        .as_deref()
+        .and_then(project_name_from_git_remote)
+    {
+        return Some(project);
+    }
+    if let Some(project) =
+        repo_basename_from_git_file(&root.join(".git")).map(|repo| normalize_project_name(&repo))
+    {
+        return Some(project);
+    }
+    root.file_name()
+        .and_then(|value| value.to_str())
+        .map(normalize_project_name)
+}
+
+fn repo_basename_from_git_file(path: &Path) -> Option<String> {
+    if !path.is_file() {
+        return None;
+    }
+    let contents = fs::read_to_string(path).ok()?;
+    let gitdir = contents
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gitdir:").map(str::trim))?;
+    repo_basename_from_gitdir(gitdir)
+}
+
+fn git_root_for_path(path: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    let root = root.trim();
+    (!root.is_empty()).then(|| PathBuf::from(root))
+}
+
+fn git_remote_for_path(path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let remote = String::from_utf8(output.stdout).ok()?;
+    let remote = remote.trim();
+    (!remote.is_empty()).then(|| remote.to_string())
+}
+
+fn project_name_from_git_remote(remote: &str) -> Option<String> {
+    let trimmed = remote.trim().trim_end_matches(".git");
+    let repo_name = trimmed
+        .rsplit(|character| character == '/' || character == ':')
+        .next()
+        .filter(|value| !value.is_empty())?;
+    Some(normalize_project_name(repo_name))
 }
 
 fn table_exists(connection: &Connection, table_name: &str) -> Result<bool> {
@@ -1033,9 +1549,8 @@ mod tests {
         );
     }
 
-    fn init_repo() -> (TempDir, PathBuf) {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let repo = temp_dir.path().join("office-automate");
+    fn init_repo_in(parent: &Path, name: &str, remote: Option<&str>) -> PathBuf {
+        let repo = parent.join(name);
         fs::create_dir(&repo).expect("repo dir");
         run_git(&repo, &["init"], None);
         run_git(&repo, &["config", "user.name", "Telemetry Test"], None);
@@ -1044,7 +1559,59 @@ mod tests {
             &["config", "user.email", "telemetry@example.com"],
             None,
         );
+        if let Some(remote) = remote {
+            run_git(&repo, &["remote", "add", "origin", remote], None);
+        }
+        repo
+    }
+
+    fn init_repo() -> (TempDir, PathBuf) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo = init_repo_in(temp_dir.path(), "office-automate", None);
         (temp_dir, repo)
+    }
+
+    fn create_codex_events_db(path: &Path) {
+        let connection = Connection::open(path).expect("open codex events DB");
+        connection
+            .execute_batch(
+                "CREATE TABLE codex_session_events (
+                    session_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    turn_id TEXT,
+                    payload_preview_json TEXT,
+                    PRIMARY KEY (session_id, seq)
+                );",
+            )
+            .expect("codex events schema");
+    }
+
+    fn insert_codex_event(
+        path: &Path,
+        session_id: &str,
+        seq: i64,
+        timestamp: &str,
+        event_type: &str,
+        payload: &Value,
+    ) {
+        let connection = Connection::open(path).expect("open codex events DB");
+        connection
+            .execute(
+                "INSERT INTO codex_session_events (
+                    session_id, seq, timestamp, event_type, turn_id, payload_preview_json
+                 ) VALUES (?, ?, ?, ?, ?, ?)",
+                params![
+                    session_id,
+                    seq,
+                    timestamp,
+                    event_type,
+                    Option::<String>::None,
+                    payload.to_string()
+                ],
+            )
+            .expect("insert codex event");
     }
 
     #[test]
@@ -1308,6 +1875,168 @@ mod tests {
         assert_eq!(
             resolver.normalize_project_name("fractal-1808-em"),
             "fractal"
+        );
+    }
+
+    #[test]
+    fn git_remote_identity_merges_fractal_repos() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let quant_repo = init_repo_in(
+            temp_dir.path(),
+            "quant-local",
+            Some("https://github.com/rajeshgoli/fractal-quant-algo.git"),
+        );
+        let rust_repo = init_repo_in(
+            temp_dir.path(),
+            "rust-local",
+            Some("git@github.com:rajeshgoli/fractal-algo-rust.git"),
+        );
+
+        for (repo, filename, contents, message) in [
+            (&quant_repo, "quant.py", "print('quant')\n", "quant"),
+            (&rust_repo, "rust.rs", "fn main() {}\n", "rust"),
+        ] {
+            fs::write(repo.join(filename), contents).expect("write tracked");
+            run_git(repo, &["add", filename], None);
+            run_git(
+                repo,
+                &["commit", "-m", message],
+                Some("2026-03-27T09:00:00-07:00"),
+            );
+        }
+
+        let tool_db = temp_dir.path().join("tool_usage.db");
+        let telemetry_db = temp_dir.path().join("telemetry.db");
+        create_tool_usage_db(&tool_db);
+
+        let stats = collect_session_telemetry(
+            &tool_db,
+            &telemetry_db,
+            &[quant_repo, rust_repo],
+            30,
+            false,
+            parse_datetime("2026-03-28 12:00:00").expect("now"),
+        )
+        .expect("collect");
+
+        assert_eq!(
+            stats,
+            TelemetryCollectStats {
+                sessions: 0,
+                rows_written: 1,
+                synthetic_rows: 1,
+                matched_commits: 0,
+            }
+        );
+
+        let connection = Connection::open(&telemetry_db).expect("open telemetry");
+        let row: (String, i64, i64) = connection
+            .query_row(
+                "SELECT project, git_commits, lines_added
+                 FROM session_output
+                 WHERE session_id = 'unattributed-fractal-2026-03-27'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("synthetic fractal row");
+
+        assert_eq!(row, ("fractal".to_string(), 2, 2));
+    }
+
+    #[test]
+    fn codex_event_import_populates_project_focus_from_git_identity() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let repo = init_repo_in(
+            temp_dir.path(),
+            "not-fractal-named",
+            Some("https://github.com/rajeshgoli/fractal-quant-algo.git"),
+        );
+        let office_db = temp_dir.path().join("office.db");
+        let codex_db = temp_dir.path().join("codex_events.db");
+        create_codex_events_db(&codex_db);
+
+        let cwd = repo.display().to_string();
+        insert_codex_event(
+            &codex_db,
+            "session-1",
+            1,
+            "2026-06-06T17:50:00Z",
+            "codex_fork_session_start",
+            &serde_json::json!({
+                "schema_version": 2,
+                "payload": { "cwd": cwd }
+            }),
+        );
+        insert_codex_event(
+            &codex_db,
+            "session-1",
+            2,
+            "2026-06-06T18:00:00Z",
+            "codex_fork_op_submitted",
+            &serde_json::json!({
+                "schema_version": 2,
+                "payload": {
+                    "UserTurn": {
+                        "cwd": repo.display().to_string(),
+                        "items": [{ "type": "text", "text": "implement the strategy check" }]
+                    }
+                }
+            }),
+        );
+        insert_codex_event(
+            &codex_db,
+            "session-1",
+            3,
+            "2026-06-06T18:05:00Z",
+            "codex_fork_op_submitted",
+            &serde_json::json!({
+                "schema_version": 2,
+                "payload": {
+                    "UserTurn": {
+                        "cwd": repo.display().to_string(),
+                        "items": [{ "type": "text", "text": "[sm review] Codex review for PR #1 is here." }]
+                    }
+                }
+            }),
+        );
+
+        let imported = import_codex_orchestration_activity(
+            &office_db,
+            &codex_db,
+            None,
+            std::slice::from_ref(&repo),
+            None,
+            1,
+            parse_datetime("2026-06-06 12:00:00").expect("now"),
+        )
+        .expect("import codex events");
+        assert_eq!(imported, 1);
+
+        let imported_again = import_codex_orchestration_activity(
+            &office_db,
+            &codex_db,
+            None,
+            std::slice::from_ref(&repo),
+            None,
+            1,
+            parse_datetime("2026-06-06 12:00:00").expect("now"),
+        )
+        .expect("import codex events again");
+        assert_eq!(imported_again, 1);
+
+        let connection = Connection::open(&office_db).expect("open office DB");
+        let row: (i64, String, String) = connection
+            .query_row(
+                "SELECT COUNT(*), MIN(project), MIN(timestamp)
+                 FROM orchestration_activity",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("orchestration rows");
+
+        assert_eq!(
+            row,
+            (1, "fractal".to_string(), "2026-06-06 11:00:00".to_string())
         );
     }
 
