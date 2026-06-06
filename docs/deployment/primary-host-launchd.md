@@ -9,7 +9,7 @@ The templates live in `scripts/launchd/primary-host/`:
 | `com.office-automate.server.plist.template` | `com.office-automate.server` | Runs `office-automate-server serve --config <config>` as the core API, WebSocket, MQTT ingress, presence, and device-client process. |
 | `com.office-automate.telemetry.plist.template` | `com.office-automate.telemetry` | Runs `office-automate-server collect --config <config> telemetry` on an interval. |
 | `com.office-automate.project-leverage.plist.template` | `com.office-automate.project-leverage` | Runs `office-automate-server collect --config <config> leverage` on an interval. |
-| `com.office-automate.tunnel.plist.template` | `com.office-automate.tunnel` | Runs `cloudflared tunnel --config <config> run <tunnel>` as the public transport process. |
+| `com.office-automate.tunnel.plist.template` | `com.office-automate.tunnel` | Runs `cloudflared tunnel --no-autoupdate --config <config> run <tunnel>` as the public transport process. |
 
 LocalTunnel is intentionally not represented. Public access is Cloudflare Tunnel only; application auth remains owned by `office-automate-server`.
 
@@ -81,7 +81,7 @@ launchctl kickstart -k "gui/$(id -u)/com.office-automate.project-leverage"
 launchctl kickstart -k "gui/$(id -u)/com.office-automate.tunnel"
 ```
 
-The server and tunnel templates use `KeepAlive`; launchd restarts them after crashes or non-manual exits. The collector templates use `StartInterval` and `RunAtLoad`; they run once at load and then on their configured interval.
+The server and tunnel templates use `KeepAlive`; launchd restarts them after crashes or non-manual exits. The tunnel template passes `--no-autoupdate` so launchd remains the only process supervisor. The collector templates use `StartInterval` and `RunAtLoad`; they run once at load and then on their configured interval.
 
 ## Logs
 
