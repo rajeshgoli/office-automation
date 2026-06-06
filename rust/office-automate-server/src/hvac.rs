@@ -406,11 +406,13 @@ impl HvacState {
         inner.manual_override.is_some()
     }
 
-    pub fn clear_manual_override(&self) {
+    pub fn clear_manual_override(&self) -> bool {
         self.inner
             .write()
             .expect("HVAC state lock poisoned")
-            .manual_override = None;
+            .manual_override
+            .take()
+            .is_some()
     }
 
     pub fn set_suspended(&self, suspended: bool, last_mode: Option<String>) {
