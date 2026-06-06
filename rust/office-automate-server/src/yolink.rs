@@ -21,7 +21,7 @@ use crate::{
     status::Status,
 };
 
-pub type DeviceIngressHook = Arc<dyn Fn() + Send + Sync + 'static>;
+pub type DeviceIngressHook = Arc<dyn Fn(Option<StateTransition>) + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceType {
@@ -640,8 +640,8 @@ async fn apply_yolink_report_with_policy(
     device_hook: Option<&DeviceIngressHook>,
 ) -> Result<()> {
     if let Some(erv_automation) = erv_automation {
-        let report_applied = Arc::new(Mutex::new(false));
-        let report_applied_for_hook = report_applied.clone();
+        let report_transition = Arc::new(Mutex::new(None::<Option<StateTransition>>));
+        let report_transition_for_hook = report_transition.clone();
         let policy_result = erv_automation
             .update_state_and_maybe_evaluate(|| {
                 let applied = yolink
@@ -650,11 +650,14 @@ async fn apply_yolink_report_with_policy(
                 let Some(applied) = applied else {
                     return Ok((None, None, now, false, false));
                 };
-                *report_applied_for_hook.lock().expect("report applied lock") = true;
+                let transition = applied.transition;
+                *report_transition_for_hook
+                    .lock()
+                    .expect("report transition lock") = Some(transition);
                 let bypass_dwell = applied.transition.is_some();
                 Ok((
-                    Some(applied.device_type),
-                    applied.transition,
+                    Some((applied.device_type, transition)),
+                    transition,
                     now,
                     bypass_dwell,
                     true,
@@ -662,17 +665,18 @@ async fn apply_yolink_report_with_policy(
             })
             .await;
         match policy_result {
-            Ok(applied_device) => {
-                if applied_device.is_some() {
+            Ok(applied) => {
+                if let Some((_device, transition)) = applied {
                     if let Some(hook) = device_hook {
-                        hook();
+                        hook(transition);
                     }
                 }
             }
             Err(error) => {
-                if *report_applied.lock().expect("report applied lock") {
+                let transition = *report_transition.lock().expect("report transition lock");
+                if let Some(transition) = transition {
                     if let Some(hook) = device_hook {
-                        hook();
+                        hook(transition);
                     }
                 }
                 return Err(error);
@@ -681,13 +685,12 @@ async fn apply_yolink_report_with_policy(
         return Ok(());
     }
 
-    if yolink
+    if let Some(applied) = yolink
         .apply_report(report, now)
         .context("failed to apply YoLink report")?
-        .is_some()
     {
         if let Some(hook) = device_hook {
-            hook();
+            hook(applied.transition);
         }
     }
 
@@ -1133,10 +1136,6 @@ mod tests {
             StateConfig::from_thresholds(&config.thresholds),
             1_000.0,
         )));
-        state_machine
-            .write()
-            .expect("state machine lock poisoned")
-            .set_manual_presence(true, 1_001.0);
         let yolink = YoLinkState::new(state_machine.clone(), db_path.clone());
         yolink.apply_devices(sample_devices());
         let qingping = QingpingState::default();
@@ -1159,19 +1158,19 @@ mod tests {
         let hook: DeviceIngressHook = Arc::new({
             let erv = erv.clone();
             let hook_observations = hook_observations.clone();
-            move || {
+            move |transition| {
                 hook_observations
                     .lock()
                     .expect("hook observations lock")
-                    .push(erv.snapshot().running);
+                    .push((transition, erv.snapshot().running));
             }
         });
 
         apply_yolink_report_with_policy(
             &yolink,
             YoLinkReport {
-                device_id: "door-1".to_string(),
-                data: json!({"state": "open"}),
+                device_id: "motion-1".to_string(),
+                data: json!({"state": "alert"}),
             },
             1_002.0,
             Some(&coordinator),
@@ -1183,7 +1182,13 @@ mod tests {
         assert_eq!(writer.write_speeds(), vec![ErvFanSpeed::Off]);
         assert_eq!(
             *hook_observations.lock().expect("hook observations lock"),
-            vec![false]
+            vec![(
+                Some(StateTransition {
+                    old_state: OccupancyState::Away,
+                    new_state: OccupancyState::Present,
+                }),
+                false,
+            )]
         );
     }
 
@@ -1224,7 +1229,7 @@ mod tests {
         let hook: DeviceIngressHook = Arc::new({
             let state_machine = state_machine.clone();
             let hook_observations = hook_observations.clone();
-            move || {
+            move |_transition| {
                 let safety_interlock = state_machine
                     .read()
                     .expect("state machine lock poisoned")

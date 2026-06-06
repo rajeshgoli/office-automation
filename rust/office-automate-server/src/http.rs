@@ -289,14 +289,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let yolink_hvac_trigger: yolink::DeviceIngressHook = Arc::new({
         let app_state = app_state.clone();
         let runtime_handle = runtime_handle.clone();
-        move || {
+        move |transition| {
             let app_state = app_state.clone();
             runtime_handle.spawn(async move {
-                if let Err(error) = evaluate_and_apply_hvac_policy(&app_state).await {
-                    tracing::warn!(
-                        "HVAC automated policy apply failed after YoLink update: {error:#}"
-                    );
-                }
+                evaluate_yolink_hvac_update(app_state, transition).await;
             });
         }
     });
@@ -567,6 +563,13 @@ async fn evaluate_sensor_policies(
         tracing::warn!("HVAC automated policy apply failed after {source} update: {error:#}");
     }
     erv_automation.broadcast_status();
+}
+
+async fn evaluate_yolink_hvac_update(state: AppState, transition: Option<StateTransition>) {
+    clear_hvac_manual_override_on_transition(&state, transition);
+    if let Err(error) = evaluate_and_apply_hvac_policy(&state).await {
+        tracing::warn!("HVAC automated policy apply failed after YoLink update: {error:#}");
+    }
 }
 
 fn unix_timestamp_now() -> f64 {
@@ -2298,6 +2301,19 @@ mod tests {
         }
     }
 
+    fn office_motion_device() -> yolink::YoLinkDevice {
+        yolink::YoLinkDevice {
+            device_id: "motion-1".to_string(),
+            name: "Office Motion".to_string(),
+            token: "motion-token".to_string(),
+            device_type: yolink::DeviceType::MotionSensor,
+            state: json!({"state": "normal", "online": true})
+                .as_object()
+                .expect("object")
+                .clone(),
+        }
+    }
+
     fn app_with_erv_writer(
         config: AppConfig,
         qingping: QingpingState,
@@ -3522,6 +3538,52 @@ mod tests {
 
         assert_eq!(writer.smoke_calls(), 1);
         assert_eq!(writer.write_modes(), vec![(HvacControlMode::Off, None)]);
+    }
+
+    #[tokio::test]
+    async fn yolink_transition_clears_hvac_manual_override_before_policy() {
+        let config = configured_hvac_config(true);
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            now,
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        yolink.apply_devices(vec![office_motion_device()]);
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Off, 22.0));
+        hvac_state.record_manual_override(HvacControlMode::Off, 70.0);
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Cool, 25.5))],
+        ));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            qingping_with_temp(28.0),
+            state_machine,
+            yolink.clone(),
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        let applied = yolink
+            .apply_event("motion-1", json!({"state": "alert"}), now + 1.0)
+            .expect("event applies")
+            .expect("motion report applies");
+        assert!(applied.transition.is_some());
+
+        evaluate_yolink_hvac_update(state.clone(), applied.transition).await;
+
+        assert!(!state.hvac.manual_override_active());
+        assert_eq!(writer.smoke_calls(), 1);
+        assert_eq!(
+            writer.write_modes(),
+            vec![(HvacControlMode::Cool, Some(25.5))]
+        );
     }
 
     #[tokio::test]
