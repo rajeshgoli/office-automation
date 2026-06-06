@@ -30,6 +30,10 @@ impl MacOsPresenceReader {
     pub async fn read_snapshot(&self) -> Result<PresenceSnapshot> {
         let idle_output =
             run_command("ioreg", &["-c", "IOHIDSystem"], self.command_timeout).await?;
+        let idle_sample_timestamp = unix_timestamp_now();
+        let idle_seconds = parse_hid_idle_seconds(&idle_output)
+            .context("ioreg output did not include HIDIdleTime")?;
+
         let display_output = run_command(
             "system_profiler",
             &["SPDisplaysDataType"],
@@ -37,17 +41,7 @@ impl MacOsPresenceReader {
         )
         .await?;
 
-        let idle_seconds = parse_hid_idle_seconds(&idle_output)
-            .context("ioreg output did not include HIDIdleTime")?;
-        let (display_count, external_displays) = parse_display_info(&display_output);
-
-        Ok(PresenceSnapshot {
-            last_active_timestamp: unix_timestamp_now() - idle_seconds,
-            external_monitor: !external_displays.is_empty(),
-            idle_seconds,
-            display_count,
-            external_displays,
-        })
+        build_presence_snapshot(idle_seconds, idle_sample_timestamp, &display_output)
     }
 }
 
@@ -128,6 +122,22 @@ pub fn parse_display_info(output: &str) -> (usize, Vec<String>) {
     }
 
     (all_displays.len(), external_displays)
+}
+
+fn build_presence_snapshot(
+    idle_seconds: f64,
+    idle_sample_timestamp: f64,
+    display_output: &str,
+) -> Result<PresenceSnapshot> {
+    let (display_count, external_displays) = parse_display_info(display_output);
+
+    Ok(PresenceSnapshot {
+        last_active_timestamp: idle_sample_timestamp - idle_seconds,
+        external_monitor: !external_displays.is_empty(),
+        idle_seconds,
+        display_count,
+        external_displays,
+    })
 }
 
 fn is_display_heading_candidate(stripped: &str) -> bool {
@@ -220,5 +230,22 @@ Graphics/Displays:
 
         assert_eq!(display_count, 1);
         assert!(external_displays.is_empty());
+    }
+
+    #[test]
+    fn last_active_timestamp_uses_idle_sample_time() {
+        let display_output = r#"
+Graphics/Displays:
+    Apple M2:
+      DELL U2720Q:
+        Resolution: 3840 x 2160
+        Display Type: External
+"#;
+
+        let snapshot =
+            build_presence_snapshot(1.0, 1000.0, display_output).expect("presence snapshot");
+
+        assert_eq!(snapshot.last_active_timestamp, 999.0);
+        assert!(snapshot.external_monitor);
     }
 }
