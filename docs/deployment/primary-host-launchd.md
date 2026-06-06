@@ -25,14 +25,20 @@ Render the templates with deployment-specific absolute paths before loading them
 | `__OFFICE_AUTOMATE_PATH__` | PATH available to launchd jobs, usually including Homebrew and system paths. |
 | `__OFFICE_AUTOMATE_RUST_LOG__` | Rust log filter, for example `info,office_automate_server=info`. |
 | `__OFFICE_AUTOMATE_LOG_DIR__` | Directory for stdout/stderr logs. Create it before loading jobs. |
-| `__OFFICE_AUTOMATE_TELEMETRY_INTERVAL_SECONDS__` | Telemetry collector interval marker. The template ships with lintable default `1800`; render this integer for deployment. |
-| `__OFFICE_AUTOMATE_PROJECT_LEVERAGE_INTERVAL_SECONDS__` | Project-leverage collector interval marker. The template ships with lintable default `7200`; render this integer for deployment. |
+| `__OFFICE_AUTOMATE_TELEMETRY_INTERVAL_SECONDS__` | Telemetry collector interval in seconds, for example `1800`. |
+| `__OFFICE_AUTOMATE_PROJECT_LEVERAGE_INTERVAL_SECONDS__` | Project-leverage collector interval in seconds, for example `7200`. |
 | `__CLOUDFLARED_BIN__` | Absolute path to the `cloudflared` binary. |
 | `__CLOUDFLARED_CONFIG__` | Absolute path to the Cloudflare Tunnel config file. |
 | `__CLOUDFLARED_TUNNEL__` | Cloudflare Tunnel name or UUID. |
 | `__CLOUDFLARED_WORKING_DIRECTORY__` | Directory where `cloudflared` should run. |
 
 Keep hostnames, public routes, credentials, and tunnel credential files in the Cloudflare config and deployment secrets, not in these templates.
+
+Raw `.plist.template` files are not loadable plists. Render every placeholder, including integer `StartInterval` values, then lint the rendered files:
+
+```bash
+plutil -lint rendered/com.office-automate.*.plist
+```
 
 ## Install
 

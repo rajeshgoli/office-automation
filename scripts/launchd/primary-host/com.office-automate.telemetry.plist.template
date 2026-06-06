@@ -31,9 +31,8 @@
 
   <key>RunAtLoad</key>
   <true/>
-  <!-- Render from __OFFICE_AUTOMATE_TELEMETRY_INTERVAL_SECONDS__. -->
   <key>StartInterval</key>
-  <integer>1800</integer>
+  <integer>__OFFICE_AUTOMATE_TELEMETRY_INTERVAL_SECONDS__</integer>
 
   <key>StandardOutPath</key>
   <string>__OFFICE_AUTOMATE_LOG_DIR__/office-automate-telemetry.out.log</string>
