@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
     net::{SocketAddr, ToSocketAddrs},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::Arc,
     thread::{self, JoinHandle},
 };
 
@@ -21,9 +22,12 @@ pub struct MqttRuntime {
     _ingest_thread: JoinHandle<()>,
 }
 
+pub type SensorIngressHook = Arc<dyn Fn() + Send + Sync + 'static>;
+
 pub fn start_qingping_ingress(
     config: &AppConfig,
     qingping: QingpingState,
+    reading_hook: Option<SensorIngressHook>,
 ) -> Result<Option<MqttRuntime>> {
     let Some(device_mac) = config.qingping.device_mac.as_deref() else {
         tracing::warn!("Qingping device_mac is not configured; MQTT broker not started");
@@ -53,6 +57,7 @@ pub fn start_qingping_ingress(
                 &configured_mac,
                 database_path,
                 qingping,
+                reading_hook,
             );
         })
         .context("failed to spawn Qingping MQTT ingest thread")?;
@@ -78,6 +83,7 @@ fn ingest_loop(
     configured_mac: &str,
     database_path: PathBuf,
     qingping: QingpingState,
+    reading_hook: Option<SensorIngressHook>,
 ) {
     loop {
         match link_rx.recv() {
@@ -85,26 +91,45 @@ fn ingest_loop(
                 if forward.publish.topic.as_ref() != topic.as_bytes() {
                     continue;
                 }
-                match parse_qingping_payload(&forward.publish.payload, configured_mac) {
-                    Ok(Some(reading)) => {
-                        if let Err(error) = db::insert_sensor_reading(&database_path, &reading) {
-                            tracing::warn!("failed to store Qingping reading: {error:#}");
-                        }
-                        qingping.apply_reading(reading);
-                    }
-                    Ok(None) => {
-                        tracing::debug!("ignoring Qingping MQTT message without sensor data");
-                    }
-                    Err(error) => {
-                        tracing::warn!("failed to parse Qingping MQTT payload: {error}");
-                    }
-                }
+                handle_qingping_publish(
+                    &forward.publish.payload,
+                    configured_mac,
+                    &database_path,
+                    &qingping,
+                    reading_hook.as_ref(),
+                );
             }
             Ok(Some(_)) | Ok(None) => {}
             Err(error) => {
                 tracing::warn!("Qingping MQTT internal link stopped: {error}");
                 break;
             }
+        }
+    }
+}
+
+fn handle_qingping_publish(
+    payload: &[u8],
+    configured_mac: &str,
+    database_path: &Path,
+    qingping: &QingpingState,
+    reading_hook: Option<&SensorIngressHook>,
+) {
+    match parse_qingping_payload(payload, configured_mac) {
+        Ok(Some(reading)) => {
+            if let Err(error) = db::insert_sensor_reading(database_path, &reading) {
+                tracing::warn!("failed to store Qingping reading: {error:#}");
+            }
+            qingping.apply_reading(reading);
+            if let Some(hook) = reading_hook {
+                hook();
+            }
+        }
+        Ok(None) => {
+            tracing::debug!("ignoring Qingping MQTT message without sensor data");
+        }
+        Err(error) => {
+            tracing::warn!("failed to parse Qingping MQTT payload: {error}");
         }
     }
 }
@@ -163,6 +188,9 @@ fn resolve_listen_address(host: &str, port: u16) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::db::migrate_database;
     use crate::qingping::{normalize_device_mac, qingping_up_topic};
 
     #[test]
@@ -183,5 +211,31 @@ mod tests {
             qingping_up_topic("aa:bb:cc:dd:ee:ff"),
             "qingping/AABBCCDDEEFF/up"
         );
+    }
+
+    #[test]
+    fn qingping_publish_hook_runs_after_valid_sensor_reading() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&database_path).expect("migration");
+        let qingping = QingpingState::default();
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook: SensorIngressHook = Arc::new({
+            let hook_calls = hook_calls.clone();
+            move || {
+                hook_calls.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        handle_qingping_publish(
+            br#"{"sensorData":[{"co2":{"value":2100},"temperature":{"value":22.5},"tvoc":{"value":25}}]}"#,
+            "aa:bb:cc:dd:ee:ff",
+            &database_path,
+            &qingping,
+            Some(&hook),
+        );
+
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(qingping.latest().expect("reading").co2_ppm, Some(2100));
     }
 }

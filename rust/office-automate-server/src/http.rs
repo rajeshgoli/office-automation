@@ -33,10 +33,14 @@ use crate::{
     artifacts::ARTIFACT_MAX_SIZE_BYTES,
     artifacts::{ArtifactStore, is_valid_artifact_hash},
     auth::{AuthManager, AuthenticatedUser, HttpAuthMode, WebSocketAuth, bearer_token},
+    automation::ErvPolicyCoordinator,
     config::AppConfig,
     db,
-    erv::ErvState,
+    erv::{
+        ERV_MANUAL_OVERRIDE_SECONDS, ErvFanSpeed, ErvSpeedWriter, ErvState, RustuyaErvSpeedWriter,
+    },
     mqtt,
+    policy::ErvPolicyState,
     qingping::QingpingState,
     state::{StateMachine, StateTransition},
     status::{Status, TemperatureBands},
@@ -56,6 +60,7 @@ struct AppState {
     status_broadcast: broadcast::Sender<()>,
     qingping: QingpingState,
     erv: ErvState,
+    erv_automation: ErvPolicyCoordinator,
 }
 
 pub fn app(config: AppConfig) -> Router {
@@ -83,6 +88,43 @@ fn try_app_with_state(
     yolink: YoLinkState,
     erv_state: ErvState,
 ) -> Result<Router> {
+    try_app_with_erv_writer(
+        config,
+        qingping,
+        state_machine,
+        yolink,
+        erv_state,
+        Arc::new(RustuyaErvSpeedWriter),
+    )
+}
+
+fn try_app_with_erv_writer(
+    config: AppConfig,
+    qingping: QingpingState,
+    state_machine: Arc<RwLock<StateMachine>>,
+    yolink: YoLinkState,
+    erv_state: ErvState,
+    erv_writer: Arc<dyn ErvSpeedWriter>,
+) -> Result<Router> {
+    try_app_with_erv_writer_and_coordinator(
+        config,
+        qingping,
+        state_machine,
+        yolink,
+        erv_state,
+        erv_writer,
+    )
+    .map(|(router, _)| router)
+}
+
+fn try_app_with_erv_writer_and_coordinator(
+    config: AppConfig,
+    qingping: QingpingState,
+    state_machine: Arc<RwLock<StateMachine>>,
+    yolink: YoLinkState,
+    erv_state: ErvState,
+    erv_writer: Arc<dyn ErvSpeedWriter>,
+) -> Result<(Router, ErvPolicyCoordinator)> {
     db::migrate_database(&config.runtime.database_path)?;
     let auth = AuthManager::new(&config.orchestrator)?;
     let artifacts = ArtifactStore::new(
@@ -95,6 +137,16 @@ fn try_app_with_state(
     yolink.set_status_broadcast(status_broadcast.clone());
     erv_state.set_status_broadcast(status_broadcast.clone());
     yolink.restore_from_database(unix_timestamp_now())?;
+    let erv_policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
+    let erv_automation = ErvPolicyCoordinator::new(
+        config.clone(),
+        state_machine.clone(),
+        qingping.clone(),
+        erv_state.clone(),
+        erv_policy,
+        erv_writer,
+        status_broadcast.clone(),
+    );
     let state = AppState {
         config,
         auth,
@@ -105,6 +157,7 @@ fn try_app_with_state(
         status_broadcast,
         qingping,
         erv: erv_state,
+        erv_automation: erv_automation.clone(),
     };
 
     let cors = CorsLayer::new()
@@ -115,7 +168,7 @@ fn try_app_with_state(
     let frontend_dist = state.config.runtime.frontend_dist.clone();
     let assets_dir = frontend_dist.join("assets");
 
-    Ok(Router::new()
+    let router = Router::new()
         .route("/status", get(status))
         .route("/ws", get(websocket))
         .route("/occupancy", post(occupancy))
@@ -160,7 +213,9 @@ fn try_app_with_state(
         ))
         .with_state(state)
         .layer(cors)
-        .layer(TraceLayer::new_for_http()))
+        .layer(TraceLayer::new_for_http());
+
+    Ok((router, erv_automation))
 }
 
 pub async fn serve(config: AppConfig) -> Result<()> {
@@ -175,17 +230,34 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     )));
     let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
     let erv_state = ErvState::new(config.runtime.database_path.clone());
-    let app = try_app_with_state(
+    let (app, erv_automation) = try_app_with_erv_writer_and_coordinator(
         config.clone(),
         qingping.clone(),
         state_machine,
         yolink.clone(),
         erv_state.clone(),
+        Arc::new(RustuyaErvSpeedWriter),
     )
     .context("failed to build HTTP app")?;
+    let runtime_handle = tokio::runtime::Handle::current();
+    let qingping_policy_trigger: mqtt::SensorIngressHook = Arc::new({
+        let erv_automation = erv_automation.clone();
+        move || {
+            let erv_automation = erv_automation.clone();
+            runtime_handle.spawn(async move {
+                if let Err(error) = erv_automation.evaluate_erv_policy(false).await {
+                    tracing::warn!(
+                        "ERV automated policy apply failed after Qingping update: {error:#}"
+                    );
+                }
+                erv_automation.broadcast_status();
+            });
+        }
+    });
     let _mqtt_runtime =
-        mqtt::start_qingping_ingress(&config, qingping).context("failed to start MQTT ingress")?;
-    let _yolink_task = yolink::start_yolink_client(&config, yolink);
+        mqtt::start_qingping_ingress(&config, qingping, Some(qingping_policy_trigger))
+            .context("failed to start MQTT ingress")?;
+    let _yolink_task = yolink::start_yolink_client(&config, yolink, Some(erv_automation.clone()));
     let _erv_task = crate::erv::start_erv_status_poll(&config, erv_state);
 
     tracing::info!("office-automate-server listening on {}", bind_address);
@@ -449,29 +521,58 @@ async fn occupancy(
     Json(payload): Json<OccupancyRequest>,
 ) -> Response {
     let now = unix_timestamp_now();
-    let (transition, state_name, erv_should_run) = {
-        let mut machine = state
-            .state_machine
-            .write()
-            .expect("state machine lock poisoned");
-        let transition = machine.update_mac_occupancy(
-            payload.last_active_timestamp,
-            payload.external_monitor,
-            now,
-        );
-        let status = machine.status_at(now);
-        (transition, status.state, status.erv_should_run)
+    let policy_result = state
+        .erv_automation
+        .update_state_and_maybe_evaluate(|| {
+            let (transition, state_name, erv_should_run) = {
+                let mut machine = state
+                    .state_machine
+                    .write()
+                    .expect("state machine lock poisoned");
+                let transition = machine.update_mac_occupancy(
+                    payload.last_active_timestamp,
+                    payload.external_monitor,
+                    now,
+                );
+                let status = machine.status_at(now);
+                (transition, status.state, status.erv_should_run)
+            };
+            log_state_transition(&state, transition, "mac_activity")
+                .context("failed to persist occupancy update")?;
+            Ok((
+                (state_name, erv_should_run),
+                transition,
+                now,
+                transition.is_some(),
+                true,
+            ))
+        })
+        .await;
+
+    let (state_name, erv_should_run) = match policy_result {
+        Ok(result) => result,
+        Err(error)
+            if error
+                .to_string()
+                .contains("failed to persist occupancy update") =>
+        {
+            tracing::error!("failed to log occupancy transition: {error:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": "Failed to persist occupancy update"})),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::warn!("ERV automated policy apply failed after occupancy update: {error:#}");
+            let status = state
+                .state_machine
+                .read()
+                .expect("state machine lock poisoned")
+                .status_at(now);
+            (status.state, status.erv_should_run)
+        }
     };
-
-    if let Err(error) = log_state_transition(&state, transition, "mac_activity") {
-        tracing::error!("failed to log occupancy transition: {error:#}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"ok": false, "error": "Failed to persist occupancy update"})),
-        )
-            .into_response();
-    }
-
     broadcast_status(&state);
     Json(json!({"ok": true, "state": state_name, "erv_should_run": erv_should_run})).into_response()
 }
@@ -487,33 +588,63 @@ async fn presence(State(state): State<AppState>, Json(payload): Json<PresenceReq
             let requested_state = payload.state.as_str();
             let now = unix_timestamp_now();
             let present = requested_state == "present";
-            let (transition, state_name, is_present) = {
-                let mut machine = state
-                    .state_machine
-                    .write()
-                    .expect("state machine lock poisoned");
-                let transition = machine.set_manual_presence(present, now);
-                let status = machine.status_at(now);
-                (transition, status.state, status.is_present)
+            let policy_result = state
+                .erv_automation
+                .update_state_and_maybe_evaluate(|| {
+                    let (transition, state_name, is_present) = {
+                        let mut machine = state
+                            .state_machine
+                            .write()
+                            .expect("state machine lock poisoned");
+                        let transition = machine.set_manual_presence(present, now);
+                        let status = machine.status_at(now);
+                        (transition, status.state, status.is_present)
+                    };
+                    db::log_device_event(
+                        &state.config.runtime.database_path,
+                        "presence",
+                        &format!("manual_{requested_state}"),
+                        Some("Dashboard"),
+                        None,
+                    )
+                    .and_then(|_| log_state_transition(&state, transition, "manual"))
+                    .context("failed to persist presence update")?;
+                    Ok((
+                        (state_name, is_present),
+                        transition,
+                        now,
+                        transition.is_some(),
+                        true,
+                    ))
+                })
+                .await;
+
+            let (state_name, is_present) = match policy_result {
+                Ok(result) => result,
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("failed to persist presence update") =>
+                {
+                    tracing::error!("failed to persist manual presence update: {error:#}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"ok": false, "error": "Failed to persist presence update"})),
+                    )
+                        .into_response();
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "ERV automated policy apply failed after presence update: {error:#}"
+                    );
+                    let status = state
+                        .state_machine
+                        .read()
+                        .expect("state machine lock poisoned")
+                        .status_at(now);
+                    (status.state, status.is_present)
+                }
             };
-
-            if let Err(error) = db::log_device_event(
-                &state.config.runtime.database_path,
-                "presence",
-                &format!("manual_{requested_state}"),
-                Some("Dashboard"),
-                None,
-            )
-            .and_then(|_| log_state_transition(&state, transition, "manual"))
-            {
-                tracing::error!("failed to persist manual presence update: {error:#}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"ok": false, "error": "Failed to persist presence update"})),
-                )
-                    .into_response();
-            }
-
             broadcast_status(&state);
             Json(json!({"ok": true, "state": state_name, "is_present": is_present})).into_response()
         }
@@ -554,22 +685,40 @@ struct ErvRequest {
     speed: String,
 }
 
-async fn erv(Json(payload): Json<ErvRequest>) -> Response {
-    if !matches!(payload.speed.as_str(), "off" | "quiet" | "medium" | "turbo") {
+async fn erv(State(state): State<AppState>, Json(payload): Json<ErvRequest>) -> Response {
+    let speed = payload.speed.to_ascii_lowercase();
+    let Some(speed) = ErvFanSpeed::parse(&speed) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"ok": false, "error": "Invalid ERV speed"})),
         )
             .into_response();
-    }
+    };
 
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(
-            json!({"ok": false, "error": "ERV control is not enabled in Rust compatibility mode"}),
-        ),
-    )
-        .into_response()
+    match state
+        .erv_automation
+        .apply_manual_erv_speed(speed, state.erv_automation.latest_co2_ppm())
+        .await
+    {
+        Ok(status) => {
+            broadcast_status(&state);
+            Json(json!({
+                "ok": true,
+                "erv": {
+                    "speed": status.fan_speed.map(ErvFanSpeed::as_str).unwrap_or("unknown"),
+                    "running": status.power,
+                    "manual_override": true,
+                    "expires_in": ERV_MANUAL_OVERRIDE_SECONDS,
+                }
+            }))
+            .into_response()
+        }
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": error.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1285,6 +1434,14 @@ fn is_safe_spa_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
     use axum::{
         body::{Body, to_bytes},
         http::Request as HttpRequest,
@@ -1297,10 +1454,79 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::config::{
-        ErvConfig, GoogleOAuthConfig, OrchestratorConfig, QingpingConfig, RuntimeConfig,
-        ThresholdsConfig, YoLinkConfig,
+    use crate::{
+        config::{
+            ErvConfig, GoogleOAuthConfig, OrchestratorConfig, QingpingConfig, RuntimeConfig,
+            ThresholdsConfig, YoLinkConfig,
+        },
+        erv::{BoxFutureResult, ErvDeviceStatus, parse_erv_status_payload},
     };
+
+    struct FakeErvWriter {
+        smoke_results: Mutex<VecDeque<Result<ErvDeviceStatus>>>,
+        write_results: Mutex<VecDeque<Result<ErvDeviceStatus>>>,
+        smoke_calls: AtomicUsize,
+        write_speeds: Mutex<Vec<ErvFanSpeed>>,
+    }
+
+    impl FakeErvWriter {
+        fn new(
+            smoke_results: Vec<Result<ErvDeviceStatus>>,
+            write_results: Vec<Result<ErvDeviceStatus>>,
+        ) -> Self {
+            Self {
+                smoke_results: Mutex::new(smoke_results.into()),
+                write_results: Mutex::new(write_results.into()),
+                smoke_calls: AtomicUsize::new(0),
+                write_speeds: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn smoke_calls(&self) -> usize {
+            self.smoke_calls.load(Ordering::SeqCst)
+        }
+
+        fn write_speeds(&self) -> Vec<ErvFanSpeed> {
+            self.write_speeds
+                .lock()
+                .expect("fake writer speeds lock")
+                .clone()
+        }
+    }
+
+    impl ErvSpeedWriter for FakeErvWriter {
+        fn smoke_status<'a>(
+            &'a self,
+            _config: &'a ErvConfig,
+        ) -> BoxFutureResult<'a, ErvDeviceStatus> {
+            self.smoke_calls.fetch_add(1, Ordering::SeqCst);
+            let result = self
+                .smoke_results
+                .lock()
+                .expect("fake writer smoke lock")
+                .pop_front()
+                .unwrap_or_else(|| anyhow::bail!("no fake ERV smoke result configured"));
+            Box::pin(async move { result })
+        }
+
+        fn set_speed<'a>(
+            &'a self,
+            _config: &'a ErvConfig,
+            speed: ErvFanSpeed,
+        ) -> BoxFutureResult<'a, ErvDeviceStatus> {
+            self.write_speeds
+                .lock()
+                .expect("fake writer speeds lock")
+                .push(speed);
+            let result = self
+                .write_results
+                .lock()
+                .expect("fake writer write lock")
+                .pop_front()
+                .unwrap_or_else(|| anyhow::bail!("no fake ERV write result configured"));
+            Box::pin(async move { result })
+        }
+    }
 
     fn test_config() -> AppConfig {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1353,6 +1579,67 @@ mod tests {
             },
             ..test_config()
         }
+    }
+
+    fn configured_erv_config(active_control_enabled: bool) -> AppConfig {
+        let mut config = test_config();
+        config.erv = ErvConfig {
+            device_type: "tuya".to_string(),
+            ip: "192.0.2.10".to_string(),
+            device_id: "device-id".to_string(),
+            local_key: "local-key".to_string(),
+            active_control_enabled,
+            verify_delay_seconds: 0,
+            ..ErvConfig::default()
+        };
+        config
+    }
+
+    fn qingping_with_co2(co2_ppm: i64) -> QingpingState {
+        let qingping = QingpingState::default();
+        qingping.apply_reading(qingping_reading(co2_ppm));
+        qingping
+    }
+
+    fn qingping_reading(co2_ppm: i64) -> crate::qingping::QingpingReading {
+        crate::qingping::QingpingReading {
+            device_name: "Qingping Air Monitor".to_string(),
+            mac_hint: "AABBCCDDEEFF".to_string(),
+            temp_c: Some(22.0),
+            humidity: Some(45.0),
+            co2_ppm: Some(co2_ppm),
+            pm25: Some(2),
+            pm10: Some(3),
+            tvoc: Some(25),
+            noise_db: Some(35),
+            timestamp: "2026-06-05T12:30:00".to_string(),
+            raw_data: "{}".to_string(),
+        }
+    }
+
+    fn app_with_erv_writer(
+        config: AppConfig,
+        qingping: QingpingState,
+        writer: Arc<dyn ErvSpeedWriter>,
+    ) -> Router {
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            unix_timestamp_now(),
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        try_app_with_erv_writer(config, qingping, state_machine, yolink, erv_state, writer)
+            .expect("app")
+    }
+
+    fn erv_status(speed: ErvFanSpeed) -> ErvDeviceStatus {
+        let payload = match speed {
+            ErvFanSpeed::Off => r#"{"dps":{"1":false,"101":1,"102":1}}"#,
+            ErvFanSpeed::Quiet => r#"{"dps":{"1":true,"101":1,"102":1}}"#,
+            ErvFanSpeed::Medium => r#"{"dps":{"1":true,"101":3,"102":2}}"#,
+            ErvFanSpeed::Turbo => r#"{"dps":{"1":true,"101":8,"102":8}}"#,
+        };
+        parse_erv_status_payload(payload).expect("ERV status")
     }
 
     fn multipart_body(boundary: &str, bytes: &[u8]) -> Vec<u8> {
@@ -1857,6 +2144,347 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn manual_erv_write_requires_active_control_gate() {
+        let writer = Arc::new(FakeErvWriter::new(
+            vec![Ok(erv_status(ErvFanSpeed::Off))],
+            vec![Ok(erv_status(ErvFanSpeed::Turbo))],
+        ));
+        let service = app_with_erv_writer(
+            configured_erv_config(false),
+            QingpingState::default(),
+            writer.clone(),
+        );
+
+        let response = service
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/erv")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"speed":"turbo"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert!(
+            value["error"]
+                .as_str()
+                .expect("error")
+                .contains("active control is disabled")
+        );
+        assert_eq!(writer.smoke_calls(), 0);
+        assert!(writer.write_speeds().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_erv_write_smokes_writes_logs_and_broadcasts_status() {
+        let config = configured_erv_config(true);
+        let writer = Arc::new(FakeErvWriter::new(
+            vec![Ok(erv_status(ErvFanSpeed::Off))],
+            vec![Ok(erv_status(ErvFanSpeed::Turbo))],
+        ));
+        let service = app_with_erv_writer(config.clone(), qingping_with_co2(2100), writer.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("addr");
+        let server_service = service.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                server_service.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("server");
+        });
+
+        let (mut ws, _) = connect_async(format!("ws://{address}/ws"))
+            .await
+            .expect("connect");
+        timeout(Duration::from_secs(1), ws.next())
+            .await
+            .expect("initial timeout")
+            .expect("initial message")
+            .expect("initial ok");
+
+        let response = service
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/erv")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"speed":"turbo"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["erv"]["speed"], "turbo");
+        assert_eq!(value["erv"]["running"], true);
+        assert_eq!(value["erv"]["manual_override"], true);
+        assert_eq!(writer.smoke_calls(), 1);
+        assert_eq!(writer.write_speeds(), vec![ErvFanSpeed::Turbo]);
+
+        let update = timeout(Duration::from_secs(1), ws.next())
+            .await
+            .expect("update timeout")
+            .expect("update message")
+            .expect("update ok");
+        assert!(
+            update
+                .into_text()
+                .expect("text")
+                .contains("\"speed\":\"turbo\"")
+        );
+
+        let response = service
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["erv"]["speed"], "turbo");
+        assert_eq!(value["erv"]["running"], true);
+        assert_eq!(value["manual_override"]["erv"], true);
+        assert_eq!(value["manual_override"]["erv_speed"], "turbo");
+        let expires_in = value["manual_override"]["erv_expires_in"]
+            .as_i64()
+            .expect("expires");
+        assert!(expires_in > 0);
+        assert!(expires_in <= ERV_MANUAL_OVERRIDE_SECONDS);
+
+        let response = service
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/history?hours=1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["climate_actions"][0]["system"], "erv");
+        assert_eq!(value["climate_actions"][0]["action"], "turbo");
+        assert_eq!(value["climate_actions"][0]["reason"], "manual_override");
+        assert_eq!(value["climate_actions"][0]["co2_ppm"], 2100);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn manual_erv_override_prevents_next_policy_update_from_rewriting_speed() {
+        let writer = Arc::new(FakeErvWriter::new(
+            vec![Ok(erv_status(ErvFanSpeed::Off))],
+            vec![Ok(erv_status(ErvFanSpeed::Turbo))],
+        ));
+        let service = app_with_erv_writer(
+            configured_erv_config(true),
+            qingping_with_co2(450),
+            writer.clone(),
+        );
+
+        let response = service
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/erv")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"speed":"turbo"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = service
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/presence")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"state":"present"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(writer.smoke_calls(), 1);
+        assert_eq!(writer.write_speeds(), vec![ErvFanSpeed::Turbo]);
+
+        let response = service
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/history?hours=1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        let actions = value["climate_actions"].as_array().expect("actions");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["action"], "turbo");
+        assert_eq!(actions[0]["reason"], "manual_override");
+    }
+
+    #[tokio::test]
+    async fn automated_erv_policy_respects_disabled_active_control_gate() {
+        let writer = Arc::new(FakeErvWriter::new(
+            vec![Ok(erv_status(ErvFanSpeed::Off))],
+            vec![Ok(erv_status(ErvFanSpeed::Quiet))],
+        ));
+        let service = app_with_erv_writer(
+            configured_erv_config(false),
+            qingping_with_co2(2100),
+            writer.clone(),
+        );
+
+        let response = service
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/presence")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"state":"present"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(writer.smoke_calls(), 0);
+        assert!(writer.write_speeds().is_empty());
+    }
+
+    #[tokio::test]
+    async fn automated_erv_policy_uses_gated_writer_after_presence_update() {
+        let writer = Arc::new(FakeErvWriter::new(
+            vec![Ok(erv_status(ErvFanSpeed::Off))],
+            vec![Ok(erv_status(ErvFanSpeed::Quiet))],
+        ));
+        let service = app_with_erv_writer(
+            configured_erv_config(true),
+            qingping_with_co2(2100),
+            writer.clone(),
+        );
+
+        let response = service
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/presence")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"state":"present"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(writer.smoke_calls(), 1);
+        assert_eq!(writer.write_speeds(), vec![ErvFanSpeed::Quiet]);
+
+        let response = service
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/history?hours=1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["climate_actions"][0]["system"], "erv");
+        assert_eq!(value["climate_actions"][0]["action"], "quiet");
+        assert_eq!(
+            value["climate_actions"][0]["reason"],
+            "present_co2_critical_2100ppm"
+        );
+        assert_eq!(value["climate_actions"][0]["co2_ppm"], 2100);
+    }
+
+    #[tokio::test]
+    async fn automated_erv_policy_records_away_transition_before_deciding() {
+        let qingping = qingping_with_co2(400);
+        let writer = Arc::new(FakeErvWriter::new(
+            vec![Ok(erv_status(ErvFanSpeed::Off))],
+            vec![Ok(erv_status(ErvFanSpeed::Turbo))],
+        ));
+        let service = app_with_erv_writer(
+            configured_erv_config(true),
+            qingping.clone(),
+            writer.clone(),
+        );
+
+        let response = service
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/presence")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"state":"present"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(writer.smoke_calls(), 1);
+
+        qingping.apply_reading(qingping_reading(2100));
+        let response = service
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/presence")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"state":"away"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(writer.smoke_calls(), 1);
+        assert!(writer.write_speeds().is_empty());
     }
 
     #[tokio::test]
