@@ -3,7 +3,11 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use crate::{config::AppConfig, db, erv, http, hvac, migration, presence, telemetry};
+use crate::{
+    config::AppConfig,
+    db, erv, http, hvac, migration, presence, telemetry,
+    validation::{self, ShadowValidationOptions},
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "office-automate-server")]
@@ -25,6 +29,8 @@ pub enum Command {
     Collect(CollectArgs),
     /// Create and validate a pre-cutover rollback snapshot.
     Snapshot(SnapshotArgs),
+    /// Run cutover validation gates.
+    Validate(ValidateArgs),
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
@@ -59,6 +65,14 @@ pub struct SnapshotArgs {
     pub cloudflared_config: Option<PathBuf>,
 }
 
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct ValidateArgs {
+    #[arg(long, env = "OFFICE_AUTOMATE_CONFIG")]
+    pub config: PathBuf,
+    #[command(subcommand)]
+    pub target: ValidateTarget,
+}
+
 #[derive(Debug, Subcommand, Clone, Copy, PartialEq, Eq)]
 pub enum SmokeTarget {
     /// Verify local ERV read credential and connectivity.
@@ -75,6 +89,31 @@ pub enum CollectTarget {
     Telemetry(CollectTelemetryArgs),
     /// Collect project leverage rows into office_climate.db.
     Leverage,
+}
+
+#[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
+pub enum ValidateTarget {
+    /// Validate Rust shadow mode before backend/MQTT cutover.
+    Shadow(ShadowValidationArgs),
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct ShadowValidationArgs {
+    /// Local Rust server URL, for example http://127.0.0.1:9001.
+    #[arg(long, env = "OFFICE_AUTOMATE_SHADOW_BASE_URL")]
+    pub base_url: Option<String>,
+    /// Public Cloudflare Tunnel URL for the Rust shadow server.
+    #[arg(long, env = "OFFICE_AUTOMATE_SHADOW_PUBLIC_URL")]
+    pub public_url: Option<String>,
+    /// Skip ERV/HVAC/YoLink live read-only checks.
+    #[arg(long)]
+    pub skip_live_devices: bool,
+    /// Skip Rust HTTP interface parity probes.
+    #[arg(long)]
+    pub skip_http_interface: bool,
+    /// Maximum accepted age for /status air_quality.last_update.
+    #[arg(long, default_value_t = 300)]
+    pub max_air_quality_age_seconds: u64,
 }
 
 #[derive(Debug, Args, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +170,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 report.validations.len()
             );
             Ok(())
+        }
+        Command::Validate(args) => {
+            let config = AppConfig::load(&args.config)?;
+            run_validate(&config, args.target).await
         }
     }
 }
@@ -190,6 +233,29 @@ fn run_collect(config: &AppConfig, target: CollectTarget) -> Result<()> {
         CollectTarget::Leverage => {
             let rows = telemetry::collect_project_leverage(config)?;
             println!("Project leverage collection complete: rows_written={rows}");
+        }
+    }
+    Ok(())
+}
+
+async fn run_validate(config: &AppConfig, target: ValidateTarget) -> Result<()> {
+    match target {
+        ValidateTarget::Shadow(args) => {
+            let report = validation::run_shadow_validation(
+                config,
+                ShadowValidationOptions {
+                    base_url: args.base_url,
+                    public_url: args.public_url,
+                    skip_live_devices: args.skip_live_devices,
+                    skip_http_interface: args.skip_http_interface,
+                    max_air_quality_age_seconds: args.max_air_quality_age_seconds,
+                },
+            )
+            .await?;
+            println!("Shadow validation complete: checks={}", report.len());
+            for check in report.checks {
+                println!("- {:?}: {} - {}", check.status, check.name, check.detail);
+            }
         }
     }
     Ok(())
@@ -428,6 +494,41 @@ mod tests {
                 );
             }
             other => panic!("expected snapshot command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_validate_shadow_command() {
+        let cli = Cli::try_parse_from([
+            "office-automate-server",
+            "validate",
+            "--config",
+            "/tmp/office.yaml",
+            "shadow",
+            "--base-url",
+            "http://127.0.0.1:9001",
+            "--public-url",
+            "https://office.example.test",
+            "--max-air-quality-age-seconds",
+            "120",
+        ])
+        .expect("validate shadow command should parse");
+
+        match cli.command {
+            Command::Validate(args) => {
+                assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
+                match args.target {
+                    ValidateTarget::Shadow(shadow) => {
+                        assert_eq!(shadow.base_url.as_deref(), Some("http://127.0.0.1:9001"));
+                        assert_eq!(
+                            shadow.public_url.as_deref(),
+                            Some("https://office.example.test")
+                        );
+                        assert_eq!(shadow.max_air_quality_age_seconds, 120);
+                    }
+                }
+            }
+            other => panic!("expected validate command, got {other:?}"),
         }
     }
 }

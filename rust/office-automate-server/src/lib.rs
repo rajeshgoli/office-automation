@@ -15,6 +15,7 @@ pub mod qingping;
 pub mod state;
 pub mod status;
 pub mod telemetry;
+pub mod validation;
 pub mod yolink;
 
 pub use cli::run_cli;
