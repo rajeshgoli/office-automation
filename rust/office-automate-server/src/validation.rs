@@ -207,6 +207,7 @@ pub async fn run_shadow_validation(
 ) -> Result<ShadowValidationReport> {
     let mut report = ShadowValidationReport { checks: Vec::new() };
 
+    validate_http_startup_config(config, options.public_url.as_deref(), &mut report)?;
     validate_active_write_gates(config, &mut report)?;
     validate_database_inputs(config, &mut report)?;
 
@@ -237,6 +238,7 @@ pub async fn run_cutover_validation(
 ) -> Result<ShadowValidationReport> {
     let mut report = ShadowValidationReport { checks: Vec::new() };
 
+    validate_http_startup_config(config, options.public_url.as_deref(), &mut report)?;
     validate_cutover_active_write_gates(config, &mut report)?;
     validate_cutover_snapshot(&options.snapshot_dir, &mut report)?;
     validate_legacy_controller_stopped(&options, &mut report).await?;
@@ -279,6 +281,20 @@ fn validate_active_write_gates(
     report.push_pass(
         "active-write-gates",
         "ERV and HVAC active-control flags are disabled",
+    );
+    Ok(())
+}
+
+fn validate_http_startup_config(
+    config: &AppConfig,
+    public_url: Option<&str>,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let effective_public_url = public_url.or(config.runtime.public_url.as_deref());
+    http::validate_http_startup_config_for_public_url(config, effective_public_url)?;
+    report.push_pass(
+        "http-startup-config",
+        "HTTP listener startup config is safe for configured public/local exposure",
     );
     Ok(())
 }
@@ -2070,6 +2086,87 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "office-climate-db")
         );
+    }
+
+    #[test]
+    fn validation_records_http_startup_config_and_rejects_public_basic_mode() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+        let config = test_config(&db_path);
+
+        validate_http_startup_config(&config, None, &mut report)
+            .expect("default config should pass");
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "http-startup-config")
+        );
+
+        let mut public_basic = test_config(&db_path);
+        public_basic.runtime.public_url = Some("https://office.example.test".to_string());
+        public_basic.orchestrator.auth_username = Some("user".to_string());
+        public_basic.orchestrator.auth_password = Some("pass".to_string());
+        let error = validate_http_startup_config(&public_basic, None, &mut report)
+            .expect_err("public Basic-only config should fail validation");
+        assert!(error.to_string().contains("requires Google OAuth/JWT"));
+    }
+
+    #[tokio::test]
+    async fn shadow_validation_rejects_option_only_public_basic_mode() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        let mut config = test_config(&db_path);
+        config.orchestrator.auth_username = Some("user".to_string());
+        config.orchestrator.auth_password = Some("pass".to_string());
+
+        let error = run_shadow_validation(
+            &config,
+            ShadowValidationOptions {
+                public_url: Some("https://office.example.test".to_string()),
+                skip_live_devices: true,
+                skip_http_interface: true,
+                ..ShadowValidationOptions::default()
+            },
+        )
+        .await
+        .expect_err("option-only public Basic mode should fail shadow validation");
+
+        assert!(error.to_string().contains("requires Google OAuth/JWT"));
+    }
+
+    #[tokio::test]
+    async fn cutover_validation_rejects_option_only_public_basic_mode() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        let mut config = test_config(&db_path);
+        config.orchestrator.auth_username = Some("user".to_string());
+        config.orchestrator.auth_password = Some("pass".to_string());
+
+        let error = run_cutover_validation(
+            &config,
+            CutoverValidationOptions {
+                base_url: None,
+                public_url: Some("https://office.example.test".to_string()),
+                legacy_base_url: None,
+                legacy_controller_stopped_at: String::new(),
+                mqtt_strategy: MqttCutoverStrategy::AtomicSwitch,
+                snapshot_dir: temp_dir.path().join("snapshot"),
+                cutover_log: temp_dir.path().join("cutover.md"),
+                manual_public_oauth_verified_at: None,
+                cloudflared_config: None,
+                cloudflare_access_client_id: None,
+                cloudflare_access_client_secret: None,
+                max_air_quality_age_seconds: 300,
+            },
+        )
+        .await
+        .expect_err(
+            "option-only public Basic mode should fail cutover validation before other gates",
+        );
+
+        assert!(error.to_string().contains("requires Google OAuth/JWT"));
     }
 
     #[test]

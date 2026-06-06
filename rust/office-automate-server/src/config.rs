@@ -64,7 +64,7 @@ pub struct OrchestratorConfig {
 impl Default for OrchestratorConfig {
     fn default() -> Self {
         Self {
-            host: "0.0.0.0".to_string(),
+            host: "127.0.0.1".to_string(),
             port: 8080,
             auth_username: None,
             auth_password: None,
@@ -632,6 +632,14 @@ fn expand_home_relative_path(path: PathBuf, home_dir: Option<&Path>) -> PathBuf 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orchestrator_default_binds_http_to_loopback() {
+        let config = OrchestratorConfig::default();
+
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.port, 8080);
+    }
 
     #[test]
     fn loads_config_and_applies_environment_overrides() {

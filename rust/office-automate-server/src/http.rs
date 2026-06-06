@@ -158,6 +158,80 @@ pub(crate) const PUBLIC_ACCESS_PROBES: &[PublicAccessProbe] = &[
     },
 ];
 
+pub(crate) fn validate_http_startup_config(config: &AppConfig) -> Result<()> {
+    validate_http_startup_config_for_public_url(config, config.runtime.public_url.as_deref())
+}
+
+pub(crate) fn validate_http_startup_config_for_public_url(
+    config: &AppConfig,
+    public_url: Option<&str>,
+) -> Result<()> {
+    let host = config.orchestrator.host.trim();
+    let is_loopback = is_loopback_bind_host(host);
+    let auth_mode = configured_http_auth_mode(config);
+    let public_url_configured = public_url.is_some_and(|public_url| !public_url.trim().is_empty());
+
+    if !is_loopback && auth_mode == HttpAuthMode::Open {
+        anyhow::bail!(
+            "HTTP listener host {host:?} is non-loopback while auth is disabled; bind to 127.0.0.1 or configure OAuth"
+        );
+    }
+
+    if public_url_configured {
+        if !is_loopback {
+            anyhow::bail!(
+                "public Cloudflare origin must bind HTTP to loopback; got orchestrator.host={host:?}"
+            );
+        }
+        match auth_mode {
+            HttpAuthMode::OAuth => {}
+            HttpAuthMode::Basic => anyhow::bail!(
+                "public Cloudflare deployment requires Google OAuth/JWT; Basic auth is a compatibility fallback only"
+            ),
+            HttpAuthMode::Open => anyhow::bail!(
+                "public Cloudflare deployment requires Google OAuth/JWT; auth is disabled"
+            ),
+        }
+        if config
+            .orchestrator
+            .google_oauth
+            .as_ref()
+            .is_some_and(|oauth| !oauth.trusted_networks.is_empty())
+        {
+            anyhow::bail!(
+                "public Cloudflare deployment must not configure google_oauth.trusted_networks; cloudflared reaches origin over loopback"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn configured_http_auth_mode(config: &AppConfig) -> HttpAuthMode {
+    if config.orchestrator.google_oauth.is_some() {
+        HttpAuthMode::OAuth
+    } else if matches!(
+        (
+            config.orchestrator.auth_username.as_deref(),
+            config.orchestrator.auth_password.as_deref()
+        ),
+        (Some(username), Some(password)) if !username.trim().is_empty() && !password.trim().is_empty()
+    ) {
+        HttpAuthMode::Basic
+    } else {
+        HttpAuthMode::Open
+    }
+}
+
+fn is_loopback_bind_host(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
 const HVAC_TEMPERATURE_BANDS_SETTING: &str = "hvac_temperature_bands";
 
 #[derive(Clone)]
@@ -378,6 +452,7 @@ fn router_from_state(state: AppState) -> Router {
 }
 
 pub async fn serve(config: AppConfig) -> Result<()> {
+    validate_http_startup_config(&config)?;
     let bind_address = format!("{}:{}", config.orchestrator.host, config.orchestrator.port);
     let listener = TcpListener::bind(&bind_address)
         .await
@@ -2388,6 +2463,62 @@ mod tests {
             },
             ..test_config()
         }
+    }
+
+    #[test]
+    fn http_startup_config_allows_default_loopback_local_open_mode() {
+        let config = test_config();
+
+        validate_http_startup_config(&config).expect("default local config should be safe");
+    }
+
+    #[test]
+    fn http_startup_config_rejects_open_non_loopback_listener() {
+        let mut config = test_config();
+        config.orchestrator.host = "0.0.0.0".to_string();
+
+        let error = validate_http_startup_config(&config)
+            .expect_err("open non-loopback listener should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("non-loopback while auth is disabled")
+        );
+    }
+
+    #[test]
+    fn http_startup_config_rejects_public_non_loopback_basic_and_trusted_networks() {
+        let mut non_loopback = oauth_config();
+        non_loopback.runtime.public_url = Some("https://office.example.test".to_string());
+        non_loopback.orchestrator.host = "0.0.0.0".to_string();
+        non_loopback
+            .orchestrator
+            .google_oauth
+            .as_mut()
+            .expect("oauth")
+            .trusted_networks
+            .clear();
+
+        let error = validate_http_startup_config(&non_loopback)
+            .expect_err("public non-loopback origin should fail");
+        assert!(error.to_string().contains("must bind HTTP to loopback"));
+
+        let mut basic = basic_config();
+        basic.runtime.public_url = Some("https://office.example.test".to_string());
+        let error =
+            validate_http_startup_config(&basic).expect_err("public Basic-only auth should fail");
+        assert!(error.to_string().contains("requires Google OAuth/JWT"));
+
+        let mut trusted_network = oauth_config();
+        trusted_network.runtime.public_url = Some("https://office.example.test".to_string());
+        let error = validate_http_startup_config(&trusted_network)
+            .expect_err("public trusted-network bypass should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("must not configure google_oauth.trusted_networks")
+        );
     }
 
     fn configured_erv_config(active_control_enabled: bool) -> AppConfig {
