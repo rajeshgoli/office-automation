@@ -78,7 +78,7 @@ pub fn collect_session_telemetry(
 ) -> Result<TelemetryCollectStats> {
     let cutoff = now - Duration::days(days.max(1) as i64);
     let sessions = build_session_index(tool_usage_db_path, cutoff)?;
-    let commits_by_repo = collect_git_stats(repos, cutoff)?;
+    let commits_by_repo = collect_git_stats(repos, start_of_day(cutoff))?;
 
     let mut matched_hashes = HashSet::new();
     let mut rows = Vec::new();
@@ -778,6 +778,13 @@ fn format_timestamp(value: NaiveDateTime) -> String {
     value.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+fn start_of_day(value: NaiveDateTime) -> NaiveDateTime {
+    value
+        .date()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight should be a valid local naive time")
+}
+
 fn is_human_session(session_name: &str, session_id: &str) -> bool {
     if session_name.starts_with("claude-")
         && session_name
@@ -1039,6 +1046,63 @@ mod tests {
         );
         assert!(!telemetry_db.exists());
         assert!(!telemetry_db.parent().expect("parent").exists());
+    }
+
+    #[test]
+    fn synthetic_rows_keep_full_cutoff_day_across_repeated_runs() {
+        let (_temp_dir, repo) = init_repo();
+        let tracked = repo.join("tracked.py");
+        fs::write(&tracked, "print('morning')\n").expect("write tracked");
+        run_git(&repo, &["add", "tracked.py"], None);
+        run_git(
+            &repo,
+            &["commit", "-m", "morning"],
+            Some("2026-03-27T09:00:00-07:00"),
+        );
+        fs::write(&tracked, "print('morning')\nprint('evening')\n").expect("write tracked");
+        run_git(&repo, &["add", "tracked.py"], None);
+        run_git(
+            &repo,
+            &["commit", "-m", "evening"],
+            Some("2026-03-27T20:00:00-07:00"),
+        );
+
+        let tool_db = repo.parent().expect("parent").join("tool_usage.db");
+        let telemetry_db = repo.parent().expect("parent").join("telemetry.db");
+        create_tool_usage_db(&tool_db);
+
+        collect_session_telemetry(
+            &tool_db,
+            &telemetry_db,
+            std::slice::from_ref(&repo),
+            1,
+            false,
+            parse_datetime("2026-03-28 00:05:00").expect("now"),
+        )
+        .expect("initial collect");
+        collect_session_telemetry(
+            &tool_db,
+            &telemetry_db,
+            std::slice::from_ref(&repo),
+            1,
+            false,
+            parse_datetime("2026-03-28 18:00:00").expect("now"),
+        )
+        .expect("second collect");
+
+        let connection = Connection::open(&telemetry_db).expect("open telemetry");
+        let (git_commits, lines_added): (i64, i64) = connection
+            .query_row(
+                "SELECT git_commits, lines_added
+                 FROM session_output
+                 WHERE session_id = 'unattributed-office-automate-2026-03-27'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("synthetic row");
+
+        assert_eq!(git_commits, 2);
+        assert_eq!(lines_added, 2);
     }
 
     #[test]
