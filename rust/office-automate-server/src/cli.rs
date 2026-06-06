@@ -75,28 +75,38 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn run_smoke(config: &AppConfig, target: Option<SmokeTarget>) -> Result<()> {
-    match target {
-        Some(SmokeTarget::Erv) | None => {
-            let status = erv::smoke_erv(config).await?;
-            println!(
-                "ERV local status OK: running={} speed={}",
-                status.power,
-                status
-                    .fan_speed
-                    .map(|speed| speed.as_str())
-                    .unwrap_or("unknown")
-            );
-        }
-        Some(SmokeTarget::Hvac) => {
-            let status = hvac::smoke_hvac(config).await?;
-            println!(
-                "HVAC Kumo status OK: mode={} setpoint_c={:.1}",
-                status.mode, status.setpoint_c
-            );
+    for smoke_target in smoke_targets(target) {
+        match smoke_target {
+            SmokeTarget::Erv => {
+                let status = erv::smoke_erv(config).await?;
+                println!(
+                    "ERV local status OK: running={} speed={}",
+                    status.power,
+                    status
+                        .fan_speed
+                        .map(|speed| speed.as_str())
+                        .unwrap_or("unknown")
+                );
+            }
+            SmokeTarget::Hvac => {
+                let status = hvac::smoke_hvac(config).await?;
+                println!(
+                    "HVAC Kumo status OK: mode={} setpoint_c={:.1}",
+                    status.mode, status.setpoint_c
+                );
+            }
         }
     }
 
     Ok(())
+}
+
+fn smoke_targets(target: Option<SmokeTarget>) -> &'static [SmokeTarget] {
+    match target {
+        Some(SmokeTarget::Erv) => &[SmokeTarget::Erv],
+        Some(SmokeTarget::Hvac) => &[SmokeTarget::Hvac],
+        None => &[SmokeTarget::Erv, SmokeTarget::Hvac],
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +181,28 @@ mod tests {
             Command::Smoke(args) => {
                 assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
                 assert_eq!(args.target, Some(SmokeTarget::Hvac));
+            }
+            other => panic!("expected smoke command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_smoke_runs_all_dependency_checks() {
+        let cli = Cli::try_parse_from([
+            "office-automate-server",
+            "smoke",
+            "--config",
+            "/tmp/office.yaml",
+        ])
+        .expect("smoke command should parse");
+
+        match cli.command {
+            Command::Smoke(args) => {
+                assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
+                assert_eq!(
+                    smoke_targets(args.target),
+                    &[SmokeTarget::Erv, SmokeTarget::Hvac]
+                );
             }
             other => panic!("expected smoke command, got {other:?}"),
         }
