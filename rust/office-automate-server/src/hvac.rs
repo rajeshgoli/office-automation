@@ -26,6 +26,7 @@ pub enum HvacControlMode {
     Off,
     Heat,
     Cool,
+    Auto,
 }
 
 impl HvacControlMode {
@@ -34,6 +35,7 @@ impl HvacControlMode {
             Self::Off => "off",
             Self::Heat => "heat",
             Self::Cool => "cool",
+            Self::Auto => "auto",
         }
     }
 
@@ -42,6 +44,7 @@ impl HvacControlMode {
             "off" => Some(Self::Off),
             "heat" => Some(Self::Heat),
             "cool" => Some(Self::Cool),
+            "auto" => Some(Self::Auto),
             _ => None,
         }
     }
@@ -510,6 +513,12 @@ impl KumoClient {
             }
             HvacControlMode::Cool => {
                 commands.insert("spCool".to_string(), json!(setpoint_c.unwrap_or(22.0)));
+            }
+            HvacControlMode::Auto => {
+                if let Some(setpoint_c) = setpoint_c {
+                    commands.insert("spHeat".to_string(), json!(setpoint_c));
+                    commands.insert("spCool".to_string(), json!(setpoint_c));
+                }
             }
         }
 

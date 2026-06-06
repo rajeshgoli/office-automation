@@ -847,6 +847,26 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
         .as_deref()
         .and_then(hvac_mode_from_str);
     let erv_snapshot = state.erv.snapshot();
+    if !state_status.is_present
+        && erv_snapshot.running
+        && !hvac_snapshot.suspended
+        && matches!(hvac_mode, HvacMode::Heat | HvacMode::Cool | HvacMode::Auto)
+        && temp_f.is_some_and(|temp_f| temp_f > state.config.thresholds.hvac_min_temp_f as f64)
+    {
+        let temp_label = temp_f.expect("ERV suspension temperature checked").round() as i64;
+        let previous_mode = hvac_snapshot.mode.clone();
+        apply_hvac_mode(
+            state,
+            HvacControlMode::Off,
+            None,
+            &format!("erv_running_temp_{temp_label}F"),
+        )
+        .await?;
+        state.hvac.set_suspended(true, Some(previous_mode));
+        state.hvac.set_temp_band_mode(None);
+        broadcast_status(state);
+        return Ok(());
+    }
 
     let action = get_hvac_band_action(
         temp_f,
@@ -877,10 +897,15 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
                 erv_snapshot.running,
             ) {
                 let setpoint_c = match restore_mode {
-                    HvacControlMode::Heat => hvac_snapshot.heat_setpoint_c.unwrap_or(22.0),
-                    HvacControlMode::Cool => hvac_snapshot.cool_setpoint_c.unwrap_or_else(|| {
-                        fahrenheit_to_celsius(state.config.thresholds.hvac_cool_setpoint_f as f64)
-                    }),
+                    HvacControlMode::Heat => Some(hvac_snapshot.heat_setpoint_c.unwrap_or(22.0)),
+                    HvacControlMode::Cool => {
+                        Some(hvac_snapshot.cool_setpoint_c.unwrap_or_else(|| {
+                            fahrenheit_to_celsius(
+                                state.config.thresholds.hvac_cool_setpoint_f as f64,
+                            )
+                        }))
+                    }
+                    HvacControlMode::Auto => None,
                     HvacControlMode::Off => unreachable!("restore mode is never off"),
                 };
                 let reason = if state_status.is_present {
@@ -888,7 +913,7 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
                 } else {
                     "erv_stopped_occupancy_hours"
                 };
-                apply_hvac_mode(state, restore_mode, Some(setpoint_c), reason).await?;
+                apply_hvac_mode(state, restore_mode, setpoint_c, reason).await?;
                 state.hvac.set_suspended(false, None);
                 state.hvac.set_temp_band_mode(None);
                 broadcast_status(state);
@@ -1027,6 +1052,7 @@ fn should_restore_hvac_mode(
     match mode {
         HvacControlMode::Heat => temp_f < bands.heat_off_temp_f as f64,
         HvacControlMode::Cool => temp_f > bands.cool_off_temp_f as f64,
+        HvacControlMode::Auto => true,
         HvacControlMode::Off => false,
     }
 }
@@ -1046,6 +1072,13 @@ async fn hvac(State(state): State<AppState>, Json(payload): Json<HvacRequest>) -
         )
             .into_response();
     };
+    if matches!(mode, HvacControlMode::Auto) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "Invalid HVAC mode"})),
+        )
+            .into_response();
+    }
 
     let setpoint_f = payload.setpoint_f.unwrap_or(70.0);
     let setpoint_c = fahrenheit_to_celsius(setpoint_f);
@@ -2062,6 +2095,13 @@ mod tests {
                 "spCool": setpoint_c
             }))
             .expect("HVAC cool status"),
+            HvacControlMode::Auto => parse_kumo_adapter_status(&json!({
+                "power": 1,
+                "operationMode": "auto",
+                "spHeat": 22.0,
+                "spCool": 25.5
+            }))
+            .expect("HVAC auto status"),
         }
     }
 
@@ -2943,6 +2983,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_hvac_write_rejects_auto_mode() {
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Auto, 22.0))],
+        ));
+        let service = app_with_hvac_writer(configured_hvac_config(true), writer.clone());
+
+        let response = service
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/hvac")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"mode":"auto","setpoint_f":70}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["error"], "Invalid HVAC mode");
+        assert_eq!(writer.smoke_calls(), 0);
+        assert!(writer.write_modes().is_empty());
+    }
+
+    #[tokio::test]
     async fn manual_hvac_write_surfaces_device_failure() {
         let writer = Arc::new(FakeHvacWriter::new(
             vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
@@ -3247,6 +3317,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automated_hvac_policy_restores_suspended_auto_after_safety_clears() {
+        let config = configured_hvac_config(true);
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            now,
+        )));
+        {
+            let mut machine = state_machine.write().expect("state machine lock poisoned");
+            machine.set_manual_presence(true, now);
+            machine.update_door(true, now + 1.0);
+        }
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Auto, 22.0));
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![
+                Ok(hvac_status(HvacControlMode::Auto, 22.0)),
+                Ok(hvac_status(HvacControlMode::Off, 22.0)),
+            ],
+            vec![
+                Ok(hvac_status(HvacControlMode::Off, 22.0)),
+                Ok(hvac_status(HvacControlMode::Auto, 22.0)),
+            ],
+        ));
+        let qingping = qingping_with_temp(fahrenheit_to_celsius(72.0));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            qingping,
+            state_machine.clone(),
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy applies safety off");
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .update_door(false, now + 2.0);
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy restores auto");
+
+        assert_eq!(writer.smoke_calls(), 2);
+        assert_eq!(
+            writer.write_modes(),
+            vec![(HvacControlMode::Off, None), (HvacControlMode::Auto, None),]
+        );
+        let snapshot = state.hvac.snapshot();
+        assert_eq!(snapshot.mode, "auto");
+        assert!(!snapshot.suspended);
+    }
+
+    #[tokio::test]
     async fn automated_hvac_policy_heats_away_room_below_critical_temp() {
         let config = configured_hvac_config(true);
         let writer = Arc::new(FakeHvacWriter::new(
@@ -3282,6 +3413,73 @@ mod tests {
         assert_eq!(
             writer.write_modes(),
             vec![(HvacControlMode::Heat, Some(22.0))]
+        );
+    }
+
+    #[tokio::test]
+    async fn automated_hvac_policy_suspends_heat_while_away_erv_running() {
+        let mut config = configured_hvac_config(true);
+        config.erv = configured_erv_config(true).erv;
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            now,
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let seed_erv_writer = FakeErvWriter::new(vec![Ok(erv_status(ErvFanSpeed::Turbo))], vec![]);
+        erv_state
+            .smoke_status_with(&config.erv, &seed_erv_writer)
+            .await
+            .expect("seed ERV running status");
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Heat, 22.0));
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Heat, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+        ));
+        let qingping = qingping_with_temp(fahrenheit_to_celsius(70.0));
+        let (service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            qingping,
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy applies ERV suspension");
+
+        assert_eq!(writer.smoke_calls(), 1);
+        assert_eq!(writer.write_modes(), vec![(HvacControlMode::Off, None)]);
+        let snapshot = state.hvac.snapshot();
+        assert!(snapshot.suspended);
+        assert_eq!(snapshot.last_mode.as_deref(), Some("heat"));
+
+        let response = service
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/history?hours=1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["climate_actions"][0]["system"], "hvac");
+        assert_eq!(value["climate_actions"][0]["action"], "off");
+        assert_eq!(
+            value["climate_actions"][0]["reason"],
+            "erv_running_temp_70F"
         );
     }
 

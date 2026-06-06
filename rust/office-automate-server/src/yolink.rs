@@ -3,7 +3,7 @@ use std::{
     future::Future,
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -640,7 +640,9 @@ async fn apply_yolink_report_with_policy(
     device_hook: Option<&DeviceIngressHook>,
 ) -> Result<()> {
     if let Some(erv_automation) = erv_automation {
-        let applied_device = erv_automation
+        let report_applied = Arc::new(Mutex::new(false));
+        let report_applied_for_hook = report_applied.clone();
+        let policy_result = erv_automation
             .update_state_and_maybe_evaluate(|| {
                 let applied = yolink
                     .apply_report(report, now)
@@ -648,6 +650,7 @@ async fn apply_yolink_report_with_policy(
                 let Some(applied) = applied else {
                     return Ok((None, None, now, false, false));
                 };
+                *report_applied_for_hook.lock().expect("report applied lock") = true;
                 let bypass_dwell = applied.transition.is_some();
                 Ok((
                     Some(applied.device_type),
@@ -657,10 +660,22 @@ async fn apply_yolink_report_with_policy(
                     true,
                 ))
             })
-            .await?;
-        if applied_device.is_some() {
-            if let Some(hook) = device_hook {
-                hook();
+            .await;
+        match policy_result {
+            Ok(applied_device) => {
+                if applied_device.is_some() {
+                    if let Some(hook) = device_hook {
+                        hook();
+                    }
+                }
+            }
+            Err(error) => {
+                if *report_applied.lock().expect("report applied lock") {
+                    if let Some(hook) = device_hook {
+                        hook();
+                    }
+                }
+                return Err(error);
             }
         }
         return Ok(());
@@ -700,13 +715,22 @@ mod tests {
 
     struct FakeErvWriter {
         smoke_results: Mutex<VecDeque<Result<ErvDeviceStatus>>>,
+        write_results: Mutex<VecDeque<Result<ErvDeviceStatus>>>,
         write_speeds: Mutex<Vec<ErvFanSpeed>>,
     }
 
     impl FakeErvWriter {
         fn new(smoke_results: Vec<Result<ErvDeviceStatus>>) -> Self {
+            Self::with_write_results(smoke_results, Vec::new())
+        }
+
+        fn with_write_results(
+            smoke_results: Vec<Result<ErvDeviceStatus>>,
+            write_results: Vec<Result<ErvDeviceStatus>>,
+        ) -> Self {
             Self {
                 smoke_results: Mutex::new(smoke_results.into()),
+                write_results: Mutex::new(write_results.into()),
                 write_speeds: Mutex::new(Vec::new()),
             }
         }
@@ -739,7 +763,13 @@ mod tests {
                 .lock()
                 .expect("write speeds lock")
                 .push(speed);
-            Box::pin(async move { Ok(erv_status(speed)) })
+            let result = self
+                .write_results
+                .lock()
+                .expect("write results lock")
+                .pop_front()
+                .unwrap_or_else(|| Ok(erv_status(speed)));
+            Box::pin(async move { result })
         }
     }
 
@@ -1154,6 +1184,76 @@ mod tests {
         assert_eq!(
             *hook_observations.lock().expect("hook observations lock"),
             vec![false]
+        );
+    }
+
+    #[tokio::test]
+    async fn device_hook_runs_when_erv_policy_write_fails_after_report_applies() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+        let config = test_config(db_path.clone());
+        let state_machine = Arc::new(RwLock::new(StateMachine::new(
+            StateConfig::from_thresholds(&config.thresholds),
+            1_000.0,
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .set_manual_presence(true, 1_001.0);
+        let yolink = YoLinkState::new(state_machine.clone(), db_path.clone());
+        yolink.apply_devices(sample_devices());
+        let qingping = QingpingState::default();
+        let erv = ErvState::new(db_path);
+        let writer = Arc::new(FakeErvWriter::with_write_results(
+            vec![Ok(erv_status(ErvFanSpeed::Medium))],
+            vec![Err(anyhow::anyhow!("ERV write failed"))],
+        ));
+        let policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
+        let (status_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let coordinator = ErvPolicyCoordinator::new(
+            config,
+            state_machine.clone(),
+            qingping,
+            erv,
+            policy,
+            writer.clone(),
+            status_broadcast,
+        );
+        let hook_observations = Arc::new(Mutex::new(Vec::new()));
+        let hook: DeviceIngressHook = Arc::new({
+            let state_machine = state_machine.clone();
+            let hook_observations = hook_observations.clone();
+            move || {
+                let safety_interlock = state_machine
+                    .read()
+                    .expect("state machine lock poisoned")
+                    .status_at(1_002.0)
+                    .safety_interlock;
+                hook_observations
+                    .lock()
+                    .expect("hook observations lock")
+                    .push(safety_interlock);
+            }
+        });
+
+        let result = apply_yolink_report_with_policy(
+            &yolink,
+            YoLinkReport {
+                device_id: "door-1".to_string(),
+                data: json!({"state": "open"}),
+            },
+            1_002.0,
+            Some(&coordinator),
+            Some(&hook),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(writer.write_speeds(), vec![ErvFanSpeed::Off]);
+        assert_eq!(
+            *hook_observations.lock().expect("hook observations lock"),
+            vec![true]
         );
     }
 
