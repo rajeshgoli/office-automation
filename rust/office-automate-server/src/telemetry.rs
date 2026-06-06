@@ -13,6 +13,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Local, NaiveDateTime};
+use chrono_tz::America::Los_Angeles;
 use rusqlite::{Connection, OptionalExtension, params};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -759,7 +760,7 @@ fn parse_datetime(value: &str) -> Result<NaiveDateTime> {
         normalized.to_string()
     };
     if let Ok(timestamp) = DateTime::parse_from_rfc3339(&rfc3339) {
-        return Ok(timestamp.with_timezone(&Local).naive_local());
+        return Ok(timestamp.with_timezone(&Los_Angeles).naive_local());
     }
     for format in [
         "%Y-%m-%d %H:%M:%S%.f",
@@ -1224,6 +1225,18 @@ mod tests {
         assert_eq!(
             parse_shortstat(" 1 file changed, 1 insertion(+)"),
             Some((1, 1, 0))
+        );
+    }
+
+    #[test]
+    fn parses_offset_timestamps_as_pacific_database_time() {
+        assert_eq!(
+            parse_datetime("2026-03-27T16:00:10Z").expect("timestamp"),
+            parse_datetime("2026-03-27 09:00:10").expect("pacific timestamp")
+        );
+        assert_eq!(
+            parse_datetime("2026-01-15T18:30:00Z").expect("timestamp"),
+            parse_datetime("2026-01-15 10:30:00").expect("pacific timestamp")
         );
     }
 }
