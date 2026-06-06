@@ -207,6 +207,7 @@ pub async fn run_shadow_validation(
 ) -> Result<ShadowValidationReport> {
     let mut report = ShadowValidationReport { checks: Vec::new() };
 
+    validate_http_startup_config(config, &mut report)?;
     validate_active_write_gates(config, &mut report)?;
     validate_database_inputs(config, &mut report)?;
 
@@ -237,6 +238,7 @@ pub async fn run_cutover_validation(
 ) -> Result<ShadowValidationReport> {
     let mut report = ShadowValidationReport { checks: Vec::new() };
 
+    validate_http_startup_config(config, &mut report)?;
     validate_cutover_active_write_gates(config, &mut report)?;
     validate_cutover_snapshot(&options.snapshot_dir, &mut report)?;
     validate_legacy_controller_stopped(&options, &mut report).await?;
@@ -279,6 +281,18 @@ fn validate_active_write_gates(
     report.push_pass(
         "active-write-gates",
         "ERV and HVAC active-control flags are disabled",
+    );
+    Ok(())
+}
+
+fn validate_http_startup_config(
+    config: &AppConfig,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    http::validate_http_startup_config(config)?;
+    report.push_pass(
+        "http-startup-config",
+        "HTTP listener startup config is safe for configured public/local exposure",
     );
     Ok(())
 }
@@ -2070,6 +2084,30 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "office-climate-db")
         );
+    }
+
+    #[test]
+    fn validation_records_http_startup_config_and_rejects_public_basic_mode() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+        let config = test_config(&db_path);
+
+        validate_http_startup_config(&config, &mut report).expect("default config should pass");
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "http-startup-config")
+        );
+
+        let mut public_basic = test_config(&db_path);
+        public_basic.runtime.public_url = Some("https://office.example.test".to_string());
+        public_basic.orchestrator.auth_username = Some("user".to_string());
+        public_basic.orchestrator.auth_password = Some("pass".to_string());
+        let error = validate_http_startup_config(&public_basic, &mut report)
+            .expect_err("public Basic-only config should fail validation");
+        assert!(error.to_string().contains("requires Google OAuth/JWT"));
     }
 
     #[test]

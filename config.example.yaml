@@ -53,7 +53,7 @@ thresholds:
 
 # Orchestrator network settings (for Mac occupancy detector to report to)
 orchestrator:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 8080
   # Optional: Enable HTTP Basic Auth for remote access (recommended with Cloudflare Tunnel)
   # auth_username: "admin"
