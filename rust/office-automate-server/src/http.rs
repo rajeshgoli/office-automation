@@ -582,6 +582,8 @@ async fn occupancy(
     Json(payload): Json<OccupancyRequest>,
 ) -> Response {
     let now = unix_timestamp_now();
+    let applied_transition = Arc::new(std::sync::Mutex::new(None));
+    let applied_transition_for_update = Arc::clone(&applied_transition);
     let policy_result = state
         .erv_automation
         .update_state_and_maybe_evaluate(|| {
@@ -598,6 +600,9 @@ async fn occupancy(
                 let status = machine.status_at(now);
                 (transition, status.state, status.erv_should_run)
             };
+            *applied_transition_for_update
+                .lock()
+                .expect("occupancy transition lock poisoned") = transition;
             log_state_transition(&state, transition, "mac_activity")
                 .context("failed to persist occupancy update")?;
             Ok((
@@ -631,7 +636,10 @@ async fn occupancy(
                 .read()
                 .expect("state machine lock poisoned")
                 .status_at(now);
-            (None, status.state, status.erv_should_run)
+            let transition = *applied_transition
+                .lock()
+                .expect("occupancy transition lock poisoned");
+            (transition, status.state, status.erv_should_run)
         }
     };
     clear_hvac_manual_override_on_transition(&state, transition);
@@ -653,6 +661,8 @@ async fn presence(State(state): State<AppState>, Json(payload): Json<PresenceReq
             let requested_state = payload.state.as_str();
             let now = unix_timestamp_now();
             let present = requested_state == "present";
+            let applied_transition = Arc::new(std::sync::Mutex::new(None));
+            let applied_transition_for_update = Arc::clone(&applied_transition);
             let policy_result = state
                 .erv_automation
                 .update_state_and_maybe_evaluate(|| {
@@ -665,6 +675,9 @@ async fn presence(State(state): State<AppState>, Json(payload): Json<PresenceReq
                         let status = machine.status_at(now);
                         (transition, status.state, status.is_present)
                     };
+                    *applied_transition_for_update
+                        .lock()
+                        .expect("presence transition lock poisoned") = transition;
                     db::log_device_event(
                         &state.config.runtime.database_path,
                         "presence",
@@ -707,7 +720,10 @@ async fn presence(State(state): State<AppState>, Json(payload): Json<PresenceReq
                         .read()
                         .expect("state machine lock poisoned")
                         .status_at(now);
-                    (None, status.state, status.is_present)
+                    let transition = *applied_transition
+                        .lock()
+                        .expect("presence transition lock poisoned");
+                    (transition, status.state, status.is_present)
                 }
             };
             clear_hvac_manual_override_on_transition(&state, transition);
@@ -3828,6 +3844,82 @@ mod tests {
             .await
             .expect("read status");
         let value: Value = serde_json::from_slice(&body).expect("status json");
+        assert_eq!(value["manual_override"]["hvac"], false);
+        assert_eq!(value["hvac"]["mode"], "cool");
+    }
+
+    #[tokio::test]
+    async fn presence_preserves_transition_when_erv_policy_fails() {
+        let mut config = configured_erv_config(true);
+        config.mitsubishi = configured_hvac_config(true).mitsubishi;
+        let qingping = QingpingState::default();
+        qingping.apply_reading(crate::qingping::QingpingReading {
+            temp_c: Some(28.0),
+            ..qingping_reading(2100)
+        });
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            unix_timestamp_now(),
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Off, 22.0));
+        hvac_state.record_manual_override(HvacControlMode::Off, 70.0);
+        let erv_writer = Arc::new(FakeErvWriter::new(
+            vec![Ok(erv_status(ErvFanSpeed::Off))],
+            vec![Err(anyhow::anyhow!("ERV write failed"))],
+        ));
+        let hvac_writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Cool, 25.5))],
+        ));
+        let service = try_app_with_erv_writer(
+            config,
+            qingping,
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            erv_writer.clone(),
+            hvac_writer.clone(),
+        )
+        .expect("app");
+
+        let response = service
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/presence")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"state":"present"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("presence response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(erv_writer.write_speeds(), vec![ErvFanSpeed::Quiet]);
+        assert_eq!(
+            hvac_writer.write_modes(),
+            vec![(HvacControlMode::Cool, Some(25.5))]
+        );
+
+        let response = service
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("status response");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read status");
+        let value: Value = serde_json::from_slice(&body).expect("status json");
+        assert_eq!(value["state"], "present");
         assert_eq!(value["manual_override"]["hvac"], false);
         assert_eq!(value["hvac"]["mode"], "cool");
     }
