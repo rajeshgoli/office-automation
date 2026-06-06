@@ -329,14 +329,16 @@ pub fn start_hvac_status_poll(config: &AppConfig, hvac: HvacState) -> Option<Joi
         let reader = KumoHvacStatusReader;
         let mut interval =
             time::interval(Duration::from_secs(config.poll_interval_seconds.max(60)));
+        let mut initial_status_loaded = false;
         loop {
             interval.tick().await;
-            if hvac_poll_paused_now() {
+            if should_skip_hvac_poll(initial_status_loaded, Local::now().hour()) {
                 tracing::debug!("HVAC polling paused during night hours");
                 continue;
             }
-            if let Err(error) = hvac.refresh_with(&config, &reader).await {
-                tracing::warn!("HVAC read-only status poll failed: {error:#}");
+            match hvac.refresh_with(&config, &reader).await {
+                Ok(_) => initial_status_loaded = true,
+                Err(error) => tracing::warn!("HVAC read-only status poll failed: {error:#}"),
             }
         }
     }))
@@ -347,9 +349,8 @@ pub async fn smoke_hvac(config: &AppConfig) -> Result<HvacDeviceStatus> {
     reader.read_status(&config.mitsubishi).await
 }
 
-fn hvac_poll_paused_now() -> bool {
-    let hour = Local::now().hour();
-    hour >= 23 || hour < 6
+fn should_skip_hvac_poll(initial_status_loaded: bool, hour: u32) -> bool {
+    initial_status_loaded && (hour >= 23 || hour < 6)
 }
 
 #[cfg(test)]
@@ -484,5 +485,15 @@ mod tests {
             .expect("refresh succeeds");
 
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn hvac_night_pause_does_not_skip_initial_status_load() {
+        assert!(!should_skip_hvac_poll(false, 23));
+        assert!(!should_skip_hvac_poll(false, 5));
+        assert!(should_skip_hvac_poll(true, 23));
+        assert!(should_skip_hvac_poll(true, 5));
+        assert!(!should_skip_hvac_poll(true, 6));
+        assert!(!should_skip_hvac_poll(true, 22));
     }
 }
