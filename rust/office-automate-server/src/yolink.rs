@@ -704,8 +704,8 @@ mod tests {
     use super::*;
     use crate::{
         config::{
-            ErvConfig, MitsubishiConfig, OrchestratorConfig, QingpingConfig, RuntimeConfig,
-            ThresholdsConfig,
+            ErvConfig, MitsubishiConfig, OrchestratorConfig, PresenceConfig, QingpingConfig,
+            RuntimeConfig, ThresholdsConfig,
         },
         db::migrate_database,
         erv::{ErvDeviceStatus, ErvFanSpeed, ErvSpeedWriter, ErvState},
@@ -793,6 +793,7 @@ mod tests {
             .to_path_buf();
         AppConfig {
             orchestrator: OrchestratorConfig::default(),
+            presence: PresenceConfig::default(),
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),
             erv: ErvConfig {

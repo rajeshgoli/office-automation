@@ -23,7 +23,12 @@ use axum::{
 use chrono::{NaiveTime, Timelike};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, sync::broadcast, time::timeout};
+use tokio::{
+    net::TcpListener,
+    sync::broadcast,
+    task::JoinHandle,
+    time::{self, timeout},
+};
 use tower_http::{
     cors::{Any, CorsLayer},
     services::ServeDir,
@@ -46,6 +51,7 @@ use crate::{
     },
     mqtt,
     policy::{ErvPolicyState, HvacBandAction, HvacMode, get_hvac_band_action},
+    presence::{MacOsPresenceReader, PresenceSnapshot},
     qingping::QingpingState,
     state::{OccupancyState, StateMachine, StateTransition},
     status::{Status, TemperatureBands},
@@ -126,7 +132,7 @@ fn try_app_with_erv_writer(
     erv_writer: Arc<dyn ErvSpeedWriter>,
     hvac_writer: Arc<dyn HvacModeWriter>,
 ) -> Result<Router> {
-    try_app_with_erv_writer_and_coordinator(
+    let (router, _) = try_app_with_erv_writer_and_coordinator(
         config,
         qingping,
         state_machine,
@@ -135,8 +141,8 @@ fn try_app_with_erv_writer(
         hvac_state,
         erv_writer,
         hvac_writer,
-    )
-    .map(|(router, _)| router)
+    )?;
+    Ok(router)
 }
 
 fn try_app_with_erv_writer_and_coordinator(
@@ -149,6 +155,30 @@ fn try_app_with_erv_writer_and_coordinator(
     erv_writer: Arc<dyn ErvSpeedWriter>,
     hvac_writer: Arc<dyn HvacModeWriter>,
 ) -> Result<(Router, AppState)> {
+    let (state, _) = build_app_state(
+        config,
+        qingping,
+        state_machine,
+        yolink,
+        erv_state,
+        hvac_state,
+        erv_writer,
+        hvac_writer,
+    )?;
+    let router = router_from_state(state.clone());
+    Ok((router, state))
+}
+
+fn build_app_state(
+    config: AppConfig,
+    qingping: QingpingState,
+    state_machine: Arc<RwLock<StateMachine>>,
+    yolink: YoLinkState,
+    erv_state: ErvState,
+    hvac_state: HvacState,
+    erv_writer: Arc<dyn ErvSpeedWriter>,
+    hvac_writer: Arc<dyn HvacModeWriter>,
+) -> Result<(AppState, ErvPolicyCoordinator)> {
     db::migrate_database(&config.runtime.database_path)?;
     let auth = AuthManager::new(&config.orchestrator)?;
     let artifacts = ArtifactStore::new(
@@ -187,6 +217,10 @@ fn try_app_with_erv_writer_and_coordinator(
         hvac_writer,
     };
 
+    Ok((state, erv_automation))
+}
+
+fn router_from_state(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
@@ -195,7 +229,7 @@ fn try_app_with_erv_writer_and_coordinator(
     let frontend_dist = state.config.runtime.frontend_dist.clone();
     let assets_dir = frontend_dist.join("assets");
 
-    let router = Router::new()
+    Router::new()
         .route("/status", get(status))
         .route("/ws", get(websocket))
         .route("/occupancy", post(occupancy))
@@ -240,9 +274,7 @@ fn try_app_with_erv_writer_and_coordinator(
         ))
         .with_state(state.clone())
         .layer(cors)
-        .layer(TraceLayer::new_for_http());
-
-    Ok((router, state))
+        .layer(TraceLayer::new_for_http())
 }
 
 pub async fn serve(config: AppConfig) -> Result<()> {
@@ -258,7 +290,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
     let erv_state = ErvState::new(config.runtime.database_path.clone());
     let hvac_state = HvacState::new(config.runtime.database_path.clone());
-    let (app, app_state) = try_app_with_erv_writer_and_coordinator(
+    let (app_state, erv_automation) = build_app_state(
         config.clone(),
         qingping.clone(),
         state_machine,
@@ -268,8 +300,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         Arc::new(RustuyaErvSpeedWriter),
         Arc::new(KumoHvacModeWriter),
     )
-    .context("failed to build HTTP app")?;
-    let erv_automation = app_state.erv_automation.clone();
+    .context("failed to build HTTP app state")?;
+    let app = router_from_state(app_state.clone());
     let runtime_handle = tokio::runtime::Handle::current();
     let qingping_policy_trigger: mqtt::SensorIngressHook = Arc::new({
         let erv_automation = erv_automation.clone();
@@ -304,6 +336,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     );
     let _erv_task = crate::erv::start_erv_status_poll(&config, erv_state);
     let _hvac_task = crate::hvac::start_hvac_status_poll(&config, hvac_state);
+    let _presence_task = start_presence_poll(app_state);
 
     tracing::info!("office-automate-server listening on {}", bind_address);
     axum::serve(
@@ -312,6 +345,32 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     )
     .await
     .context("HTTP server failed")
+}
+
+fn start_presence_poll(state: AppState) -> Option<JoinHandle<()>> {
+    if !state.config.presence.enabled {
+        tracing::info!("internal macOS presence polling disabled");
+        return None;
+    }
+
+    let poll_interval = Duration::from_secs(state.config.presence.poll_interval_seconds.max(1));
+    let reader = MacOsPresenceReader::from_config(&state.config.presence);
+    Some(tokio::spawn(async move {
+        let mut interval = time::interval(poll_interval);
+        loop {
+            interval.tick().await;
+            match reader.read_snapshot().await {
+                Ok(snapshot) => {
+                    if let Err(error) = apply_presence_snapshot(&state, snapshot).await {
+                        tracing::warn!("internal presence update failed: {error:#}");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("internal presence signal read failed: {error:#}");
+                }
+            }
+        }
+    }))
 }
 
 async fn auth_middleware(
@@ -590,6 +649,46 @@ async fn occupancy(
     State(state): State<AppState>,
     Json(payload): Json<OccupancyRequest>,
 ) -> Response {
+    match apply_occupancy_signal(
+        &state,
+        payload.last_active_timestamp,
+        payload.external_monitor,
+        "mac_activity",
+    )
+    .await
+    {
+        Ok((state_name, erv_should_run)) => {
+            Json(json!({"ok": true, "state": state_name, "erv_should_run": erv_should_run}))
+                .into_response()
+        }
+        Err(error) => {
+            tracing::error!("failed to apply occupancy update: {error:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": "Failed to persist occupancy update"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn apply_presence_snapshot(state: &AppState, snapshot: PresenceSnapshot) -> Result<()> {
+    apply_occupancy_signal(
+        state,
+        snapshot.last_active_timestamp,
+        snapshot.external_monitor,
+        "internal_presence",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn apply_occupancy_signal(
+    state: &AppState,
+    last_active_timestamp: f64,
+    external_monitor: bool,
+    trigger: &str,
+) -> Result<(String, bool)> {
     let now = unix_timestamp_now();
     let applied_transition = Arc::new(std::sync::Mutex::new(None));
     let applied_transition_for_update = Arc::clone(&applied_transition);
@@ -601,18 +700,15 @@ async fn occupancy(
                     .state_machine
                     .write()
                     .expect("state machine lock poisoned");
-                let transition = machine.update_mac_occupancy(
-                    payload.last_active_timestamp,
-                    payload.external_monitor,
-                    now,
-                );
+                let transition =
+                    machine.update_mac_occupancy(last_active_timestamp, external_monitor, now);
                 let status = machine.status_at(now);
                 (transition, status.state, status.erv_should_run)
             };
             *applied_transition_for_update
                 .lock()
                 .expect("occupancy transition lock poisoned") = transition;
-            log_state_transition(&state, transition, "mac_activity")
+            log_state_transition(state, transition, trigger)
                 .context("failed to persist occupancy update")?;
             Ok((
                 (transition, state_name, erv_should_run),
@@ -631,12 +727,7 @@ async fn occupancy(
                 .to_string()
                 .contains("failed to persist occupancy update") =>
         {
-            tracing::error!("failed to log occupancy transition: {error:#}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"ok": false, "error": "Failed to persist occupancy update"})),
-            )
-                .into_response();
+            return Err(error);
         }
         Err(error) => {
             tracing::warn!("ERV automated policy apply failed after occupancy update: {error:#}");
@@ -651,12 +742,12 @@ async fn occupancy(
             (transition, status.state, status.erv_should_run)
         }
     };
-    clear_hvac_manual_override_on_transition(&state, transition);
-    if let Err(error) = evaluate_and_apply_hvac_policy(&state).await {
+    clear_hvac_manual_override_on_transition(state, transition);
+    if let Err(error) = evaluate_and_apply_hvac_policy(state).await {
         tracing::warn!("HVAC automated policy apply failed after occupancy update: {error:#}");
     }
-    broadcast_status(&state);
-    Json(json!({"ok": true, "state": state_name, "erv_should_run": erv_should_run})).into_response()
+    broadcast_status(state);
+    Ok((state_name, erv_should_run))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2139,6 +2230,7 @@ mod tests {
         let root = temp_dir.keep();
         AppConfig {
             orchestrator: OrchestratorConfig::default(),
+            presence: crate::config::PresenceConfig::default(),
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),
             erv: ErvConfig::default(),
@@ -2881,6 +2973,196 @@ mod tests {
         assert_eq!(value["device_events"][0]["event"], "manual_present");
         assert_eq!(value["occupancy_history"][0]["state"], "present");
         assert_eq!(value["occupancy_history"][0]["trigger"], "manual");
+    }
+
+    #[tokio::test]
+    async fn occupancy_route_preserves_external_reporter_contract() {
+        let service = app(test_config());
+        let last_active_timestamp = unix_timestamp_now();
+        let response = service
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/occupancy")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "last_active_timestamp": last_active_timestamp,
+                            "external_monitor": true
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["state"], "present");
+        assert_eq!(value["erv_should_run"], false);
+
+        let response = service
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["state"], "present");
+        assert_eq!(value["sensors"]["mac_last_active"], last_active_timestamp);
+        assert_eq!(value["sensors"]["external_monitor"], true);
+
+        let response = service
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/history?hours=1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["occupancy_history"][0]["state"], "present");
+        assert_eq!(value["occupancy_history"][0]["trigger"], "mac_activity");
+    }
+
+    #[tokio::test]
+    async fn stale_occupancy_signal_does_not_undo_manual_away() {
+        let service = app(test_config());
+        let last_active_timestamp = unix_timestamp_now() - 5.0;
+        let occupancy_body = json!({
+            "last_active_timestamp": last_active_timestamp,
+            "external_monitor": true
+        })
+        .to_string();
+
+        let response = service
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/occupancy")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(occupancy_body.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("first occupancy response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = service
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/presence")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"state":"away"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("manual away response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = service
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/occupancy")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(occupancy_body))
+                    .expect("request"),
+            )
+            .await
+            .expect("second occupancy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["state"], "away");
+
+        let response = service
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("status response");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["state"], "away");
+        assert_eq!(value["sensors"]["mac_last_active"], last_active_timestamp);
+        assert_eq!(value["sensors"]["external_monitor"], true);
+    }
+
+    #[tokio::test]
+    async fn internal_presence_snapshot_uses_occupancy_update_path() {
+        let config = test_config();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            unix_timestamp_now(),
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let (state, _) = build_app_state(
+            config.clone(),
+            QingpingState::default(),
+            state_machine,
+            yolink,
+            ErvState::new(config.runtime.database_path.clone()),
+            HvacState::new(config.runtime.database_path.clone()),
+            Arc::new(FakeErvWriter::default()),
+            Arc::new(FakeHvacWriter::default()),
+        )
+        .expect("app state");
+        let last_active_timestamp = unix_timestamp_now();
+
+        apply_presence_snapshot(
+            &state,
+            PresenceSnapshot {
+                last_active_timestamp,
+                external_monitor: true,
+                idle_seconds: 0.1,
+                display_count: 2,
+                external_displays: vec!["Studio Display".to_string()],
+            },
+        )
+        .await
+        .expect("presence update");
+
+        let status = state
+            .state_machine
+            .read()
+            .expect("state machine lock poisoned")
+            .status_at(unix_timestamp_now());
+        assert_eq!(status.state, "present");
+        assert_eq!(status.sensors.mac_last_active, last_active_timestamp);
+        assert!(status.sensors.external_monitor);
+
+        let history = db::read_history(&config.runtime.database_path, 1, 10).expect("history");
+        assert_eq!(history.occupancy_history[0]["state"], "present");
+        assert_eq!(history.occupancy_history[0]["trigger"], "internal_presence");
     }
 
     #[tokio::test]

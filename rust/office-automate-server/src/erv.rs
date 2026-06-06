@@ -934,6 +934,7 @@ mod tests {
     fn app_config(erv: ErvConfig) -> AppConfig {
         AppConfig {
             orchestrator: OrchestratorConfig::default(),
+            presence: crate::config::PresenceConfig::default(),
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),
             erv,
