@@ -112,6 +112,18 @@ pub struct ShadowValidationArgs {
     /// Public Cloudflare Tunnel URL for the Rust shadow server.
     #[arg(long, env = "OFFICE_AUTOMATE_SHADOW_PUBLIC_URL")]
     pub public_url: Option<String>,
+    /// Local cloudflared config to validate for exact hostname and final deny ingress.
+    #[arg(long, env = "CLOUDFLARED_CONFIG")]
+    pub cloudflared_config: Option<PathBuf>,
+    /// Cloudflare Access service-token client id for authenticated public validation.
+    #[arg(long, env = "OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_CLIENT_ID")]
+    pub cloudflare_access_client_id: Option<String>,
+    /// Cloudflare Access service-token client secret for authenticated public validation.
+    #[arg(long, env = "OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_CLIENT_SECRET")]
+    pub cloudflare_access_client_secret: Option<String>,
+    /// Manual timestamp after browser/mobile Cloudflare Access plus Office auth verification.
+    #[arg(long, env = "OFFICE_AUTOMATE_MANUAL_PUBLIC_ACCESS_VERIFIED_AT")]
+    pub manual_public_access_verified_at: Option<String>,
     /// Skip ERV/HVAC/YoLink live read-only checks.
     #[arg(long)]
     pub skip_live_devices: bool,
@@ -146,9 +158,18 @@ pub struct CutoverValidationArgs {
     /// Markdown log file to write with timestamps, checks, and rollback point.
     #[arg(long, env = "OFFICE_AUTOMATE_CUTOVER_LOG")]
     pub cutover_log: PathBuf,
-    /// Manual browser/mobile OAuth verification timestamp when no validation JWT can be minted.
+    /// Manual browser/mobile Cloudflare Access plus Office auth verification timestamp.
     #[arg(long, env = "OFFICE_AUTOMATE_MANUAL_PUBLIC_OAUTH_VERIFIED_AT")]
     pub manual_public_oauth_verified_at: Option<String>,
+    /// Local cloudflared config to validate for exact hostname and final deny ingress.
+    #[arg(long, env = "CLOUDFLARED_CONFIG")]
+    pub cloudflared_config: Option<PathBuf>,
+    /// Cloudflare Access service-token client id for authenticated public validation.
+    #[arg(long, env = "OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_CLIENT_ID")]
+    pub cloudflare_access_client_id: Option<String>,
+    /// Cloudflare Access service-token client secret for authenticated public validation.
+    #[arg(long, env = "OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_CLIENT_SECRET")]
+    pub cloudflare_access_client_secret: Option<String>,
     /// Maximum accepted age for /status air_quality.last_update.
     #[arg(long, default_value_t = 300)]
     pub max_air_quality_age_seconds: u64,
@@ -376,6 +397,10 @@ async fn run_validate(config: &AppConfig, target: ValidateTarget) -> Result<()> 
                 ShadowValidationOptions {
                     base_url: args.base_url,
                     public_url: args.public_url,
+                    cloudflared_config: args.cloudflared_config,
+                    cloudflare_access_client_id: args.cloudflare_access_client_id,
+                    cloudflare_access_client_secret: args.cloudflare_access_client_secret,
+                    manual_public_access_verified_at: args.manual_public_access_verified_at,
                     skip_live_devices: args.skip_live_devices,
                     skip_http_interface: args.skip_http_interface,
                     max_air_quality_age_seconds: args.max_air_quality_age_seconds,
@@ -399,6 +424,9 @@ async fn run_validate(config: &AppConfig, target: ValidateTarget) -> Result<()> 
                     snapshot_dir: args.snapshot_dir,
                     cutover_log: args.cutover_log,
                     manual_public_oauth_verified_at: args.manual_public_oauth_verified_at,
+                    cloudflared_config: args.cloudflared_config,
+                    cloudflare_access_client_id: args.cloudflare_access_client_id,
+                    cloudflare_access_client_secret: args.cloudflare_access_client_secret,
                     max_air_quality_age_seconds: args.max_air_quality_age_seconds,
                 },
             )
@@ -684,6 +712,14 @@ mod tests {
             "http://127.0.0.1:9001",
             "--public-url",
             "https://office.example.test",
+            "--cloudflared-config",
+            "/tmp/cloudflared.yml",
+            "--cloudflare-access-client-id",
+            "access-id",
+            "--cloudflare-access-client-secret",
+            "access-secret",
+            "--manual-public-access-verified-at",
+            "2026-06-06T12:00:00-07:00",
             "--max-air-quality-age-seconds",
             "120",
         ])
@@ -698,6 +734,22 @@ mod tests {
                         assert_eq!(
                             shadow.public_url.as_deref(),
                             Some("https://office.example.test")
+                        );
+                        assert_eq!(
+                            shadow.cloudflared_config,
+                            Some(PathBuf::from("/tmp/cloudflared.yml"))
+                        );
+                        assert_eq!(
+                            shadow.cloudflare_access_client_id.as_deref(),
+                            Some("access-id")
+                        );
+                        assert_eq!(
+                            shadow.cloudflare_access_client_secret.as_deref(),
+                            Some("access-secret")
+                        );
+                        assert_eq!(
+                            shadow.manual_public_access_verified_at.as_deref(),
+                            Some("2026-06-06T12:00:00-07:00")
                         );
                         assert_eq!(shadow.max_air_quality_age_seconds, 120);
                     }
@@ -728,6 +780,12 @@ mod tests {
             "/tmp/snapshot",
             "--cutover-log",
             "/tmp/cutover.md",
+            "--cloudflared-config",
+            "/tmp/cloudflared.yml",
+            "--cloudflare-access-client-id",
+            "access-id",
+            "--cloudflare-access-client-secret",
+            "access-secret",
         ])
         .expect("validate cutover command should parse");
 
@@ -744,6 +802,18 @@ mod tests {
                         assert_eq!(cutover.mqtt_strategy, MqttCutoverStrategyArg::AtomicSwitch);
                         assert_eq!(cutover.snapshot_dir, PathBuf::from("/tmp/snapshot"));
                         assert_eq!(cutover.cutover_log, PathBuf::from("/tmp/cutover.md"));
+                        assert_eq!(
+                            cutover.cloudflared_config,
+                            Some(PathBuf::from("/tmp/cloudflared.yml"))
+                        );
+                        assert_eq!(
+                            cutover.cloudflare_access_client_id.as_deref(),
+                            Some("access-id")
+                        );
+                        assert_eq!(
+                            cutover.cloudflare_access_client_secret.as_deref(),
+                            Some("access-secret")
+                        );
                     }
                     other => panic!("expected cutover validation target, got {other:?}"),
                 }

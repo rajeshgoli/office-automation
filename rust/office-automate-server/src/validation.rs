@@ -15,11 +15,12 @@ use reqwest::{StatusCode, Url};
 use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::{Value, json};
+use serde_yaml::Value as YamlValue;
 use tokio::time::timeout;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
-        Message as TungsteniteMessage,
+        Error as TungsteniteError, Message as TungsteniteMessage,
         client::IntoClientRequest,
         http::{HeaderValue, header},
     },
@@ -29,7 +30,7 @@ use crate::{
     artifacts::is_valid_artifact_hash,
     auth::AuthManager,
     config::AppConfig,
-    db, erv, hvac,
+    db, erv, http, hvac,
     state::StateMachine,
     yolink::{self, YoLinkCloudClient, YoLinkState},
 };
@@ -40,6 +41,10 @@ const INTERFACE_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct ShadowValidationOptions {
     pub base_url: Option<String>,
     pub public_url: Option<String>,
+    pub cloudflared_config: Option<PathBuf>,
+    pub cloudflare_access_client_id: Option<String>,
+    pub cloudflare_access_client_secret: Option<String>,
+    pub manual_public_access_verified_at: Option<String>,
     pub skip_live_devices: bool,
     pub skip_http_interface: bool,
     pub max_air_quality_age_seconds: u64,
@@ -50,6 +55,10 @@ impl Default for ShadowValidationOptions {
         Self {
             base_url: None,
             public_url: None,
+            cloudflared_config: None,
+            cloudflare_access_client_id: None,
+            cloudflare_access_client_secret: None,
+            manual_public_access_verified_at: None,
             skip_live_devices: false,
             skip_http_interface: false,
             max_air_quality_age_seconds: 300,
@@ -67,6 +76,9 @@ pub struct CutoverValidationOptions {
     pub snapshot_dir: PathBuf,
     pub cutover_log: PathBuf,
     pub manual_public_oauth_verified_at: Option<String>,
+    pub cloudflared_config: Option<PathBuf>,
+    pub cloudflare_access_client_id: Option<String>,
+    pub cloudflare_access_client_secret: Option<String>,
     pub max_air_quality_age_seconds: u64,
 }
 
@@ -601,17 +613,47 @@ async fn validate_http_interfaces(
         .as_deref()
         .or(config.runtime.public_url.as_deref());
     if let Some(public_url) = public_url {
-        if auth.supports_public_http_auth() {
-            let public_status = get_json(&client, public_url, "/status", Some(&auth)).await?;
+        validate_cloudflared_public_config_optional(
+            options.cloudflared_config.as_deref(),
+            public_url,
+            report,
+        )?;
+        validate_public_access_blocks_unauthenticated(public_url, report).await?;
+        let access_auth = public_access_probe_auth(
+            options.cloudflare_access_client_id.as_deref(),
+            options.cloudflare_access_client_secret.as_deref(),
+        )?;
+        if access_auth.is_some() && auth.supports_public_http_auth() {
+            let public_status = get_public_json(
+                &client,
+                public_url,
+                "/status",
+                Some(&auth),
+                access_auth.as_ref(),
+            )
+            .await?;
             validate_status_shape(&public_status)?;
             report.push_pass(
                 "cloudflare-public-status",
-                format!("public URL returned authenticated /status through Cloudflare Tunnel: {public_url}"),
+                format!(
+                    "public URL returned authenticated /status through Cloudflare Access and Office auth: {public_url}"
+                ),
+            );
+        } else if let Some(verified_at) = options.manual_public_access_verified_at.as_deref() {
+            validate_manual_verification_timestamp(
+                verified_at,
+                "manual public Access verification",
+            )?;
+            report.push_pass(
+                "cloudflare-public-status",
+                format!(
+                    "manual authenticated Cloudflare Access plus Office auth verification recorded at {verified_at}"
+                ),
             );
         } else {
             report.push_skip(
                 "cloudflare-public-status",
-                "OAuth config has no jwt_secret, so protected public /status cannot be authenticated non-interactively; validate browser/mobile auth manually",
+                "no Cloudflare Access service token or manual verification timestamp supplied; authenticated public /status was not probed",
             );
         }
     } else {
@@ -656,29 +698,66 @@ async fn validate_cutover_http_interfaces(
     );
 
     validate_websocket_interface(base_url, &auth, report).await?;
-    validate_public_oauth_login(config, &client, public_url, report).await?;
+    validate_cloudflared_public_config_required(
+        options.cloudflared_config.as_deref(),
+        public_url,
+        report,
+    )?;
+    validate_public_access_blocks_unauthenticated(public_url, report).await?;
 
+    let access_auth = public_access_probe_auth(
+        options.cloudflare_access_client_id.as_deref(),
+        options.cloudflare_access_client_secret.as_deref(),
+    )?;
     if auth.supports_public_http_auth() {
-        let public_status = get_json(&client, public_url, "/status", Some(&auth)).await?;
+        let Some(access_auth) = access_auth.as_ref() else {
+            if let Some(verified_at) = options.manual_public_oauth_verified_at.as_deref() {
+                validate_manual_verification_timestamp(
+                    verified_at,
+                    "manual authenticated public Access verification",
+                )?;
+                report.push_pass(
+                    "cloudflare-public-status",
+                    format!(
+                        "manual authenticated Cloudflare Access plus Office auth verification recorded at {verified_at}"
+                    ),
+                );
+                return Ok(());
+            }
+            bail!(
+                "cutover validation requires Cloudflare Access service-token headers or --manual-public-oauth-verified-at after browser/mobile Access plus Office auth verification"
+            );
+        };
+        let public_status = get_public_json(
+            &client,
+            public_url,
+            "/status",
+            Some(&auth),
+            Some(access_auth),
+        )
+        .await?;
         validate_status_shape(&public_status)?;
         validate_fresh_air_quality(&public_status, options.max_air_quality_age_seconds)?;
         report.push_pass(
             "cloudflare-public-status",
-            format!("public URL returned authenticated fresh /status through Cloudflare Tunnel: {public_url}"),
+            format!(
+                "public URL returned authenticated fresh /status through Cloudflare Access and Office auth: {public_url}"
+            ),
         );
     } else if let Some(verified_at) = options.manual_public_oauth_verified_at.as_deref() {
-        if verified_at.trim().is_empty() {
-            bail!("manual public OAuth verification timestamp cannot be empty");
-        }
+        validate_manual_verification_timestamp(
+            verified_at,
+            "manual authenticated public Access verification",
+        )?;
         report.push_pass(
             "cloudflare-public-status",
             format!(
-                "manual browser/mobile OAuth verification recorded at {verified_at}; validation token unavailable"
+                "manual authenticated Cloudflare Access plus Office auth verification recorded at {verified_at}; validation token unavailable"
             ),
         );
     } else {
         bail!(
-            "OAuth config has no jwt_secret, so protected public /status cannot be authenticated non-interactively; supply --manual-public-oauth-verified-at after browser/mobile verification"
+            "cutover validation requires Cloudflare Access service-token headers or --manual-public-oauth-verified-at after browser/mobile Access plus Office auth verification"
         );
     }
 
@@ -895,7 +974,9 @@ async fn validate_public_oauth_login(
     report: &mut ShadowValidationReport,
 ) -> Result<()> {
     if config.orchestrator.google_oauth.is_none() {
-        bail!("cutover validation requires Google OAuth config for the Cloudflare public URL");
+        bail!(
+            "rollback validation requires Google OAuth config for the legacy Cloudflare public URL"
+        );
     }
 
     let url = join_url(public_url, "/auth/login")?;
@@ -903,27 +984,433 @@ async fn validate_public_oauth_login(
         .get(url)
         .send()
         .await
-        .context("failed to call public OAuth login endpoint")?;
+        .context("failed to call legacy public OAuth login endpoint")?;
     if response.status() != StatusCode::OK {
-        bail!("public OAuth login endpoint returned {}", response.status());
+        bail!(
+            "legacy public OAuth login endpoint returned {}",
+            response.status()
+        );
     }
     let payload: Value = response
         .json()
         .await
-        .context("failed to parse public OAuth login payload")?;
+        .context("failed to parse legacy public OAuth login payload")?;
     if !payload
         .get("authorization_url")
         .and_then(Value::as_str)
         .is_some_and(|value| value.starts_with("https://"))
         || !payload.get("state").and_then(Value::as_str).is_some()
     {
-        bail!("public OAuth login payload missing authorization_url or state");
+        bail!("legacy public OAuth login payload missing authorization_url or state");
     }
     report.push_pass(
-        "cloudflare-oauth-login",
-        format!("/auth/login returned OAuth start payload through {public_url}"),
+        "legacy-cloudflare-oauth-login",
+        format!("legacy /auth/login returned OAuth start payload through {public_url}"),
     );
     Ok(())
+}
+
+fn validate_cloudflared_public_config_optional(
+    cloudflared_config: Option<&Path>,
+    public_url: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if let Some(cloudflared_config) = cloudflared_config {
+        validate_cloudflared_public_config(cloudflared_config, public_url, report)
+    } else {
+        report.push_skip(
+            "cloudflare-tunnel-config",
+            "no --cloudflared-config supplied; tunnel ingress shape was not validated",
+        );
+        Ok(())
+    }
+}
+
+fn validate_cloudflared_public_config_required(
+    cloudflared_config: Option<&Path>,
+    public_url: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let cloudflared_config = cloudflared_config
+        .context("cutover validation requires --cloudflared-config or CLOUDFLARED_CONFIG")?;
+    validate_cloudflared_public_config(cloudflared_config, public_url, report)
+}
+
+fn validate_cloudflared_public_config(
+    cloudflared_config: &Path,
+    public_url: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let public_host = Url::parse(public_url)
+        .with_context(|| format!("invalid Cloudflare public URL {public_url}"))?
+        .host_str()
+        .context("Cloudflare public URL must include a hostname")?
+        .to_ascii_lowercase();
+    let contents = fs::read_to_string(cloudflared_config).with_context(|| {
+        format!(
+            "failed to read cloudflared config {}",
+            cloudflared_config.display()
+        )
+    })?;
+    let root: YamlValue = serde_yaml::from_str(&contents).with_context(|| {
+        format!(
+            "failed to parse cloudflared config {}",
+            cloudflared_config.display()
+        )
+    })?;
+
+    validate_cloudflared_private_routing_disabled(&root)?;
+
+    let ingress = yaml_mapping_value(&root, "ingress")
+        .and_then(YamlValue::as_sequence)
+        .with_context(|| {
+            format!(
+                "cloudflared config missing ingress sequence: {}",
+                cloudflared_config.display()
+            )
+        })?;
+    if ingress.len() < 2 {
+        bail!(
+            "cloudflared config must contain an exact hostname rule and a final http_status:404 rule: {}",
+            cloudflared_config.display()
+        );
+    }
+
+    let mut matching_hostname_rules = 0usize;
+    for (index, rule) in ingress.iter().enumerate() {
+        let Some(mapping) = rule.as_mapping() else {
+            bail!("cloudflared ingress rule {} is not a mapping", index + 1);
+        };
+        let hostname = yaml_mapping_str(mapping, "hostname");
+        let service = yaml_mapping_str(mapping, "service")
+            .with_context(|| format!("cloudflared ingress rule {} missing service", index + 1))?;
+        if let Some(hostname) = hostname {
+            let hostname = hostname.to_ascii_lowercase();
+            if hostname.contains('*') {
+                bail!(
+                    "cloudflared ingress rule {} uses wildcard hostname {hostname:?}",
+                    index + 1
+                );
+            }
+            if hostname != public_host {
+                bail!(
+                    "cloudflared ingress rule {} publishes unexpected hostname {hostname:?}; expected only {public_host:?}",
+                    index + 1
+                );
+            }
+            matching_hostname_rules += 1;
+            validate_cloudflared_origin_service(service).with_context(|| {
+                format!("unsafe service for cloudflared ingress rule {}", index + 1)
+            })?;
+        } else if index + 1 != ingress.len() {
+            bail!(
+                "cloudflared ingress rule {} has no hostname before the final rule; only the final deny rule may omit hostname",
+                index + 1
+            );
+        }
+    }
+
+    if matching_hostname_rules != 1 {
+        bail!(
+            "cloudflared config must publish exactly one rule for {public_host:?}, found {matching_hostname_rules}"
+        );
+    }
+
+    let final_rule = ingress.last().expect("checked ingress length");
+    let final_mapping = final_rule
+        .as_mapping()
+        .context("cloudflared final ingress rule is not a mapping")?;
+    if yaml_mapping_str(final_mapping, "hostname").is_some() {
+        bail!("cloudflared final ingress rule must not specify a hostname");
+    }
+    let final_service = yaml_mapping_str(final_mapping, "service")
+        .context("cloudflared final ingress rule missing service")?;
+    if final_service != "http_status:404" {
+        bail!("cloudflared final ingress rule must be service: http_status:404");
+    }
+
+    report.push_pass(
+        "cloudflare-tunnel-config",
+        format!(
+            "cloudflared config {} publishes exact hostname {public_host}, uses loopback/Unix origin, disables private routing, and ends with http_status:404",
+            cloudflared_config.display()
+        ),
+    );
+    Ok(())
+}
+
+fn validate_cloudflared_private_routing_disabled(root: &YamlValue) -> Result<()> {
+    let Some(warp_routing) = yaml_mapping_value(root, "warp-routing") else {
+        return Ok(());
+    };
+    let Some(mapping) = warp_routing.as_mapping() else {
+        bail!("cloudflared warp-routing must be a mapping when present");
+    };
+    let enabled = yaml_mapping_value_from_mapping(mapping, "enabled")
+        .and_then(YamlValue::as_bool)
+        .unwrap_or(false);
+    if enabled {
+        bail!("cloudflared warp-routing.enabled must be false for the public Office tunnel");
+    }
+    Ok(())
+}
+
+fn validate_cloudflared_origin_service(service: &str) -> Result<()> {
+    if service == "http_status:404" {
+        bail!("hostname rule must route to the local origin, not http_status:404");
+    }
+    if service.starts_with("unix:") {
+        return Ok(());
+    }
+    let parsed = Url::parse(service).with_context(|| {
+        format!("cloudflared service must be a URL or unix socket, got {service:?}")
+    })?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            bail!("cloudflared service scheme {scheme:?} is not allowed for the public origin")
+        }
+    }
+    let host = parsed
+        .host_str()
+        .context("cloudflared service URL must include a host")?;
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(());
+    }
+    let ip = host.parse::<std::net::IpAddr>().with_context(|| {
+        format!("cloudflared public origin host must be loopback or localhost, got {host:?}")
+    })?;
+    if !ip.is_loopback() {
+        bail!("cloudflared public origin host must be loopback, got {host:?}");
+    }
+    Ok(())
+}
+
+fn yaml_mapping_value<'a>(value: &'a YamlValue, key: &str) -> Option<&'a YamlValue> {
+    value
+        .as_mapping()
+        .and_then(|mapping| yaml_mapping_value_from_mapping(mapping, key))
+}
+
+fn yaml_mapping_value_from_mapping<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Option<&'a YamlValue> {
+    mapping.get(YamlValue::String(key.to_string()))
+}
+
+fn yaml_mapping_str<'a>(mapping: &'a serde_yaml::Mapping, key: &str) -> Option<&'a str> {
+    yaml_mapping_value_from_mapping(mapping, key).and_then(YamlValue::as_str)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicAccessProbeAuth {
+    client_id: String,
+    client_secret: String,
+}
+
+fn public_access_probe_auth(
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
+) -> Result<Option<PublicAccessProbeAuth>> {
+    match (client_id, client_secret) {
+        (Some(client_id), Some(client_secret))
+            if !client_id.trim().is_empty() && !client_secret.trim().is_empty() =>
+        {
+            Ok(Some(PublicAccessProbeAuth {
+                client_id: client_id.trim().to_string(),
+                client_secret: client_secret.trim().to_string(),
+            }))
+        }
+        (None, None) => Ok(None),
+        (Some(client_id), None) if client_id.trim().is_empty() => Ok(None),
+        (None, Some(client_secret)) if client_secret.trim().is_empty() => Ok(None),
+        _ => bail!(
+            "Cloudflare Access validation requires both client id and client secret when either is supplied"
+        ),
+    }
+}
+
+fn apply_public_access_auth(
+    builder: reqwest::RequestBuilder,
+    access_auth: Option<&PublicAccessProbeAuth>,
+) -> reqwest::RequestBuilder {
+    if let Some(access_auth) = access_auth {
+        builder
+            .header("CF-Access-Client-Id", access_auth.client_id.as_str())
+            .header(
+                "CF-Access-Client-Secret",
+                access_auth.client_secret.as_str(),
+            )
+    } else {
+        builder
+    }
+}
+
+async fn validate_public_access_blocks_unauthenticated(
+    public_url: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to create unauthenticated public Access probe client")?;
+
+    for probe in http::PUBLIC_ACCESS_PROBES {
+        let url = join_url(public_url, probe.path)?;
+        let request = match probe.method {
+            http::PublicAccessProbeMethod::Get => client.get(url),
+            http::PublicAccessProbeMethod::Post => client.post(url),
+        };
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("failed to probe unauthenticated public {}", probe.path))?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.bytes().await.with_context(|| {
+            format!(
+                "failed to read unauthenticated public {} response",
+                probe.path
+            )
+        })?;
+        validate_public_access_block_http_response(probe.path, status, &headers, &body)?;
+        report.push_pass(
+            format!("cloudflare-access-blocks-{}", probe.name),
+            format!(
+                "unauthenticated public {} {} was blocked before origin with status {}",
+                probe.method.as_str(),
+                probe.path,
+                status
+            ),
+        );
+    }
+
+    validate_public_websocket_access_blocked(public_url, report).await?;
+    Ok(())
+}
+
+fn validate_public_access_block_http_response(
+    path: &str,
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &[u8],
+) -> Result<()> {
+    if looks_like_office_origin_response(status, headers, body) {
+        bail!(
+            "unauthenticated public {path} reached the Office Automate origin instead of Cloudflare Access"
+        );
+    }
+    if is_cloudflare_access_block_status(status, headers) {
+        return Ok(());
+    }
+    bail!(
+        "unauthenticated public {path} was not blocked by Cloudflare Access before origin; status={status}"
+    );
+}
+
+fn is_cloudflare_access_block_status(
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> bool {
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return true;
+    }
+    if status.is_redirection() {
+        return headers
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|location| {
+                location.contains("/cdn-cgi/access") || location.contains("cloudflareaccess.com")
+            });
+    }
+    false
+}
+
+fn looks_like_office_origin_response(
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &[u8],
+) -> bool {
+    if headers
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("Office Automate"))
+    {
+        return true;
+    }
+    if matches!(status, StatusCode::OK | StatusCode::SWITCHING_PROTOCOLS) {
+        return true;
+    }
+    let text = String::from_utf8_lossy(body);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        for key in [
+            "authorization_url",
+            "login_url",
+            "state",
+            "sensors",
+            "air_quality",
+            "projects",
+            "artifact_hash",
+            "download_url",
+        ] {
+            if value.get(key).is_some() {
+                return true;
+            }
+        }
+    }
+    let lowercase = trimmed.to_ascii_lowercase();
+    lowercase.contains("office automate") || lowercase.contains("officeclimate://auth")
+}
+
+async fn validate_public_websocket_access_blocked(
+    public_url: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let request = websocket_url(public_url)?
+        .into_client_request()
+        .context("failed to build unauthenticated public WebSocket probe request")?;
+    let result = timeout(INTERFACE_TIMEOUT, connect_async(request))
+        .await
+        .context("timed out probing unauthenticated public /ws WebSocket")?;
+    match result {
+        Ok((_socket, _response)) => {
+            bail!(
+                "unauthenticated public /ws WebSocket upgrade succeeded; Cloudflare Access did not block before origin"
+            )
+        }
+        Err(TungsteniteError::Http(response)) => {
+            let status = StatusCode::from_u16(response.status().as_u16())
+                .context("invalid WebSocket probe HTTP status")?;
+            let headers = response.headers();
+            let location = headers
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            let access_blocked = matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+                || (status.is_redirection()
+                    && (location.contains("/cdn-cgi/access")
+                        || location.contains("cloudflareaccess.com")));
+            if !access_blocked {
+                bail!(
+                    "unauthenticated public /ws WebSocket was not blocked by Cloudflare Access before origin; status={status}"
+                );
+            }
+            report.push_pass(
+                "cloudflare-access-blocks-websocket",
+                format!(
+                    "unauthenticated public /ws WebSocket upgrade was blocked with status {status}"
+                ),
+            );
+            Ok(())
+        }
+        Err(error) => Err(error).context("failed to verify public /ws Cloudflare Access block"),
+    }
 }
 
 fn write_cutover_log(
@@ -1366,6 +1853,36 @@ async fn get_json(
         .with_context(|| format!("failed to parse {path} JSON"))
 }
 
+async fn get_public_json(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    auth: Option<&InterfaceProbeAuth>,
+    access_auth: Option<&PublicAccessProbeAuth>,
+) -> Result<Value> {
+    let url = join_url(base_url, path)?;
+    let mut request = apply_public_access_auth(client.get(url), access_auth);
+    if let Some(auth) = auth {
+        request = auth.apply_http_auth(request);
+    }
+    request
+        .send()
+        .await
+        .with_context(|| format!("failed to call public {path}"))?
+        .error_for_status()
+        .with_context(|| format!("public {path} returned non-success status"))?
+        .json()
+        .await
+        .with_context(|| format!("failed to parse public {path} JSON"))
+}
+
+fn validate_manual_verification_timestamp(value: &str, label: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("{label} timestamp cannot be empty");
+    }
+    Ok(())
+}
+
 fn join_url(base_url: &str, path: &str) -> Result<Url> {
     let mut base = base_url.trim_end_matches('/').to_string();
     base.push_str(path);
@@ -1626,6 +2143,9 @@ mod tests {
             snapshot_dir: temp_dir.path().join("snapshot"),
             cutover_log: temp_dir.path().join("cutover.md"),
             manual_public_oauth_verified_at: None,
+            cloudflared_config: None,
+            cloudflare_access_client_id: None,
+            cloudflare_access_client_secret: None,
             max_air_quality_age_seconds: 300,
         };
         let mut report = ShadowValidationReport { checks: Vec::new() };
@@ -1780,6 +2300,9 @@ mod tests {
             snapshot_dir: snapshot_dir.clone(),
             cutover_log: temp_dir.path().join("logs").join("cutover.md"),
             manual_public_oauth_verified_at: Some("2026-06-06T03:10:00-07:00".to_string()),
+            cloudflared_config: None,
+            cloudflare_access_client_id: None,
+            cloudflare_access_client_secret: None,
             max_air_quality_age_seconds: 300,
         };
         let report = ShadowValidationReport {
@@ -1840,6 +2363,185 @@ mod tests {
         assert!(contents.contains("legacy-status-fresh"));
         assert!(contents.contains(&snapshot_dir.display().to_string()));
         assert!(contents.contains("Legacy backend and Cloudflare Tunnel are the active"));
+    }
+
+    #[test]
+    fn cloudflared_public_config_accepts_exact_loopback_origin_and_final_404() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("cloudflared.yml");
+        fs::write(
+            &config_path,
+            "credentials-file: tunnel.json\ningress:\n  - hostname: office.example.test\n    service: http://127.0.0.1:9001\n  - service: http_status:404\n",
+        )
+        .expect("cloudflared config");
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+
+        validate_cloudflared_public_config(
+            &config_path,
+            "https://office.example.test",
+            &mut report,
+        )
+        .expect("config should pass");
+
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "cloudflare-tunnel-config")
+        );
+    }
+
+    #[test]
+    fn cloudflared_public_config_rejects_private_origin_wildcards_and_missing_404() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let private_origin = temp_dir.path().join("private-origin.yml");
+        fs::write(
+            &private_origin,
+            "ingress:\n  - hostname: office.example.test\n    service: http://192.168.5.10:9001\n  - service: http_status:404\n",
+        )
+        .expect("private origin config");
+        let wildcard = temp_dir.path().join("wildcard.yml");
+        fs::write(
+            &wildcard,
+            "ingress:\n  - hostname: '*.example.test'\n    service: http://127.0.0.1:9001\n  - service: http_status:404\n",
+        )
+        .expect("wildcard config");
+        let no_final_404 = temp_dir.path().join("no-final-404.yml");
+        fs::write(
+            &no_final_404,
+            "ingress:\n  - hostname: office.example.test\n    service: http://127.0.0.1:9001\n  - service: http://127.0.0.1:9002\n",
+        )
+        .expect("missing final 404 config");
+        let warp_routing = temp_dir.path().join("warp-routing.yml");
+        fs::write(
+            &warp_routing,
+            "warp-routing:\n  enabled: true\ningress:\n  - hostname: office.example.test\n    service: http://127.0.0.1:9001\n  - service: http_status:404\n",
+        )
+        .expect("warp routing config");
+
+        for (path, expected) in [
+            (
+                &private_origin,
+                "unsafe service for cloudflared ingress rule",
+            ),
+            (&wildcard, "wildcard hostname"),
+            (
+                &no_final_404,
+                "final ingress rule must be service: http_status:404",
+            ),
+            (&warp_routing, "warp-routing.enabled must be false"),
+        ] {
+            let mut report = ShadowValidationReport { checks: Vec::new() };
+            let error = validate_cloudflared_public_config(
+                path,
+                "https://office.example.test",
+                &mut report,
+            )
+            .expect_err("unsafe tunnel config should fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_access_response_classifier_accepts_access_blocks_and_rejects_origin() {
+        let headers = reqwest::header::HeaderMap::new();
+        validate_public_access_block_http_response(
+            "/status",
+            StatusCode::FORBIDDEN,
+            &headers,
+            b"<html>Cloudflare Access</html>",
+        )
+        .expect("Cloudflare-style 403 should pass");
+
+        let mut redirect_headers = reqwest::header::HeaderMap::new();
+        redirect_headers.insert(
+            reqwest::header::LOCATION,
+            reqwest::header::HeaderValue::from_static("/cdn-cgi/access/login/example"),
+        );
+        validate_public_access_block_http_response(
+            "/auth/login",
+            StatusCode::FOUND,
+            &redirect_headers,
+            b"",
+        )
+        .expect("Cloudflare Access redirect should pass");
+
+        let error = validate_public_access_block_http_response(
+            "/status",
+            StatusCode::UNAUTHORIZED,
+            &headers,
+            br#"{"error":"authentication required","login_url":"/auth/login"}"#,
+        )
+        .expect_err("Office origin 401 should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("reached the Office Automate origin")
+        );
+
+        let error = validate_public_access_block_http_response(
+            "/auth/login",
+            StatusCode::OK,
+            &headers,
+            br#"{"authorization_url":"https://accounts.google.com","state":"abc"}"#,
+        )
+        .expect_err("Office OAuth payload should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("reached the Office Automate origin")
+        );
+    }
+
+    #[test]
+    fn public_access_probe_inventory_covers_current_public_skip_and_sensitive_routes() {
+        let paths = http::PUBLIC_ACCESS_PROBES
+            .iter()
+            .map(|probe| probe.path)
+            .collect::<std::collections::HashSet<_>>();
+        for path in [
+            "/",
+            "/status",
+            "/auth/login",
+            "/auth/callback",
+            "/auth/device/start",
+            "/auth/device/poll",
+            "/assets/app.js",
+            "/manifest.json",
+            "/favicon.png",
+            "/apps/office-climate/meta.json",
+            "/apps/office-climate/latest.apk",
+            "/apps/office-climate/00000000.apk",
+            "/apk",
+            "/deploy/office-climate",
+        ] {
+            assert!(
+                paths.contains(path),
+                "missing public Access probe for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_access_probe_auth_requires_id_and_secret_pair() {
+        assert_eq!(
+            public_access_probe_auth(None, None).expect("no access token"),
+            None
+        );
+        assert!(
+            public_access_probe_auth(Some("id"), None)
+                .expect_err("partial access token should fail")
+                .to_string()
+                .contains("requires both")
+        );
+        assert!(
+            public_access_probe_auth(Some("id"), Some("secret"))
+                .expect("access token pair")
+                .is_some()
+        );
     }
 
     #[test]
