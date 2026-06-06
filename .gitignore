@@ -4,6 +4,17 @@ config.yaml
 # Rust
 target/
 
+# Tuya local key / Smart Life auth material
+tuya-sharing-auth.json
+.tuya-sharing-auth.json
+.office-automate/
+
+# Python utility caches / local environments
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
 # Node
 node_modules/
 frontend/node_modules/

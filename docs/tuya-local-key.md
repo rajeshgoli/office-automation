@@ -2,10 +2,11 @@
 
 This is the repeatable process to restore ERV local control when Tuya local commands start failing (e.g., Err 914 or dashboard control not working). Two paths depending on whether the local key has actually rotated or just gotten out of sync:
 
+- **Preferred: Smart Life sharing API refresh** using `scripts/refresh-erv-key.py`. This avoids the Android emulator and does **not** require a Tuya IoT Platform subscription.
 - **Path A: Re-extract** the cached local key from the Smart Life app. Works if the key in `config.yaml` is wrong but Smart Life still has working local control.
 - **Path B: Re-pair** the ERV through Smart Life. Required when both the device's key AND Smart Life's cached copy are stale (which is what happened on 2026-04-30 — see Troubleshooting).
 
-Always start with Path A. Drop to Path B only if the diagnostic in step 4 says so.
+Start with the preferred path. Use Path A only if Smart Life sharing auth fails, and drop to Path B only if the diagnostic in step 4 says so.
 
 ## When To Run This
 
@@ -22,6 +23,45 @@ Always start with Path A. Drop to Path B only if the diagnostic in step 4 says s
   - Slow flash = AP mode (fallback if EZ doesn't work).
 - **Wi-Fi:** 2.4 GHz only. 5 GHz networks won't pair.
 - **Smart Life category:** Small Home Appliances → Ventilation System.
+
+## Preferred Path: Refresh From Smart Life Sharing API
+
+This path uses Tuya's Home Assistant / Smart Life device-sharing API. It stores a refreshable token cache at `~/.office-automate/tuya-sharing-auth.json` with `0600` permissions. It does not store Tuya account credentials in `config.yaml`.
+
+Install/update dependencies:
+
+```sh
+source venv/bin/activate
+python -m pip install -r scripts/refresh-erv-key-requirements.txt
+```
+
+First-time authorization:
+
+```sh
+scripts/refresh-erv-key.py --init-auth --user-code <SMART_LIFE_USER_CODE>
+```
+
+The script prints a QR code. Scan it with Smart Life or Tuya Smart. In Smart Life, the user code is under **Me → Settings → Account and Security → User Code**.
+
+After authorization, print the current key:
+
+```sh
+scripts/refresh-erv-key.py
+```
+
+Update `config.yaml` if the key rotated:
+
+```sh
+scripts/refresh-erv-key.py --update-config
+```
+
+Update `config.yaml` and restart the launchd orchestrator:
+
+```sh
+scripts/refresh-erv-key.py --update-config --restart
+```
+
+If the API returns the same key that is already in `config.yaml`, the script prints `no rotation needed` and exits 0 without editing or restarting.
 
 ## Prereqs
 
