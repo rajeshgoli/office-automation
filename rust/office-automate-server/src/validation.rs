@@ -1,5 +1,7 @@
 use std::{
-    path::Path,
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -55,6 +57,34 @@ impl Default for ShadowValidationOptions {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutoverValidationOptions {
+    pub base_url: Option<String>,
+    pub public_url: Option<String>,
+    pub legacy_base_url: Option<String>,
+    pub legacy_controller_stopped_at: String,
+    pub mqtt_strategy: MqttCutoverStrategy,
+    pub snapshot_dir: PathBuf,
+    pub cutover_log: PathBuf,
+    pub manual_public_oauth_verified_at: Option<String>,
+    pub max_air_quality_age_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MqttCutoverStrategy {
+    BridgeMirror,
+    AtomicSwitch,
+}
+
+impl MqttCutoverStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BridgeMirror => "bridge-mirror",
+            Self::AtomicSwitch => "atomic-switch",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ShadowValidationReport {
     pub checks: Vec<ValidationCheck>,
@@ -82,6 +112,15 @@ pub struct ValidationCheck {
 pub enum ValidationStatus {
     Passed,
     Skipped,
+}
+
+impl ValidationStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Skipped => "skipped",
+        }
+    }
 }
 
 impl ShadowValidationReport {
@@ -132,6 +171,23 @@ pub async fn run_shadow_validation(
     Ok(report)
 }
 
+pub async fn run_cutover_validation(
+    config: &AppConfig,
+    options: CutoverValidationOptions,
+) -> Result<ShadowValidationReport> {
+    let mut report = ShadowValidationReport { checks: Vec::new() };
+
+    validate_cutover_active_write_gates(config, &mut report)?;
+    validate_cutover_snapshot(&options.snapshot_dir, &mut report)?;
+    validate_legacy_controller_stopped(&options, &mut report).await?;
+    validate_mqtt_cutover_strategy(config, options.mqtt_strategy, &mut report)?;
+    validate_live_devices(config, &mut report).await?;
+    validate_cutover_http_interfaces(config, &options, &mut report).await?;
+    write_cutover_log(config, &options, &report)?;
+
+    Ok(report)
+}
+
 fn validate_active_write_gates(
     config: &AppConfig,
     report: &mut ShadowValidationReport,
@@ -146,6 +202,127 @@ fn validate_active_write_gates(
     report.push_pass(
         "active-write-gates",
         "ERV and HVAC active-control flags are disabled",
+    );
+    Ok(())
+}
+
+fn validate_cutover_active_write_gates(
+    config: &AppConfig,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if !config.erv.active_control_enabled {
+        bail!("cutover validation requires ERV active control enabled in Rust config");
+    }
+    if !config.mitsubishi.active_control_enabled {
+        bail!("cutover validation requires HVAC active control enabled in Rust config");
+    }
+
+    report.push_pass(
+        "rust-active-write-gates",
+        "ERV and HVAC active-control flags are enabled for Rust",
+    );
+    Ok(())
+}
+
+fn validate_cutover_snapshot(
+    snapshot_dir: &Path,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if !snapshot_dir.is_dir() {
+        bail!(
+            "cutover snapshot directory is missing: {}",
+            snapshot_dir.display()
+        );
+    }
+    let manifest = snapshot_dir.join("manifest.json");
+    if !manifest.is_file() {
+        bail!(
+            "cutover snapshot manifest is missing: {}",
+            manifest.display()
+        );
+    }
+    report.push_pass(
+        "rollback-snapshot",
+        format!(
+            "pre-cutover rollback snapshot manifest present at {}",
+            manifest.display()
+        ),
+    );
+    Ok(())
+}
+
+async fn validate_legacy_controller_stopped(
+    options: &CutoverValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if options.legacy_controller_stopped_at.trim().is_empty() {
+        bail!(
+            "cutover requires --legacy-controller-stopped-at before Rust active control remains enabled"
+        );
+    }
+
+    if let Some(legacy_base_url) = options.legacy_base_url.as_deref() {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .context("failed to create legacy-controller probe client")?;
+        let url = join_url(legacy_base_url, "/status")?;
+        match client.get(url).send().await {
+            Ok(response) => {
+                bail!(
+                    "legacy controller URL still responded with {}; do not run two active controllers",
+                    response.status()
+                );
+            }
+            Err(error) => report.push_pass(
+                "legacy-controller-disabled",
+                format!(
+                    "operator recorded stopped_at={}; legacy /status did not respond: {}",
+                    options.legacy_controller_stopped_at, error
+                ),
+            ),
+        }
+    } else {
+        report.push_pass(
+            "legacy-controller-disabled",
+            format!(
+                "operator recorded stopped_at={}; no legacy URL probe supplied",
+                options.legacy_controller_stopped_at
+            ),
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_mqtt_cutover_strategy(
+    config: &AppConfig,
+    strategy: MqttCutoverStrategy,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let device_mac = config
+        .qingping
+        .device_mac
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .context(
+            "cutover validation requires qingping.device_mac so the active feed can be audited",
+        )?;
+
+    let detail = match strategy {
+        MqttCutoverStrategy::BridgeMirror => {
+            "bridge/mirror strategy recorded; active controller must continue receiving mirrored fresh readings"
+        }
+        MqttCutoverStrategy::AtomicSwitch => {
+            "atomic switch strategy recorded; Qingping feed moves in the same window as active-controller cutover"
+        }
+    };
+    report.push_pass(
+        "mqtt-feed-strategy",
+        format!(
+            "{detail}; rust_broker={}:{} device_mac={device_mac}",
+            config.runtime.mqtt_host, config.runtime.mqtt_port
+        ),
     );
     Ok(())
 }
@@ -364,6 +541,193 @@ async fn validate_http_interfaces(
     validate_websocket_interface(base_url, &auth, report).await?;
 
     Ok(())
+}
+
+async fn validate_cutover_http_interfaces(
+    config: &AppConfig,
+    options: &CutoverValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let base_url = options
+        .base_url
+        .as_deref()
+        .or(config.runtime.base_url.as_deref())
+        .context("cutover validation requires --base-url or OFFICE_AUTOMATE_BASE_URL")?;
+    let public_url = options
+        .public_url
+        .as_deref()
+        .or(config.runtime.public_url.as_deref())
+        .context("cutover validation requires --public-url or OFFICE_AUTOMATE_PUBLIC_URL")?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("failed to create cutover validation HTTP client")?;
+    let auth = interface_probe_auth(config)?;
+
+    let status = get_json(&client, base_url, "/status", Some(&auth)).await?;
+    validate_status_shape(&status)?;
+    validate_fresh_air_quality(&status, options.max_air_quality_age_seconds)?;
+    report.push_pass(
+        "rust-status-fresh",
+        format!("/status returned compatible shape with fresh air-quality reading from {base_url}"),
+    );
+
+    validate_websocket_interface(base_url, &auth, report).await?;
+    validate_public_oauth_login(config, &client, public_url, report).await?;
+
+    if auth.supports_public_http_auth() {
+        let public_status = get_json(&client, public_url, "/status", Some(&auth)).await?;
+        validate_status_shape(&public_status)?;
+        validate_fresh_air_quality(&public_status, options.max_air_quality_age_seconds)?;
+        report.push_pass(
+            "cloudflare-public-status",
+            format!("public URL returned authenticated fresh /status through Cloudflare Tunnel: {public_url}"),
+        );
+    } else if let Some(verified_at) = options.manual_public_oauth_verified_at.as_deref() {
+        if verified_at.trim().is_empty() {
+            bail!("manual public OAuth verification timestamp cannot be empty");
+        }
+        report.push_pass(
+            "cloudflare-public-status",
+            format!(
+                "manual browser/mobile OAuth verification recorded at {verified_at}; validation token unavailable"
+            ),
+        );
+    } else {
+        bail!(
+            "OAuth config has no jwt_secret, so protected public /status cannot be authenticated non-interactively; supply --manual-public-oauth-verified-at after browser/mobile verification"
+        );
+    }
+
+    Ok(())
+}
+
+async fn validate_public_oauth_login(
+    config: &AppConfig,
+    client: &reqwest::Client,
+    public_url: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if config.orchestrator.google_oauth.is_none() {
+        bail!("cutover validation requires Google OAuth config for the Cloudflare public URL");
+    }
+
+    let url = join_url(public_url, "/auth/login")?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .context("failed to call public OAuth login endpoint")?;
+    if response.status() != StatusCode::OK {
+        bail!("public OAuth login endpoint returned {}", response.status());
+    }
+    let payload: Value = response
+        .json()
+        .await
+        .context("failed to parse public OAuth login payload")?;
+    if !payload
+        .get("authorization_url")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.starts_with("https://"))
+        || !payload.get("state").and_then(Value::as_str).is_some()
+    {
+        bail!("public OAuth login payload missing authorization_url or state");
+    }
+    report.push_pass(
+        "cloudflare-oauth-login",
+        format!("/auth/login returned OAuth start payload through {public_url}"),
+    );
+    Ok(())
+}
+
+fn write_cutover_log(
+    config: &AppConfig,
+    options: &CutoverValidationOptions,
+    report: &ShadowValidationReport,
+) -> Result<()> {
+    if let Some(parent) = options
+        .cutover_log
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create cutover log directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let base_url = options
+        .base_url
+        .as_deref()
+        .or(config.runtime.base_url.as_deref())
+        .unwrap_or("not recorded");
+    let public_url = options
+        .public_url
+        .as_deref()
+        .or(config.runtime.public_url.as_deref())
+        .unwrap_or("not recorded");
+    let legacy_url = options.legacy_base_url.as_deref().unwrap_or("not supplied");
+    let manifest = options.snapshot_dir.join("manifest.json");
+
+    let mut contents = String::new();
+    writeln!(&mut contents, "# Backend/MQTT Cutover Log\n")?;
+    writeln!(
+        &mut contents,
+        "| Field | Value |\n| --- | --- |\n| Generated at | {} |\n| Rust config | {} |\n| Local Rust URL | {} |\n| Cloudflare public URL | {} |\n| Legacy backend URL | {} |\n| Legacy controller stopped at | {} |\n| MQTT strategy | {} |\n| Rust MQTT broker | {}:{} |\n| Rollback snapshot | {} |\n| Snapshot manifest | {} |\n| Cutover log | {} |",
+        markdown_cell(&Local::now().format("%Y-%m-%d %H:%M:%S %z").to_string()),
+        markdown_cell(&config.runtime.config_path.display().to_string()),
+        markdown_cell(base_url),
+        markdown_cell(public_url),
+        markdown_cell(legacy_url),
+        markdown_cell(&options.legacy_controller_stopped_at),
+        options.mqtt_strategy.as_str(),
+        markdown_cell(&config.runtime.mqtt_host),
+        config.runtime.mqtt_port,
+        markdown_cell(&options.snapshot_dir.display().to_string()),
+        markdown_cell(&manifest.display().to_string()),
+        markdown_cell(&options.cutover_log.display().to_string()),
+    )?;
+
+    writeln!(&mut contents, "\n## Checks\n")?;
+    writeln!(&mut contents, "| Status | Check | Detail |")?;
+    writeln!(&mut contents, "| --- | --- | --- |")?;
+    for check in &report.checks {
+        writeln!(
+            &mut contents,
+            "| {} | {} | {} |",
+            check.status.as_str(),
+            markdown_cell(&check.name),
+            markdown_cell(&check.detail),
+        )?;
+    }
+
+    writeln!(&mut contents, "\n## Rollback Point\n")?;
+    writeln!(
+        &mut contents,
+        "Use the snapshot at `{}` as the rollback source for this cutover window.",
+        options.snapshot_dir.display()
+    )?;
+    writeln!(
+        &mut contents,
+        "Rollback sequence: stop `office-automate-server` and the Cloudflare Tunnel service, start the legacy backend and legacy tunnel, repoint Qingping to the legacy broker if it moved, then restore copied state from the snapshot if Rust wrote incompatible data."
+    )?;
+
+    fs::write(&options.cutover_log, contents).with_context(|| {
+        format!(
+            "failed to write cutover log {}",
+            options.cutover_log.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn markdown_cell(value: &str) -> String {
+    value
+        .replace('|', "\\|")
+        .replace('\n', "<br>")
+        .replace('\r', "")
 }
 
 async fn validate_artifact_interface(
@@ -751,8 +1115,8 @@ mod tests {
                 mqtt_host: "127.0.0.1".to_string(),
                 mqtt_port: 1883,
                 telemetry_db_path: root.join("telemetry.db"),
+                session_tool_usage_db_path: root.join("claude-tool-usage.db"),
                 tool_usage_db_path: root.join("tool_usage.db"),
-                session_tool_usage_db_path: root.join("claude_tool_usage.db"),
                 engram_db_path: root.join("engram_state.db"),
                 engram_registry_path: root.join("engram_concept_registry.md"),
             },
@@ -811,6 +1175,134 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "office-climate-db")
         );
+    }
+
+    #[test]
+    fn cutover_validation_requires_active_write_gates() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        let mut config = test_config(&db_path);
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+
+        let error = validate_cutover_active_write_gates(&config, &mut report)
+            .expect_err("inactive writes should fail cutover validation");
+        assert!(error.to_string().contains("ERV active control enabled"));
+
+        config.erv.active_control_enabled = true;
+        config.mitsubishi.active_control_enabled = true;
+        validate_cutover_active_write_gates(&config, &mut report).expect("active write gates pass");
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "rust-active-write-gates")
+        );
+    }
+
+    #[test]
+    fn cutover_validation_requires_snapshot_manifest() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+
+        let error = validate_cutover_snapshot(temp_dir.path(), &mut report)
+            .expect_err("missing manifest should fail");
+        assert!(error.to_string().contains("manifest is missing"));
+
+        fs::write(temp_dir.path().join("manifest.json"), "{}").expect("manifest");
+        validate_cutover_snapshot(temp_dir.path(), &mut report).expect("snapshot passes");
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "rollback-snapshot")
+        );
+    }
+
+    #[tokio::test]
+    async fn cutover_validation_requires_legacy_stop_timestamp() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let options = CutoverValidationOptions {
+            base_url: Some("http://127.0.0.1:9001".to_string()),
+            public_url: Some("https://office.example.test".to_string()),
+            legacy_base_url: None,
+            legacy_controller_stopped_at: String::new(),
+            mqtt_strategy: MqttCutoverStrategy::AtomicSwitch,
+            snapshot_dir: temp_dir.path().join("snapshot"),
+            cutover_log: temp_dir.path().join("cutover.md"),
+            manual_public_oauth_verified_at: None,
+            max_air_quality_age_seconds: 300,
+        };
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+
+        let error = validate_legacy_controller_stopped(&options, &mut report)
+            .await
+            .expect_err("empty timestamp should fail");
+        assert!(error.to_string().contains("legacy-controller-stopped-at"));
+    }
+
+    #[test]
+    fn cutover_validation_records_mqtt_strategy() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        let mut config = test_config(&db_path);
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+
+        let error =
+            validate_mqtt_cutover_strategy(&config, MqttCutoverStrategy::BridgeMirror, &mut report)
+                .expect_err("missing device mac should fail");
+        assert!(error.to_string().contains("qingping.device_mac"));
+
+        config.qingping.device_mac = Some("AA:BB:CC:DD:EE:FF".to_string());
+        validate_mqtt_cutover_strategy(&config, MqttCutoverStrategy::BridgeMirror, &mut report)
+            .expect("strategy passes");
+        let detail = report
+            .checks
+            .iter()
+            .find(|check| check.name == "mqtt-feed-strategy")
+            .expect("mqtt check")
+            .detail
+            .as_str();
+        assert!(detail.contains("bridge/mirror strategy"));
+        assert!(detail.contains("127.0.0.1:1883"));
+    }
+
+    #[test]
+    fn write_cutover_log_records_checks_and_rollback_point() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        let mut config = test_config(&db_path);
+        config.runtime.base_url = Some("http://127.0.0.1:9001".to_string());
+        config.runtime.public_url = Some("https://office.example.test".to_string());
+        let snapshot_dir = temp_dir.path().join("snapshot");
+        fs::create_dir(&snapshot_dir).expect("snapshot dir");
+        fs::write(snapshot_dir.join("manifest.json"), "{}").expect("manifest");
+        let options = CutoverValidationOptions {
+            base_url: None,
+            public_url: None,
+            legacy_base_url: Some("http://legacy.example.test".to_string()),
+            legacy_controller_stopped_at: "2026-06-06T03:00:00-07:00".to_string(),
+            mqtt_strategy: MqttCutoverStrategy::AtomicSwitch,
+            snapshot_dir: snapshot_dir.clone(),
+            cutover_log: temp_dir.path().join("logs").join("cutover.md"),
+            manual_public_oauth_verified_at: Some("2026-06-06T03:10:00-07:00".to_string()),
+            max_air_quality_age_seconds: 300,
+        };
+        let report = ShadowValidationReport {
+            checks: vec![ValidationCheck {
+                name: "cloudflare-public-status".to_string(),
+                status: ValidationStatus::Passed,
+                detail: "public URL returned fresh /status".to_string(),
+            }],
+        };
+
+        write_cutover_log(&config, &options, &report).expect("write log");
+
+        let contents = fs::read_to_string(&options.cutover_log).expect("log contents");
+        assert!(contents.contains("# Backend/MQTT Cutover Log"));
+        assert!(contents.contains("atomic-switch"));
+        assert!(contents.contains("cloudflare-public-status"));
+        assert!(contents.contains(&snapshot_dir.display().to_string()));
+        assert!(contents.contains("Rollback sequence"));
     }
 
     #[test]

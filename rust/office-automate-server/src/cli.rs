@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::{
     config::AppConfig,
     db, erv, http, hvac, migration, presence, telemetry,
-    validation::{self, ShadowValidationOptions},
+    validation::{self, CutoverValidationOptions, MqttCutoverStrategy, ShadowValidationOptions},
 };
 
 #[derive(Debug, Parser)]
@@ -95,6 +95,8 @@ pub enum CollectTarget {
 pub enum ValidateTarget {
     /// Validate Rust shadow mode before backend/MQTT cutover.
     Shadow(ShadowValidationArgs),
+    /// Validate backend/MQTT cutover with Rust as the only active controller.
+    Cutover(CutoverValidationArgs),
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
@@ -114,6 +116,52 @@ pub struct ShadowValidationArgs {
     /// Maximum accepted age for /status air_quality.last_update.
     #[arg(long, default_value_t = 300)]
     pub max_air_quality_age_seconds: u64,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct CutoverValidationArgs {
+    /// Local Rust server URL, for example http://127.0.0.1:9001.
+    #[arg(long, env = "OFFICE_AUTOMATE_CUTOVER_BASE_URL")]
+    pub base_url: Option<String>,
+    /// Public Cloudflare Tunnel URL for the Rust server.
+    #[arg(long, env = "OFFICE_AUTOMATE_PUBLIC_URL")]
+    pub public_url: Option<String>,
+    /// Optional legacy backend URL; validation fails if it still responds.
+    #[arg(long, env = "OFFICE_AUTOMATE_LEGACY_BASE_URL")]
+    pub legacy_base_url: Option<String>,
+    /// Operator-recorded timestamp proving Python active control was stopped.
+    #[arg(long, env = "OFFICE_AUTOMATE_LEGACY_STOPPED_AT")]
+    pub legacy_controller_stopped_at: String,
+    /// Qingping feed cutover strategy used for this window.
+    #[arg(long, env = "OFFICE_AUTOMATE_MQTT_CUTOVER_STRATEGY", value_enum)]
+    pub mqtt_strategy: MqttCutoverStrategyArg,
+    /// Pre-cutover rollback snapshot directory from ticket #76.
+    #[arg(long, env = "OFFICE_AUTOMATE_CUTOVER_SNAPSHOT_DIR")]
+    pub snapshot_dir: PathBuf,
+    /// Markdown log file to write with timestamps, checks, and rollback point.
+    #[arg(long, env = "OFFICE_AUTOMATE_CUTOVER_LOG")]
+    pub cutover_log: PathBuf,
+    /// Manual browser/mobile OAuth verification timestamp when no validation JWT can be minted.
+    #[arg(long, env = "OFFICE_AUTOMATE_MANUAL_PUBLIC_OAUTH_VERIFIED_AT")]
+    pub manual_public_oauth_verified_at: Option<String>,
+    /// Maximum accepted age for /status air_quality.last_update.
+    #[arg(long, default_value_t = 300)]
+    pub max_air_quality_age_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum MqttCutoverStrategyArg {
+    BridgeMirror,
+    AtomicSwitch,
+}
+
+impl From<MqttCutoverStrategyArg> for MqttCutoverStrategy {
+    fn from(value: MqttCutoverStrategyArg) -> Self {
+        match value {
+            MqttCutoverStrategyArg::BridgeMirror => Self::BridgeMirror,
+            MqttCutoverStrategyArg::AtomicSwitch => Self::AtomicSwitch,
+        }
+    }
 }
 
 #[derive(Debug, Args, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +301,27 @@ async fn run_validate(config: &AppConfig, target: ValidateTarget) -> Result<()> 
             )
             .await?;
             println!("Shadow validation complete: checks={}", report.len());
+            for check in report.checks {
+                println!("- {:?}: {} - {}", check.status, check.name, check.detail);
+            }
+        }
+        ValidateTarget::Cutover(args) => {
+            let report = validation::run_cutover_validation(
+                config,
+                CutoverValidationOptions {
+                    base_url: args.base_url,
+                    public_url: args.public_url,
+                    legacy_base_url: args.legacy_base_url,
+                    legacy_controller_stopped_at: args.legacy_controller_stopped_at,
+                    mqtt_strategy: args.mqtt_strategy.into(),
+                    snapshot_dir: args.snapshot_dir,
+                    cutover_log: args.cutover_log,
+                    manual_public_oauth_verified_at: args.manual_public_oauth_verified_at,
+                    max_air_quality_age_seconds: args.max_air_quality_age_seconds,
+                },
+            )
+            .await?;
+            println!("Cutover validation complete: checks={}", report.len());
             for check in report.checks {
                 println!("- {:?}: {} - {}", check.status, check.name, check.detail);
             }
@@ -526,6 +595,51 @@ mod tests {
                         );
                         assert_eq!(shadow.max_air_quality_age_seconds, 120);
                     }
+                    other => panic!("expected shadow validation target, got {other:?}"),
+                }
+            }
+            other => panic!("expected validate command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_validate_cutover_command() {
+        let cli = Cli::try_parse_from([
+            "office-automate-server",
+            "validate",
+            "--config",
+            "/tmp/office.yaml",
+            "cutover",
+            "--base-url",
+            "http://127.0.0.1:9001",
+            "--public-url",
+            "https://office.example.test",
+            "--legacy-controller-stopped-at",
+            "2026-06-06T03:00:00-07:00",
+            "--mqtt-strategy",
+            "atomic-switch",
+            "--snapshot-dir",
+            "/tmp/snapshot",
+            "--cutover-log",
+            "/tmp/cutover.md",
+        ])
+        .expect("validate cutover command should parse");
+
+        match cli.command {
+            Command::Validate(args) => {
+                assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
+                match args.target {
+                    ValidateTarget::Cutover(cutover) => {
+                        assert_eq!(cutover.base_url.as_deref(), Some("http://127.0.0.1:9001"));
+                        assert_eq!(
+                            cutover.public_url.as_deref(),
+                            Some("https://office.example.test")
+                        );
+                        assert_eq!(cutover.mqtt_strategy, MqttCutoverStrategyArg::AtomicSwitch);
+                        assert_eq!(cutover.snapshot_dir, PathBuf::from("/tmp/snapshot"));
+                        assert_eq!(cutover.cutover_log, PathBuf::from("/tmp/cutover.md"));
+                    }
+                    other => panic!("expected cutover validation target, got {other:?}"),
                 }
             }
             other => panic!("expected validate command, got {other:?}"),
