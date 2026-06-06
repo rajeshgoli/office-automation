@@ -66,7 +66,7 @@ pub fn create_pre_cutover_snapshot(
     copy_file(config_path, &snapshot_dir.join("config.yaml"))?;
     files_copied += 1;
     validations.push("config readable".to_string());
-    validations.extend(validate_config_material(config));
+    validations.extend(validate_config_material(config)?);
 
     let office_db_snapshot = snapshot_dir.join("office_climate.db");
     backup_sqlite(
@@ -263,12 +263,25 @@ fn ensure_writable_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_config_material(config: &AppConfig) -> Vec<String> {
+fn validate_config_material(config: &AppConfig) -> Result<Vec<String>> {
     let mut validations = Vec::new();
-    if config.orchestrator.google_oauth.is_some() {
-        validations.push("OAuth material present in config".to_string());
-    } else {
-        validations.push("OAuth material absent from config".to_string());
+    match &config.orchestrator.google_oauth {
+        Some(oauth) => {
+            ensure_non_empty_config_value(
+                "OAuth client_id",
+                &oauth.client_id,
+                "google_oauth is configured",
+            )?;
+            ensure_non_empty_config_value(
+                "OAuth client_secret",
+                &oauth.client_secret,
+                "google_oauth is configured",
+            )?;
+            validations.push("OAuth material present in config".to_string());
+        }
+        None => {
+            validations.push("OAuth material absent from config".to_string());
+        }
     }
     if config.erv.is_configured() {
         validations.push("ERV local credential material present in config".to_string());
@@ -280,7 +293,14 @@ fn validate_config_material(config: &AppConfig) -> Vec<String> {
     } else {
         validations.push("HVAC credential material absent from config".to_string());
     }
-    validations
+    Ok(validations)
+}
+
+fn ensure_non_empty_config_value(label: &str, value: &str, context: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("{label} must be non-empty when {context}");
+    }
+    Ok(())
 }
 
 fn validate_cloudflared_config(
@@ -817,8 +837,8 @@ fn write_manifest(snapshot_dir: &Path, manifest: SnapshotManifest) -> Result<()>
 mod tests {
     use super::*;
     use crate::config::{
-        ErvConfig, MitsubishiConfig, OrchestratorConfig, PresenceConfig, QingpingConfig,
-        RuntimeConfig, TelemetryConfig, ThresholdsConfig, YoLinkConfig,
+        ErvConfig, GoogleOAuthConfig, MitsubishiConfig, OrchestratorConfig, PresenceConfig,
+        QingpingConfig, RuntimeConfig, TelemetryConfig, ThresholdsConfig, YoLinkConfig,
     };
 
     fn test_config(root: &Path, config_path: PathBuf, database_path: PathBuf) -> AppConfig {
@@ -963,6 +983,63 @@ mod tests {
                 .validations
                 .iter()
                 .any(|validation| validation == "worktree map readable")
+        );
+    }
+
+    #[test]
+    fn snapshot_validates_non_empty_oauth_material() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path();
+        let config_path = root.join("config.yaml");
+        fs::write(&config_path, "orchestrator:\n  port: 9001\n").expect("config");
+        let database_path = root.join("data/office_climate.db");
+        fs::create_dir_all(database_path.parent().expect("db parent")).expect("data dir");
+        db::migrate_database(&database_path).expect("office db");
+
+        let mut config = test_config(root, config_path.clone(), database_path);
+        config.orchestrator.google_oauth = Some(GoogleOAuthConfig {
+            client_id: "client-id".to_string(),
+            client_secret: "client-secret".to_string(),
+            ..GoogleOAuthConfig::default()
+        });
+
+        let report =
+            create_pre_cutover_snapshot(&config, &config_path, &root.join("snapshots"), None)
+                .expect("snapshot succeeds");
+
+        assert!(
+            report
+                .validations
+                .iter()
+                .any(|validation| validation == "OAuth material present in config")
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_empty_oauth_material_when_configured() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path();
+        let config_path = root.join("config.yaml");
+        fs::write(&config_path, "orchestrator:\n  port: 9001\n").expect("config");
+        let database_path = root.join("data/office_climate.db");
+        fs::create_dir_all(database_path.parent().expect("db parent")).expect("data dir");
+        db::migrate_database(&database_path).expect("office db");
+
+        let mut config = test_config(root, config_path.clone(), database_path);
+        config.orchestrator.google_oauth = Some(GoogleOAuthConfig {
+            client_id: "client-id".to_string(),
+            client_secret: "   ".to_string(),
+            ..GoogleOAuthConfig::default()
+        });
+
+        let error =
+            create_pre_cutover_snapshot(&config, &config_path, &root.join("snapshots"), None)
+                .expect_err("empty OAuth secret should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("OAuth client_secret must be non-empty when google_oauth is configured")
         );
     }
 

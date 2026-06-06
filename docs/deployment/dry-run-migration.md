@@ -66,7 +66,7 @@ The snapshot command validates:
 - Optional telemetry, project-leverage tool usage, session telemetry tool usage, and Engram SQLite DBs with SQLite online backup plus `quick_check` when present.
 - Optional Engram registry, telemetry worktree map, and legacy APK readability when present.
 - Artifact metadata under the configured artifacts directory, including hash shape and referenced APK files.
-- Presence or absence of OAuth, ERV, and HVAC credential material without printing secret values.
+- Presence or absence of OAuth, ERV, and HVAC credential material without printing secret values. When OAuth is configured, client ID and client secret must be non-empty.
 - Cloudflare Tunnel config readability, readable `credentials-file`, required tunnel credential JSON fields, at least one ingress rule, and copied tunnel config/credential files in the snapshot.
 - Effective restore environment written to `restore-env.sh`.
 
