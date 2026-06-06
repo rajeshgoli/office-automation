@@ -6,7 +6,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::{
     config::AppConfig,
     db, erv, http, hvac, migration, presence, telemetry,
-    validation::{self, CutoverValidationOptions, MqttCutoverStrategy, ShadowValidationOptions},
+    validation::{
+        self, CutoverValidationOptions, MqttCutoverStrategy, MqttRollbackState,
+        RestoreVerification, RollbackValidationOptions, ShadowValidationOptions,
+    },
 };
 
 #[derive(Debug, Parser)]
@@ -97,6 +100,8 @@ pub enum ValidateTarget {
     Shadow(ShadowValidationArgs),
     /// Validate backend/MQTT cutover with Rust as the only active controller.
     Cutover(CutoverValidationArgs),
+    /// Validate rollback from Rust active control to the legacy controller.
+    Rollback(RollbackValidationArgs),
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
@@ -149,6 +154,46 @@ pub struct CutoverValidationArgs {
     pub max_air_quality_age_seconds: u64,
 }
 
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct RollbackValidationArgs {
+    /// Local legacy backend URL after rollback, for example http://legacy-host:9001.
+    #[arg(long, env = "OFFICE_AUTOMATE_LEGACY_BASE_URL")]
+    pub legacy_base_url: Option<String>,
+    /// Public Cloudflare URL after rollback routes to the legacy backend.
+    #[arg(long, env = "OFFICE_AUTOMATE_LEGACY_PUBLIC_URL")]
+    pub legacy_public_url: Option<String>,
+    /// Optional local Rust server URL; validation fails if it still responds.
+    #[arg(long, env = "OFFICE_AUTOMATE_CUTOVER_BASE_URL")]
+    pub rust_base_url: Option<String>,
+    /// Optional primary-host public URL; validation fails if it still responds.
+    #[arg(long, env = "OFFICE_AUTOMATE_RUST_PUBLIC_URL")]
+    pub rust_public_url: Option<String>,
+    /// Operator-recorded timestamp proving Rust active control was stopped.
+    #[arg(long, env = "OFFICE_AUTOMATE_RUST_STOPPED_AT")]
+    pub rust_stopped_at: String,
+    /// Operator-recorded timestamp proving the legacy backend/tunnel started.
+    #[arg(long, env = "OFFICE_AUTOMATE_LEGACY_STARTED_AT")]
+    pub legacy_started_at: String,
+    /// Qingping feed state after rollback.
+    #[arg(long, env = "OFFICE_AUTOMATE_MQTT_ROLLBACK_STATE", value_enum)]
+    pub mqtt_rollback_state: MqttRollbackStateArg,
+    /// Pre-cutover rollback snapshot directory from ticket #76.
+    #[arg(long, env = "OFFICE_AUTOMATE_CUTOVER_SNAPSHOT_DIR")]
+    pub snapshot_dir: PathBuf,
+    /// Restore verification result for copied state from the snapshot.
+    #[arg(long, env = "OFFICE_AUTOMATE_RESTORE_VERIFICATION", value_enum)]
+    pub restore_verification: RestoreVerificationArg,
+    /// Markdown log file to write with rollback checks and restore decision.
+    #[arg(long, env = "OFFICE_AUTOMATE_ROLLBACK_LOG")]
+    pub rollback_log: PathBuf,
+    /// Manual browser/mobile public legacy verification timestamp when no validation JWT can be minted.
+    #[arg(long, env = "OFFICE_AUTOMATE_MANUAL_LEGACY_PUBLIC_VERIFIED_AT")]
+    pub manual_legacy_public_verified_at: Option<String>,
+    /// Maximum accepted age for legacy /status air_quality.last_update.
+    #[arg(long, default_value_t = 300)]
+    pub max_air_quality_age_seconds: u64,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum MqttCutoverStrategyArg {
     BridgeMirror,
@@ -160,6 +205,43 @@ impl From<MqttCutoverStrategyArg> for MqttCutoverStrategy {
         match value {
             MqttCutoverStrategyArg::BridgeMirror => Self::BridgeMirror,
             MqttCutoverStrategyArg::AtomicSwitch => Self::AtomicSwitch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum MqttRollbackStateArg {
+    /// Qingping never moved off the legacy-compatible MQTT path.
+    NotMoved,
+    /// Qingping device or bridge was repointed to the legacy broker.
+    RepointedLegacy,
+    /// Bridge/mirror forwarding keeps the legacy controller receiving fresh reports.
+    LegacyMirror,
+}
+
+impl From<MqttRollbackStateArg> for MqttRollbackState {
+    fn from(value: MqttRollbackStateArg) -> Self {
+        match value {
+            MqttRollbackStateArg::NotMoved => Self::NotMoved,
+            MqttRollbackStateArg::RepointedLegacy => Self::RepointedLegacy,
+            MqttRollbackStateArg::LegacyMirror => Self::LegacyMirror,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum RestoreVerificationArg {
+    /// State was restored from the pre-cutover snapshot.
+    RestoredFromSnapshot,
+    /// Rust-written state was reviewed and no restore was required.
+    VerifiedSafeNoRestore,
+}
+
+impl From<RestoreVerificationArg> for RestoreVerification {
+    fn from(value: RestoreVerificationArg) -> Self {
+        match value {
+            RestoreVerificationArg::RestoredFromSnapshot => Self::RestoredFromSnapshot,
+            RestoreVerificationArg::VerifiedSafeNoRestore => Self::VerifiedSafeNoRestore,
         }
     }
 }
@@ -322,6 +404,30 @@ async fn run_validate(config: &AppConfig, target: ValidateTarget) -> Result<()> 
             )
             .await?;
             println!("Cutover validation complete: checks={}", report.len());
+            for check in report.checks {
+                println!("- {:?}: {} - {}", check.status, check.name, check.detail);
+            }
+        }
+        ValidateTarget::Rollback(args) => {
+            let report = validation::run_rollback_validation(
+                config,
+                RollbackValidationOptions {
+                    legacy_base_url: args.legacy_base_url,
+                    legacy_public_url: args.legacy_public_url,
+                    rust_base_url: args.rust_base_url,
+                    rust_public_url: args.rust_public_url,
+                    rust_stopped_at: args.rust_stopped_at,
+                    legacy_started_at: args.legacy_started_at,
+                    mqtt_rollback_state: args.mqtt_rollback_state.into(),
+                    snapshot_dir: args.snapshot_dir,
+                    restore_verification: args.restore_verification.into(),
+                    rollback_log: args.rollback_log,
+                    manual_legacy_public_verified_at: args.manual_legacy_public_verified_at,
+                    max_air_quality_age_seconds: args.max_air_quality_age_seconds,
+                },
+            )
+            .await?;
+            println!("Rollback validation complete: checks={}", report.len());
             for check in report.checks {
                 println!("- {:?}: {} - {}", check.status, check.name, check.detail);
             }
@@ -640,6 +746,73 @@ mod tests {
                         assert_eq!(cutover.cutover_log, PathBuf::from("/tmp/cutover.md"));
                     }
                     other => panic!("expected cutover validation target, got {other:?}"),
+                }
+            }
+            other => panic!("expected validate command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_validate_rollback_command() {
+        let cli = Cli::try_parse_from([
+            "office-automate-server",
+            "validate",
+            "--config",
+            "/tmp/office.yaml",
+            "rollback",
+            "--legacy-base-url",
+            "http://legacy-host:9001",
+            "--legacy-public-url",
+            "https://office.example.test",
+            "--rust-base-url",
+            "http://127.0.0.1:9001",
+            "--rust-stopped-at",
+            "2026-06-06T04:00:00-07:00",
+            "--legacy-started-at",
+            "2026-06-06T04:05:00-07:00",
+            "--mqtt-rollback-state",
+            "repointed-legacy",
+            "--snapshot-dir",
+            "/tmp/snapshot",
+            "--restore-verification",
+            "restored-from-snapshot",
+            "--rollback-log",
+            "/tmp/rollback.md",
+            "--max-air-quality-age-seconds",
+            "120",
+        ])
+        .expect("validate rollback command should parse");
+
+        match cli.command {
+            Command::Validate(args) => {
+                assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
+                match args.target {
+                    ValidateTarget::Rollback(rollback) => {
+                        assert_eq!(
+                            rollback.legacy_base_url.as_deref(),
+                            Some("http://legacy-host:9001")
+                        );
+                        assert_eq!(
+                            rollback.legacy_public_url.as_deref(),
+                            Some("https://office.example.test")
+                        );
+                        assert_eq!(
+                            rollback.rust_base_url.as_deref(),
+                            Some("http://127.0.0.1:9001")
+                        );
+                        assert_eq!(
+                            rollback.mqtt_rollback_state,
+                            MqttRollbackStateArg::RepointedLegacy
+                        );
+                        assert_eq!(
+                            rollback.restore_verification,
+                            RestoreVerificationArg::RestoredFromSnapshot
+                        );
+                        assert_eq!(rollback.snapshot_dir, PathBuf::from("/tmp/snapshot"));
+                        assert_eq!(rollback.rollback_log, PathBuf::from("/tmp/rollback.md"));
+                        assert_eq!(rollback.max_air_quality_age_seconds, 120);
+                    }
+                    other => panic!("expected rollback validation target, got {other:?}"),
                 }
             }
             other => panic!("expected validate command, got {other:?}"),
