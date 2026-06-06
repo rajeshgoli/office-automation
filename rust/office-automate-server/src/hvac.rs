@@ -199,20 +199,44 @@ impl HvacState {
     where
         W: HvacModeWriter + ?Sized,
     {
-        if !config.active_control_enabled {
-            bail!("HVAC active control is disabled");
-        }
-        if !config.is_configured() {
-            bail!("Mitsubishi Kumo config is incomplete");
-        }
+        self.smoke_status_with(config, writer).await?;
+        let status = writer.set_mode(config, mode, setpoint_c).await?;
+        self.record_write_success(status.clone(), mode, setpoint_c, reason);
+        Ok(status)
+    }
+
+    pub async fn smoke_status_with<W>(
+        &self,
+        config: &MitsubishiConfig,
+        writer: &W,
+    ) -> Result<HvacDeviceStatus>
+    where
+        W: HvacModeWriter + ?Sized,
+    {
+        validate_active_hvac_config(config)?;
 
         let smoke_status = writer
             .smoke_status(config)
             .await
             .context("HVAC smoke check failed before active write")?;
-        if self.record_status(smoke_status) {
+        if self.record_status(smoke_status.clone()) {
             self.notify_status();
         }
+        Ok(smoke_status)
+    }
+
+    pub async fn set_mode_after_verified_status_with<W>(
+        &self,
+        config: &MitsubishiConfig,
+        writer: &W,
+        mode: HvacControlMode,
+        setpoint_c: Option<f64>,
+        reason: &str,
+    ) -> Result<HvacDeviceStatus>
+    where
+        W: HvacModeWriter + ?Sized,
+    {
+        validate_active_hvac_config(config)?;
 
         let status = writer.set_mode(config, mode, setpoint_c).await?;
         self.record_write_success(status.clone(), mode, setpoint_c, reason);
@@ -344,6 +368,16 @@ impl HvacState {
             tracing::warn!("failed to log HVAC climate action: {error:#}");
         }
     }
+}
+
+fn validate_active_hvac_config(config: &MitsubishiConfig) -> Result<()> {
+    if !config.active_control_enabled {
+        bail!("HVAC active control is disabled");
+    }
+    if !config.is_configured() {
+        bail!("Mitsubishi Kumo config is incomplete");
+    }
+    Ok(())
 }
 
 impl Default for HvacState {

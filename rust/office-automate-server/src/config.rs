@@ -244,6 +244,8 @@ pub struct ThresholdsConfig {
     pub hvac_cool_setpoint_f: i64,
     pub hvac_cool_off_temp_f: i64,
     pub hvac_cool_on_temp_f: i64,
+    pub expected_occupancy_start: String,
+    pub expected_occupancy_end: String,
     pub away_stale_flush_enabled: bool,
     pub away_stale_flush_interval_hours: u64,
     pub away_stale_flush_duration_minutes: u64,
@@ -288,6 +290,8 @@ impl Default for ThresholdsConfig {
             hvac_cool_setpoint_f: 78,
             hvac_cool_off_temp_f: 78,
             hvac_cool_on_temp_f: 81,
+            expected_occupancy_start: "07:00".to_string(),
+            expected_occupancy_end: "22:00".to_string(),
             away_stale_flush_enabled: true,
             away_stale_flush_interval_hours: 8,
             away_stale_flush_duration_minutes: 30,
@@ -480,6 +484,8 @@ thresholds:
   hvac_cool_setpoint_f: 77
   hvac_cool_off_temp_f: 79
   hvac_cool_on_temp_f: 82
+  expected_occupancy_start: "08:30"
+  expected_occupancy_end: "18:45"
 "#,
         )
         .expect("write config");
@@ -561,5 +567,7 @@ thresholds:
         assert_eq!(config.thresholds.hvac_heat_on_temp_f, 70);
         assert_eq!(config.thresholds.hvac_cool_setpoint_f, 77);
         assert_eq!(config.thresholds.hvac_cool_on_temp_f, 82);
+        assert_eq!(config.thresholds.expected_occupancy_start, "08:30");
+        assert_eq!(config.thresholds.expected_occupancy_end, "18:45");
     }
 }

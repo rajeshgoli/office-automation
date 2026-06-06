@@ -20,6 +20,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, get_service, post},
 };
+use chrono::{NaiveTime, Timelike};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, sync::broadcast, time::timeout};
@@ -34,7 +35,7 @@ use crate::{
     artifacts::{ArtifactStore, is_valid_artifact_hash},
     auth::{AuthManager, AuthenticatedUser, HttpAuthMode, WebSocketAuth, bearer_token},
     automation::ErvPolicyCoordinator,
-    config::AppConfig,
+    config::{AppConfig, ThresholdsConfig},
     db,
     erv::{
         ERV_MANUAL_OVERRIDE_SECONDS, ErvFanSpeed, ErvSpeedWriter, ErvState, RustuyaErvSpeedWriter,
@@ -814,10 +815,20 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
     let hvac_mode = hvac_mode_from_str(&hvac_snapshot.mode).unwrap_or(HvacMode::Off);
 
     if state_status.safety_interlock {
-        if hvac_snapshot.mode != "off" {
-            let previous_mode = hvac_snapshot.mode.clone();
-            apply_hvac_mode(state, HvacControlMode::Off, None, "safety_interlock").await?;
+        let verified_status = state
+            .hvac
+            .smoke_status_with(&state.config.mitsubishi, state.hvac_writer.as_ref())
+            .await?;
+        if let Some(previous_mode) = active_hvac_control_mode(&verified_status.mode) {
+            apply_hvac_mode_after_verified_status(
+                state,
+                HvacControlMode::Off,
+                None,
+                "safety_interlock",
+            )
+            .await?;
             state.hvac.set_suspended(true, Some(previous_mode));
+            state.hvac.set_temp_band_mode(None);
             broadcast_status(state);
         }
         return Ok(());
@@ -847,24 +858,29 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
         .as_deref()
         .and_then(hvac_mode_from_str);
     let erv_snapshot = state.erv.snapshot();
+    let within_occupancy_hours = is_within_occupancy_hours(&state.config.thresholds);
     if !state_status.is_present
         && erv_snapshot.running
         && !hvac_snapshot.suspended
-        && matches!(hvac_mode, HvacMode::Heat | HvacMode::Cool | HvacMode::Auto)
         && temp_f.is_some_and(|temp_f| temp_f > state.config.thresholds.hvac_min_temp_f as f64)
     {
-        let temp_label = temp_f.expect("ERV suspension temperature checked").round() as i64;
-        let previous_mode = hvac_snapshot.mode.clone();
-        apply_hvac_mode(
-            state,
-            HvacControlMode::Off,
-            None,
-            &format!("erv_running_temp_{temp_label}F"),
-        )
-        .await?;
-        state.hvac.set_suspended(true, Some(previous_mode));
-        state.hvac.set_temp_band_mode(None);
-        broadcast_status(state);
+        let verified_status = state
+            .hvac
+            .smoke_status_with(&state.config.mitsubishi, state.hvac_writer.as_ref())
+            .await?;
+        if let Some(previous_mode) = active_hvac_control_mode(&verified_status.mode) {
+            let temp_label = temp_f.expect("ERV suspension temperature checked").round() as i64;
+            apply_hvac_mode_after_verified_status(
+                state,
+                HvacControlMode::Off,
+                None,
+                &format!("erv_running_temp_{temp_label}F"),
+            )
+            .await?;
+            state.hvac.set_suspended(true, Some(previous_mode));
+            state.hvac.set_temp_band_mode(None);
+            broadcast_status(state);
+        }
         return Ok(());
     }
 
@@ -879,7 +895,7 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
         },
         erv_snapshot.running,
         state.config.thresholds.hvac_min_temp_f as f64,
-        true,
+        within_occupancy_hours,
         bands.heat_off_temp_f as f64,
         bands.heat_on_temp_f as f64,
         bands.cool_on_temp_f as f64,
@@ -895,6 +911,7 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
                 bands,
                 state_status.is_present,
                 erv_snapshot.running,
+                within_occupancy_hours,
             ) {
                 let setpoint_c = match restore_mode {
                     HvacControlMode::Heat => Some(hvac_snapshot.heat_setpoint_c.unwrap_or(22.0)),
@@ -996,6 +1013,33 @@ async fn apply_hvac_mode(
         .await
 }
 
+async fn apply_hvac_mode_after_verified_status(
+    state: &AppState,
+    mode: HvacControlMode,
+    setpoint_c: Option<f64>,
+    reason: &str,
+) -> Result<crate::hvac::HvacDeviceStatus> {
+    state
+        .hvac
+        .set_mode_after_verified_status_with(
+            &state.config.mitsubishi,
+            state.hvac_writer.as_ref(),
+            mode,
+            setpoint_c,
+            reason,
+        )
+        .await
+}
+
+fn active_hvac_control_mode(mode: &str) -> Option<String> {
+    match HvacControlMode::parse(mode) {
+        Some(HvacControlMode::Heat | HvacControlMode::Cool | HvacControlMode::Auto) => {
+            Some(mode.to_string())
+        }
+        Some(HvacControlMode::Off) | None => None,
+    }
+}
+
 fn fahrenheit_to_celsius(value: f64) -> f64 {
     (value - 32.0) * 5.0 / 9.0
 }
@@ -1018,14 +1062,31 @@ fn hvac_mode_from_str(value: &str) -> Option<HvacMode> {
     }
 }
 
+fn is_within_occupancy_hours(thresholds: &ThresholdsConfig) -> bool {
+    is_within_occupancy_hours_at(thresholds, chrono::Local::now().time())
+}
+
+fn is_within_occupancy_hours_at(thresholds: &ThresholdsConfig, now: NaiveTime) -> bool {
+    let start = NaiveTime::parse_from_str(&thresholds.expected_occupancy_start, "%H:%M");
+    let end = NaiveTime::parse_from_str(&thresholds.expected_occupancy_end, "%H:%M");
+    match (start, end) {
+        (Ok(start), Ok(end)) => start <= now && now <= end,
+        _ => {
+            tracing::warn!("Invalid occupancy hours config, defaulting to 7AM-10PM");
+            (7..22).contains(&now.hour())
+        }
+    }
+}
+
 fn suspended_restore_mode(
     snapshot: &HvacRuntimeSnapshot,
     temp_f: Option<f64>,
     bands: TemperatureBands,
     is_present: bool,
     erv_running: bool,
+    within_occupancy_hours: bool,
 ) -> Option<HvacControlMode> {
-    if !snapshot.suspended || (!is_present && erv_running) {
+    if !snapshot.suspended || (!is_present && (erv_running || !within_occupancy_hours)) {
         return None;
     }
 
@@ -2039,6 +2100,17 @@ mod tests {
             ..MitsubishiConfig::default()
         };
         config
+    }
+
+    fn set_occupancy_window_excluding_now(config: &mut AppConfig) {
+        let current_hour = chrono::Timelike::hour(&chrono::Local::now());
+        let (start, end) = if current_hour < 22 {
+            ("23:00", "23:30")
+        } else {
+            ("00:00", "01:00")
+        };
+        config.thresholds.expected_occupancy_start = start.to_string();
+        config.thresholds.expected_occupancy_end = end.to_string();
     }
 
     fn qingping_with_co2(co2_ppm: i64) -> QingpingState {
@@ -3212,6 +3284,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automated_hvac_policy_reads_device_before_safety_interlock_off() {
+        let config = configured_hvac_config(true);
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            now,
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .update_door(true, now + 1.0);
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Off, 22.0));
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Heat, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+        ));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            QingpingState::default(),
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy applies safety off from fresh status");
+
+        assert_eq!(writer.smoke_calls(), 1);
+        assert_eq!(writer.write_modes(), vec![(HvacControlMode::Off, None)]);
+        let snapshot = state.hvac.snapshot();
+        assert!(snapshot.suspended);
+        assert_eq!(snapshot.last_mode.as_deref(), Some("heat"));
+    }
+
+    #[tokio::test]
     async fn yolink_safety_event_drives_hvac_policy_without_route_update() {
         let config = configured_hvac_config(true);
         let now = unix_timestamp_now();
@@ -3414,6 +3529,44 @@ mod tests {
             writer.write_modes(),
             vec![(HvacControlMode::Heat, Some(22.0))]
         );
+    }
+
+    #[tokio::test]
+    async fn automated_hvac_policy_skips_away_heat_band_resume_outside_occupancy_hours() {
+        let mut config = configured_hvac_config(true);
+        set_occupancy_window_excluding_now(&mut config);
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Heat, 22.0))],
+        ));
+        let qingping = qingping_with_temp(fahrenheit_to_celsius(70.0));
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            unix_timestamp_now(),
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Off, 22.0));
+        hvac_state.set_temp_band_mode(Some(HvacControlMode::Heat));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            qingping,
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy respects occupancy hours");
+
+        assert_eq!(writer.smoke_calls(), 0);
+        assert!(writer.write_modes().is_empty());
     }
 
     #[tokio::test]
