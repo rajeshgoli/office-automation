@@ -7,11 +7,12 @@ The templates live in `scripts/launchd/primary-host/`:
 | Template | Label | Purpose |
 | --- | --- | --- |
 | `com.office-automate.server.plist.template` | `com.office-automate.server` | Runs `office-automate-server serve --config <config>` as the core API, WebSocket, MQTT ingress, presence, and device-client process. |
+| `com.office-automate.edge.plist.template` | `com.office-automate.edge` | Runs `office-automate-server serve-edge --config <edge-config>` as the quarantined public HTTP edge and narrow controller client. |
 | `com.office-automate.telemetry.plist.template` | `com.office-automate.telemetry` | Runs `office-automate-server collect --config <config> telemetry` on an interval. |
 | `com.office-automate.project-leverage.plist.template` | `com.office-automate.project-leverage` | Runs `office-automate-server collect --config <config> leverage` on an interval. |
 | `com.office-automate.tunnel.plist.template` | `com.office-automate.tunnel` | Runs `cloudflared tunnel --no-autoupdate --config <config> run <tunnel>` as the quarantined public transport process. |
 
-LocalTunnel is intentionally not represented. Public access is Cloudflare Tunnel only; application auth remains owned by `office-automate-server`.
+LocalTunnel is intentionally not represented. Public access is Cloudflare Tunnel only. `cloudflared` should route to `office-automate-server serve-edge`; the edge then calls the controller over the local authenticated IPC token.
 
 ## Template Values
 
@@ -22,6 +23,9 @@ Render the templates with deployment-specific absolute paths before loading them
 | `__OFFICE_AUTOMATE_ROOT__` | Repository checkout or release directory. |
 | `__OFFICE_AUTOMATE_SERVER_BIN__` | Absolute path to the Rust `office-automate-server` binary. |
 | `__OFFICE_AUTOMATE_CONFIG__` | Absolute path to the deployment config file. |
+| `__OFFICE_AUTOMATE_EDGE_CONFIG__` | Absolute path to the edge-only config file. This file must not contain device, telemetry, repo, or climate database settings. |
+| `__OFFICE_AUTOMATE_EDGE_WORKING_DIRECTORY__` | Working directory for the edge process, usually a release directory readable by the edge user. |
+| `__OFFICE_AUTOMATE_EDGE_LOG_DIR__` | Directory for edge stdout/stderr logs. |
 | `__OFFICE_AUTOMATE_PATH__` | PATH available to launchd jobs, usually including Homebrew and system paths. |
 | `__OFFICE_AUTOMATE_RUST_LOG__` | Rust log filter, for example `info,office_automate_server=info`. |
 | `__OFFICE_AUTOMATE_LOG_DIR__` | Directory for stdout/stderr logs. Create it before loading jobs. |
@@ -33,7 +37,8 @@ Render the templates with deployment-specific absolute paths before loading them
 | `__CLOUDFLARED_WORKING_DIRECTORY__` | Directory where `cloudflared` should run. |
 | `__OFFICE_AUTOMATE_TUNNEL_USER__` | Dedicated low-privilege user that runs only `cloudflared`, for example `_office_tunnel`. |
 | `__OFFICE_AUTOMATE_TUNNEL_GROUP__` | Dedicated group for the tunnel user, for example `_office_tunnel`. |
-| `__OFFICE_AUTOMATE_EDGE_USER__` | Public HTTP edge user for the later edge/controller split. Until that split exists, render this to the same value as `__OFFICE_AUTOMATE_TUNNEL_USER__` in PF templates. |
+| `__OFFICE_AUTOMATE_EDGE_USER__` | Dedicated low-privilege user that runs only the public HTTP edge, for example `_office_edge`. |
+| `__OFFICE_AUTOMATE_EDGE_GROUP__` | Dedicated group for the edge user, for example `_office_edge`. |
 | `__OFFICE_AUTOMATE_ORIGIN_PORTS__` | Loopback origin ports the tunnel/edge users may reach, for example `8080`. |
 
 Keep hostnames, public routes, credentials, and tunnel credential files in the Cloudflare config and deployment secrets, not in these templates.
@@ -46,16 +51,20 @@ plutil -lint rendered/com.office-automate.*.plist
 
 ## Public Edge Quarantine
 
-`cloudflared` is public edge code. Do not run it as the logged-in user. Use a dedicated low-privilege tunnel account with no shell, no repo access, no controller config/data access, and only the tunnel config/credential/log paths it needs.
+`cloudflared` and `serve-edge` are public edge code. Do not run either as the logged-in user. Use dedicated low-privilege tunnel and edge accounts with no shell, no repo access, no controller config/data access, and only the config/credential/log/static paths they need.
 
 Recommended local ownership model:
 
 | Path | Owner | Mode | Purpose |
 | --- | --- | --- | --- |
 | `/Library/LaunchDaemons/com.office-automate.tunnel.plist` | `root:wheel` | `0644` | LaunchDaemon wrapper that switches to the tunnel user. |
+| `/Library/LaunchDaemons/com.office-automate.edge.plist` | `root:wheel` | `0644` | LaunchDaemon wrapper that switches to the edge user. |
 | `/var/lib/office-automate/tunnel/` | `_office_tunnel:_office_tunnel` | `0700` | Cloudflare tunnel config and credential directory. |
+| `/var/lib/office-automate/edge/` | `_office_edge:_office_edge` | `0700` | Edge-only config and controller IPC token. |
 | `/var/log/office-automate/tunnel/` | `_office_tunnel:_office_tunnel` | `0700` | Tunnel stdout/stderr logs. |
-| Controller config, data, repos, telemetry DBs | controller user/group only | `0600` files, `0700` directories | Must be unreadable and non-traversable by `_office_tunnel` and by the later public edge user. |
+| `/var/log/office-automate/edge/` | `_office_edge:_office_edge` | `0700` | Edge stdout/stderr logs. |
+| Frontend static assets | `_office_edge:_office_edge` or release owner with edge read-only access | `0550` dirs, `0440` files | The edge may read static assets only; it does not need repo, DB, telemetry, artifact-write, or device-secret access. |
+| Controller config, data, repos, telemetry DBs | controller user/group only | `0600` files, `0700` directories | Must be unreadable and non-traversable by `_office_tunnel` and `_office_edge`. |
 | Public edge config and credentials | public edge user/group only | `0600` files, `0700` directories | Must be unreadable and non-traversable by `_office_tunnel` unless the tunnel explicitly needs them. |
 
 Create the tunnel account through your normal macOS account-management path or MDM. The account must be non-login and dedicated to Office Automate tunnel transport. The examples below assume `_office_tunnel`.
@@ -63,11 +72,36 @@ Create the tunnel account through your normal macOS account-management path or M
 ```bash
 sudo install -d -o _office_tunnel -g _office_tunnel -m 0700 /var/lib/office-automate/tunnel
 sudo install -d -o _office_tunnel -g _office_tunnel -m 0700 /var/log/office-automate/tunnel
+sudo install -d -o _office_edge -g _office_edge -m 0700 /var/lib/office-automate/edge
+sudo install -d -o _office_edge -g _office_edge -m 0700 /var/log/office-automate/edge
 sudo install -o _office_tunnel -g _office_tunnel -m 0600 "$CLOUDFLARED_CONFIG" /var/lib/office-automate/tunnel/config.yml
 sudo install -o _office_tunnel -g _office_tunnel -m 0600 "$CLOUDFLARED_CREDENTIALS" /var/lib/office-automate/tunnel/credentials.json
+sudo install -o _office_edge -g _office_edge -m 0600 "$OFFICE_AUTOMATE_EDGE_CONFIG" /var/lib/office-automate/edge/config.yaml
 ```
 
-The Cloudflare config in `/var/lib/office-automate/tunnel/config.yml` should reference the credential copy in that same directory and route only to the loopback or Unix-socket origin validated by `office-automate-server validate`.
+The edge config must use the edge-only schema:
+
+```yaml
+orchestrator:
+  host: "127.0.0.1"
+  port: 8080
+  google_oauth:
+    client_id: "<google-client-id>"
+    client_secret: "<google-client-secret>"
+    allowed_emails:
+      - "you@example.com"
+    jwt_secret: "<stable-jwt-secret>"
+    trusted_networks: []
+controller:
+  base_url: "http://127.0.0.1:9001"
+  token: "<same value as controller orchestrator.controller_ipc_token>"
+runtime:
+  frontend_dist: "/opt/office-automate/frontend/dist"
+```
+
+The edge config parser rejects unrelated top-level sections such as `qingping`, `yolink`, `erv`, `mitsubishi`, `telemetry`, or `thresholds`. Keep the controller IPC token out of rendered plists; store it in the edge config and in the controller config or `OFFICE_AUTOMATE_CONTROLLER_IPC_TOKEN`.
+
+The Cloudflare config in `/var/lib/office-automate/tunnel/config.yml` should reference the credential copy in that same directory and route only to the loopback edge origin. The edge should then reach only the loopback controller IPC URL.
 
 Render and install the PF anchor template in `scripts/pf/office-automate-edge-anchor.conf.template` after replacing every placeholder:
 
@@ -94,18 +128,20 @@ The anchor must deny the tunnel/edge users outbound RFC1918/LAN traffic while st
 
 ## Install
 
-Use LaunchAgents only for jobs that need the logged-in macOS user session. The server currently owns presence polling, so it remains a LaunchAgent until the public edge/controller split is implemented. The tunnel does not need the user session and must run as a LaunchDaemon under the dedicated tunnel user.
+Use LaunchAgents only for jobs that need the logged-in macOS user session. The controller currently owns presence polling, so `com.office-automate.server` remains a LaunchAgent. The edge and tunnel do not need the user session and must run as LaunchDaemons under their dedicated users.
 
 ```bash
 mkdir -p "$HOME/Library/LaunchAgents" "$OFFICE_AUTOMATE_LOG_DIR"
 cp rendered/com.office-automate.server.plist "$HOME/Library/LaunchAgents/"
 cp rendered/com.office-automate.telemetry.plist "$HOME/Library/LaunchAgents/"
 cp rendered/com.office-automate.project-leverage.plist "$HOME/Library/LaunchAgents/"
+sudo install -o root -g wheel -m 0644 rendered/com.office-automate.edge.plist /Library/LaunchDaemons/com.office-automate.edge.plist
 sudo install -o root -g wheel -m 0644 rendered/com.office-automate.tunnel.plist /Library/LaunchDaemons/com.office-automate.tunnel.plist
 
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.office-automate.server.plist"
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.office-automate.telemetry.plist"
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.office-automate.project-leverage.plist"
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.office-automate.edge.plist
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.office-automate.tunnel.plist
 ```
 
@@ -115,6 +151,7 @@ Validate loaded jobs:
 launchctl print "gui/$(id -u)/com.office-automate.server"
 launchctl print "gui/$(id -u)/com.office-automate.telemetry"
 launchctl print "gui/$(id -u)/com.office-automate.project-leverage"
+sudo launchctl print system/com.office-automate.edge
 sudo launchctl print system/com.office-automate.tunnel
 ```
 
@@ -124,6 +161,7 @@ sudo launchctl print system/com.office-automate.tunnel
 launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.office-automate.server.plist"
 launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.office-automate.telemetry.plist"
 launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.office-automate.project-leverage.plist"
+sudo launchctl bootout system /Library/LaunchDaemons/com.office-automate.edge.plist
 sudo launchctl bootout system /Library/LaunchDaemons/com.office-automate.tunnel.plist
 ```
 
@@ -133,10 +171,11 @@ sudo launchctl bootout system /Library/LaunchDaemons/com.office-automate.tunnel.
 launchctl kickstart -k "gui/$(id -u)/com.office-automate.server"
 launchctl kickstart -k "gui/$(id -u)/com.office-automate.telemetry"
 launchctl kickstart -k "gui/$(id -u)/com.office-automate.project-leverage"
+sudo launchctl kickstart -k system/com.office-automate.edge
 sudo launchctl kickstart -k system/com.office-automate.tunnel
 ```
 
-The server and tunnel templates use `KeepAlive`; launchd restarts them after crashes or non-manual exits. The tunnel template passes `--no-autoupdate` so launchd remains the only process supervisor. The collector templates use `StartInterval` and `RunAtLoad`; they run once at load and then on their configured interval.
+The server, edge, and tunnel templates use `KeepAlive`; launchd restarts them after crashes or non-manual exits. The tunnel template passes `--no-autoupdate` so launchd remains the only process supervisor. The collector templates use `StartInterval` and `RunAtLoad`; they run once at load and then on their configured interval.
 
 ## Logs
 
@@ -147,6 +186,8 @@ tail -F "$OFFICE_AUTOMATE_LOG_DIR"/office-automate-telemetry.out.log
 tail -F "$OFFICE_AUTOMATE_LOG_DIR"/office-automate-telemetry.err.log
 tail -F "$OFFICE_AUTOMATE_LOG_DIR"/office-automate-project-leverage.out.log
 tail -F "$OFFICE_AUTOMATE_LOG_DIR"/office-automate-project-leverage.err.log
+sudo tail -F /var/log/office-automate/edge/office-automate-edge.out.log
+sudo tail -F /var/log/office-automate/edge/office-automate-edge.err.log
 sudo tail -F /var/log/office-automate/tunnel/office-automate-tunnel.out.log
 sudo tail -F /var/log/office-automate/tunnel/office-automate-tunnel.err.log
 ```
@@ -181,8 +222,8 @@ scripts/security/validate-edge-quarantine.sh \
   --tunnel-readable /var/lib/office-automate/tunnel/credentials.json \
   --tunnel-private /var/lib/office-automate/tunnel/config.yml \
   --tunnel-private /var/lib/office-automate/tunnel/credentials.json \
-  --edge-readable "$OFFICE_AUTOMATE_EDGE_CREDENTIALS" \
-  --edge-private "$OFFICE_AUTOMATE_EDGE_CREDENTIALS" \
+  --edge-readable /var/lib/office-automate/edge/config.yaml \
+  --edge-private /var/lib/office-automate/edge/config.yaml \
   --protected-path "$OFFICE_AUTOMATE_CONFIG" \
   --protected-path "$OFFICE_AUTOMATE_DATABASE" \
   --protected-path "$OFFICE_AUTOMATE_REPO_ROOT" \
@@ -196,4 +237,4 @@ The validation passes only if the tunnel/edge users can read the material they n
 
 ## Cloudflare Tunnel Notes
 
-The tunnel template only starts `cloudflared`; it does not define DNS, public hostnames, TLS, credentials, or application authorization. Configure those through Cloudflare and the `cloudflared` config file. The tunnel should forward only to the local Rust origin, and the Rust server should continue enforcing OAuth/JWT. Public deployments must not use `trusted_networks`.
+The tunnel template only starts `cloudflared`; it does not define DNS, public hostnames, TLS, credentials, or application authorization. Configure those through Cloudflare and the `cloudflared` config file. The tunnel should forward only to the local Rust edge origin, and the edge/controller pair should continue enforcing OAuth/JWT plus the local controller IPC token. Public deployments must not use `trusted_networks`.

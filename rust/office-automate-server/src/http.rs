@@ -233,6 +233,7 @@ fn is_loopback_bind_host(host: &str) -> bool {
 }
 
 const HVAC_TEMPERATURE_BANDS_SETTING: &str = "hvac_temperature_bands";
+pub(crate) const CONTROLLER_IPC_TOKEN_HEADER: &str = "x-office-automate-controller-token";
 
 #[derive(Clone)]
 struct AppState {
@@ -564,6 +565,13 @@ async fn auth_middleware(
         .map(|ConnectInfo(remote_addr)| *remote_addr);
     let headers = auth_headers_with_peer(request.headers(), remote_addr);
 
+    if has_valid_controller_ipc_token(&state.config, &headers, remote_addr) {
+        request.extensions_mut().insert(AuthenticatedUser {
+            email: "edge_ipc".to_string(),
+        });
+        return next.run(request).await;
+    }
+
     if request.uri().path() == "/ws"
         && is_websocket_upgrade(&headers)
         && matches!(auth_mode, HttpAuthMode::OAuth | HttpAuthMode::Basic)
@@ -694,8 +702,35 @@ async fn websocket(
     ws: WebSocketUpgrade,
 ) -> Response {
     let auth_headers = auth_headers_with_peer(&headers, Some(remote_addr));
-    let mode = state.auth.websocket_auth(&auth_headers);
+    let mode = if has_valid_controller_ipc_token(&state.config, &auth_headers, Some(remote_addr)) {
+        WebSocketAuth::Open
+    } else {
+        state.auth.websocket_auth(&auth_headers)
+    };
     ws.on_upgrade(move |socket| websocket_session(socket, state, mode))
+}
+
+fn has_valid_controller_ipc_token(
+    config: &AppConfig,
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+) -> bool {
+    if remote_addr.is_some_and(|address| !address.ip().is_loopback()) {
+        return false;
+    }
+    let Some(expected) = config
+        .orchestrator
+        .controller_ipc_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    else {
+        return false;
+    };
+    headers
+        .get(CONTROLLER_IPC_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|actual| actual == expected)
 }
 
 async fn websocket_session(mut socket: WebSocket, state: AppState, auth_mode: WebSocketAuth) {
@@ -2989,6 +3024,41 @@ mod tests {
             .expect("read body");
         let value: Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(value["login_url"], "/auth/login");
+    }
+
+    #[tokio::test]
+    async fn controller_ipc_token_allows_local_edge_calls() {
+        let mut config = oauth_config();
+        config.orchestrator.controller_ipc_token = Some("edge-token".to_string());
+
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .header(CONTROLLER_IPC_TOKEN_HEADER, "edge-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut request = HttpRequest::builder()
+            .uri("/status")
+            .header(CONTROLLER_IPC_TOKEN_HEADER, "edge-token")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(ConnectInfo(
+            "203.0.113.10:4231"
+                .parse::<SocketAddr>()
+                .expect("socket addr"),
+        ));
+        let mut config = oauth_config();
+        config.orchestrator.controller_ipc_token = Some("edge-token".to_string());
+        let response = app(config).oneshot(request).await.expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
