@@ -927,6 +927,7 @@ mod tests {
                 mqtt_host: "127.0.0.1".to_string(),
                 mqtt_port: 1883,
                 telemetry_db_path: "/tmp/office/data/telemetry.db".into(),
+                session_tool_usage_db_path: "/tmp/office/data/claude_tool_usage.db".into(),
                 tool_usage_db_path: "/tmp/office/data/tool_usage.db".into(),
                 engram_db_path: "/tmp/office/data/engram_state.db".into(),
                 engram_registry_path: "/tmp/office/data/engram_concept_registry.md".into(),

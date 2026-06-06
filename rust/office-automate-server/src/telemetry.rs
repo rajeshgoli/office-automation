@@ -59,7 +59,7 @@ pub fn collect_telemetry(config: &AppConfig, dry_run: bool) -> Result<TelemetryC
         config.telemetry.days
     };
     collect_session_telemetry(
-        &config.runtime.tool_usage_db_path,
+        &config.runtime.session_tool_usage_db_path,
         &config.runtime.telemetry_db_path,
         &config.telemetry.repos,
         days,

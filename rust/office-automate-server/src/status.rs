@@ -277,6 +277,7 @@ mod tests {
                 mqtt_host: "127.0.0.1".to_string(),
                 mqtt_port: 1883,
                 telemetry_db_path: PathBuf::from("/tmp/office/data/telemetry.db"),
+                session_tool_usage_db_path: PathBuf::from("/tmp/office/data/claude_tool_usage.db"),
                 tool_usage_db_path: PathBuf::from("/tmp/office/data/tool_usage.db"),
                 engram_db_path: PathBuf::from("/tmp/office/data/engram_state.db"),
                 engram_registry_path: PathBuf::from("/tmp/office/data/engram_concept_registry.md"),

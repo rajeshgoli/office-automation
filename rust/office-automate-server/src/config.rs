@@ -42,6 +42,7 @@ impl Default for PresenceConfig {
 pub struct TelemetryConfig {
     pub repos: Vec<PathBuf>,
     pub tool_usage_db: Option<PathBuf>,
+    pub session_tool_usage_db: Option<PathBuf>,
     pub telemetry_db: Option<PathBuf>,
     pub engram_db: Option<PathBuf>,
     pub engram_registry: Option<PathBuf>,
@@ -345,6 +346,7 @@ pub struct RuntimeConfig {
     pub mqtt_host: String,
     pub mqtt_port: u16,
     pub telemetry_db_path: PathBuf,
+    pub session_tool_usage_db_path: PathBuf,
     pub tool_usage_db_path: PathBuf,
     pub engram_db_path: PathBuf,
     pub engram_registry_path: PathBuf,
@@ -483,6 +485,10 @@ impl AppConfig {
             file_config.telemetry.tool_usage_db = Some(PathBuf::from(path));
         }
 
+        if let Some(path) = env_lookup("OFFICE_AUTOMATE_SESSION_TOOL_USAGE_DB") {
+            file_config.telemetry.session_tool_usage_db = Some(PathBuf::from(path));
+        }
+
         if let Some(path) = env_lookup("OFFICE_AUTOMATE_TELEMETRY_DB") {
             file_config.telemetry.telemetry_db = Some(PathBuf::from(path));
         }
@@ -511,21 +517,41 @@ impl AppConfig {
             .telemetry
             .telemetry_db
             .clone()
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()))
             .unwrap_or_else(|| data_dir.join("telemetry.db"));
+        let default_session_tool_usage_db_path = home_dir
+            .as_deref()
+            .map(|home| {
+                home.join(".local")
+                    .join("share")
+                    .join("claude-sessions")
+                    .join("tool_usage.db")
+            })
+            .unwrap_or_else(|| data_dir.join("tool_usage.db"));
+        let session_tool_usage_db_path = file_config
+            .telemetry
+            .session_tool_usage_db
+            .clone()
+            .or_else(|| file_config.telemetry.tool_usage_db.clone())
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()))
+            .unwrap_or(default_session_tool_usage_db_path);
         let tool_usage_db_path = file_config
             .telemetry
             .tool_usage_db
             .clone()
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()))
             .unwrap_or_else(|| data_dir.join("tool_usage.db"));
         let engram_db_path = file_config
             .telemetry
             .engram_db
             .clone()
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()))
             .unwrap_or_else(|| data_dir.join("engram_state.db"));
         let engram_registry_path = file_config
             .telemetry
             .engram_registry
             .clone()
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()))
             .unwrap_or_else(|| data_dir.join("engram_concept_registry.md"));
 
         let runtime = RuntimeConfig {
@@ -541,6 +567,7 @@ impl AppConfig {
             mqtt_host: file_config.qingping.mqtt_broker.clone(),
             mqtt_port: file_config.qingping.mqtt_port,
             telemetry_db_path,
+            session_tool_usage_db_path,
             tool_usage_db_path,
             engram_db_path,
             engram_registry_path,
@@ -658,6 +685,13 @@ thresholds:
                     .display()
                     .to_string(),
             ),
+            "OFFICE_AUTOMATE_SESSION_TOOL_USAGE_DB" => Some(
+                temp_dir
+                    .path()
+                    .join("session_tool_usage.sqlite")
+                    .display()
+                    .to_string(),
+            ),
             "OFFICE_AUTOMATE_TELEMETRY_DB" => Some(
                 temp_dir
                     .path()
@@ -735,6 +769,10 @@ thresholds:
             temp_dir.path().join("tool_usage.sqlite")
         );
         assert_eq!(
+            config.runtime.session_tool_usage_db_path,
+            temp_dir.path().join("session_tool_usage.sqlite")
+        );
+        assert_eq!(
             config.runtime.telemetry_db_path,
             temp_dir.path().join("telemetry.sqlite")
         );
@@ -786,6 +824,21 @@ telemetry:
             config.telemetry.repos,
             vec![home_dir.join("Desktop/automation/office-automate")]
         );
+        assert_eq!(
+            config.runtime.session_tool_usage_db_path,
+            home_dir
+                .join(".local")
+                .join("share")
+                .join("claude-sessions")
+                .join("tool_usage.db")
+        );
+        assert_eq!(
+            config.runtime.tool_usage_db_path,
+            std::env::current_dir()
+                .expect("current dir")
+                .join("data")
+                .join("tool_usage.db")
+        );
 
         let config = AppConfig::load_with_env(&config_path, |key| match key {
             "HOME" => Some(home_dir.display().to_string()),
@@ -798,5 +851,36 @@ telemetry:
             config.telemetry.repos,
             vec![home_dir.join("repo-a"), PathBuf::from("/absolute/repo-b")]
         );
+    }
+
+    #[test]
+    fn explicit_tool_usage_db_applies_to_session_telemetry_unless_split() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home_dir = temp_dir.path().join("home");
+        let config_path = temp_dir.path().join("config.yaml");
+        fs::write(&config_path, "telemetry: {}\n").expect("write config");
+
+        let shared_tool_db = home_dir.join("shared-tool-usage.db");
+        let config = AppConfig::load_with_env(&config_path, |key| match key {
+            "HOME" => Some(home_dir.display().to_string()),
+            "OFFICE_AUTOMATE_TOOL_USAGE_DB" => Some("~/shared-tool-usage.db".to_string()),
+            _ => None,
+        })
+        .expect("load config");
+
+        assert_eq!(config.runtime.tool_usage_db_path, shared_tool_db);
+        assert_eq!(config.runtime.session_tool_usage_db_path, shared_tool_db);
+
+        let split_session_db = home_dir.join("claude-tool-usage.db");
+        let config = AppConfig::load_with_env(&config_path, |key| match key {
+            "HOME" => Some(home_dir.display().to_string()),
+            "OFFICE_AUTOMATE_TOOL_USAGE_DB" => Some("~/shared-tool-usage.db".to_string()),
+            "OFFICE_AUTOMATE_SESSION_TOOL_USAGE_DB" => Some("~/claude-tool-usage.db".to_string()),
+            _ => None,
+        })
+        .expect("load config");
+
+        assert_eq!(config.runtime.tool_usage_db_path, shared_tool_db);
+        assert_eq!(config.runtime.session_tool_usage_db_path, split_session_db);
     }
 }
