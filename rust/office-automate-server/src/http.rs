@@ -39,7 +39,7 @@ use crate::{
     erv::{
         ERV_MANUAL_OVERRIDE_SECONDS, ErvFanSpeed, ErvSpeedWriter, ErvState, RustuyaErvSpeedWriter,
     },
-    hvac::{HvacControlMode, HvacModeWriter, HvacState, KumoHvacModeWriter},
+    hvac::{HvacControlMode, HvacModeWriter, HvacRuntimeSnapshot, HvacState, KumoHvacModeWriter},
     mqtt,
     policy::{ErvPolicyState, HvacBandAction, HvacMode, get_hvac_band_action},
     qingping::QingpingState,
@@ -144,7 +144,7 @@ fn try_app_with_erv_writer_and_coordinator(
     hvac_state: HvacState,
     erv_writer: Arc<dyn ErvSpeedWriter>,
     hvac_writer: Arc<dyn HvacModeWriter>,
-) -> Result<(Router, ErvPolicyCoordinator)> {
+) -> Result<(Router, AppState)> {
     db::migrate_database(&config.runtime.database_path)?;
     let auth = AuthManager::new(&config.orchestrator)?;
     let artifacts = ArtifactStore::new(
@@ -234,11 +234,11 @@ fn try_app_with_erv_writer_and_coordinator(
             state.clone(),
             auth_middleware,
         ))
-        .with_state(state)
+        .with_state(state.clone())
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 
-    Ok((router, erv_automation))
+    Ok((router, state))
 }
 
 pub async fn serve(config: AppConfig) -> Result<()> {
@@ -254,7 +254,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
     let erv_state = ErvState::new(config.runtime.database_path.clone());
     let hvac_state = HvacState::new(config.runtime.database_path.clone());
-    let (app, erv_automation) = try_app_with_erv_writer_and_coordinator(
+    let (app, app_state) = try_app_with_erv_writer_and_coordinator(
         config.clone(),
         qingping.clone(),
         state_machine,
@@ -265,25 +265,43 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         Arc::new(KumoHvacModeWriter),
     )
     .context("failed to build HTTP app")?;
+    let erv_automation = app_state.erv_automation.clone();
     let runtime_handle = tokio::runtime::Handle::current();
     let qingping_policy_trigger: mqtt::SensorIngressHook = Arc::new({
         let erv_automation = erv_automation.clone();
+        let app_state = app_state.clone();
+        let runtime_handle = runtime_handle.clone();
         move || {
             let erv_automation = erv_automation.clone();
+            let app_state = app_state.clone();
             runtime_handle.spawn(async move {
-                if let Err(error) = erv_automation.evaluate_erv_policy(false).await {
-                    tracing::warn!(
-                        "ERV automated policy apply failed after Qingping update: {error:#}"
-                    );
-                }
-                erv_automation.broadcast_status();
+                evaluate_sensor_policies(erv_automation, app_state, false, "Qingping").await;
             });
         }
     });
     let _mqtt_runtime =
         mqtt::start_qingping_ingress(&config, qingping, Some(qingping_policy_trigger))
             .context("failed to start MQTT ingress")?;
-    let _yolink_task = yolink::start_yolink_client(&config, yolink, Some(erv_automation.clone()));
+    let yolink_hvac_trigger: yolink::DeviceIngressHook = Arc::new({
+        let app_state = app_state.clone();
+        let runtime_handle = runtime_handle.clone();
+        move || {
+            let app_state = app_state.clone();
+            runtime_handle.spawn(async move {
+                if let Err(error) = evaluate_and_apply_hvac_policy(&app_state).await {
+                    tracing::warn!(
+                        "HVAC automated policy apply failed after YoLink update: {error:#}"
+                    );
+                }
+            });
+        }
+    });
+    let _yolink_task = yolink::start_yolink_client(
+        &config,
+        yolink,
+        Some(erv_automation.clone()),
+        Some(yolink_hvac_trigger),
+    );
     let _erv_task = crate::erv::start_erv_status_poll(&config, erv_state);
     let _hvac_task = crate::hvac::start_hvac_status_poll(&config, hvac_state);
 
@@ -532,6 +550,21 @@ fn broadcast_status(state: &AppState) {
     let _ = state.status_broadcast.send(());
 }
 
+async fn evaluate_sensor_policies(
+    erv_automation: ErvPolicyCoordinator,
+    state: AppState,
+    bypass_dwell: bool,
+    source: &'static str,
+) {
+    if let Err(error) = erv_automation.evaluate_erv_policy(bypass_dwell).await {
+        tracing::warn!("ERV automated policy apply failed after {source} update: {error:#}");
+    }
+    if let Err(error) = evaluate_and_apply_hvac_policy(&state).await {
+        tracing::warn!("HVAC automated policy apply failed after {source} update: {error:#}");
+    }
+    erv_automation.broadcast_status();
+}
+
 fn unix_timestamp_now() -> f64 {
     chrono::Local::now().timestamp_millis() as f64 / 1_000.0
 }
@@ -772,6 +805,13 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
         machine.status_at(now)
     };
     let hvac_snapshot = state.hvac.snapshot();
+    let temp_f = state
+        .qingping
+        .latest()
+        .and_then(|reading| reading.temp_c)
+        .map(celsius_to_fahrenheit);
+    let bands = active_temperature_bands(state);
+    let hvac_mode = hvac_mode_from_str(&hvac_snapshot.mode).unwrap_or(HvacMode::Off);
 
     if state_status.safety_interlock {
         if hvac_snapshot.mode != "off" {
@@ -783,20 +823,32 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
         return Ok(());
     }
 
-    let temp_f = state
-        .qingping
-        .latest()
-        .and_then(|reading| reading.temp_c)
-        .map(celsius_to_fahrenheit);
-    let bands = active_temperature_bands(state);
+    if !state_status.is_present
+        && temp_f.is_some_and(|temp_f| temp_f < state.config.thresholds.hvac_critical_temp_f as f64)
+        && hvac_mode != HvacMode::Heat
+    {
+        let temp_label = temp_f.expect("critical temperature checked").round() as i64;
+        let setpoint_c = hvac_snapshot.heat_setpoint_c.unwrap_or(22.0);
+        apply_hvac_mode(
+            state,
+            HvacControlMode::Heat,
+            Some(setpoint_c),
+            &format!("critical_temp_{temp_label}F"),
+        )
+        .await?;
+        state.hvac.set_suspended(false, None);
+        state.hvac.set_temp_band_mode(None);
+        broadcast_status(state);
+        return Ok(());
+    }
+
     let temp_band_mode = hvac_snapshot
         .temp_band_mode
         .as_deref()
         .and_then(hvac_mode_from_str);
-    let hvac_mode = hvac_mode_from_str(&hvac_snapshot.mode).unwrap_or(HvacMode::Off);
     let erv_snapshot = state.erv.snapshot();
 
-    let Some(action) = get_hvac_band_action(
+    let action = get_hvac_band_action(
         temp_f,
         hvac_mode,
         temp_band_mode,
@@ -812,13 +864,38 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
         bands.heat_on_temp_f as f64,
         bands.cool_on_temp_f as f64,
         bands.cool_off_temp_f as f64,
-    ) else {
-        return Ok(());
-    };
+    );
 
     let temp_label = temp_f.unwrap_or_default().round() as i64;
     match action {
-        HvacBandAction::PauseHeat => {
+        None => {
+            if let Some(restore_mode) = suspended_restore_mode(
+                &hvac_snapshot,
+                temp_f,
+                bands,
+                state_status.is_present,
+                erv_snapshot.running,
+            ) {
+                let setpoint_c = match restore_mode {
+                    HvacControlMode::Heat => hvac_snapshot.heat_setpoint_c.unwrap_or(22.0),
+                    HvacControlMode::Cool => hvac_snapshot.cool_setpoint_c.unwrap_or_else(|| {
+                        fahrenheit_to_celsius(state.config.thresholds.hvac_cool_setpoint_f as f64)
+                    }),
+                    HvacControlMode::Off => unreachable!("restore mode is never off"),
+                };
+                let reason = if state_status.is_present {
+                    "present_restore"
+                } else {
+                    "erv_stopped_occupancy_hours"
+                };
+                apply_hvac_mode(state, restore_mode, Some(setpoint_c), reason).await?;
+                state.hvac.set_suspended(false, None);
+                state.hvac.set_temp_band_mode(None);
+                broadcast_status(state);
+            }
+            return Ok(());
+        }
+        Some(HvacBandAction::PauseHeat) => {
             apply_hvac_mode(
                 state,
                 HvacControlMode::Off,
@@ -828,7 +905,7 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
             .await?;
             state.hvac.set_temp_band_mode(Some(HvacControlMode::Heat));
         }
-        HvacBandAction::ResumeHeat => {
+        Some(HvacBandAction::ResumeHeat) => {
             let setpoint_c = hvac_snapshot.heat_setpoint_c.unwrap_or(22.0);
             apply_hvac_mode(
                 state,
@@ -840,7 +917,7 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
             state.hvac.set_suspended(false, None);
             state.hvac.set_temp_band_mode(None);
         }
-        HvacBandAction::StopCool => {
+        Some(HvacBandAction::StopCool) => {
             apply_hvac_mode(
                 state,
                 HvacControlMode::Off,
@@ -850,7 +927,7 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
             .await?;
             state.hvac.set_temp_band_mode(Some(HvacControlMode::Cool));
         }
-        HvacBandAction::StartCool => {
+        Some(HvacBandAction::StartCool) => {
             let setpoint_c = hvac_snapshot.cool_setpoint_c.unwrap_or_else(|| {
                 fahrenheit_to_celsius(state.config.thresholds.hvac_cool_setpoint_f as f64)
             });
@@ -913,6 +990,44 @@ fn hvac_mode_from_str(value: &str) -> Option<HvacMode> {
         "cool" => Some(HvacMode::Cool),
         "auto" => Some(HvacMode::Auto),
         _ => None,
+    }
+}
+
+fn suspended_restore_mode(
+    snapshot: &HvacRuntimeSnapshot,
+    temp_f: Option<f64>,
+    bands: TemperatureBands,
+    is_present: bool,
+    erv_running: bool,
+) -> Option<HvacControlMode> {
+    if !snapshot.suspended || (!is_present && erv_running) {
+        return None;
+    }
+
+    let mode = snapshot
+        .last_mode
+        .as_deref()
+        .and_then(HvacControlMode::parse)?;
+    if should_restore_hvac_mode(mode, temp_f, bands) {
+        Some(mode)
+    } else {
+        None
+    }
+}
+
+fn should_restore_hvac_mode(
+    mode: HvacControlMode,
+    temp_f: Option<f64>,
+    bands: TemperatureBands,
+) -> bool {
+    let Some(temp_f) = temp_f else {
+        return true;
+    };
+
+    match mode {
+        HvacControlMode::Heat => temp_f < bands.heat_off_temp_f as f64,
+        HvacControlMode::Cool => temp_f > bands.cool_off_temp_f as f64,
+        HvacControlMode::Off => false,
     }
 }
 
@@ -1947,6 +2062,19 @@ mod tests {
                 "spCool": setpoint_c
             }))
             .expect("HVAC cool status"),
+        }
+    }
+
+    fn office_door_device() -> yolink::YoLinkDevice {
+        yolink::YoLinkDevice {
+            device_id: "door-1".to_string(),
+            name: "Office Door".to_string(),
+            token: "door-token".to_string(),
+            device_type: yolink::DeviceType::DoorSensor,
+            state: json!({"state": "closed", "online": true})
+                .as_object()
+                .expect("object")
+                .clone(),
         }
     }
 
@@ -3014,6 +3142,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn yolink_safety_event_drives_hvac_policy_without_route_update() {
+        let config = configured_hvac_config(true);
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            now,
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .set_manual_presence(true, now);
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        yolink.apply_devices(vec![office_door_device()]);
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Heat, 22.0));
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Heat, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+        ));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            QingpingState::default(),
+            state_machine,
+            yolink.clone(),
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        yolink
+            .apply_event("door-1", json!({"state": "open"}), now + 1.0)
+            .expect("event applies");
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy applies");
+
+        assert_eq!(writer.smoke_calls(), 1);
+        assert_eq!(writer.write_modes(), vec![(HvacControlMode::Off, None)]);
+    }
+
+    #[tokio::test]
+    async fn automated_hvac_policy_restores_suspended_heat_after_safety_clears() {
+        let config = configured_hvac_config(true);
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            now,
+        )));
+        {
+            let mut machine = state_machine.write().expect("state machine lock poisoned");
+            machine.set_manual_presence(true, now);
+            machine.update_door(true, now + 1.0);
+        }
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Heat, 22.0));
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![
+                Ok(hvac_status(HvacControlMode::Heat, 22.0)),
+                Ok(hvac_status(HvacControlMode::Off, 22.0)),
+            ],
+            vec![
+                Ok(hvac_status(HvacControlMode::Off, 22.0)),
+                Ok(hvac_status(HvacControlMode::Heat, 22.0)),
+            ],
+        ));
+        let qingping = qingping_with_temp(fahrenheit_to_celsius(68.0));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            qingping,
+            state_machine.clone(),
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy applies safety off");
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .update_door(false, now + 2.0);
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy restores heat");
+
+        assert_eq!(writer.smoke_calls(), 2);
+        assert_eq!(
+            writer.write_modes(),
+            vec![
+                (HvacControlMode::Off, None),
+                (HvacControlMode::Heat, Some(22.0)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn automated_hvac_policy_heats_away_room_below_critical_temp() {
+        let config = configured_hvac_config(true);
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Heat, 22.0))],
+        ));
+        let qingping = qingping_with_temp(fahrenheit_to_celsius(54.0));
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            unix_timestamp_now(),
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Off, 22.0));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            qingping,
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy applies");
+
+        assert_eq!(writer.smoke_calls(), 1);
+        assert_eq!(
+            writer.write_modes(),
+            vec![(HvacControlMode::Heat, Some(22.0))]
+        );
+    }
+
+    #[tokio::test]
     async fn automated_hvac_policy_respects_disabled_active_control_gate() {
         let config = configured_hvac_config(false);
         let writer = Arc::new(FakeHvacWriter::new(Vec::new(), Vec::new()));
@@ -3226,6 +3498,56 @@ mod tests {
         assert_eq!(value["climate_actions"][0]["system"], "hvac");
         assert_eq!(value["climate_actions"][0]["action"], "cool");
         assert_eq!(value["climate_actions"][0]["reason"], "cool_band_start_82F");
+    }
+
+    #[tokio::test]
+    async fn qingping_sensor_update_drives_hvac_policy_without_route_update() {
+        let config = configured_hvac_config(true);
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+            vec![Ok(hvac_status(
+                HvacControlMode::Cool,
+                fahrenheit_to_celsius(78.0),
+            ))],
+        ));
+        let qingping = qingping_with_temp(28.0);
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            unix_timestamp_now(),
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .set_manual_presence(true, unix_timestamp_now());
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Off, 22.0));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            qingping,
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        evaluate_sensor_policies(
+            state.erv_automation.clone(),
+            state.clone(),
+            false,
+            "Qingping",
+        )
+        .await;
+
+        assert_eq!(writer.smoke_calls(), 1);
+        assert_eq!(
+            writer.write_modes(),
+            vec![(HvacControlMode::Cool, Some(25.5))]
+        );
     }
 
     #[tokio::test]

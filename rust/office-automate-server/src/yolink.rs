@@ -21,6 +21,8 @@ use crate::{
     status::Status,
 };
 
+pub type DeviceIngressHook = Arc<dyn Fn() + Send + Sync + 'static>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceType {
     DoorSensor,
@@ -529,6 +531,7 @@ pub fn start_yolink_client(
     config: &AppConfig,
     yolink: YoLinkState,
     erv_automation: Option<ErvPolicyCoordinator>,
+    device_hook: Option<DeviceIngressHook>,
 ) -> Option<JoinHandle<()>> {
     if !config.yolink.is_configured() {
         tracing::warn!("YoLink credentials are not configured; client not started");
@@ -538,8 +541,13 @@ pub fn start_yolink_client(
     let config = config.clone();
     Some(tokio::spawn(async move {
         loop {
-            if let Err(error) =
-                run_yolink_client_once(&config, yolink.clone(), erv_automation.clone()).await
+            if let Err(error) = run_yolink_client_once(
+                &config,
+                yolink.clone(),
+                erv_automation.clone(),
+                device_hook.clone(),
+            )
+            .await
             {
                 tracing::warn!("YoLink client stopped: {error:#}");
             }
@@ -552,6 +560,7 @@ async fn run_yolink_client_once(
     config: &AppConfig,
     yolink: YoLinkState,
     erv_automation: Option<ErvPolicyCoordinator>,
+    device_hook: Option<DeviceIngressHook>,
 ) -> Result<()> {
     let cloud = YoLinkCloudClient::new(config.yolink.clone());
     let (access_token, home_id) = initialize_yolink_inventory(&cloud, &yolink).await?;
@@ -562,6 +571,7 @@ async fn run_yolink_client_once(
         &home_id,
         yolink,
         erv_automation,
+        device_hook,
     )
     .await
 }
@@ -572,6 +582,7 @@ async fn listen_yolink_mqtt(
     home_id: &str,
     yolink: YoLinkState,
     erv_automation: Option<ErvPolicyCoordinator>,
+    device_hook: Option<DeviceIngressHook>,
 ) -> Result<()> {
     let mut options = MqttOptions::new(
         "office-automate-yolink",
@@ -603,6 +614,9 @@ async fn listen_yolink_mqtt(
                                     let Some(applied) = applied else {
                                         return Ok((None, None, now, false, false));
                                     };
+                                    if let Some(hook) = &device_hook {
+                                        hook();
+                                    }
                                     let bypass_dwell = applied.transition.is_some();
                                     Ok((
                                         Some(applied.device_type),
@@ -630,7 +644,12 @@ async fn listen_yolink_mqtt(
                             }
                         } else {
                             match yolink.apply_report(report, now) {
-                                Ok(Some(_)) | Ok(None) => {}
+                                Ok(Some(_)) => {
+                                    if let Some(hook) = &device_hook {
+                                        hook();
+                                    }
+                                }
+                                Ok(None) => {}
                                 Err(error) => {
                                     tracing::warn!("failed to apply YoLink report: {error:#}")
                                 }
