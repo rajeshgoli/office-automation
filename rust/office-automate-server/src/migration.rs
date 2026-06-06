@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::Local;
 use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     artifacts::{ArtifactMetadata, is_valid_artifact_hash},
@@ -30,10 +30,18 @@ struct SnapshotManifest {
     validations: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CloudflaredConfig {
+    #[serde(rename = "credentials-file")]
+    credentials_file: Option<PathBuf>,
+    ingress: Option<Vec<serde_yaml::Value>>,
+}
+
 pub fn create_pre_cutover_snapshot(
     config: &AppConfig,
     config_path: &Path,
     output_dir: &Path,
+    cloudflared_config_path: Option<&Path>,
 ) -> Result<SnapshotReport> {
     ensure_readable_file("config", config_path)?;
     ensure_readable_file("office database", &config.runtime.database_path)?;
@@ -94,6 +102,27 @@ pub fn create_pre_cutover_snapshot(
         &snapshot_dir.join("legacy").join("office-climate.apk"),
         &mut validations,
     )?;
+    if let Some(cloudflared_config_path) = cloudflared_config_path {
+        let cloudflared_credentials =
+            validate_cloudflared_config(cloudflared_config_path, &mut validations)?;
+        copy_file(
+            cloudflared_config_path,
+            &snapshot_dir.join("cloudflared").join("config.yml"),
+        )?;
+        files_copied += 1;
+        let credential_name = cloudflared_credentials
+            .file_name()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("credentials.json"));
+        copy_file(
+            &cloudflared_credentials,
+            &snapshot_dir.join("cloudflared").join(credential_name),
+        )?;
+        files_copied += 1;
+        validations.push("cloudflared config and credential file copied".to_string());
+    } else {
+        validations.push("cloudflared config validation skipped".to_string());
+    }
 
     if config.runtime.artifacts_dir.exists() {
         validate_artifact_metadata(&config.runtime.artifacts_dir, &mut validations)?;
@@ -175,6 +204,97 @@ fn validate_config_material(config: &AppConfig) -> Vec<String> {
         validations.push("HVAC credential material absent from config".to_string());
     }
     validations
+}
+
+fn validate_cloudflared_config(path: &Path, validations: &mut Vec<String>) -> Result<PathBuf> {
+    ensure_readable_file("cloudflared config", path)?;
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let config: CloudflaredConfig = serde_yaml::from_str(&contents)
+        .with_context(|| format!("failed to parse cloudflared config {}", path.display()))?;
+
+    let credentials_file = config.credentials_file.with_context(|| {
+        format!(
+            "cloudflared config missing credentials-file: {}",
+            path.display()
+        )
+    })?;
+    let credentials_file = resolve_cloudflared_path(path, credentials_file);
+    ensure_readable_file("cloudflared credentials file", &credentials_file)?;
+    validate_cloudflared_credentials(&credentials_file)?;
+
+    let ingress = config
+        .ingress
+        .with_context(|| format!("cloudflared config missing ingress: {}", path.display()))?;
+    if ingress.is_empty() {
+        bail!("cloudflared config ingress is empty: {}", path.display());
+    }
+
+    validations.push(format!("cloudflared config readable: {}", path.display()));
+    validations.push(format!(
+        "cloudflared credential file readable: {}",
+        credentials_file.display()
+    ));
+    validations.push(format!(
+        "cloudflared ingress rules present: {}",
+        ingress.len()
+    ));
+    Ok(credentials_file)
+}
+
+fn resolve_cloudflared_path(config_path: &Path, configured_path: PathBuf) -> PathBuf {
+    if configured_path.is_absolute() {
+        return configured_path;
+    }
+    if let Some(configured_path) = configured_path.to_str() {
+        if let Some(rest) = configured_path.strip_prefix("~/") {
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home).join(rest);
+            }
+        }
+    }
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(configured_path)
+}
+
+fn validate_cloudflared_credentials(path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path).with_context(|| {
+        format!(
+            "cloudflared credentials file is not readable: {}",
+            path.display()
+        )
+    })?;
+    if metadata.len() == 0 {
+        bail!("cloudflared credentials file is empty: {}", path.display());
+    }
+
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let credentials: serde_json::Value = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse cloudflared credentials {}", path.display()))?;
+    let object = credentials.as_object().with_context(|| {
+        format!(
+            "cloudflared credentials file is not a JSON object: {}",
+            path.display()
+        )
+    })?;
+
+    for key in ["AccountTag", "TunnelID", "TunnelSecret"] {
+        let present = object
+            .get(key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty());
+        if !present {
+            bail!(
+                "cloudflared credentials file missing {key}: {}",
+                path.display()
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn copy_optional_sqlite(
@@ -382,7 +502,7 @@ mod tests {
 
         let config = test_config(root, config_path.clone(), database_path);
         let output_dir = root.join("snapshots");
-        let report = create_pre_cutover_snapshot(&config, &config_path, &output_dir)
+        let report = create_pre_cutover_snapshot(&config, &config_path, &output_dir, None)
             .expect("snapshot succeeds");
 
         assert!(report.snapshot_dir.join("config.yaml").is_file());
@@ -423,9 +543,99 @@ mod tests {
         .expect("metadata");
 
         let config = test_config(root, config_path.clone(), database_path);
-        let error = create_pre_cutover_snapshot(&config, &config_path, &root.join("snapshots"))
-            .expect_err("invalid metadata should fail");
+        let error =
+            create_pre_cutover_snapshot(&config, &config_path, &root.join("snapshots"), None)
+                .expect_err("invalid metadata should fail");
 
         assert!(error.to_string().contains("invalid artifact hash"));
+    }
+
+    #[test]
+    fn snapshot_validates_cloudflared_config_and_credentials() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path();
+        let config_path = root.join("config.yaml");
+        fs::write(&config_path, "orchestrator:\n  port: 9001\n").expect("config");
+        let database_path = root.join("data/office_climate.db");
+        fs::create_dir_all(database_path.parent().expect("db parent")).expect("data dir");
+        db::migrate_database(&database_path).expect("office db");
+
+        let cloudflared_dir = root.join("cloudflared");
+        fs::create_dir_all(&cloudflared_dir).expect("cloudflared dir");
+        fs::write(
+            cloudflared_dir.join("office-tunnel.json"),
+            r#"{"AccountTag":"account","TunnelID":"tunnel-id","TunnelSecret":"secret"}"#,
+        )
+        .expect("credentials");
+        let cloudflared_config = cloudflared_dir.join("config.yml");
+        fs::write(
+            &cloudflared_config,
+            "credentials-file: office-tunnel.json\ningress:\n  - hostname: office.example.test\n    service: http://localhost:9001\n  - service: http_status:404\n",
+        )
+        .expect("cloudflared config");
+
+        let config = test_config(root, config_path.clone(), database_path);
+        let report = create_pre_cutover_snapshot(
+            &config,
+            &config_path,
+            &root.join("snapshots"),
+            Some(&cloudflared_config),
+        )
+        .expect("snapshot succeeds");
+
+        assert!(
+            report
+                .validations
+                .iter()
+                .any(|validation| validation.starts_with("cloudflared credential file readable:"))
+        );
+        assert!(
+            report
+                .validations
+                .iter()
+                .any(|validation| validation == "cloudflared ingress rules present: 2")
+        );
+        assert!(report.snapshot_dir.join("cloudflared/config.yml").is_file());
+        assert!(
+            report
+                .snapshot_dir
+                .join("cloudflared/office-tunnel.json")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_missing_cloudflared_credentials() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path();
+        let config_path = root.join("config.yaml");
+        fs::write(&config_path, "orchestrator:\n  port: 9001\n").expect("config");
+        let database_path = root.join("data/office_climate.db");
+        fs::create_dir_all(database_path.parent().expect("db parent")).expect("data dir");
+        db::migrate_database(&database_path).expect("office db");
+
+        let cloudflared_config = root.join("cloudflared/config.yml");
+        fs::create_dir_all(cloudflared_config.parent().expect("cloudflared parent"))
+            .expect("cloudflared dir");
+        fs::write(
+            &cloudflared_config,
+            "credentials-file: missing.json\ningress:\n  - service: http://localhost:9001\n",
+        )
+        .expect("cloudflared config");
+
+        let config = test_config(root, config_path.clone(), database_path);
+        let error = create_pre_cutover_snapshot(
+            &config,
+            &config_path,
+            &root.join("snapshots"),
+            Some(&cloudflared_config),
+        )
+        .expect_err("missing cloudflared credentials should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cloudflared credentials file is not readable")
+        );
     }
 }

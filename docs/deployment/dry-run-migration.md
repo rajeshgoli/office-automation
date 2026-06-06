@@ -34,7 +34,8 @@ Build the Rust binary, then run:
 cargo build --manifest-path rust/office-automate-server/Cargo.toml --release
 ./target/release/office-automate-server snapshot \
   --config "$OFFICE_AUTOMATE_CONFIG" \
-  --output-dir "$OFFICE_AUTOMATE_SNAPSHOT_DIR"
+  --output-dir "$OFFICE_AUTOMATE_SNAPSHOT_DIR" \
+  --cloudflared-config "$CLOUDFLARED_CONFIG"
 ```
 
 The command creates:
@@ -43,7 +44,7 @@ The command creates:
 $OFFICE_AUTOMATE_SNAPSHOT_DIR/office-automate-precutover-YYYYMMDD-HHMMSS/
 ```
 
-The snapshot contains copied config/data inputs plus `manifest.json`. The office climate database is copied first and schema migration is run only against the copied database. The source database is not modified by the snapshot command.
+The snapshot contains copied config/data inputs, cloudflared config and tunnel credential file, plus `manifest.json`. The office climate database is copied first and schema migration is run only against the copied database. The source database is not modified by the snapshot command.
 
 ## Validations
 
@@ -56,15 +57,16 @@ The snapshot command validates:
 - Optional Engram registry and legacy APK readability when present.
 - Artifact metadata under the configured artifacts directory, including hash shape and referenced APK files.
 - Presence or absence of OAuth, ERV, and HVAC credential material without printing secret values.
+- Cloudflare Tunnel config readability, readable `credentials-file`, required tunnel credential JSON fields, at least one ingress rule, and copied tunnel config/credential files in the snapshot.
 
-Validate the Cloudflare Tunnel config separately:
+For an extra cloudflared-native syntax check, run:
 
 ```bash
 test -r "$CLOUDFLARED_CONFIG"
 cloudflared tunnel ingress validate --config "$CLOUDFLARED_CONFIG"
 ```
 
-If `cloudflared tunnel ingress validate` is unavailable in the installed version, run `cloudflared tunnel --config "$CLOUDFLARED_CONFIG" ingress validate` or verify the config and credential file with the deployed Cloudflare version's equivalent command.
+If `cloudflared tunnel ingress validate` is unavailable in the installed version, run `cloudflared tunnel --config "$CLOUDFLARED_CONFIG" ingress validate` or verify the config with the deployed Cloudflare version's equivalent command.
 
 ## Rollback Use
 
