@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use crate::{config::AppConfig, db, erv, http, hvac, presence};
+use crate::{config::AppConfig, db, erv, http, hvac, presence, telemetry};
 
 #[derive(Debug, Parser)]
 #[command(name = "office-automate-server")]
@@ -21,6 +21,8 @@ pub enum Command {
     Migrate(ConfigArgs),
     /// Run local dependency checks without changing device state.
     Smoke(SmokeArgs),
+    /// Run local telemetry collectors.
+    Collect(CollectArgs),
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
@@ -37,6 +39,14 @@ pub struct SmokeArgs {
     pub target: Option<SmokeTarget>,
 }
 
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct CollectArgs {
+    #[arg(long, env = "OFFICE_AUTOMATE_CONFIG", global = true)]
+    pub config: Option<PathBuf>,
+    #[command(subcommand)]
+    pub target: CollectTarget,
+}
+
 #[derive(Debug, Subcommand, Clone, Copy, PartialEq, Eq)]
 pub enum SmokeTarget {
     /// Verify local ERV read credential and connectivity.
@@ -45,6 +55,20 @@ pub enum SmokeTarget {
     Hvac,
     /// Verify macOS keyboard/display presence signals.
     Presence,
+}
+
+#[derive(Debug, Subcommand, Clone, Copy, PartialEq, Eq)]
+pub enum CollectTarget {
+    /// Collect session-output telemetry into telemetry.db.
+    Telemetry(CollectTelemetryArgs),
+    /// Collect project leverage rows into office_climate.db.
+    Leverage,
+}
+
+#[derive(Debug, Args, Clone, Copy, PartialEq, Eq)]
+pub struct CollectTelemetryArgs {
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 pub async fn run_cli() -> Result<()> {
@@ -72,6 +96,13 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Smoke(args) => {
             let config = AppConfig::load(&args.config)?;
             run_smoke(&config, args.target).await
+        }
+        Command::Collect(args) => {
+            let config_path = args
+                .config
+                .context("collect requires --config or OFFICE_AUTOMATE_CONFIG")?;
+            let config = AppConfig::load(&config_path)?;
+            run_collect(&config, args.target)
         }
     }
 }
@@ -117,6 +148,23 @@ fn smoke_targets(target: Option<SmokeTarget>) -> &'static [SmokeTarget] {
         Some(SmokeTarget::Presence) => &[SmokeTarget::Presence],
         None => &[SmokeTarget::Erv, SmokeTarget::Hvac, SmokeTarget::Presence],
     }
+}
+
+fn run_collect(config: &AppConfig, target: CollectTarget) -> Result<()> {
+    match target {
+        CollectTarget::Telemetry(args) => {
+            let stats = telemetry::collect_telemetry(config, args.dry_run)?;
+            println!(
+                "Telemetry collection complete: sessions={} rows_written={} synthetic_rows={} matched_commits={}",
+                stats.sessions, stats.rows_written, stats.synthetic_rows, stats.matched_commits
+            );
+        }
+        CollectTarget::Leverage => {
+            let rows = telemetry::collect_project_leverage(config)?;
+            println!("Project leverage collection complete: rows_written={rows}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -235,6 +283,74 @@ mod tests {
                 assert_eq!(args.target, Some(SmokeTarget::Presence));
             }
             other => panic!("expected smoke command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_collect_telemetry_command_with_dry_run() {
+        let cli = Cli::try_parse_from([
+            "office-automate-server",
+            "collect",
+            "--config",
+            "/tmp/office.yaml",
+            "telemetry",
+            "--dry-run",
+        ])
+        .expect("collect command should parse");
+
+        match cli.command {
+            Command::Collect(args) => {
+                assert_eq!(args.config, Some(PathBuf::from("/tmp/office.yaml")));
+                assert_eq!(
+                    args.target,
+                    CollectTarget::Telemetry(CollectTelemetryArgs { dry_run: true })
+                );
+            }
+            other => panic!("expected collect command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_collect_telemetry_command_with_config_after_target() {
+        let cli = Cli::try_parse_from([
+            "office-automate-server",
+            "collect",
+            "telemetry",
+            "--config",
+            "/tmp/office.yaml",
+            "--dry-run",
+        ])
+        .expect("collect command should parse");
+
+        match cli.command {
+            Command::Collect(args) => {
+                assert_eq!(args.config, Some(PathBuf::from("/tmp/office.yaml")));
+                assert_eq!(
+                    args.target,
+                    CollectTarget::Telemetry(CollectTelemetryArgs { dry_run: true })
+                );
+            }
+            other => panic!("expected collect command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_collect_leverage_command() {
+        let cli = Cli::try_parse_from([
+            "office-automate-server",
+            "collect",
+            "--config",
+            "/tmp/office.yaml",
+            "leverage",
+        ])
+        .expect("collect command should parse");
+
+        match cli.command {
+            Command::Collect(args) => {
+                assert_eq!(args.config, Some(PathBuf::from("/tmp/office.yaml")));
+                assert_eq!(args.target, CollectTarget::Leverage);
+            }
+            other => panic!("expected collect command, got {other:?}"),
         }
     }
 }

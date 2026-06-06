@@ -359,7 +359,7 @@ mod tests {
     use crate::{
         config::{
             ErvConfig, MitsubishiConfig, OrchestratorConfig, PresenceConfig, QingpingConfig,
-            RuntimeConfig, ThresholdsConfig, YoLinkConfig,
+            RuntimeConfig, TelemetryConfig, ThresholdsConfig, YoLinkConfig,
         },
         db,
         erv::BoxFutureResult,
@@ -443,6 +443,7 @@ mod tests {
             },
             mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
+            telemetry: TelemetryConfig::default(),
             runtime: RuntimeConfig {
                 root: root.clone(),
                 config_path: root.join("config.yaml"),
@@ -455,6 +456,11 @@ mod tests {
                 public_url: None,
                 mqtt_host: "127.0.0.1".to_string(),
                 mqtt_port: 1883,
+                telemetry_db_path: root.join("telemetry.db"),
+                session_tool_usage_db_path: root.join("claude-tool-usage.db"),
+                tool_usage_db_path: root.join("tool-usage.db"),
+                engram_db_path: root.join("engram.db"),
+                engram_registry_path: root.join("engram-registry.json"),
             },
         }
     }

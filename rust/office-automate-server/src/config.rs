@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub erv: ErvConfig,
     pub mitsubishi: MitsubishiConfig,
     pub thresholds: ThresholdsConfig,
+    pub telemetry: TelemetryConfig,
     pub runtime: RuntimeConfig,
 }
 
@@ -34,6 +35,18 @@ impl Default for PresenceConfig {
             command_timeout_seconds: 10,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct TelemetryConfig {
+    pub repos: Vec<PathBuf>,
+    pub tool_usage_db: Option<PathBuf>,
+    pub session_tool_usage_db: Option<PathBuf>,
+    pub telemetry_db: Option<PathBuf>,
+    pub engram_db: Option<PathBuf>,
+    pub engram_registry: Option<PathBuf>,
+    pub days: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -332,6 +345,11 @@ pub struct RuntimeConfig {
     pub public_url: Option<String>,
     pub mqtt_host: String,
     pub mqtt_port: u16,
+    pub telemetry_db_path: PathBuf,
+    pub session_tool_usage_db_path: PathBuf,
+    pub tool_usage_db_path: PathBuf,
+    pub engram_db_path: PathBuf,
+    pub engram_registry_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -344,6 +362,7 @@ struct FileConfig {
     erv: ErvConfig,
     mitsubishi: MitsubishiConfig,
     thresholds: ThresholdsConfig,
+    telemetry: TelemetryConfig,
 }
 
 impl AppConfig {
@@ -376,6 +395,7 @@ impl AppConfig {
         let data_dir = env_lookup("OFFICE_AUTOMATE_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join("data"));
+        let home_dir = env_lookup("HOME").map(PathBuf::from);
 
         if let Some(host) = env_lookup("OFFICE_AUTOMATE_MQTT_HOST") {
             file_config.qingping.mqtt_broker = host;
@@ -452,6 +472,88 @@ impl AppConfig {
             })?;
         }
 
+        if let Some(repos) = env_lookup("OFFICE_AUTOMATE_TELEMETRY_REPOS") {
+            file_config.telemetry.repos = repos
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .collect();
+        }
+
+        if let Some(path) = env_lookup("OFFICE_AUTOMATE_TOOL_USAGE_DB") {
+            file_config.telemetry.tool_usage_db = Some(PathBuf::from(path));
+        }
+
+        if let Some(path) = env_lookup("OFFICE_AUTOMATE_SESSION_TOOL_USAGE_DB") {
+            file_config.telemetry.session_tool_usage_db = Some(PathBuf::from(path));
+        }
+
+        if let Some(path) = env_lookup("OFFICE_AUTOMATE_TELEMETRY_DB") {
+            file_config.telemetry.telemetry_db = Some(PathBuf::from(path));
+        }
+
+        if let Some(path) = env_lookup("OFFICE_AUTOMATE_ENGRAM_DB") {
+            file_config.telemetry.engram_db = Some(PathBuf::from(path));
+        }
+
+        if let Some(path) = env_lookup("OFFICE_AUTOMATE_ENGRAM_REGISTRY") {
+            file_config.telemetry.engram_registry = Some(PathBuf::from(path));
+        }
+
+        if let Some(days) = env_lookup("OFFICE_AUTOMATE_TELEMETRY_DAYS") {
+            file_config.telemetry.days = days.parse().with_context(|| {
+                format!("invalid OFFICE_AUTOMATE_TELEMETRY_DAYS value {days:?}")
+            })?;
+        }
+        file_config.telemetry.repos = file_config
+            .telemetry
+            .repos
+            .into_iter()
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()))
+            .collect();
+
+        let telemetry_db_path = file_config
+            .telemetry
+            .telemetry_db
+            .clone()
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()))
+            .unwrap_or_else(|| data_dir.join("telemetry.db"));
+        let default_session_tool_usage_db_path = home_dir
+            .as_deref()
+            .map(|home| {
+                home.join(".local")
+                    .join("share")
+                    .join("claude-sessions")
+                    .join("tool_usage.db")
+            })
+            .unwrap_or_else(|| data_dir.join("tool_usage.db"));
+        let session_tool_usage_db_path = file_config
+            .telemetry
+            .session_tool_usage_db
+            .clone()
+            .or_else(|| file_config.telemetry.tool_usage_db.clone())
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()))
+            .unwrap_or(default_session_tool_usage_db_path);
+        let tool_usage_db_path = file_config
+            .telemetry
+            .tool_usage_db
+            .clone()
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()))
+            .unwrap_or_else(|| data_dir.join("tool_usage.db"));
+        let engram_db_path = file_config
+            .telemetry
+            .engram_db
+            .clone()
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()))
+            .unwrap_or_else(|| data_dir.join("engram_state.db"));
+        let engram_registry_path = file_config
+            .telemetry
+            .engram_registry
+            .clone()
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()))
+            .unwrap_or_else(|| data_dir.join("engram_concept_registry.md"));
+
         let runtime = RuntimeConfig {
             frontend_dist: root.join("frontend").join("dist"),
             root,
@@ -464,6 +566,11 @@ impl AppConfig {
             public_url: env_lookup("OFFICE_AUTOMATE_PUBLIC_URL"),
             mqtt_host: file_config.qingping.mqtt_broker.clone(),
             mqtt_port: file_config.qingping.mqtt_port,
+            telemetry_db_path,
+            session_tool_usage_db_path,
+            tool_usage_db_path,
+            engram_db_path,
+            engram_registry_path,
         };
 
         Ok(Self {
@@ -474,6 +581,7 @@ impl AppConfig {
             erv: file_config.erv,
             mitsubishi: file_config.mitsubishi,
             thresholds: file_config.thresholds,
+            telemetry: file_config.telemetry,
             runtime,
         })
     }
@@ -485,6 +593,22 @@ fn parse_bool_env(name: &str, value: &str) -> Result<bool> {
         "0" | "false" | "no" | "off" => Ok(false),
         _ => anyhow::bail!("invalid {name} value {value:?}; expected true/false"),
     }
+}
+
+fn expand_home_relative_path(path: PathBuf, home_dir: Option<&Path>) -> PathBuf {
+    let Some(home_dir) = home_dir else {
+        return path;
+    };
+    let Some(raw_path) = path.to_str() else {
+        return path;
+    };
+    if raw_path == "~" {
+        return home_dir.to_path_buf();
+    }
+    raw_path
+        .strip_prefix("~/")
+        .map(|suffix| home_dir.join(suffix))
+        .unwrap_or(path)
 }
 
 #[cfg(test)]
@@ -503,6 +627,9 @@ orchestrator:
   port: 9001
 presence:
   poll_interval_seconds: 7
+telemetry:
+  repos:
+    - "/yaml/repo"
 qingping:
   mqtt_broker: "legacy-broker"
   mqtt_port: 1883
@@ -550,6 +677,35 @@ thresholds:
             "OFFICE_AUTOMATE_ERV_ACTIVE_CONTROL_ENABLED" => Some("true".to_string()),
             "OFFICE_AUTOMATE_PRESENCE_ENABLED" => Some("true".to_string()),
             "OFFICE_AUTOMATE_PRESENCE_COMMAND_TIMEOUT_SECONDS" => Some("3".to_string()),
+            "OFFICE_AUTOMATE_TELEMETRY_REPOS" => Some("/env/repo-a,/env/repo-b".to_string()),
+            "OFFICE_AUTOMATE_TOOL_USAGE_DB" => Some(
+                temp_dir
+                    .path()
+                    .join("tool_usage.sqlite")
+                    .display()
+                    .to_string(),
+            ),
+            "OFFICE_AUTOMATE_SESSION_TOOL_USAGE_DB" => Some(
+                temp_dir
+                    .path()
+                    .join("session_tool_usage.sqlite")
+                    .display()
+                    .to_string(),
+            ),
+            "OFFICE_AUTOMATE_TELEMETRY_DB" => Some(
+                temp_dir
+                    .path()
+                    .join("telemetry.sqlite")
+                    .display()
+                    .to_string(),
+            ),
+            "OFFICE_AUTOMATE_ENGRAM_DB" => {
+                Some(temp_dir.path().join("engram.sqlite").display().to_string())
+            }
+            "OFFICE_AUTOMATE_ENGRAM_REGISTRY" => {
+                Some(temp_dir.path().join("registry.md").display().to_string())
+            }
+            "OFFICE_AUTOMATE_TELEMETRY_DAYS" => Some("14".to_string()),
             "OFFICE_AUTOMATE_PUBLIC_URL" => Some("https://office.example.com".to_string()),
             _ => None,
         })
@@ -560,6 +716,11 @@ thresholds:
         assert!(config.presence.enabled);
         assert_eq!(config.presence.poll_interval_seconds, 7);
         assert_eq!(config.presence.command_timeout_seconds, 3);
+        assert_eq!(
+            config.telemetry.repos,
+            vec![PathBuf::from("/env/repo-a"), PathBuf::from("/env/repo-b")]
+        );
+        assert_eq!(config.telemetry.days, 14);
         assert_eq!(config.qingping.mqtt_broker, "rust-broker");
         assert_eq!(config.qingping.mqtt_port, 2883);
         assert_eq!(config.yolink.uaid, "env-uaid");
@@ -604,6 +765,26 @@ thresholds:
             temp_dir.path().join("db").join("apps")
         );
         assert_eq!(
+            config.runtime.tool_usage_db_path,
+            temp_dir.path().join("tool_usage.sqlite")
+        );
+        assert_eq!(
+            config.runtime.session_tool_usage_db_path,
+            temp_dir.path().join("session_tool_usage.sqlite")
+        );
+        assert_eq!(
+            config.runtime.telemetry_db_path,
+            temp_dir.path().join("telemetry.sqlite")
+        );
+        assert_eq!(
+            config.runtime.engram_db_path,
+            temp_dir.path().join("engram.sqlite")
+        );
+        assert_eq!(
+            config.runtime.engram_registry_path,
+            temp_dir.path().join("registry.md")
+        );
+        assert_eq!(
             config.runtime.legacy_apk_path,
             temp_dir.path().join("db").join("app-debug.apk")
         );
@@ -616,5 +797,90 @@ thresholds:
         assert_eq!(config.thresholds.hvac_cool_on_temp_f, 82);
         assert_eq!(config.thresholds.expected_occupancy_start, "08:30");
         assert_eq!(config.thresholds.expected_occupancy_end, "18:45");
+    }
+
+    #[test]
+    fn expands_home_relative_telemetry_repo_paths() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home_dir = temp_dir.path().join("home");
+        let config_path = temp_dir.path().join("config.yaml");
+        fs::write(
+            &config_path,
+            r#"
+telemetry:
+  repos:
+    - "~/Desktop/automation/office-automate"
+"#,
+        )
+        .expect("write config");
+
+        let config = AppConfig::load_with_env(&config_path, |key| match key {
+            "HOME" => Some(home_dir.display().to_string()),
+            _ => None,
+        })
+        .expect("load config");
+
+        assert_eq!(
+            config.telemetry.repos,
+            vec![home_dir.join("Desktop/automation/office-automate")]
+        );
+        assert_eq!(
+            config.runtime.session_tool_usage_db_path,
+            home_dir
+                .join(".local")
+                .join("share")
+                .join("claude-sessions")
+                .join("tool_usage.db")
+        );
+        assert_eq!(
+            config.runtime.tool_usage_db_path,
+            std::env::current_dir()
+                .expect("current dir")
+                .join("data")
+                .join("tool_usage.db")
+        );
+
+        let config = AppConfig::load_with_env(&config_path, |key| match key {
+            "HOME" => Some(home_dir.display().to_string()),
+            "OFFICE_AUTOMATE_TELEMETRY_REPOS" => Some("~/repo-a,/absolute/repo-b".to_string()),
+            _ => None,
+        })
+        .expect("load config");
+
+        assert_eq!(
+            config.telemetry.repos,
+            vec![home_dir.join("repo-a"), PathBuf::from("/absolute/repo-b")]
+        );
+    }
+
+    #[test]
+    fn explicit_tool_usage_db_applies_to_session_telemetry_unless_split() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home_dir = temp_dir.path().join("home");
+        let config_path = temp_dir.path().join("config.yaml");
+        fs::write(&config_path, "telemetry: {}\n").expect("write config");
+
+        let shared_tool_db = home_dir.join("shared-tool-usage.db");
+        let config = AppConfig::load_with_env(&config_path, |key| match key {
+            "HOME" => Some(home_dir.display().to_string()),
+            "OFFICE_AUTOMATE_TOOL_USAGE_DB" => Some("~/shared-tool-usage.db".to_string()),
+            _ => None,
+        })
+        .expect("load config");
+
+        assert_eq!(config.runtime.tool_usage_db_path, shared_tool_db);
+        assert_eq!(config.runtime.session_tool_usage_db_path, shared_tool_db);
+
+        let split_session_db = home_dir.join("claude-tool-usage.db");
+        let config = AppConfig::load_with_env(&config_path, |key| match key {
+            "HOME" => Some(home_dir.display().to_string()),
+            "OFFICE_AUTOMATE_TOOL_USAGE_DB" => Some("~/shared-tool-usage.db".to_string()),
+            "OFFICE_AUTOMATE_SESSION_TOOL_USAGE_DB" => Some("~/claude-tool-usage.db".to_string()),
+            _ => None,
+        })
+        .expect("load config");
+
+        assert_eq!(config.runtime.tool_usage_db_path, shared_tool_db);
+        assert_eq!(config.runtime.session_tool_usage_db_path, split_session_db);
     }
 }
