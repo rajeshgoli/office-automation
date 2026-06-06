@@ -331,9 +331,21 @@ impl HvacState {
 
     pub fn record_status(&self, status: HvacDeviceStatus) -> bool {
         let mut inner = self.inner.write().expect("HVAC state lock poisoned");
-        let changed = inner.latest_status.as_ref() != Some(&status);
+        let mut changed = inner.latest_status.as_ref() != Some(&status);
         if status.mode != "off" {
+            if inner.last_mode.as_deref() != Some(status.mode.as_str()) {
+                changed = true;
+            }
             inner.last_mode = Some(status.mode.clone());
+            if inner.suspended
+                || inner.suspended_heat_setpoint_c.is_some()
+                || inner.suspended_cool_setpoint_c.is_some()
+            {
+                changed = true;
+            }
+            inner.suspended = false;
+            inner.suspended_heat_setpoint_c = None;
+            inner.suspended_cool_setpoint_c = None;
         }
         inner.latest_status = Some(status);
         changed
@@ -916,6 +928,27 @@ mod tests {
 
         assert_eq!(status.hvac.mode, "cool");
         assert_eq!(status.hvac.setpoint_c, 24.5);
+    }
+
+    #[test]
+    fn record_status_clears_stale_suspension_when_device_is_active() {
+        let hvac = HvacState::default();
+        let status = parse_kumo_adapter_status(&json!({
+            "power": 1,
+            "operationMode": "auto",
+            "spHeat": 20.0,
+            "spCool": 26.0
+        }))
+        .expect("status");
+        hvac.record_status(status.clone());
+        hvac.set_suspended_with_setpoints(true, Some("auto".to_string()), Some(20.0), Some(26.0));
+
+        assert!(hvac.record_status(status));
+        let snapshot = hvac.snapshot();
+        assert!(!snapshot.suspended);
+        assert_eq!(snapshot.last_mode.as_deref(), Some("auto"));
+        assert_eq!(snapshot.suspended_heat_setpoint_c, None);
+        assert_eq!(snapshot.suspended_cool_setpoint_c, None);
     }
 
     #[tokio::test]
