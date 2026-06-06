@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use crate::{config::AppConfig, db, erv, http, hvac, presence, telemetry};
+use crate::{config::AppConfig, db, erv, http, hvac, migration, presence, telemetry};
 
 #[derive(Debug, Parser)]
 #[command(name = "office-automate-server")]
@@ -23,6 +23,8 @@ pub enum Command {
     Smoke(SmokeArgs),
     /// Run local telemetry collectors.
     Collect(CollectArgs),
+    /// Create and validate a pre-cutover rollback snapshot.
+    Snapshot(SnapshotArgs),
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
@@ -45,6 +47,14 @@ pub struct CollectArgs {
     pub config: Option<PathBuf>,
     #[command(subcommand)]
     pub target: CollectTarget,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct SnapshotArgs {
+    #[arg(long, env = "OFFICE_AUTOMATE_CONFIG")]
+    pub config: PathBuf,
+    #[arg(long, env = "OFFICE_AUTOMATE_SNAPSHOT_DIR")]
+    pub output_dir: PathBuf,
 }
 
 #[derive(Debug, Subcommand, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +113,18 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .context("collect requires --config or OFFICE_AUTOMATE_CONFIG")?;
             let config = AppConfig::load(&config_path)?;
             run_collect(&config, args.target)
+        }
+        Command::Snapshot(args) => {
+            let config = AppConfig::load(&args.config)?;
+            let report =
+                migration::create_pre_cutover_snapshot(&config, &args.config, &args.output_dir)?;
+            println!(
+                "Pre-cutover snapshot complete: snapshot_dir={} files_copied={} validations={}",
+                report.snapshot_dir.display(),
+                report.files_copied,
+                report.validations.len()
+            );
+            Ok(())
         }
     }
 }
@@ -351,6 +373,27 @@ mod tests {
                 assert_eq!(args.target, CollectTarget::Leverage);
             }
             other => panic!("expected collect command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_snapshot_command_with_output_dir() {
+        let cli = Cli::try_parse_from([
+            "office-automate-server",
+            "snapshot",
+            "--config",
+            "/tmp/office.yaml",
+            "--output-dir",
+            "/tmp/snapshots",
+        ])
+        .expect("snapshot command should parse");
+
+        match cli.command {
+            Command::Snapshot(args) => {
+                assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
+                assert_eq!(args.output_dir, PathBuf::from("/tmp/snapshots"));
+            }
+            other => panic!("expected snapshot command, got {other:?}"),
         }
     }
 }

@@ -7,6 +7,7 @@ pub mod db;
 pub mod erv;
 pub mod http;
 pub mod hvac;
+pub mod migration;
 pub mod mqtt;
 pub mod policy;
 pub mod presence;
