@@ -59,6 +59,7 @@ pub struct OrchestratorConfig {
     pub auth_username: Option<String>,
     pub auth_password: Option<String>,
     pub google_oauth: Option<GoogleOAuthConfig>,
+    pub controller_ipc_token: Option<String>,
 }
 
 impl Default for OrchestratorConfig {
@@ -69,6 +70,7 @@ impl Default for OrchestratorConfig {
             auth_username: None,
             auth_password: None,
             google_oauth: None,
+            controller_ipc_token: None,
         }
     }
 }
@@ -474,6 +476,10 @@ impl AppConfig {
             })?;
         }
 
+        if let Some(token) = env_lookup("OFFICE_AUTOMATE_CONTROLLER_IPC_TOKEN") {
+            file_config.orchestrator.controller_ipc_token = Some(token);
+        }
+
         if let Some(repos) = env_lookup("OFFICE_AUTOMATE_TELEMETRY_REPOS") {
             file_config.telemetry.repos = repos
                 .split(',')
@@ -743,6 +749,7 @@ thresholds:
             }
             "OFFICE_AUTOMATE_TELEMETRY_DAYS" => Some("14".to_string()),
             "OFFICE_AUTOMATE_PUBLIC_URL" => Some("https://office.example.com".to_string()),
+            "OFFICE_AUTOMATE_CONTROLLER_IPC_TOKEN" => Some("edge-ipc-token".to_string()),
             _ => None,
         })
         .expect("load config");
@@ -835,6 +842,10 @@ thresholds:
         assert_eq!(
             config.runtime.public_url.as_deref(),
             Some("https://office.example.com")
+        );
+        assert_eq!(
+            config.orchestrator.controller_ipc_token.as_deref(),
+            Some("edge-ipc-token")
         );
         assert_eq!(config.thresholds.hvac_heat_on_temp_f, 70);
         assert_eq!(config.thresholds.hvac_cool_setpoint_f, 77);

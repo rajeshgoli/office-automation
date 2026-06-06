@@ -4,6 +4,7 @@ pub mod automation;
 pub mod cli;
 pub mod config;
 pub mod db;
+pub mod edge;
 pub mod erv;
 pub mod http;
 pub mod hvac;

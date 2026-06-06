@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.office-automate.edge</string>
+
+  <key>UserName</key>
+  <string>__OFFICE_AUTOMATE_EDGE_USER__</string>
+
+  <key>GroupName</key>
+  <string>__OFFICE_AUTOMATE_EDGE_GROUP__</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__OFFICE_AUTOMATE_SERVER_BIN__</string>
+    <string>serve-edge</string>
+    <string>--config</string>
+    <string>__OFFICE_AUTOMATE_EDGE_CONFIG__</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__OFFICE_AUTOMATE_EDGE_WORKING_DIRECTORY__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OFFICE_AUTOMATE_EDGE_CONFIG</key>
+    <string>__OFFICE_AUTOMATE_EDGE_CONFIG__</string>
+    <key>PATH</key>
+    <string>__OFFICE_AUTOMATE_PATH__</string>
+    <key>RUST_LOG</key>
+    <string>__OFFICE_AUTOMATE_RUST_LOG__</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__OFFICE_AUTOMATE_EDGE_LOG_DIR__/office-automate-edge.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__OFFICE_AUTOMATE_EDGE_LOG_DIR__/office-automate-edge.err.log</string>
+</dict>
+</plist>

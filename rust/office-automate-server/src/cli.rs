@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::{
     config::AppConfig,
-    db, erv, http, hvac, migration, presence, telemetry,
+    db, edge, erv, http, hvac, migration, presence, telemetry,
     validation::{
         self, CutoverValidationOptions, MqttCutoverStrategy, MqttRollbackState,
         RestoreVerification, RollbackValidationOptions, ShadowValidationOptions,
@@ -24,6 +24,8 @@ pub struct Cli {
 pub enum Command {
     /// Run the HTTP/API server.
     Serve(ConfigArgs),
+    /// Run the quarantined public HTTP edge.
+    ServeEdge(EdgeConfigArgs),
     /// Create or upgrade the SQLite schema.
     Migrate(ConfigArgs),
     /// Run local dependency checks without changing device state.
@@ -39,6 +41,12 @@ pub enum Command {
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
 pub struct ConfigArgs {
     #[arg(long, env = "OFFICE_AUTOMATE_CONFIG")]
+    pub config: PathBuf,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct EdgeConfigArgs {
+    #[arg(long, env = "OFFICE_AUTOMATE_EDGE_CONFIG")]
     pub config: PathBuf,
 }
 
@@ -290,6 +298,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             let config = AppConfig::load(&args.config)?;
             http::serve(config).await
         }
+        Command::ServeEdge(args) => {
+            let config = edge::PublicEdgeConfig::load(&args.config)?;
+            edge::serve(config).await
+        }
         Command::Migrate(args) => {
             let config = AppConfig::load(&args.config)?;
             db::migrate(&config)?;
@@ -482,6 +494,24 @@ mod tests {
         match cli.command {
             Command::Serve(args) => assert_eq!(args.config, PathBuf::from("/tmp/office.yaml")),
             other => panic!("expected serve command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_serve_edge_command_with_config() {
+        let cli = Cli::try_parse_from([
+            "office-automate-server",
+            "serve-edge",
+            "--config",
+            "/tmp/office-edge.yaml",
+        ])
+        .expect("serve-edge command should parse");
+
+        match cli.command {
+            Command::ServeEdge(args) => {
+                assert_eq!(args.config, PathBuf::from("/tmp/office-edge.yaml"));
+            }
+            other => panic!("expected serve-edge command, got {other:?}"),
         }
     }
 
