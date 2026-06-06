@@ -21,7 +21,7 @@ use axum::{
     routing::{get, get_service, post},
 };
 use futures_util::{SinkExt, StreamExt};
-use reqwest::{Client, Url};
+use reqwest::{Client, Url, redirect::Policy};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, time::timeout};
@@ -528,6 +528,7 @@ impl ControllerClient {
         let timeout = Duration::from_secs(config.timeout_seconds.max(1));
         let client = Client::builder()
             .timeout(timeout)
+            .redirect(Policy::none())
             .build()
             .context("failed to build controller IPC client")?;
         Ok(Self {
@@ -1166,5 +1167,62 @@ qingping:
             .expect("body");
         let payload: Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(payload["source"], "controller");
+    }
+
+    #[tokio::test]
+    async fn latest_apk_redirect_is_preserved_by_public_edge() {
+        let controller = Router::new()
+            .route(
+                "/apps/demo/latest.apk",
+                get(|| async move {
+                    (
+                        StatusCode::FOUND,
+                        [
+                            (header::LOCATION, "/apps/demo/abc123.apk"),
+                            (header::CACHE_CONTROL, "no-cache"),
+                        ],
+                    )
+                        .into_response()
+                }),
+            )
+            .route(
+                "/apps/demo/abc123.apk",
+                get(|| async move { (StatusCode::OK, "hashed-apk").into_response() }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind controller");
+        let address = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, controller).await.expect("controller");
+        });
+
+        let config = edge_config(format!("http://{address}"));
+        let app = app(config).expect("edge app");
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/apps/demo/latest.apk")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/apps/demo/abc123.apk")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-cache")
+        );
     }
 }
