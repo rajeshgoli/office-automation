@@ -21,7 +21,7 @@ use axum::{
     routing::{get, get_service, post},
 };
 use futures_util::{SinkExt, StreamExt};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, time::timeout};
@@ -223,6 +223,7 @@ fn validate_public_edge_config(config: &PublicEdgeConfig) -> Result<()> {
     if config.controller.base_url.trim().is_empty() {
         anyhow::bail!("public edge requires controller.base_url");
     }
+    validate_loopback_controller_base_url(&config.controller.base_url)?;
     if config.controller.token.trim().is_empty() {
         anyhow::bail!("public edge requires controller.token");
     }
@@ -523,6 +524,7 @@ fn tungstenite_to_axum(message: TungsteniteMessage) -> Option<Message> {
 
 impl ControllerClient {
     fn new(config: &ControllerIpcConfig) -> Result<Self> {
+        validate_loopback_controller_base_url(&config.base_url)?;
         let timeout = Duration::from_secs(config.timeout_seconds.max(1));
         let client = Client::builder()
             .timeout(timeout)
@@ -686,6 +688,23 @@ fn websocket_url(base_url: &str) -> Result<String> {
     } else {
         anyhow::bail!("controller.base_url must start with http:// or https://")
     }
+}
+
+fn validate_loopback_controller_base_url(base_url: &str) -> Result<()> {
+    let url = Url::parse(base_url.trim())
+        .with_context(|| format!("invalid controller.base_url {base_url:?}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("controller.base_url must start with http:// or https://");
+    }
+    let Some(host) = url.host_str() else {
+        anyhow::bail!("controller.base_url must include a hostname");
+    };
+    if !is_loopback_bind_host(host) {
+        anyhow::bail!(
+            "public edge controller.base_url must stay on loopback; got host={host:?}"
+        );
+    }
+    Ok(())
 }
 
 fn should_skip_auth(method: &Method, path: &str, auth_mode: HttpAuthMode) -> bool {
@@ -1044,6 +1063,15 @@ qingping:
         let error =
             validate_public_edge_config(&config).expect_err("empty controller token should fail");
         assert!(error.to_string().contains("requires controller.token"));
+
+        let config = edge_config("http://192.168.1.10:9001".to_string());
+        let error = validate_public_edge_config(&config)
+            .expect_err("non-loopback controller base url should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("public edge controller.base_url must stay on loopback")
+        );
     }
 
     #[test]
