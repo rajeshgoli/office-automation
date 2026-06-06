@@ -42,14 +42,16 @@ cargo build --manifest-path rust/office-automate-server/Cargo.toml --release
 The command creates:
 
 ```text
-$OFFICE_AUTOMATE_SNAPSHOT_DIR/office-automate-precutover-YYYYMMDD-HHMMSS/
+$OFFICE_AUTOMATE_SNAPSHOT_DIR/office-automate-precutover-YYYYMMDD-HHMMSS-NNNNNNNNN-PID-ATTEMPT/
 ```
+
+The subsecond timestamp, process id, and retry suffix avoid same-second rerun collisions. On Unix, the snapshot directory is created with owner-only permissions before config, database, tunnel, and restore files are written.
 
 The snapshot contains copied config/data inputs, rewritten cloudflared config and tunnel credential file, `restore-env.sh`, and `manifest.json`. SQLite inputs are captured through SQLite's online backup API so committed WAL-mode data is included without copying raw database files out from under the writer. The office climate database is backed up first and schema migration is run only against the backed-up database. The source database is not modified by the snapshot command.
 
 Restore paths intentionally match the Rust runtime data layout. `restore-env.sh` sets `OFFICE_AUTOMATE_DATA_DIR` to the snapshot directory, so the snapshot stores the office database at `office_climate.db`, runtime app artifacts under `apps/`, the legacy APK at `app-debug.apk`, and optional telemetry/tool/Engram databases at their runtime filenames.
 
-`restore-env.sh` exports the effective runtime paths and environment-backed deployment values used during validation, including device credentials when those values were present in the merged config. Keep the snapshot directory private; the file is written with owner-only permissions on Unix.
+`restore-env.sh` exports the effective runtime paths and environment-backed deployment values used during validation, including device credentials when those values were present in the merged config. Keep the snapshot directory private; both the snapshot root and this file are written with owner-only permissions on Unix.
 
 ## Validations
 
@@ -57,6 +59,7 @@ The snapshot command validates:
 
 - Config file readability.
 - Rollback output directory writability.
+- Owner-only snapshot directory creation on Unix before secret-bearing files are copied.
 - Office climate DB readability, migration compatibility on the backed-up DB, and SQLite `quick_check`.
 - Optional telemetry, project-leverage tool usage, session telemetry tool usage, and Engram SQLite DBs with SQLite online backup plus `quick_check` when present.
 - Optional Engram registry and legacy APK readability when present.

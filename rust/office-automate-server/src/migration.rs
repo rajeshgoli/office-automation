@@ -1,15 +1,15 @@
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::{
     fmt::Write as FmtWrite,
     fs,
     fs::File,
-    io::Write,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::Local;
+use chrono::{DateTime, Local};
 use rusqlite::{Connection, DatabaseName, OpenFlags};
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +46,8 @@ struct CloudflaredCredentialSnapshot {
     snapshot_relative_path: PathBuf,
 }
 
+const SNAPSHOT_CREATE_ATTEMPTS: usize = 100;
+
 pub fn create_pre_cutover_snapshot(
     config: &AppConfig,
     config_path: &Path,
@@ -56,9 +58,7 @@ pub fn create_pre_cutover_snapshot(
     ensure_readable_file("office database", &config.runtime.database_path)?;
     ensure_writable_directory(output_dir)?;
 
-    let snapshot_dir = unique_snapshot_dir(output_dir);
-    fs::create_dir(&snapshot_dir)
-        .with_context(|| format!("failed to create {}", snapshot_dir.display()))?;
+    let snapshot_dir = create_private_snapshot_dir(output_dir)?;
 
     let mut files_copied = 0_usize;
     let mut validations = Vec::new();
@@ -182,11 +182,49 @@ pub fn create_pre_cutover_snapshot(
     })
 }
 
-fn unique_snapshot_dir(output_dir: &Path) -> PathBuf {
-    output_dir.join(format!(
-        "office-automate-precutover-{}",
-        Local::now().format("%Y%m%d-%H%M%S")
-    ))
+fn create_private_snapshot_dir(output_dir: &Path) -> Result<PathBuf> {
+    for attempt in 0..SNAPSHOT_CREATE_ATTEMPTS {
+        let snapshot_dir = unique_snapshot_dir(output_dir, attempt);
+        match create_private_dir(&snapshot_dir) {
+            Ok(()) => return Ok(snapshot_dir),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to create {}", snapshot_dir.display()));
+            }
+        }
+    }
+
+    bail!(
+        "failed to create a unique snapshot directory under {} after {SNAPSHOT_CREATE_ATTEMPTS} attempts",
+        output_dir.display()
+    );
+}
+
+fn unique_snapshot_dir(output_dir: &Path, attempt: usize) -> PathBuf {
+    output_dir.join(snapshot_dir_name(Local::now(), attempt))
+}
+
+fn snapshot_dir_name(created_at: DateTime<Local>, attempt: usize) -> String {
+    format!(
+        "office-automate-precutover-{}-{}-{attempt:02}",
+        created_at.format("%Y%m%d-%H%M%S-%f"),
+        std::process::id()
+    )
+}
+
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path)
+    }
 }
 
 fn ensure_readable_file(label: &str, path: &Path) -> Result<()> {
@@ -835,6 +873,18 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_dir_name_includes_retry_attempt_suffix() {
+        let created_at = Local::now();
+
+        let first = snapshot_dir_name(created_at.clone(), 0);
+        let retry = snapshot_dir_name(created_at, 1);
+
+        assert_ne!(first, retry);
+        assert!(first.ends_with("-00"));
+        assert!(retry.ends_with("-01"));
+    }
+
+    #[test]
     fn snapshot_copies_config_database_artifacts_and_manifest() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let root = temp_dir.path();
@@ -861,6 +911,15 @@ mod tests {
             .expect("snapshot succeeds");
 
         assert!(report.snapshot_dir.join("config.yaml").is_file());
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&report.snapshot_dir)
+                .expect("snapshot dir metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700);
+        }
         assert!(report.snapshot_dir.join("office_climate.db").is_file());
         assert!(
             report
