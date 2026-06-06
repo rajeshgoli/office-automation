@@ -122,6 +122,12 @@ pub fn create_pre_cutover_snapshot(
         &mut validations,
     )?;
     files_copied += copy_optional_file(
+        "worktree map",
+        &config.runtime.data_dir.join("worktree_map.json"),
+        &snapshot_dir.join("worktree_map.json"),
+        &mut validations,
+    )?;
+    files_copied += copy_optional_file(
         "legacy APK",
         &config.runtime.legacy_apk_path,
         &snapshot_dir.join("app-debug.apk"),
@@ -903,6 +909,11 @@ mod tests {
             r#"{"artifact_hash":"1a2b3c4d","uploaded_at":"2026-06-05T00:00:00Z","size_bytes":3,"uploaded_by":"test@example.com"}"#,
         )
         .expect("metadata");
+        fs::write(
+            root.join("data/worktree_map.json"),
+            r#"{"office-automate-pr76":"office-automate"}"#,
+        )
+        .expect("worktree map");
         fs::write(root.join("data/app-debug.apk"), b"legacy").expect("legacy apk");
 
         let config = test_config(root, config_path.clone(), database_path);
@@ -921,6 +932,7 @@ mod tests {
             assert_eq!(mode, 0o700);
         }
         assert!(report.snapshot_dir.join("office_climate.db").is_file());
+        assert!(report.snapshot_dir.join("worktree_map.json").is_file());
         assert!(
             report
                 .snapshot_dir
@@ -941,6 +953,12 @@ mod tests {
                 .validations
                 .iter()
                 .any(|validation| validation == "office database migrated on snapshot copy")
+        );
+        assert!(
+            report
+                .validations
+                .iter()
+                .any(|validation| validation == "worktree map readable")
         );
     }
 
