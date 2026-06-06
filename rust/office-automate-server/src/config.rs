@@ -393,6 +393,7 @@ impl AppConfig {
         let data_dir = env_lookup("OFFICE_AUTOMATE_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join("data"));
+        let home_dir = env_lookup("HOME").map(PathBuf::from);
 
         if let Some(host) = env_lookup("OFFICE_AUTOMATE_MQTT_HOST") {
             file_config.qingping.mqtt_broker = host;
@@ -499,6 +500,12 @@ impl AppConfig {
                 format!("invalid OFFICE_AUTOMATE_TELEMETRY_DAYS value {days:?}")
             })?;
         }
+        file_config.telemetry.repos = file_config
+            .telemetry
+            .repos
+            .into_iter()
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()))
+            .collect();
 
         let telemetry_db_path = file_config
             .telemetry
@@ -559,6 +566,22 @@ fn parse_bool_env(name: &str, value: &str) -> Result<bool> {
         "0" | "false" | "no" | "off" => Ok(false),
         _ => anyhow::bail!("invalid {name} value {value:?}; expected true/false"),
     }
+}
+
+fn expand_home_relative_path(path: PathBuf, home_dir: Option<&Path>) -> PathBuf {
+    let Some(home_dir) = home_dir else {
+        return path;
+    };
+    let Some(raw_path) = path.to_str() else {
+        return path;
+    };
+    if raw_path == "~" {
+        return home_dir.to_path_buf();
+    }
+    raw_path
+        .strip_prefix("~/")
+        .map(|suffix| home_dir.join(suffix))
+        .unwrap_or(path)
 }
 
 #[cfg(test)]
@@ -736,5 +759,44 @@ thresholds:
         assert_eq!(config.thresholds.hvac_cool_on_temp_f, 82);
         assert_eq!(config.thresholds.expected_occupancy_start, "08:30");
         assert_eq!(config.thresholds.expected_occupancy_end, "18:45");
+    }
+
+    #[test]
+    fn expands_home_relative_telemetry_repo_paths() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let home_dir = temp_dir.path().join("home");
+        let config_path = temp_dir.path().join("config.yaml");
+        fs::write(
+            &config_path,
+            r#"
+telemetry:
+  repos:
+    - "~/Desktop/automation/office-automate"
+"#,
+        )
+        .expect("write config");
+
+        let config = AppConfig::load_with_env(&config_path, |key| match key {
+            "HOME" => Some(home_dir.display().to_string()),
+            _ => None,
+        })
+        .expect("load config");
+
+        assert_eq!(
+            config.telemetry.repos,
+            vec![home_dir.join("Desktop/automation/office-automate")]
+        );
+
+        let config = AppConfig::load_with_env(&config_path, |key| match key {
+            "HOME" => Some(home_dir.display().to_string()),
+            "OFFICE_AUTOMATE_TELEMETRY_REPOS" => Some("~/repo-a,/absolute/repo-b".to_string()),
+            _ => None,
+        })
+        .expect("load config");
+
+        assert_eq!(
+            config.telemetry.repos,
+            vec![home_dir.join("repo-a"), PathBuf::from("/absolute/repo-b")]
+        );
     }
 }

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use crate::{config::AppConfig, db, erv, http, hvac, presence, telemetry};
@@ -41,8 +41,8 @@ pub struct SmokeArgs {
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
 pub struct CollectArgs {
-    #[arg(long, env = "OFFICE_AUTOMATE_CONFIG")]
-    pub config: PathBuf,
+    #[arg(long, env = "OFFICE_AUTOMATE_CONFIG", global = true)]
+    pub config: Option<PathBuf>,
     #[command(subcommand)]
     pub target: CollectTarget,
 }
@@ -98,7 +98,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             run_smoke(&config, args.target).await
         }
         Command::Collect(args) => {
-            let config = AppConfig::load(&args.config)?;
+            let config_path = args
+                .config
+                .context("collect requires --config or OFFICE_AUTOMATE_CONFIG")?;
+            let config = AppConfig::load(&config_path)?;
             run_collect(&config, args.target)
         }
     }
@@ -297,7 +300,31 @@ mod tests {
 
         match cli.command {
             Command::Collect(args) => {
-                assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
+                assert_eq!(args.config, Some(PathBuf::from("/tmp/office.yaml")));
+                assert_eq!(
+                    args.target,
+                    CollectTarget::Telemetry(CollectTelemetryArgs { dry_run: true })
+                );
+            }
+            other => panic!("expected collect command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_collect_telemetry_command_with_config_after_target() {
+        let cli = Cli::try_parse_from([
+            "office-automate-server",
+            "collect",
+            "telemetry",
+            "--config",
+            "/tmp/office.yaml",
+            "--dry-run",
+        ])
+        .expect("collect command should parse");
+
+        match cli.command {
+            Command::Collect(args) => {
+                assert_eq!(args.config, Some(PathBuf::from("/tmp/office.yaml")));
                 assert_eq!(
                     args.target,
                     CollectTarget::Telemetry(CollectTelemetryArgs { dry_run: true })
@@ -320,7 +347,7 @@ mod tests {
 
         match cli.command {
             Command::Collect(args) => {
-                assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
+                assert_eq!(args.config, Some(PathBuf::from("/tmp/office.yaml")));
                 assert_eq!(args.target, CollectTarget::Leverage);
             }
             other => panic!("expected collect command, got {other:?}"),
