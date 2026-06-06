@@ -246,13 +246,17 @@ impl YoLinkState {
             }
         };
 
-        db::log_device_event(
+        if let Err(error) = db::log_device_event(
             &self.database_path,
             device_type,
             event,
             Some(&device_name),
             Some(&event_data),
-        )?;
+        ) {
+            tracing::warn!(
+                "failed to persist YoLink {device_type} event after state update: {error:#}"
+            );
+        }
         self.notify_status();
 
         Ok(Some(YoLinkAppliedEvent {
@@ -894,6 +898,29 @@ mod tests {
         assert_eq!(
             db::get_latest_device_state(&db_path, "motion").expect("motion state"),
             Some("detected".to_string())
+        );
+    }
+
+    #[test]
+    fn event_logging_failure_still_returns_applied_event() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let yolink = test_state(temp_dir.path().to_path_buf());
+        yolink.apply_devices(sample_devices());
+
+        let applied = yolink
+            .apply_event("door-1", json!({"state": "open"}), 1_010.0)
+            .expect("state update survives logging failure")
+            .expect("applied");
+
+        assert_eq!(applied.device_type, "door");
+        assert_eq!(applied.event, "open");
+        assert!(
+            yolink
+                .state_machine
+                .read()
+                .expect("state machine lock poisoned")
+                .sensors
+                .door_open
         );
     }
 
