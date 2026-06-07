@@ -2549,6 +2549,7 @@ mod tests {
         http::Request as HttpRequest,
     };
     use futures_util::{SinkExt, StreamExt};
+    use sha2::{Digest, Sha256};
     use tokio_tungstenite::{
         connect_async,
         tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest},
@@ -6080,6 +6081,9 @@ mod tests {
             .expect("read body");
         let metadata: Value = serde_json::from_slice(&body).expect("json body");
         let artifact_hash = metadata["artifact_hash"].as_str().expect("hash");
+        let sha256 = format!("{:x}", Sha256::digest(b"apk-bytes"));
+        assert_eq!(artifact_hash, &sha256[..8]);
+        assert_eq!(metadata["sha256"], sha256);
         assert_eq!(metadata["uploaded_by"], "engineer@rajeshgo.li");
         assert_eq!(metadata["version_code"], 7);
         assert_eq!(metadata["version_name"], "1.2.0");
