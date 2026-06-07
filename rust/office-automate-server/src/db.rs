@@ -5,10 +5,13 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use base64::{Engine, engine::general_purpose};
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, Timelike};
+use rand::{RngCore, rngs::OsRng};
 use rusqlite::{Connection, OptionalExtension, params, types::ValueRef};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::{config::AppConfig, qingping::QingpingReading};
 
@@ -141,6 +144,23 @@ pub fn migrate_database(database_path: &Path) -> Result<()> {
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS device_registrations (
+                device_id TEXT PRIMARY KEY,
+                device_name TEXT NOT NULL,
+                pairing_code TEXT NOT NULL UNIQUE,
+                public_key_fingerprint TEXT,
+                common_name TEXT,
+                created_at DATETIME NOT NULL,
+                expires_at DATETIME NOT NULL,
+                paired_at DATETIME,
+                revoked_at DATETIME
+            );
+            CREATE INDEX IF NOT EXISTS idx_device_registrations_created_at ON device_registrations(created_at);
+            CREATE INDEX IF NOT EXISTS idx_device_registrations_expires_at ON device_registrations(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_device_registrations_revoked_at ON device_registrations(revoked_at);
+            CREATE INDEX IF NOT EXISTS idx_device_registrations_common_name ON device_registrations(common_name);
+            CREATE INDEX IF NOT EXISTS idx_device_registrations_device_name ON device_registrations(device_name);
+
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -215,6 +235,341 @@ where
         .with_context(|| format!("failed to write app setting {key}"))?;
 
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceRegistration {
+    pub device_id: String,
+    pub device_name: String,
+    pub pairing_code: String,
+    pub public_key_fingerprint: Option<String>,
+    pub common_name: Option<String>,
+    pub created_at: String,
+    pub expires_at: String,
+    pub paired_at: Option<String>,
+    pub revoked_at: Option<String>,
+}
+
+pub fn create_device_registration(
+    database_path: &Path,
+    device_name: &str,
+    expires_in_minutes: i64,
+) -> Result<DeviceRegistration> {
+    if let Some(parent) = database_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create data directory {}", parent.display()))?;
+    }
+
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let created_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let expires_at = (chrono::Local::now() + chrono::Duration::minutes(expires_in_minutes))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let registration = DeviceRegistration {
+        device_id: random_device_id(),
+        device_name: device_name.trim().to_string(),
+        pairing_code: random_pairing_code(),
+        public_key_fingerprint: None,
+        common_name: None,
+        created_at,
+        expires_at,
+        paired_at: None,
+        revoked_at: None,
+    };
+
+    connection
+        .execute(
+            r#"
+            INSERT INTO device_registrations (
+                device_id, device_name, pairing_code, public_key_fingerprint,
+                common_name, created_at, expires_at, paired_at, revoked_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                registration.device_id,
+                registration.device_name,
+                registration.pairing_code,
+                registration.public_key_fingerprint,
+                registration.common_name,
+                registration.created_at,
+                registration.expires_at,
+                registration.paired_at,
+                registration.revoked_at,
+            ],
+        )
+        .context("failed to create device registration")?;
+
+    Ok(registration)
+}
+
+pub fn list_device_registrations(database_path: &Path) -> Result<Vec<DeviceRegistration>> {
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT device_id, device_name, pairing_code, public_key_fingerprint,
+                   common_name, created_at, expires_at, paired_at, revoked_at
+            FROM device_registrations
+            ORDER BY created_at DESC
+            "#,
+        )
+        .context("failed to prepare device registration list query")?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(DeviceRegistration {
+                device_id: row.get(0)?,
+                device_name: row.get(1)?,
+                pairing_code: row.get(2)?,
+                public_key_fingerprint: row.get(3)?,
+                common_name: row.get(4)?,
+                created_at: row.get(5)?,
+                expires_at: row.get(6)?,
+                paired_at: row.get(7)?,
+                revoked_at: row.get(8)?,
+            })
+        })
+        .context("failed to query device registrations")?;
+
+    let mut devices = Vec::new();
+    for row in rows {
+        devices.push(row.context("failed to read device registration row")?);
+    }
+    Ok(devices)
+}
+
+pub fn pending_device_registration_by_pairing_code(
+    database_path: &Path,
+    pairing_code: &str,
+) -> Result<Option<DeviceRegistration>> {
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    connection
+        .query_row(
+            r#"
+            SELECT device_id, device_name, pairing_code, public_key_fingerprint,
+                   common_name, created_at, expires_at, paired_at, revoked_at
+            FROM device_registrations
+            WHERE pairing_code = ?
+              AND revoked_at IS NULL
+              AND paired_at IS NULL
+              AND expires_at > ?
+            "#,
+            params![pairing_code, now],
+            |row| {
+                Ok(DeviceRegistration {
+                    device_id: row.get(0)?,
+                    device_name: row.get(1)?,
+                    pairing_code: row.get(2)?,
+                    public_key_fingerprint: row.get(3)?,
+                    common_name: row.get(4)?,
+                    created_at: row.get(5)?,
+                    expires_at: row.get(6)?,
+                    paired_at: row.get(7)?,
+                    revoked_at: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .context("failed to check device registration eligibility")
+}
+
+pub fn find_active_device_registration_by_common_name(
+    database_path: &Path,
+    common_name: &str,
+) -> Result<Option<DeviceRegistration>> {
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT device_id, device_name, pairing_code, public_key_fingerprint,
+                   common_name, created_at, expires_at, paired_at, revoked_at
+            FROM device_registrations
+            WHERE common_name = ?
+              AND paired_at IS NOT NULL
+              AND revoked_at IS NULL
+            ORDER BY paired_at DESC
+            LIMIT 2
+            "#,
+        )
+        .context("failed to prepare active device lookup query")?;
+    let rows = statement
+        .query_map(params![common_name], |row| {
+            Ok(DeviceRegistration {
+                device_id: row.get(0)?,
+                device_name: row.get(1)?,
+                pairing_code: row.get(2)?,
+                public_key_fingerprint: row.get(3)?,
+                common_name: row.get(4)?,
+                created_at: row.get(5)?,
+                expires_at: row.get(6)?,
+                paired_at: row.get(7)?,
+                revoked_at: row.get(8)?,
+            })
+        })
+        .with_context(|| format!("failed to look up active device common name {common_name}"))?;
+
+    let mut devices = Vec::new();
+    for row in rows {
+        devices.push(row.context("failed to read active device registration row")?);
+    }
+
+    match devices.len() {
+        0 => Ok(None),
+        1 => Ok(devices.pop()),
+        _ => {
+            anyhow::bail!(
+                "multiple active device registrations share common name {common_name}; revoke stale registrations before accepting mTLS"
+            );
+        }
+    }
+}
+
+pub fn revoke_device_registration(database_path: &Path, device_id: &str) -> Result<bool> {
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let changed = connection
+        .execute(
+            r#"
+            UPDATE device_registrations
+            SET revoked_at = ?
+            WHERE device_id = ? AND revoked_at IS NULL
+            "#,
+            params![updated_at, device_id],
+        )
+        .with_context(|| format!("failed to revoke device {device_id}"))?;
+    Ok(changed > 0)
+}
+
+pub fn complete_device_registration(
+    database_path: &Path,
+    pairing_code: &str,
+    public_key: &str,
+    common_name: &str,
+) -> Result<Option<DeviceRegistration>> {
+    if common_name.trim().is_empty() {
+        anyhow::bail!("device certificate common name must not be empty");
+    }
+
+    let fingerprint = fingerprint_public_key(public_key);
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let device_name = match connection
+        .query_row(
+            r#"
+            SELECT device_name
+            FROM device_registrations
+            WHERE pairing_code = ?
+              AND revoked_at IS NULL
+              AND paired_at IS NULL
+              AND expires_at > ?
+            "#,
+            params![pairing_code, now],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .context("failed to check device registration eligibility")?
+    {
+        Some(device_name) => device_name,
+        None => return Ok(None),
+    };
+    connection
+        .execute(
+            r#"
+            UPDATE device_registrations
+            SET revoked_at = ?
+            WHERE device_name = ?
+              AND revoked_at IS NULL
+              AND paired_at IS NOT NULL
+            "#,
+            params![now, device_name],
+        )
+        .with_context(|| {
+            format!("failed to revoke prior registrations for device name {device_name}")
+        })?;
+    let changed = connection
+        .execute(
+            r#"
+            UPDATE device_registrations
+            SET public_key_fingerprint = ?,
+                common_name = ?,
+                paired_at = ?
+            WHERE pairing_code = ?
+              AND revoked_at IS NULL
+              AND paired_at IS NULL
+              AND expires_at > ?
+            "#,
+            params![fingerprint, common_name, now, pairing_code, now],
+        )
+        .with_context(|| {
+            format!("failed to complete registration for pairing code {pairing_code}")
+        })?;
+
+    if changed == 0 {
+        return Ok(None);
+    }
+
+    let registration = connection
+        .query_row(
+            r#"
+            SELECT device_id, device_name, pairing_code, public_key_fingerprint,
+                   common_name, created_at, expires_at, paired_at, revoked_at
+            FROM device_registrations
+            WHERE pairing_code = ?
+            "#,
+            params![pairing_code],
+            |row| {
+                Ok(DeviceRegistration {
+                    device_id: row.get(0)?,
+                    device_name: row.get(1)?,
+                    pairing_code: row.get(2)?,
+                    public_key_fingerprint: row.get(3)?,
+                    common_name: row.get(4)?,
+                    created_at: row.get(5)?,
+                    expires_at: row.get(6)?,
+                    paired_at: row.get(7)?,
+                    revoked_at: row.get(8)?,
+                })
+            },
+        )
+        .context("failed to reload completed device registration")?;
+
+    Ok(Some(registration))
+}
+
+fn random_device_id() -> String {
+    random_url_token(16)
+}
+
+fn random_pairing_code() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut bytes = [0_u8; 6];
+    OsRng.fill_bytes(&mut bytes);
+    bytes
+        .iter()
+        .map(|byte| ALPHABET[(*byte as usize) % ALPHABET.len()] as char)
+        .collect()
+}
+
+fn fingerprint_public_key(public_key: &str) -> String {
+    let digest = Sha256::digest(public_key.as_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn random_url_token(byte_len: usize) -> String {
+    let mut bytes = vec![0_u8; byte_len];
+    OsRng.fill_bytes(&mut bytes);
+    general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 pub fn insert_sensor_reading(database_path: &Path, reading: &QingpingReading) -> Result<()> {
@@ -1909,6 +2264,81 @@ mod tests {
             .expect("read setting")
             .expect("value");
         assert_eq!(stored, value);
+    }
+
+    #[test]
+    fn device_registration_round_trip() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+
+        let registration =
+            create_device_registration(&db_path, "phone", 15).expect("create registration");
+        assert_eq!(registration.device_name, "phone");
+        assert_eq!(registration.paired_at, None);
+        assert_eq!(registration.revoked_at, None);
+        assert_eq!(registration.pairing_code.len(), 6);
+
+        let devices = list_device_registrations(&db_path).expect("list devices");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].device_id, registration.device_id);
+
+        let completed = complete_device_registration(
+            &db_path,
+            &registration.pairing_code,
+            "public-key",
+            "device-1",
+        )
+        .expect("complete registration")
+        .expect("registration completed");
+        assert_eq!(completed.common_name.as_deref(), Some("device-1"));
+
+        let active = find_active_device_registration_by_common_name(&db_path, "device-1")
+            .expect("find active device")
+            .expect("active device");
+        assert_eq!(active.device_id, registration.device_id);
+
+        let replacement =
+            create_device_registration(&db_path, "phone", 15).expect("create replacement");
+        let replacement_completed = complete_device_registration(
+            &db_path,
+            &replacement.pairing_code,
+            "replacement-key",
+            "device-2",
+        )
+        .expect("complete replacement")
+        .expect("replacement completed");
+        assert_eq!(
+            replacement_completed.common_name.as_deref(),
+            Some("device-2")
+        );
+
+        let old_active = find_active_device_registration_by_common_name(&db_path, "device-1")
+            .expect("find active original after replacement");
+        assert!(old_active.is_none());
+
+        let active = find_active_device_registration_by_common_name(&db_path, "device-2")
+            .expect("find active replacement")
+            .expect("active replacement");
+        assert_eq!(active.device_id, replacement.device_id);
+
+        let devices = list_device_registrations(&db_path).expect("list devices after replacement");
+        let replaced = devices
+            .iter()
+            .find(|device| device.device_id == registration.device_id)
+            .expect("original device");
+        assert!(replaced.revoked_at.is_some());
+
+        let revoked =
+            revoke_device_registration(&db_path, &replacement.device_id).expect("revoke device");
+        assert!(revoked);
+
+        let devices = list_device_registrations(&db_path).expect("list devices after revoke");
+        assert!(devices.iter().all(|device| device.revoked_at.is_some()));
+        let active_after_revoke =
+            find_active_device_registration_by_common_name(&db_path, "device-2")
+                .expect("find active device after revoke");
+        assert!(active_after_revoke.is_none());
     }
 
     #[test]

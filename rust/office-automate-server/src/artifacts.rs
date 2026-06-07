@@ -122,6 +122,14 @@ impl ArtifactStore {
             Response::builder()
                 .status(StatusCode::OK)
                 .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.android.package-archive",
+                )
+                .header(
+                    header::HeaderName::from_static("x-content-type-options"),
+                    "nosniff",
+                )
+                .header(
                     header::CONTENT_DISPOSITION,
                     "attachment; filename=office-climate.apk",
                 )
@@ -150,6 +158,14 @@ impl ArtifactStore {
         Ok(Some(
             Response::builder()
                 .status(StatusCode::OK)
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.android.package-archive",
+                )
+                .header(
+                    header::HeaderName::from_static("x-content-type-options"),
+                    "nosniff",
+                )
                 .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
                 .header(
                     header::CONTENT_DISPOSITION,

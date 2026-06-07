@@ -6,12 +6,12 @@ import androidx.core.content.FileProvider
 import com.rajesh.officeclimate.BuildConfig
 import com.rajesh.officeclimate.data.model.AppArtifactMetadata
 import com.rajesh.officeclimate.data.remote.ApiService
+import com.rajesh.officeclimate.data.remote.HttpClientFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import retrofit2.HttpException
 import retrofit2.Retrofit
@@ -19,7 +19,6 @@ import retrofit2.converter.kotlinx.serialization.asConverterFactory
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
-import java.util.concurrent.TimeUnit
 
 data class AvailableAppUpdate(
     val artifactHash: String,
@@ -32,6 +31,7 @@ class AppUpdateRepository(
     private val settingsRepository: SettingsRepository,
 ) {
     private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
+    private val httpClientFactory = HttpClientFactory(settingsRepository)
     @Volatile private var cachedCurrentArtifactHash: String? = null
 
     suspend fun getAvailableUpdate(): AvailableAppUpdate? {
@@ -67,18 +67,21 @@ class AppUpdateRepository(
         val updatesDir = File(context.cacheDir, "updates").apply { mkdirs() }
         val apkFile = File(updatesDir, "office-climate-${update.artifactHash}.apk")
 
-        okHttpClient().newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw IOException("Update download failed: HTTP ${response.code}")
-            }
+        httpClientFactory.create(connectTimeoutSeconds = 10, readTimeoutSeconds = 30)
+            .newCall(request)
+            .execute()
+            .use { response ->
+                if (!response.isSuccessful) {
+                    throw IOException("Update download failed: HTTP ${response.code}")
+                }
 
-            val responseBody = response.body ?: throw IOException("Update download returned no body")
-            responseBody.byteStream().use { input ->
-                apkFile.outputStream().use { output ->
-                    input.copyTo(output)
+                val responseBody = response.body ?: throw IOException("Update download returned no body")
+                responseBody.byteStream().use { input ->
+                    apkFile.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
                 }
             }
-        }
 
         apkFile
     }
@@ -101,7 +104,11 @@ class AppUpdateRepository(
         try {
             apiService(serverUrl).getAppArtifactMetadata()
         } catch (e: HttpException) {
-            if (e.code() == 404) null else throw e
+            if (e.code() == 404) return@withContext null
+            if (e.code() == 302 || e.code() == 401 || e.code() == 403) {
+                return@withContext null
+            }
+            throw e
         }
     }
 
@@ -136,17 +143,12 @@ class AppUpdateRepository(
             .take(8)
     }
 
-    private fun apiService(serverUrl: String): ApiService {
+    private suspend fun apiService(serverUrl: String): ApiService {
         val retrofit = Retrofit.Builder()
             .baseUrl("$serverUrl/")
-            .client(okHttpClient())
+            .client(httpClientFactory.create(connectTimeoutSeconds = 10, readTimeoutSeconds = 30))
             .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
             .build()
         return retrofit.create(ApiService::class.java)
     }
-
-    private fun okHttpClient(): OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .build()
 }

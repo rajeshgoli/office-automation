@@ -68,9 +68,9 @@ fun AppNavigation(authResult: StateFlow<MainActivity.AuthResult?>) {
     val navController = rememberNavController()
     val context = LocalContext.current
     val settingsRepo = SettingsRepository(context)
-    val isLoggedIn by settingsRepo.isLoggedIn.collectAsState(initial = null)
+    val isAuthenticated by settingsRepo.isAuthenticated.collectAsState(initial = null)
 
-    val startDestination = when (isLoggedIn) {
+    val startDestination = when (isAuthenticated) {
         true -> Routes.DASHBOARD
         false -> Routes.SETTINGS
         null -> return // Still loading

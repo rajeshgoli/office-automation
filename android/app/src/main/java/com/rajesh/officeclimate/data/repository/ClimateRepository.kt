@@ -13,7 +13,7 @@ import com.rajesh.officeclimate.data.model.SessionsResponse
 import com.rajesh.officeclimate.data.model.TemperatureBands
 import com.rajesh.officeclimate.data.model.TemperatureResponse
 import com.rajesh.officeclimate.data.remote.ApiService
-import com.rajesh.officeclimate.data.remote.AuthInterceptor
+import com.rajesh.officeclimate.data.remote.HttpClientFactory
 import com.rajesh.officeclimate.data.remote.WebSocketManager
 import com.rajesh.officeclimate.util.Defaults
 import kotlinx.coroutines.CoroutineScope
@@ -30,11 +30,9 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.HttpException
 import retrofit2.Retrofit
 import retrofit2.converter.kotlinx.serialization.asConverterFactory
-import java.util.concurrent.TimeUnit
 
 class ClimateRepository(
     private val settingsRepository: SettingsRepository,
@@ -48,6 +46,7 @@ class ClimateRepository(
     private lateinit var apiService: ApiService
     private lateinit var wsManager: WebSocketManager
     private var okHttpClient: OkHttpClient? = null
+    private val httpClientFactory = HttpClientFactory(settingsRepository)
 
     private val _status = MutableStateFlow<ApiStatus?>(null)
     val status: StateFlow<ApiStatus?> = _status
@@ -88,18 +87,16 @@ class ClimateRepository(
         if (::wsManager.isInitialized) wsManager.disconnect()
     }
 
-    private fun rebuild(url: String, token: String) {
+    private suspend fun rebuild(url: String, token: String) {
         currentUrl = url
         currentToken = token
 
-        val client = OkHttpClient.Builder()
-            .addInterceptor(AuthInterceptor { currentToken })
-            .addInterceptor(HttpLoggingInterceptor().apply {
-                level = HttpLoggingInterceptor.Level.BASIC
-            })
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(10, TimeUnit.SECONDS)
-            .build()
+        val client = httpClientFactory.create(
+            tokenProvider = { currentToken },
+            includeLogging = true,
+            connectTimeoutSeconds = 10,
+            readTimeoutSeconds = 10,
+        )
         okHttpClient = client
 
         val retrofit = Retrofit.Builder()
@@ -129,16 +126,23 @@ class ClimateRepository(
                         stop()
                         return@launch
                     }
+                    if (e.code() == 302 || e.code() == 403) {
+                        Log.w(TAG, "Cloudflare Access blocked request (${e.code()})")
+                        _apiConnected.value = false
+                        _error.value = "Cloudflare Access blocked this device. Enroll it with oa register-device."
+                        delay(Defaults.POLL_INTERVAL_MS)
+                        continue
+                    }
                     Log.w(TAG, "Poll failed: ${e.message}")
                     _apiConnected.value = false
                     if (_status.value == null) {
-                        _error.value = e.message ?: "Connection failed"
+                        _error.value = "${e::class.java.simpleName}: ${e.message ?: "Connection failed"}"
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "Poll failed: ${e.message}")
                     _apiConnected.value = false
                     if (_status.value == null) {
-                        _error.value = e.message ?: "Connection failed"
+                        _error.value = "${e::class.java.simpleName}: ${e.message ?: "Connection failed"}"
                     }
                 }
                 delay(Defaults.POLL_INTERVAL_MS)
@@ -246,11 +250,11 @@ class ClimateRepository(
     }
 
     suspend fun testConnection(url: String, token: String): Result<ApiStatus> = runCatching {
-        val client = OkHttpClient.Builder()
-            .addInterceptor(AuthInterceptor { token })
-            .connectTimeout(5, TimeUnit.SECONDS)
-            .readTimeout(5, TimeUnit.SECONDS)
-            .build()
+        val client = httpClientFactory.create(
+            tokenProvider = { token },
+            connectTimeoutSeconds = 5,
+            readTimeoutSeconds = 5,
+        )
 
         val retrofit = Retrofit.Builder()
             .baseUrl("${url.trimEnd('/')}/")

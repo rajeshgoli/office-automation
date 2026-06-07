@@ -33,6 +33,9 @@ tmp/
 /data/
 client_secret.json
 
+# Local certs / device PKI
+certs/
+
 # tinytuya generated files
 snapshot.json
 tinytuya.json

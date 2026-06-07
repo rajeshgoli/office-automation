@@ -22,6 +22,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -46,6 +47,7 @@ fun SettingsScreen(
     val state by viewModel.uiState.collectAsState()
     val context = LocalContext.current
     var showServerUrl by remember { mutableStateOf(false) }
+    var showAdvancedEnrollment by remember { mutableStateOf(false) }
 
     val textFieldColors = OutlinedTextFieldDefaults.colors(
         focusedBorderColor = Emerald,
@@ -74,7 +76,11 @@ fun SettingsScreen(
         Spacer(Modifier.height(8.dp))
 
         Text(
-            text = if (state.isLoggedIn) "Signed in as ${state.userEmail}" else "Sign in to your climate server",
+            text = when {
+                state.deviceCertificateAlias.isNotBlank() -> "Device enrolled as ${state.deviceCertificateAlias}"
+                state.isLoggedIn -> "Signed in as ${state.userEmail}"
+                else -> "Sign in to your climate server"
+            },
             style = MaterialTheme.typography.bodyMedium,
             color = if (state.isLoggedIn) Emerald else TextSecondary,
         )
@@ -94,7 +100,67 @@ fun SettingsScreen(
             )
         }
 
+        Spacer(Modifier.height(16.dp))
+
+        TextButton(
+            onClick = { showAdvancedEnrollment = !showAdvancedEnrollment },
+        ) {
+            Text(if (showAdvancedEnrollment) "Hide Advanced" else "Advanced")
+        }
+
+        if (showAdvancedEnrollment) {
+            OutlinedTextField(
+                value = state.pairingUrl,
+                onValueChange = viewModel::updatePairingUrl,
+                label = { Text("Pairing URL") },
+                placeholder = { Text("http://192.168.5.10:19191") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                modifier = Modifier.fillMaxWidth(),
+                colors = textFieldColors,
+            )
+        }
+
+        Spacer(Modifier.height(12.dp))
+
+        OutlinedTextField(
+            value = state.pairingCode,
+            onValueChange = viewModel::updatePairingCode,
+            label = { Text("Pairing Code") },
+            placeholder = { Text("ABC123") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            colors = textFieldColors,
+        )
+
         Spacer(Modifier.height(24.dp))
+
+        Button(
+            onClick = viewModel::enrollDevice,
+            enabled = !state.enrolling && state.pairingUrl.isNotBlank() && state.pairingCode.isNotBlank(),
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Emerald),
+        ) {
+            if (state.enrolling) {
+                CircularProgressIndicator(
+                    modifier = Modifier.height(20.dp),
+                    strokeWidth = 2.dp,
+                    color = MaterialTheme.colorScheme.background,
+                )
+            } else {
+                Text("Enroll Device", color = MaterialTheme.colorScheme.background)
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+
+        state.enrollmentStatus?.let { message ->
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodySmall,
+                color = Emerald,
+            )
+        }
 
         if (state.isLoggedIn) {
             Button(
@@ -107,12 +173,14 @@ fun SettingsScreen(
 
             Spacer(Modifier.height(12.dp))
 
-            OutlinedButton(
-                onClick = viewModel::logout,
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = Red),
-            ) {
-                Text("Sign Out")
+            if (state.userEmail.isNotBlank()) {
+                OutlinedButton(
+                    onClick = viewModel::logout,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Red),
+                ) {
+                    Text("Sign Out")
+                }
             }
         } else {
             Button(
@@ -135,7 +203,7 @@ fun SettingsScreen(
                         color = MaterialTheme.colorScheme.background,
                     )
                 } else {
-                    Text("Sign in with Google", color = MaterialTheme.colorScheme.background)
+                    Text("Browser Sign-In", color = MaterialTheme.colorScheme.background)
                 }
             }
         }

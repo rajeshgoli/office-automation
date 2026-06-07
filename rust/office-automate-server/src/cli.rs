@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::{
     config::AppConfig,
-    db, edge, erv, http, hvac, migration, presence, telemetry,
+    db, device, edge, erv, http, hvac, migration, presence, telemetry,
     validation::{
         self, CutoverValidationOptions, MqttCutoverStrategy, MqttRollbackState,
         RestoreVerification, RollbackValidationOptions, ShadowValidationOptions,
@@ -28,6 +28,12 @@ pub enum Command {
     ServeEdge(EdgeConfigArgs),
     /// Create or upgrade the SQLite schema.
     Migrate(ConfigArgs),
+    /// Register a new device pairing code.
+    RegisterDevice(RegisterDeviceArgs),
+    /// List enrolled device registrations.
+    ListDevices(ConfigArgs),
+    /// Revoke an enrolled device registration.
+    RevokeDevice(RevokeDeviceArgs),
     /// Run local dependency checks without changing device state.
     Smoke(SmokeArgs),
     /// Run local telemetry collectors.
@@ -64,6 +70,30 @@ pub struct CollectArgs {
     pub config: Option<PathBuf>,
     #[command(subcommand)]
     pub target: CollectTarget,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct RegisterDeviceArgs {
+    #[arg(long, env = "OFFICE_AUTOMATE_CONFIG")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub device_name: String,
+    #[arg(long, default_value_t = 15)]
+    pub expires_in_minutes: i64,
+    #[arg(long, default_value = "0.0.0.0:19191")]
+    pub listen: SocketAddr,
+    #[arg(long, env = "OFFICE_AUTOMATE_DEVICE_CA_CERT")]
+    pub device_ca_cert: Option<PathBuf>,
+    #[arg(long, env = "OFFICE_AUTOMATE_DEVICE_CA_KEY")]
+    pub device_ca_key: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct RevokeDeviceArgs {
+    #[arg(long, env = "OFFICE_AUTOMATE_CONFIG")]
+    pub config: PathBuf,
+    #[arg(long)]
+    pub device_id: String,
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
@@ -300,6 +330,56 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Migrate(args) => {
             let config = AppConfig::load(&args.config)?;
             db::migrate(&config)?;
+            Ok(())
+        }
+        Command::RegisterDevice(args) => {
+            let config = AppConfig::load(&args.config)?;
+            let device = device::register_device(
+                &config.runtime.database_path,
+                &args.device_name,
+                args.expires_in_minutes,
+            )?;
+            println!(
+                "device registered: device_id={} pairing_code={} expires_at={} listen={}",
+                device.device_id, device.pairing_code, device.expires_at, args.listen
+            );
+            device::serve_pairing_listener(
+                config.runtime.database_path,
+                args.listen,
+                args.device_ca_cert,
+                args.device_ca_key,
+            )
+            .await
+        }
+        Command::ListDevices(args) => {
+            let config = AppConfig::load(&args.config)?;
+            let devices = device::list_devices(&config.runtime.database_path)?;
+            if devices.is_empty() {
+                println!("no device registrations found");
+            } else {
+                for device in devices {
+                    println!(
+                        "device_id={} name={} code={} paired_at={} revoked_at={} expires_at={} fingerprint={}",
+                        device.device_id,
+                        device.device_name,
+                        device.pairing_code,
+                        device.paired_at.as_deref().unwrap_or("-"),
+                        device.revoked_at.as_deref().unwrap_or("-"),
+                        device.expires_at,
+                        device.public_key_fingerprint.as_deref().unwrap_or("-"),
+                    );
+                }
+            }
+            Ok(())
+        }
+        Command::RevokeDevice(args) => {
+            let config = AppConfig::load(&args.config)?;
+            let revoked = device::revoke_device(&config.runtime.database_path, &args.device_id)?;
+            if revoked {
+                println!("device revoked: {}", args.device_id);
+            } else {
+                println!("device not found or already revoked: {}", args.device_id);
+            }
             Ok(())
         }
         Command::Smoke(args) => {
