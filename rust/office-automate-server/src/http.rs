@@ -818,9 +818,18 @@ async fn websocket(
     let mode = if has_valid_controller_ipc_token(&state.config, &auth_headers, Some(remote_addr)) {
         WebSocketAuth::Open
     } else {
-        state.auth.websocket_auth(&auth_headers)
+        websocket_auth_mode(&state, &auth_headers)
     };
     ws.on_upgrade(move |socket| websocket_session(socket, state, mode))
+}
+
+fn websocket_auth_mode(state: &AppState, headers: &HeaderMap) -> WebSocketAuth {
+    let mode = state.auth.websocket_auth(headers);
+    if mode == WebSocketAuth::TrustedNetwork && has_cloudflare_proxy_context(headers) {
+        WebSocketAuth::FirstMessage
+    } else {
+        mode
+    }
 }
 
 fn has_valid_controller_ipc_token(
@@ -3563,6 +3572,40 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn websocket_cloudflare_context_cannot_use_trusted_network_bypass() {
+        let config = oauth_config();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            unix_timestamp_now(),
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let (state, _) = build_app_state(
+            config.clone(),
+            QingpingState::default(),
+            state_machine,
+            yolink,
+            ErvState::new(config.runtime.database_path.clone()),
+            HvacState::new(config.runtime.database_path.clone()),
+            Arc::new(FakeErvWriter::default()),
+            Arc::new(FakeHvacWriter::default()),
+        )
+        .expect("app state");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "127.0.0.1".parse().expect("header"));
+
+        assert_eq!(
+            websocket_auth_mode(&state, &headers),
+            WebSocketAuth::TrustedNetwork
+        );
+
+        headers.insert("cf-connecting-ip", "127.0.0.1".parse().expect("header"));
+        assert_eq!(
+            websocket_auth_mode(&state, &headers),
+            WebSocketAuth::FirstMessage
+        );
     }
 
     #[tokio::test]
