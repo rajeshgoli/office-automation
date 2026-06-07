@@ -19,14 +19,15 @@ const WS_URL = `${wsProtocol}//${API_HOST}${portSuffix}/ws`;
 
 const TOKEN_KEY = 'auth_token';
 const EMAIL_KEY = 'user_email';
+const CSRF_COOKIE = 'office_csrf';
+const CSRF_HEADER = 'X-CSRF-Token';
 
 export function getAuthToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY);
+  return null;
 }
 
-export function setAuthToken(token: string, email: string) {
-  localStorage.setItem(TOKEN_KEY, token);
-  localStorage.setItem(EMAIL_KEY, email);
+export function setAuthToken(_token: string, _email: string) {
+  clearAuthToken();
 }
 
 export function clearAuthToken() {
@@ -35,11 +36,38 @@ export function clearAuthToken() {
 }
 
 export function getUserEmail(): string | null {
-  return localStorage.getItem(EMAIL_KEY);
+  return null;
 }
 
 export function isAuthenticated(): boolean {
-  return getAuthToken() !== null;
+  return false;
+}
+
+function getCsrfToken(): string | null {
+  const prefix = `${CSRF_COOKIE}=`;
+  const cookie = document.cookie
+    .split(';')
+    .map((value) => value.trim())
+    .find((value) => value.startsWith(prefix));
+  return cookie ? decodeURIComponent(cookie.slice(prefix.length)) : null;
+}
+
+function addCsrfHeader(headers: HeadersInit = {}): HeadersInit {
+  const csrfToken = getCsrfToken();
+  if (!csrfToken) return headers;
+  return { ...headers, [CSRF_HEADER]: csrfToken };
+}
+
+function authFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const method = (init.method || 'GET').toUpperCase();
+  const headers = method === 'GET' || method === 'HEAD'
+    ? init.headers
+    : addCsrfHeader(init.headers);
+  return fetch(input, {
+    ...init,
+    headers,
+    credentials: 'include',
+  });
 }
 
 /**
@@ -48,8 +76,7 @@ export function isAuthenticated(): boolean {
  */
 export async function checkTrustedNetwork(): Promise<boolean> {
   try {
-    const response = await fetch(`${API_BASE}/status`);
-    // If we get 200 without a token, we're on a trusted network
+    const response = await authFetch(`${API_BASE}/status`);
     return response.ok;
   } catch {
     return false;
@@ -57,7 +84,8 @@ export async function checkTrustedNetwork(): Promise<boolean> {
 }
 
 export async function startLogin(): Promise<{ authorization_url: string }> {
-  const response = await fetch(`${API_BASE}/auth/login`);
+  clearAuthToken();
+  const response = await authFetch(`${API_BASE}/auth/login`);
   if (!response.ok) {
     throw new Error('Failed to initiate login');
   }
@@ -65,13 +93,7 @@ export async function startLogin(): Promise<{ authorization_url: string }> {
 }
 
 export async function logout(): Promise<void> {
-  const token = getAuthToken();
-  if (token) {
-    await fetch(`${API_BASE}/auth/logout`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${token}` }
-    });
-  }
+  await authFetch(`${API_BASE}/auth/logout`, { method: 'POST' });
   clearAuthToken();
 }
 
@@ -138,14 +160,7 @@ export interface ApiEvent {
  * Fetch current status from orchestrator
  */
 export async function fetchStatus(): Promise<ApiStatus> {
-  const token = getAuthToken();
-  const headers: HeadersInit = {};
-
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  const response = await fetch(`${API_BASE}/status`, { headers });
+  const response = await authFetch(`${API_BASE}/status`);
 
   if (response.status === 401) {
     clearAuthToken();
@@ -163,7 +178,7 @@ export async function fetchStatus(): Promise<ApiStatus> {
  * Fetch recent events from orchestrator
  */
 export async function fetchEvents(limit: number = 50): Promise<ApiEvent[]> {
-  const response = await fetch(`${API_BASE}/events?limit=${limit}`);
+  const response = await authFetch(`${API_BASE}/events?limit=${limit}`);
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
   }
@@ -174,14 +189,7 @@ export async function fetchEvents(limit: number = 50): Promise<ApiEvent[]> {
  * Fetch historical data from orchestrator
  */
 export async function fetchHistory(hours: number = 24): Promise<any> {
-  const token = getAuthToken();
-  const headers: HeadersInit = {};
-
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  const response = await fetch(`${API_BASE}/history?hours=${hours}`, { headers });
+  const response = await authFetch(`${API_BASE}/history?hours=${hours}`);
 
   if (response.status === 401) {
     clearAuthToken();
@@ -208,14 +216,9 @@ export type ERVSpeed = 'off' | 'quiet' | 'medium' | 'turbo';
  * Set ERV speed manually
  */
 export async function setERVSpeed(speed: ERVSpeed): Promise<{ ok: boolean; error?: string }> {
-  const token = getAuthToken();
   const headers: HeadersInit = { 'Content-Type': 'application/json' };
 
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  const response = await fetch(`${API_BASE}/erv`, {
+  const response = await authFetch(`${API_BASE}/erv`, {
     method: 'POST',
     headers,
     body: JSON.stringify({ speed }),
@@ -236,14 +239,9 @@ export type PresenceState = 'present' | 'away';
  * Set HVAC mode manually
  */
 export async function setHVACMode(mode: HVACMode, setpoint_f: number = 70): Promise<{ ok: boolean; error?: string }> {
-  const token = getAuthToken();
   const headers: HeadersInit = { 'Content-Type': 'application/json' };
 
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  const response = await fetch(`${API_BASE}/hvac`, {
+  const response = await authFetch(`${API_BASE}/hvac`, {
     method: 'POST',
     headers,
     body: JSON.stringify({ mode, setpoint_f }),
@@ -261,14 +259,9 @@ export async function setHVACMode(mode: HVACMode, setpoint_f: number = 70): Prom
  * Manually correct detected presence.
  */
 export async function setPresence(state: PresenceState): Promise<{ ok: boolean; error?: string; state?: string; is_present?: boolean }> {
-  const token = getAuthToken();
   const headers: HeadersInit = { 'Content-Type': 'application/json' };
 
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  const response = await fetch(`${API_BASE}/presence`, {
+  const response = await authFetch(`${API_BASE}/presence`, {
     method: 'POST',
     headers,
     body: JSON.stringify({ state }),
@@ -293,14 +286,9 @@ export async function setHVACTemperatureBands(
   temperature_bands?: HVACTemperatureBands;
   temperature_band_defaults?: HVACTemperatureBands;
 }> {
-  const token = getAuthToken();
   const headers: HeadersInit = { 'Content-Type': 'application/json' };
 
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-
-  const response = await fetch(`${API_BASE}/hvac/temperature-bands`, {
+  const response = await authFetch(`${API_BASE}/hvac/temperature-bands`, {
     method: 'POST',
     headers,
     body: JSON.stringify({ temperature_bands }),
@@ -333,11 +321,6 @@ export class StatusWebSocket {
 
       this.ws.onopen = () => {
         console.log('WebSocket connected');
-        // Send auth message first
-        const token = getAuthToken();
-        if (token) {
-          this.ws!.send(JSON.stringify({ type: 'auth', token }));
-        }
         this.onConnectionCallback?.(true);
         if (this.reconnectTimer) {
           clearTimeout(this.reconnectTimer);
