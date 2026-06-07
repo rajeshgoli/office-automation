@@ -624,7 +624,8 @@ async fn auth_middleware(
             next.run(request).await
         }
         HttpAuthMode::Basic => {
-            if state.auth.verify_basic_header(&headers) {
+            if let Some(user) = state.auth.verify_basic_header_user(&headers) {
+                request.extensions_mut().insert(user);
                 let mut response = next.run(request).await;
                 if let Some(cookie) = state.auth.issue_basic_websocket_cookie() {
                     if let Ok(cookie) = cookie.parse() {
@@ -3335,6 +3336,46 @@ mod tests {
                         format!("multipart/form-data; boundary={boundary}"),
                     )
                     .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                    .body(Body::from(multipart_body(boundary, b"apk-bytes")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn basic_deploy_requires_configured_admin_principal() {
+        let boundary = "deploy-boundary";
+        let mut config = basic_config();
+        let response = app(config.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/deploy/office-climate")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+                    .body(Body::from(multipart_body(boundary, b"apk-bytes")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        config.orchestrator.admin_emails = vec!["user".to_string()];
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/deploy/office-climate")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
                     .body(Body::from(multipart_body(boundary, b"apk-bytes")))
                     .expect("request"),
             )

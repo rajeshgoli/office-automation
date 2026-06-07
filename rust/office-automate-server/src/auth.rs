@@ -269,26 +269,36 @@ impl AuthManager {
     }
 
     pub fn verify_basic_header(&self, headers: &HeaderMap) -> bool {
+        self.verify_basic_header_user(headers).is_some()
+    }
+
+    pub fn verify_basic_header_user(&self, headers: &HeaderMap) -> Option<AuthenticatedUser> {
         let Some(credentials) = &self.inner.basic else {
-            return false;
+            return None;
         };
         let Some(header_value) = headers.get(header::AUTHORIZATION).and_then(header_to_str) else {
-            return false;
+            return None;
         };
         let Some(encoded) = header_value.strip_prefix("Basic ") else {
-            return false;
+            return None;
         };
         let Ok(decoded) = general_purpose::STANDARD.decode(encoded) else {
-            return false;
+            return None;
         };
         let Ok(decoded) = String::from_utf8(decoded) else {
-            return false;
+            return None;
         };
         let Some((username, password)) = decoded.split_once(':') else {
-            return false;
+            return None;
         };
 
-        username == credentials.username && password == credentials.password
+        if username == credentials.username && password == credentials.password {
+            Some(AuthenticatedUser {
+                email: credentials.username.clone(),
+            })
+        } else {
+            None
+        }
     }
 
     pub fn issue_basic_websocket_cookie(&self) -> Option<String> {
