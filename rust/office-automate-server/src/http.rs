@@ -555,10 +555,6 @@ async fn auth_middleware(
     next: Next,
 ) -> Response {
     let auth_mode = state.auth.mode();
-    if should_skip_auth(request.method(), request.uri().path(), auth_mode) {
-        return next.run(request).await;
-    }
-
     let remote_addr = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -569,6 +565,25 @@ async fn auth_middleware(
         request.extensions_mut().insert(AuthenticatedUser {
             email: "edge_ipc".to_string(),
         });
+        return next.run(request).await;
+    }
+
+    match cloudflare_access_service_auth(&state, &headers, remote_addr).await {
+        CloudflareAccessServiceAuth::Authenticated(user) => {
+            request.extensions_mut().insert(user);
+            return next.run(request).await;
+        }
+        CloudflareAccessServiceAuth::Rejected => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Cloudflare mTLS device is not enrolled"})),
+            )
+                .into_response();
+        }
+        CloudflareAccessServiceAuth::AbsentOrUserAccess => {}
+    }
+
+    if should_skip_auth(request.method(), request.uri().path(), auth_mode) {
         return next.run(request).await;
     }
 
@@ -689,6 +704,56 @@ fn forwarded_for_ip(headers: &HeaderMap) -> Option<IpAddr> {
         .trim()
         .parse()
         .ok()
+}
+
+enum CloudflareAccessServiceAuth {
+    Authenticated(AuthenticatedUser),
+    Rejected,
+    AbsentOrUserAccess,
+}
+
+async fn cloudflare_access_service_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    remote_addr: Option<SocketAddr>,
+) -> CloudflareAccessServiceAuth {
+    if !remote_addr.is_some_and(|address| address.ip().is_loopback()) {
+        return CloudflareAccessServiceAuth::AbsentOrUserAccess;
+    }
+
+    let Some(assertion) = headers
+        .get("cf-access-jwt-assertion")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return CloudflareAccessServiceAuth::AbsentOrUserAccess;
+    };
+    let Some(claims) = state
+        .auth
+        .verify_cloudflare_access_assertion(assertion)
+        .await
+    else {
+        return CloudflareAccessServiceAuth::Rejected;
+    };
+    let Some(identity) = claims
+        .common_name
+        .filter(|common_name| !common_name.trim().is_empty())
+    else {
+        return CloudflareAccessServiceAuth::AbsentOrUserAccess;
+    };
+    let device = match db::find_active_device_registration_by_common_name(
+        &state.config.runtime.database_path,
+        &identity,
+    ) {
+        Ok(Some(device)) => device,
+        Ok(None) => return CloudflareAccessServiceAuth::Rejected,
+        Err(error) => {
+            tracing::warn!("failed to validate Cloudflare mTLS device registration: {error:#}");
+            return CloudflareAccessServiceAuth::Rejected;
+        }
+    };
+    CloudflareAccessServiceAuth::Authenticated(AuthenticatedUser {
+        email: format!("cloudflare_mtls:{}", device.device_id),
+    })
 }
 
 async fn status(State(state): State<AppState>) -> Json<Status> {
@@ -5412,6 +5477,14 @@ mod tests {
         assert_eq!(
             response.headers().get(header::CONTENT_DISPOSITION).unwrap(),
             "attachment; filename=office-climate.apk"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/vnd.android.package-archive"
+        );
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
         );
     }
 

@@ -701,9 +701,7 @@ fn validate_loopback_controller_base_url(base_url: &str) -> Result<()> {
         anyhow::bail!("controller.base_url must include a hostname");
     };
     if !is_loopback_bind_host(host) {
-        anyhow::bail!(
-            "public edge controller.base_url must stay on loopback; got host={host:?}"
-        );
+        anyhow::bail!("public edge controller.base_url must stay on loopback; got host={host:?}");
     }
     Ok(())
 }

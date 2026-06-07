@@ -10,9 +10,12 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use base64::{Engine, engine::general_purpose};
 use chrono::{TimeDelta, Utc};
 use ipnet::IpNet;
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
+    jwk::JwkSet,
+};
 use rand::{RngCore, rngs::OsRng};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -99,6 +102,16 @@ struct Claims {
     email: String,
     exp: usize,
     iat: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CloudflareAccessClaims {
+    pub sub: String,
+    pub exp: usize,
+    pub iat: usize,
+    pub iss: String,
+    #[serde(default)]
+    pub common_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -199,6 +212,48 @@ impl AuthManager {
         let token = bearer_token(headers)?;
         self.verify_jwt(token)
             .map(|email| AuthenticatedUser { email })
+    }
+
+    pub async fn verify_cloudflare_access_assertion(
+        &self,
+        token: &str,
+    ) -> Option<CloudflareAccessClaims> {
+        let header = decode_header(token).ok()?;
+        let kid = header.kid.as_deref()?;
+        let untrusted_claims = Self::decode_cloudflare_access_assertion_unverified(token)?;
+        let issuer = cloudflare_access_issuer_url(&untrusted_claims.iss)?;
+        let jwks_url = issuer.join("/cdn-cgi/access/certs").ok()?;
+        let jwks = self
+            .inner
+            .client
+            .get(jwks_url)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json::<JwkSet>()
+            .await
+            .ok()?;
+        let key = DecodingKey::from_jwk(jwks.find(kid)?).ok()?;
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_aud = false;
+        validation.set_issuer(&[issuer.as_str().trim_end_matches('/')]);
+        decode::<CloudflareAccessClaims>(token, &key, &validation)
+            .ok()
+            .map(|decoded| decoded.claims)
+    }
+
+    fn decode_cloudflare_access_assertion_unverified(
+        token: &str,
+    ) -> Option<CloudflareAccessClaims> {
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.insecure_disable_signature_validation();
+        validation.validate_aud = false;
+        validation.validate_exp = false;
+        decode::<CloudflareAccessClaims>(token, &DecodingKey::from_secret(&[]), &validation)
+            .ok()
+            .map(|decoded| decoded.claims)
     }
 
     pub fn verify_basic_header(&self, headers: &HeaderMap) -> bool {
@@ -670,6 +725,19 @@ fn prune_expired_tokens_at(
     tokens.retain(|_, expires_at| *expires_at > now);
 }
 
+fn cloudflare_access_issuer_url(issuer: &str) -> Option<Url> {
+    let url = Url::parse(issuer).ok()?;
+    if url.scheme() != "https" {
+        return None;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    if host == "cloudflareaccess.com" || host.ends_with(".cloudflareaccess.com") {
+        Some(url)
+    } else {
+        None
+    }
+}
+
 fn generate_pkce_pair() -> (String, String) {
     let code_verifier = random_url_token(32);
     let challenge = Sha256::digest(code_verifier.as_bytes());
@@ -784,6 +852,15 @@ mod tests {
         );
 
         assert!(manager.verify_basic_header(&headers));
+    }
+
+    #[test]
+    fn cloudflare_access_issuer_guard_rejects_non_cloudflare_hosts() {
+        assert!(cloudflare_access_issuer_url("https://team.cloudflareaccess.com").is_some());
+        assert!(cloudflare_access_issuer_url("https://rajeshgoli.cloudflareaccess.com").is_some());
+        assert!(cloudflare_access_issuer_url("http://rajeshgoli.cloudflareaccess.com").is_none());
+        assert!(cloudflare_access_issuer_url("https://cloudflareaccess.com.evil.test").is_none());
+        assert!(cloudflare_access_issuer_url("https://example.test").is_none());
     }
 
     #[test]
