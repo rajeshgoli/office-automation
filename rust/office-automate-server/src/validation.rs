@@ -2,9 +2,13 @@ use std::{
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, RwLock},
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose};
@@ -30,7 +34,7 @@ use crate::{
     artifacts::{is_valid_artifact_hash, is_valid_sha256_digest},
     auth::AuthManager,
     config::AppConfig,
-    db, erv, http, hvac,
+    db, edge, erv, http, hvac,
     state::StateMachine,
     yolink::{self, YoLinkCloudClient, YoLinkState},
 };
@@ -99,6 +103,29 @@ pub struct RollbackValidationOptions {
     pub rollback_log: PathBuf,
     pub manual_legacy_public_verified_at: Option<String>,
     pub max_air_quality_age_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SecurityValidationOptions {
+    pub public_url: Option<String>,
+    pub cloudflared_config: Option<PathBuf>,
+    pub cloudflare_evidence: Option<PathBuf>,
+    pub edge_config: Option<PathBuf>,
+    pub server_launchd_plist: Option<PathBuf>,
+    pub edge_launchd_plist: Option<PathBuf>,
+    pub tunnel_launchd_plist: Option<PathBuf>,
+    pub tunnel_user: Option<String>,
+    pub edge_user: Option<String>,
+    pub secret_files: Vec<PathBuf>,
+    pub protected_paths: Vec<PathBuf>,
+    pub tunnel_readable_paths: Vec<PathBuf>,
+    pub tunnel_private_paths: Vec<PathBuf>,
+    pub edge_readable_paths: Vec<PathBuf>,
+    pub edge_private_paths: Vec<PathBuf>,
+    pub tunnel_origin_probes: Vec<String>,
+    pub edge_ipc_probes: Vec<String>,
+    pub denied_lan_probes: Vec<String>,
+    pub lan_control_user: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +293,26 @@ pub async fn run_rollback_validation(
     Ok(report)
 }
 
+pub async fn run_security_validation(
+    config: &AppConfig,
+    options: SecurityValidationOptions,
+) -> Result<ShadowValidationReport> {
+    let mut report = ShadowValidationReport { checks: Vec::new() };
+    let public_url = options
+        .public_url
+        .as_deref()
+        .or(config.runtime.public_url.as_deref());
+
+    validate_http_startup_config(config, public_url, &mut report)?;
+    validate_security_file_permissions(config, &options, &mut report)?;
+    validate_security_edge_config(public_url, &options, &mut report)?;
+    validate_security_cloudflare(public_url, &options, &mut report).await?;
+    validate_security_launchd(public_url, &options, &mut report)?;
+    validate_security_role_boundaries(config, public_url, &options, &mut report)?;
+
+    Ok(report)
+}
+
 fn validate_active_write_gates(
     config: &AppConfig,
     report: &mut ShadowValidationReport,
@@ -296,6 +343,634 @@ fn validate_http_startup_config(
         "HTTP listener startup config is safe for configured public/local exposure",
     );
     Ok(())
+}
+
+fn validate_security_file_permissions(
+    config: &AppConfig,
+    options: &SecurityValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    validate_strict_private_file(&config.runtime.config_path, "controller config")?;
+    report.push_pass(
+        "controller-config-permissions",
+        format!(
+            "{} is owner-only readable/writable",
+            config.runtime.config_path.display()
+        ),
+    );
+
+    for path in [
+        &config.runtime.data_dir,
+        &config.runtime.artifacts_dir,
+        &config.runtime.database_path,
+        &config.runtime.telemetry_db_path,
+        &config.runtime.tool_usage_db_path,
+        &config.runtime.session_tool_usage_db_path,
+        &config.runtime.engram_db_path,
+    ] {
+        validate_not_group_world_writable(path)?;
+    }
+    report.push_pass(
+        "runtime-file-permissions",
+        "data, artifact, SQLite, and telemetry paths are not group/world writable",
+    );
+
+    let mut strict_paths = options.secret_files.clone();
+    if let Some(path) = options.edge_config.as_ref() {
+        strict_paths.push(path.clone());
+    }
+    if let Some(path) = options.cloudflared_config.as_ref() {
+        validate_not_group_world_writable(path)?;
+        if let Some(credentials_file) = cloudflared_credentials_file(path)? {
+            strict_paths.push(credentials_file);
+        }
+    }
+
+    strict_paths.sort();
+    strict_paths.dedup();
+    if strict_paths.is_empty() {
+        report.push_skip(
+            "extra-secret-file-permissions",
+            "no --secret-file, --edge-config, or --cloudflared-config supplied",
+        );
+    } else {
+        for path in &strict_paths {
+            validate_strict_private_file(path, "secret/config file")?;
+        }
+        report.push_pass(
+            "extra-secret-file-permissions",
+            format!(
+                "validated {} owner-only secret/config files",
+                strict_paths.len()
+            ),
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_security_edge_config(
+    public_url: Option<&str>,
+    options: &SecurityValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    match options.edge_config.as_deref() {
+        Some(path) => {
+            let edge_config = edge::PublicEdgeConfig::load(path)?;
+            report.push_pass(
+                "public-edge-config",
+                format!(
+                    "edge config {} binds to {}:{}, uses loopback controller IPC, and has no trusted-network bypass",
+                    path.display(),
+                    edge_config.orchestrator.host,
+                    edge_config.orchestrator.port
+                ),
+            );
+        }
+        None if public_url.is_some() => {
+            bail!("security validation for a public URL requires --edge-config");
+        }
+        None => report.push_skip(
+            "public-edge-config",
+            "no public URL or --edge-config supplied",
+        ),
+    }
+    Ok(())
+}
+
+async fn validate_security_cloudflare(
+    public_url: Option<&str>,
+    options: &SecurityValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let Some(public_url) = public_url else {
+        report.push_skip(
+            "cloudflare-security",
+            "no public URL configured; Cloudflare Access/tunnel probes were not required",
+        );
+        return Ok(());
+    };
+
+    validate_cloudflared_public_config_required(
+        options.cloudflared_config.as_deref(),
+        public_url,
+        report,
+    )?;
+    validate_cloudflare_drift_evidence_required(
+        options.cloudflare_evidence.as_deref(),
+        public_url,
+        report,
+    )?;
+    validate_public_access_blocks_unauthenticated(public_url, report).await?;
+    Ok(())
+}
+
+fn validate_security_launchd(
+    public_url: Option<&str>,
+    options: &SecurityValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if let Some(path) = options.server_launchd_plist.as_deref() {
+        validate_launchd_plist(path, "com.office-automate.server", None)?;
+        report.push_pass(
+            "server-launchd-plist",
+            format!("validated controller launchd plist {}", path.display()),
+        );
+    } else {
+        report.push_skip("server-launchd-plist", "no --server-launchd-plist supplied");
+    }
+
+    match options.edge_launchd_plist.as_deref() {
+        Some(path) => {
+            validate_launchd_plist(
+                path,
+                "com.office-automate.edge",
+                options.edge_user.as_deref(),
+            )?;
+            report.push_pass(
+                "edge-launchd-plist",
+                format!("validated edge launchd plist {}", path.display()),
+            );
+        }
+        None if public_url.is_some() => {
+            bail!("security validation for a public URL requires --edge-launchd-plist");
+        }
+        None => report.push_skip("edge-launchd-plist", "no --edge-launchd-plist supplied"),
+    }
+
+    match options.tunnel_launchd_plist.as_deref() {
+        Some(path) => {
+            validate_launchd_plist(
+                path,
+                "com.office-automate.tunnel",
+                options.tunnel_user.as_deref(),
+            )?;
+            report.push_pass(
+                "tunnel-launchd-plist",
+                format!("validated tunnel launchd plist {}", path.display()),
+            );
+        }
+        None if public_url.is_some() => {
+            bail!("security validation for a public URL requires --tunnel-launchd-plist");
+        }
+        None => report.push_skip("tunnel-launchd-plist", "no --tunnel-launchd-plist supplied"),
+    }
+
+    Ok(())
+}
+
+fn validate_security_role_boundaries(
+    config: &AppConfig,
+    public_url: Option<&str>,
+    options: &SecurityValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let Some(public_url) = public_url else {
+        report.push_skip(
+            "edge-tunnel-boundary-probes",
+            "no public URL configured; edge/tunnel OS boundary probes were not required",
+        );
+        return Ok(());
+    };
+
+    let tunnel_user = options
+        .tunnel_user
+        .as_deref()
+        .context("security validation for a public URL requires --tunnel-user")?;
+    let edge_user = options
+        .edge_user
+        .as_deref()
+        .context("security validation for a public URL requires --edge-user")?;
+    if options.tunnel_origin_probes.is_empty() {
+        bail!("security validation for {public_url} requires at least one --tunnel-origin-probe");
+    }
+    if options.edge_ipc_probes.is_empty() {
+        bail!("security validation for {public_url} requires at least one --edge-ipc-probe");
+    }
+    if options.denied_lan_probes.is_empty() {
+        bail!("security validation for {public_url} requires at least one --denied-lan-probe");
+    }
+
+    let protected_paths = security_protected_paths(config, options);
+    validate_user_read_denied(
+        tunnel_user,
+        &protected_paths,
+        "tunnel-user-read-denial",
+        report,
+    )?;
+    validate_user_read_denied(edge_user, &protected_paths, "edge-user-read-denial", report)?;
+
+    let mut tunnel_readable = options.tunnel_readable_paths.clone();
+    let mut tunnel_private = options.tunnel_private_paths.clone();
+    if let Some(path) = options.cloudflared_config.as_ref() {
+        tunnel_readable.push(path.clone());
+        if let Some(credentials_file) = cloudflared_credentials_file(path)? {
+            tunnel_readable.push(credentials_file.clone());
+            tunnel_private.push(credentials_file);
+        }
+    }
+    validate_user_read_allowed(
+        tunnel_user,
+        &tunnel_readable,
+        "tunnel-user-readable-files",
+        report,
+    )?;
+
+    let mut edge_readable = options.edge_readable_paths.clone();
+    let mut edge_private = options.edge_private_paths.clone();
+    if let Some(path) = options.edge_config.as_ref() {
+        edge_readable.push(path.clone());
+        edge_private.push(path.clone());
+    }
+    validate_user_read_allowed(
+        edge_user,
+        &edge_readable,
+        "edge-user-readable-files",
+        report,
+    )?;
+    validate_user_read_denied(
+        edge_user,
+        &tunnel_private,
+        "edge-user-tunnel-private-denial",
+        report,
+    )?;
+    validate_user_read_denied(
+        tunnel_user,
+        &edge_private,
+        "tunnel-user-edge-private-denial",
+        report,
+    )?;
+
+    validate_user_connect_allowed(
+        tunnel_user,
+        &options.tunnel_origin_probes,
+        "tunnel-origin-connectivity",
+        report,
+    )?;
+    validate_user_connect_allowed(
+        edge_user,
+        &options.edge_ipc_probes,
+        "edge-ipc-connectivity",
+        report,
+    )?;
+    validate_control_connectivity(
+        options.lan_control_user.as_deref(),
+        &options.denied_lan_probes,
+        "lan-control-connectivity",
+        report,
+    )?;
+    validate_user_connect_denied(
+        tunnel_user,
+        &options.denied_lan_probes,
+        "tunnel-user-lan-denial",
+        report,
+    )?;
+    validate_user_connect_denied(
+        edge_user,
+        &options.denied_lan_probes,
+        "edge-user-lan-denial",
+        report,
+    )?;
+
+    Ok(())
+}
+
+fn validate_strict_private_file(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("{label} is missing or unreadable: {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{label} must be a file: {}", path.display());
+    }
+    validate_not_group_world_writable(path)?;
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            bail!(
+                "{label} must be owner-only with no group/world permissions: {} mode={mode:o}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_not_group_world_writable(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to stat security-sensitive path {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o022 != 0 {
+            bail!(
+                "security-sensitive path must not be group/world writable: {} mode={mode:o}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cloudflared_credentials_file(config_path: &Path) -> Result<Option<PathBuf>> {
+    let contents = fs::read_to_string(config_path).with_context(|| {
+        format!(
+            "failed to read cloudflared config {}",
+            config_path.display()
+        )
+    })?;
+    let root: YamlValue = serde_yaml::from_str(&contents).with_context(|| {
+        format!(
+            "failed to parse cloudflared config {}",
+            config_path.display()
+        )
+    })?;
+    let Some(credentials_file) = yaml_mapping_value(&root, "credentials-file")
+        .and_then(YamlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(credentials_file);
+    if path.is_absolute() {
+        Ok(Some(path))
+    } else {
+        Ok(Some(
+            config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(path),
+        ))
+    }
+}
+
+fn validate_launchd_plist(path: &Path, label: &str, expected_user: Option<&str>) -> Result<()> {
+    validate_not_group_world_writable(path)?;
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read launchd plist {}", path.display()))?;
+    if !contents.contains(label) {
+        bail!(
+            "launchd plist {} does not contain label {label}",
+            path.display()
+        );
+    }
+    if let Some(expected_user) = expected_user {
+        if expected_user.trim().is_empty() {
+            bail!("expected launchd user for {label} must not be empty");
+        }
+        if !contents.contains("UserName") || !contents.contains(expected_user) {
+            bail!(
+                "launchd plist {} must run label {label} as UserName={expected_user}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn security_protected_paths(
+    config: &AppConfig,
+    options: &SecurityValidationOptions,
+) -> Vec<PathBuf> {
+    let mut paths = vec![
+        config.runtime.config_path.clone(),
+        config.runtime.data_dir.clone(),
+        config.runtime.database_path.clone(),
+        config.runtime.telemetry_db_path.clone(),
+        config.runtime.tool_usage_db_path.clone(),
+        config.runtime.session_tool_usage_db_path.clone(),
+        config.runtime.engram_db_path.clone(),
+        config.runtime.engram_registry_path.clone(),
+    ];
+    paths.extend(config.telemetry.repos.iter().cloned());
+    paths.extend(config.telemetry.codex_events_db.iter().cloned());
+    paths.extend(config.telemetry.session_manager_sessions.iter().cloned());
+    paths.extend(options.protected_paths.iter().cloned());
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn validate_user_read_allowed(
+    user: &str,
+    paths: &[PathBuf],
+    check_name: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if paths.is_empty() {
+        report.push_skip(check_name, "no readable paths supplied");
+        return Ok(());
+    }
+    ensure_user_probe_runnable(user)?;
+    for path in paths {
+        if path.as_os_str().is_empty() {
+            bail!("{check_name} contains an empty path");
+        }
+        let path_text = path.to_string_lossy();
+        run_as_user(user, &["test", "-r", path_text.as_ref()])?;
+    }
+    report.push_pass(
+        check_name,
+        format!("validated {} paths are readable by {user}", paths.len()),
+    );
+    Ok(())
+}
+
+fn validate_user_read_denied(
+    user: &str,
+    paths: &[PathBuf],
+    check_name: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if paths.is_empty() {
+        report.push_skip(check_name, "no protected paths supplied");
+        return Ok(());
+    }
+    ensure_user_probe_runnable(user)?;
+    let mut checked = 0usize;
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let path_text = path.to_string_lossy();
+        if run_as_user_status(user, &["test", "-r", path_text.as_ref()])? {
+            bail!(
+                "{check_name}: quarantined user {user} can read protected path {}",
+                path.display()
+            );
+        }
+        if run_as_user_status(user, &["test", "-x", path_text.as_ref()])? {
+            bail!(
+                "{check_name}: quarantined user {user} can traverse/execute protected path {}",
+                path.display()
+            );
+        }
+        checked += 1;
+    }
+    if checked == 0 {
+        report.push_skip(
+            check_name,
+            "protected paths were absent on this host; no read-denial probe was run",
+        );
+    } else {
+        report.push_pass(
+            check_name,
+            format!("validated {checked} protected paths are denied to {user}"),
+        );
+    }
+    Ok(())
+}
+
+fn validate_user_connect_allowed(
+    user: &str,
+    endpoints: &[String],
+    check_name: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if endpoints.is_empty() {
+        report.push_skip(check_name, "no allowed connectivity probes supplied");
+        return Ok(());
+    }
+    ensure_user_probe_runnable(user)?;
+    for endpoint in endpoints {
+        run_connect_probe_as(Some(user), endpoint)
+            .with_context(|| format!("{check_name}: {user} could not connect to {endpoint}"))?;
+    }
+    report.push_pass(
+        check_name,
+        format!(
+            "validated {} endpoints are reachable by {user}",
+            endpoints.len()
+        ),
+    );
+    Ok(())
+}
+
+fn validate_control_connectivity(
+    user: Option<&str>,
+    endpoints: &[String],
+    check_name: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if endpoints.is_empty() {
+        report.push_skip(check_name, "no LAN control probes supplied");
+        return Ok(());
+    }
+    if let Some(user) = user {
+        ensure_user_probe_runnable(user)?;
+    }
+    for endpoint in endpoints {
+        run_connect_probe_as(user, endpoint).with_context(|| {
+            format!(
+                "{check_name}: LAN control endpoint {endpoint} was not reachable by {}",
+                user.unwrap_or("current user")
+            )
+        })?;
+    }
+    report.push_pass(
+        check_name,
+        format!(
+            "validated {} LAN endpoints are reachable before denial checks",
+            endpoints.len()
+        ),
+    );
+    Ok(())
+}
+
+fn validate_user_connect_denied(
+    user: &str,
+    endpoints: &[String],
+    check_name: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if endpoints.is_empty() {
+        report.push_skip(check_name, "no denied LAN connectivity probes supplied");
+        return Ok(());
+    }
+    ensure_user_probe_runnable(user)?;
+    for endpoint in endpoints {
+        if run_connect_probe_status_as(Some(user), endpoint)? {
+            bail!("{check_name}: quarantined user {user} can connect to LAN endpoint {endpoint}");
+        }
+    }
+    report.push_pass(
+        check_name,
+        format!(
+            "validated {} LAN endpoints are denied to {user}",
+            endpoints.len()
+        ),
+    );
+    Ok(())
+}
+
+fn ensure_user_probe_runnable(user: &str) -> Result<()> {
+    if user.trim().is_empty() {
+        bail!("probe user must not be empty");
+    }
+    run_as_user(user, &["true"])
+        .with_context(|| format!("cannot run passwordless sudo probes as user {user}"))
+}
+
+fn run_as_user(user: &str, args: &[&str]) -> Result<()> {
+    if run_as_user_status(user, args)? {
+        Ok(())
+    } else {
+        bail!("sudo probe failed for user {user}");
+    }
+}
+
+fn run_as_user_status(user: &str, args: &[&str]) -> Result<bool> {
+    let status = Command::new("sudo")
+        .arg("-n")
+        .arg("-u")
+        .arg(user)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run sudo probe as {user}"))?;
+    Ok(status.success())
+}
+
+fn run_connect_probe_as(user: Option<&str>, endpoint: &str) -> Result<()> {
+    if run_connect_probe_status_as(user, endpoint)? {
+        Ok(())
+    } else {
+        bail!("connectivity probe failed for {endpoint}");
+    }
+}
+
+fn run_connect_probe_status_as(user: Option<&str>, endpoint: &str) -> Result<bool> {
+    let (host, port) = split_host_port(endpoint)?;
+    let mut command = if let Some(user) = user {
+        let mut command = Command::new("sudo");
+        command.arg("-n").arg("-u").arg(user).arg("nc");
+        command
+    } else {
+        Command::new("nc")
+    };
+    let status = command
+        .arg("-G")
+        .arg("2")
+        .arg("-z")
+        .arg(host)
+        .arg(port)
+        .status()
+        .with_context(|| format!("failed to run nc probe for {endpoint}"))?;
+    Ok(status.success())
+}
+
+fn split_host_port(endpoint: &str) -> Result<(&str, &str)> {
+    let (host, port) = endpoint
+        .rsplit_once(':')
+        .with_context(|| format!("endpoint must be HOST:PORT: {endpoint}"))?;
+    if host.trim().is_empty() || port.trim().is_empty() {
+        bail!("endpoint must be HOST:PORT: {endpoint}");
+    }
+    port.parse::<u16>()
+        .with_context(|| format!("endpoint port must be a TCP port number: {endpoint}"))?;
+    Ok((host, port))
 }
 
 fn validate_rollback_active_write_gates(
@@ -2251,6 +2926,8 @@ mod tests {
         },
         db,
     };
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn test_config(database_path: &Path) -> AppConfig {
         let root = database_path
@@ -3082,6 +3759,72 @@ mod tests {
         assert_eq!(
             websocket_url("https://office.example.test/").expect("public ws url"),
             "wss://office.example.test/ws"
+        );
+    }
+
+    #[test]
+    fn security_file_permission_validation_requires_owner_only_secret_files() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let secret_path = temp_dir.path().join("secret.yaml");
+        fs::write(&secret_path, "token: secret").expect("secret file");
+
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600))
+                .expect("set secure mode");
+        }
+        validate_strict_private_file(&secret_path, "test secret").expect("secure secret passes");
+
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o640))
+                .expect("set insecure mode");
+            let error = validate_strict_private_file(&secret_path, "test secret")
+                .expect_err("group-readable secret should fail");
+            assert!(error.to_string().contains("owner-only"));
+        }
+    }
+
+    #[test]
+    fn cloudflared_credentials_file_resolves_relative_to_config() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("cloudflared.yml");
+        fs::write(
+            &config_path,
+            r#"
+tunnel: office
+credentials-file: creds/tunnel.json
+ingress:
+  - hostname: office.example.test
+    service: http://127.0.0.1:19190
+  - service: http_status:404
+"#,
+        )
+        .expect("cloudflared config");
+
+        assert_eq!(
+            cloudflared_credentials_file(&config_path).expect("credentials file"),
+            Some(temp_dir.path().join("creds/tunnel.json"))
+        );
+    }
+
+    #[test]
+    fn split_host_port_rejects_malformed_endpoints() {
+        assert_eq!(
+            split_host_port("127.0.0.1:19190").expect("host port"),
+            ("127.0.0.1", "19190")
+        );
+        assert!(
+            split_host_port("127.0.0.1")
+                .expect_err("missing port should fail")
+                .to_string()
+                .contains("HOST:PORT")
+        );
+        assert!(
+            split_host_port("127.0.0.1:not-a-port")
+                .expect_err("bad port should fail")
+                .to_string()
+                .contains("TCP port")
         );
     }
 
