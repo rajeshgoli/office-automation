@@ -84,7 +84,25 @@ if [[ ! "$log_lines" =~ ^[0-9]+$ ]] || [[ "$log_lines" -lt 1 ]]; then
   exit 2
 fi
 
-if [[ "$allow_unencrypted_local" != true ]]; then
+existing_path_for_volume_check() {
+  local path="$1"
+  while [[ ! -e "$path" ]]; do
+    local parent
+    parent="$(dirname "$path")"
+    if [[ "$parent" == "$path" ]]; then
+      return 1
+    fi
+    path="$parent"
+  done
+  printf '%s\n' "$path"
+}
+
+mount_point_for_path() {
+  local path="$1"
+  df -P "$path" 2>/dev/null | awk 'NR == 2 { for (i = 6; i <= NF; i++) printf "%s%s", (i == 6 ? "" : " "), $i; print "" }'
+}
+
+require_encrypted_evidence_volume() {
   if ! command -v fdesetup >/dev/null 2>&1 || ! fdesetup status 2>/dev/null | grep -q "FileVault is On"; then
     cat >&2 <<'MSG'
 FileVault is not reported as enabled.
@@ -94,6 +112,41 @@ machine you accept as evidence storage.
 MSG
     exit 1
   fi
+  if ! command -v diskutil >/dev/null 2>&1; then
+    cat >&2 <<'MSG'
+diskutil is not available to verify the evidence destination volume.
+Raw incident evidence may contain secrets. Use an encrypted evidence directory
+or re-run with --allow-unencrypted-local only for a local, access-controlled
+machine you accept as evidence storage.
+MSG
+    exit 1
+  fi
+  local probe_path
+  probe_path="$(existing_path_for_volume_check "$output_root")" || {
+    echo "failed to resolve an existing parent for output directory: $output_root" >&2
+    exit 1
+  }
+  local mount_point
+  mount_point="$(mount_point_for_path "$probe_path")"
+  if [[ -z "$mount_point" ]]; then
+    echo "failed to resolve evidence destination mount point for: $output_root" >&2
+    exit 1
+  fi
+  local volume_info
+  volume_info="$(diskutil info "$mount_point" 2>/dev/null || true)"
+  if ! grep -Eq '^[[:space:]]*(FileVault|Encrypted):[[:space:]]*Yes' <<<"$volume_info"; then
+    cat >&2 <<MSG
+Evidence destination volume is not reported as encrypted: $mount_point
+Raw incident evidence may contain secrets. Choose a FileVault/encrypted local
+volume or re-run with --allow-unencrypted-local only for a local,
+access-controlled machine you accept as evidence storage.
+MSG
+    exit 1
+  fi
+}
+
+if [[ "$allow_unencrypted_local" != true ]]; then
+  require_encrypted_evidence_volume
 fi
 
 timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
