@@ -110,6 +110,8 @@ pub struct SecurityValidationOptions {
     pub public_url: Option<String>,
     pub cloudflared_config: Option<PathBuf>,
     pub cloudflare_evidence: Option<PathBuf>,
+    pub cloudflare_access_client_id: Option<String>,
+    pub cloudflare_access_client_secret: Option<String>,
     pub edge_config: Option<PathBuf>,
     pub server_launchd_plist: Option<PathBuf>,
     pub edge_launchd_plist: Option<PathBuf>,
@@ -306,7 +308,7 @@ pub async fn run_security_validation(
     validate_http_startup_config(config, public_url, &mut report)?;
     validate_security_file_permissions(config, &options, &mut report)?;
     validate_security_edge_config(public_url, &options, &mut report)?;
-    validate_security_cloudflare(public_url, &options, &mut report).await?;
+    validate_security_cloudflare(config, public_url, &options, &mut report).await?;
     validate_security_launchd(public_url, &options, &mut report)?;
     validate_security_role_boundaries(config, public_url, &options, &mut report)?;
 
@@ -439,6 +441,7 @@ fn validate_security_edge_config(
 }
 
 async fn validate_security_cloudflare(
+    config: &AppConfig,
     public_url: Option<&str>,
     options: &SecurityValidationOptions,
     report: &mut ShadowValidationReport,
@@ -462,6 +465,44 @@ async fn validate_security_cloudflare(
         report,
     )?;
     validate_public_access_blocks_unauthenticated(public_url, report).await?;
+    validate_security_authenticated_access(config, public_url, options, report).await?;
+    Ok(())
+}
+
+async fn validate_security_authenticated_access(
+    config: &AppConfig,
+    public_url: &str,
+    options: &SecurityValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let access_auth = public_access_probe_auth(
+        options.cloudflare_access_client_id.as_deref(),
+        options.cloudflare_access_client_secret.as_deref(),
+    )?
+    .context(
+        "security validation for a public URL requires Cloudflare Access service-token headers for authenticated public probes",
+    )?;
+    let office_auth = interface_probe_auth(config)?;
+    if !office_auth.supports_public_http_auth() {
+        bail!("security validation requires Office auth that can be probed over the public URL");
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("failed to create security validation HTTP client")?;
+    let public_status = get_public_json(
+        &client,
+        public_url,
+        "/status",
+        Some(&office_auth),
+        Some(&access_auth),
+    )
+    .await?;
+    validate_status_shape(&public_status)?;
+    report.push_pass(
+        "cloudflare-authenticated-access",
+        format!("authenticated /status reached origin through Cloudflare Access and Office auth: {public_url}"),
+    );
     Ok(())
 }
 
@@ -471,7 +512,7 @@ fn validate_security_launchd(
     report: &mut ShadowValidationReport,
 ) -> Result<()> {
     if let Some(path) = options.server_launchd_plist.as_deref() {
-        validate_launchd_plist(path, "com.office-automate.server", None)?;
+        validate_launchd_plist(path, "com.office-automate.server", None, &["serve"])?;
         report.push_pass(
             "server-launchd-plist",
             format!("validated controller launchd plist {}", path.display()),
@@ -486,6 +527,7 @@ fn validate_security_launchd(
                 path,
                 "com.office-automate.edge",
                 options.edge_user.as_deref(),
+                &["serve-edge"],
             )?;
             report.push_pass(
                 "edge-launchd-plist",
@@ -504,6 +546,7 @@ fn validate_security_launchd(
                 path,
                 "com.office-automate.tunnel",
                 options.tunnel_user.as_deref(),
+                &["tunnel", "--no-autoupdate", "--config", "run"],
             )?;
             report.push_pass(
                 "tunnel-launchd-plist",
@@ -707,7 +750,12 @@ fn cloudflared_credentials_file(config_path: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
-fn validate_launchd_plist(path: &Path, label: &str, expected_user: Option<&str>) -> Result<()> {
+fn validate_launchd_plist(
+    path: &Path,
+    label: &str,
+    expected_user: Option<&str>,
+    required_argument_sequence: &[&str],
+) -> Result<()> {
     validate_not_group_world_writable(path)?;
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read launchd plist {}", path.display()))?;
@@ -740,6 +788,21 @@ fn validate_launchd_plist(path: &Path, label: &str, expected_user: Option<&str>)
             );
         }
     }
+    let program_arguments =
+        plist_array_string_values(&contents, "ProgramArguments").with_context(|| {
+            format!(
+                "launchd plist {} is missing string array value for ProgramArguments",
+                path.display()
+            )
+        })?;
+    validate_argument_sequence(&program_arguments, required_argument_sequence).with_context(
+        || {
+            format!(
+                "launchd plist {} ProgramArguments do not match label {label}",
+                path.display()
+            )
+        },
+    )?;
     Ok(())
 }
 
@@ -760,6 +823,50 @@ fn xml_unescape_plist_string(value: &str) -> String {
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&amp;", "&")
+}
+
+fn plist_array_string_values(contents: &str, key: &str) -> Option<Vec<String>> {
+    let key_tag = format!("<key>{key}</key>");
+    let key_start = contents.find(&key_tag)?;
+    let after_key = &contents[key_start + key_tag.len()..];
+    let array_start = after_key.find("<array>")? + "<array>".len();
+    let after_array = &after_key[array_start..];
+    let array_end = after_array.find("</array>")?;
+    let array_contents = &after_array[..array_end];
+    let mut values = Vec::new();
+    let mut rest = array_contents;
+    while let Some(start) = rest.find("<string>") {
+        let after_start = &rest[start + "<string>".len()..];
+        let Some(end) = after_start.find("</string>") else {
+            return None;
+        };
+        values.push(xml_unescape_plist_string(&after_start[..end]));
+        rest = &after_start[end + "</string>".len()..];
+    }
+    Some(values)
+}
+
+fn validate_argument_sequence(
+    program_arguments: &[String],
+    required_sequence: &[&str],
+) -> Result<()> {
+    if required_sequence.is_empty() {
+        return Ok(());
+    }
+    let mut next_required_index = 0usize;
+    for argument in program_arguments {
+        if argument == required_sequence[next_required_index] {
+            next_required_index += 1;
+            if next_required_index == required_sequence.len() {
+                return Ok(());
+            }
+        }
+    }
+    bail!(
+        "ProgramArguments missing required ordered arguments {:?}; found {:?}",
+        required_sequence,
+        program_arguments
+    )
 }
 
 fn security_protected_paths(
@@ -3781,6 +3888,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn security_authenticated_access_requires_access_service_token() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        let mut config = test_config(&db_path);
+        config.orchestrator.google_oauth = Some(GoogleOAuthConfig {
+            client_id: "client".to_string(),
+            client_secret: "secret".to_string(),
+            allowed_emails: vec!["engineer@example.test".to_string()],
+            jwt_secret: Some("stable-test-secret".to_string()),
+            ..GoogleOAuthConfig::default()
+        });
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+
+        let error = validate_security_authenticated_access(
+            &config,
+            "https://office.example.test",
+            &SecurityValidationOptions::default(),
+            &mut report,
+        )
+        .await
+        .expect_err("public security validation should require Access service-token credentials");
+
+        assert!(error.to_string().contains("service-token headers"));
+    }
+
     #[test]
     fn websocket_url_maps_http_schemes_to_ws() {
         assert_eq!(
@@ -3927,9 +4060,39 @@ runtime:
             &plist_path,
             "com.office-automate.edge",
             Some("_office_edge"),
+            &["serve-edge"],
         )
         .expect_err("actual UserName must be compared, not substring-matched");
         assert!(error.to_string().contains("found root"));
+
+        fs::write(
+            &plist_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	  <key>Label</key>
+	  <string>com.office-automate.edge</string>
+	  <key>UserName</key>
+	  <string>_office_edge</string>
+	  <key>ProgramArguments</key>
+	  <array>
+	    <string>/usr/local/bin/office-automate-server</string>
+	    <string>serve</string>
+	  </array>
+	</dict>
+	</plist>
+	"#,
+        )
+        .expect("plist");
+        let error = validate_launchd_plist(
+            &plist_path,
+            "com.office-automate.edge",
+            Some("_office_edge"),
+            &["serve-edge"],
+        )
+        .expect_err("wrong public edge subcommand should fail");
+        assert!(error.to_string().contains("ProgramArguments"));
 
         fs::write(
             &plist_path,
@@ -3941,6 +4104,13 @@ runtime:
   <string>com.office-automate.edge</string>
   <key>UserName</key>
   <string>_office_edge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/office-automate-server</string>
+    <string>serve-edge</string>
+    <string>--config</string>
+    <string>/var/lib/office-automate/edge/config.yaml</string>
+  </array>
 </dict>
 </plist>
 "#,
@@ -3950,8 +4120,9 @@ runtime:
             &plist_path,
             "com.office-automate.edge",
             Some("_office_edge"),
+            &["serve-edge"],
         )
-        .expect("matching UserName passes");
+        .expect("matching UserName and ProgramArguments pass");
     }
 
     #[test]

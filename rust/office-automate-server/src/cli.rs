@@ -275,6 +275,12 @@ pub struct SecurityValidationArgs {
     /// Sanitized Cloudflare API/Terraform/dashboard evidence JSON.
     #[arg(long, env = "OFFICE_AUTOMATE_CLOUDFLARE_EVIDENCE")]
     pub cloudflare_evidence: Option<PathBuf>,
+    /// Cloudflare Access service-token client id for authenticated public validation.
+    #[arg(long, env = "OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_CLIENT_ID")]
+    pub cloudflare_access_client_id: Option<String>,
+    /// Cloudflare Access service-token client secret for authenticated public validation.
+    #[arg(long, env = "OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_CLIENT_SECRET")]
+    pub cloudflare_access_client_secret: Option<String>,
     /// Public edge config file.
     #[arg(long, env = "OFFICE_AUTOMATE_EDGE_CONFIG")]
     pub edge_config: Option<PathBuf>,
@@ -635,6 +641,8 @@ async fn run_validate(config: &AppConfig, target: ValidateTarget) -> Result<()> 
                     public_url: args.public_url,
                     cloudflared_config: args.cloudflared_config,
                     cloudflare_evidence: args.cloudflare_evidence,
+                    cloudflare_access_client_id: args.cloudflare_access_client_id,
+                    cloudflare_access_client_secret: args.cloudflare_access_client_secret,
                     edge_config: args.edge_config,
                     server_launchd_plist: args.server_launchd_plist,
                     edge_launchd_plist: args.edge_launchd_plist,
@@ -1194,6 +1202,10 @@ mod tests {
             "/tmp/cloudflared.yml",
             "--cloudflare-evidence",
             "/tmp/cloudflare-evidence.json",
+            "--cloudflare-access-client-id",
+            "access-client-id",
+            "--cloudflare-access-client-secret",
+            "access-client-secret",
             "--edge-config",
             "/tmp/edge.yaml",
             "--server-launchd-plist",
@@ -1245,6 +1257,14 @@ mod tests {
                         assert_eq!(
                             security.cloudflare_evidence,
                             Some(PathBuf::from("/tmp/cloudflare-evidence.json"))
+                        );
+                        assert_eq!(
+                            security.cloudflare_access_client_id.as_deref(),
+                            Some("access-client-id")
+                        );
+                        assert_eq!(
+                            security.cloudflare_access_client_secret.as_deref(),
+                            Some("access-client-secret")
                         );
                         assert_eq!(security.edge_config, Some(PathBuf::from("/tmp/edge.yaml")));
                         assert_eq!(security.tunnel_user.as_deref(), Some("_office_tunnel"));
