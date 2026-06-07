@@ -6,6 +6,7 @@ import kotlinx.serialization.Serializable
 @Serializable
 data class AppArtifactMetadata(
     @SerialName("artifact_hash") val artifactHash: String? = null,
+    @SerialName("sha256") val sha256: String? = null,
     @SerialName("uploaded_at") val uploadedAt: String? = null,
     @SerialName("size_bytes") val sizeBytes: Long? = null,
     @SerialName("uploaded_by") val uploadedBy: String? = null,

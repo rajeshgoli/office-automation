@@ -35,6 +35,8 @@ struct ArtifactStoreInner {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactMetadata {
     pub artifact_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sha256: String,
     pub uploaded_at: String,
     pub size_bytes: u64,
     pub uploaded_by: String,
@@ -92,9 +94,26 @@ impl ArtifactStore {
         let contents = fs::read_to_string(&meta_path)
             .await
             .with_context(|| format!("failed to read {}", meta_path.display()))?;
-        serde_json::from_str(&contents)
-            .with_context(|| format!("failed to parse {}", meta_path.display()))
-            .map(Some)
+        let mut metadata: ArtifactMetadata = serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", meta_path.display()))?;
+
+        if metadata.sha256.is_empty() && is_valid_artifact_hash(&metadata.artifact_hash) {
+            let artifact_path = self.hashed_path(app, &metadata.artifact_hash);
+            let bytes = fs::read(&artifact_path)
+                .await
+                .with_context(|| format!("failed to read {}", artifact_path.display()))?;
+            let sha256 = format!("{:x}", Sha256::digest(&bytes));
+            if !sha256.starts_with(&metadata.artifact_hash) {
+                anyhow::bail!(
+                    "artifact hash prefix does not match computed sha256 for {}",
+                    artifact_path.display()
+                );
+            }
+            metadata.sha256 = sha256;
+            self.write_metadata(app, &metadata).await?;
+        }
+
+        Ok(Some(metadata))
     }
 
     async fn write_metadata(&self, app: &str, metadata: &ArtifactMetadata) -> Result<()> {
@@ -264,7 +283,8 @@ impl ArtifactStore {
             ));
         }
 
-        let artifact_hash = format!("{:x}", sha256.finalize())[..8].to_string();
+        let sha256 = format!("{:x}", sha256.finalize());
+        let artifact_hash = sha256[..8].to_string();
         let hashed_path = self.hashed_path(app, &artifact_hash);
         if !hashed_path.exists() {
             copy_file_atomically(&temp_path, &hashed_path).await?;
@@ -279,6 +299,7 @@ impl ArtifactStore {
 
         let metadata = ArtifactMetadata {
             artifact_hash,
+            sha256,
             uploaded_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
             size_bytes,
             uploaded_by: user_email.to_string(),
@@ -354,6 +375,13 @@ pub fn is_valid_artifact_hash(artifact_hash: &str) -> bool {
             .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
 }
 
+pub fn is_valid_sha256_digest(sha256: &str) -> bool {
+    sha256.len() == 64
+        && sha256
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+}
+
 async fn copy_file_atomically(
     source_path: &PathBuf,
     destination_path: &PathBuf,
@@ -409,6 +437,70 @@ async fn remove_file_if_exists(path: &PathBuf) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn read_metadata_hydrates_legacy_short_hash_metadata() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = ArtifactStore::new(
+            temp_dir.path().join("apps"),
+            temp_dir.path().join("legacy.apk"),
+        );
+        let app_dir = store.app_dir("office-climate");
+        fs::create_dir_all(&app_dir).await.expect("app dir");
+        fs::write(app_dir.join("dd37c2d7.apk"), b"apk")
+            .await
+            .expect("hashed artifact");
+        fs::write(
+            app_dir.join("meta.json"),
+            r#"{"artifact_hash":"dd37c2d7","uploaded_at":"2026-06-05T00:00:00","size_bytes":3,"uploaded_by":"test@example.com"}"#,
+        )
+        .await
+        .expect("legacy metadata");
+
+        let metadata = store
+            .read_metadata("office-climate")
+            .await
+            .expect("metadata read")
+            .expect("metadata");
+
+        assert_eq!(
+            metadata.sha256,
+            "dd37c2d7274f7ea982cb83390c36918fee9ce8889073c44b68cdc00bdb8c3e04"
+        );
+        let persisted = fs::read_to_string(app_dir.join("meta.json"))
+            .await
+            .expect("persisted metadata");
+        assert!(persisted.contains(
+            r#""sha256":"dd37c2d7274f7ea982cb83390c36918fee9ce8889073c44b68cdc00bdb8c3e04""#
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_metadata_rejects_legacy_hash_prefix_mismatch() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = ArtifactStore::new(
+            temp_dir.path().join("apps"),
+            temp_dir.path().join("legacy.apk"),
+        );
+        let app_dir = store.app_dir("office-climate");
+        fs::create_dir_all(&app_dir).await.expect("app dir");
+        fs::write(app_dir.join("1a2b3c4d.apk"), b"apk")
+            .await
+            .expect("hashed artifact");
+        fs::write(
+            app_dir.join("meta.json"),
+            r#"{"artifact_hash":"1a2b3c4d","uploaded_at":"2026-06-05T00:00:00","size_bytes":3,"uploaded_by":"test@example.com"}"#,
+        )
+        .await
+        .expect("legacy metadata");
+
+        let error = store
+            .read_metadata("office-climate")
+            .await
+            .expect_err("metadata should reject mismatched digest");
+
+        assert!(error.to_string().contains("artifact hash prefix"));
+    }
+
     #[test]
     fn validates_app_names_and_hashes() {
         assert!(is_valid_app_name("office-climate"));
@@ -418,5 +510,12 @@ mod tests {
         assert!(is_valid_artifact_hash("1a2b3c4d"));
         assert!(!is_valid_artifact_hash("1A2B3C4D"));
         assert!(!is_valid_artifact_hash("abcd"));
+        assert!(is_valid_sha256_digest(
+            "dd37c2d7274f7ea982cb83390c36918fee9ce8889073c44b68cdc00bdb8c3e04"
+        ));
+        assert!(!is_valid_sha256_digest("1a2b3c4d"));
+        assert!(!is_valid_sha256_digest(
+            "DD37C2D7274F7EA982CB83390C36918FEE9CE8889073C44B68CDC00BDB8C3E04"
+        ));
     }
 }

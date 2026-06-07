@@ -12,9 +12,10 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local};
 use rusqlite::{Connection, DatabaseName, OpenFlags};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
-    artifacts::{ArtifactMetadata, is_valid_artifact_hash},
+    artifacts::{ArtifactMetadata, is_valid_artifact_hash, is_valid_sha256_digest},
     config::AppConfig,
     db,
 };
@@ -759,7 +760,7 @@ fn validate_artifact_metadata(artifacts_dir: &Path, validations: &mut Vec<String
         }
         let contents = fs::read_to_string(&meta_path)
             .with_context(|| format!("failed to read {}", meta_path.display()))?;
-        let metadata: ArtifactMetadata = serde_json::from_str(&contents)
+        let mut metadata: ArtifactMetadata = serde_json::from_str(&contents)
             .with_context(|| format!("failed to parse {}", meta_path.display()))?;
         if !is_valid_artifact_hash(&metadata.artifact_hash) {
             bail!(
@@ -772,6 +773,41 @@ fn validate_artifact_metadata(artifacts_dir: &Path, validations: &mut Vec<String
         if !hashed_path.is_file() {
             bail!(
                 "artifact metadata references missing APK: {}",
+                hashed_path.display()
+            );
+        }
+        let hashed_bytes = fs::read(&hashed_path)
+            .with_context(|| format!("failed to read {}", hashed_path.display()))?;
+        let actual_sha256 = format!("{:x}", Sha256::digest(&hashed_bytes));
+        if metadata.sha256.is_empty() {
+            if !actual_sha256.starts_with(&metadata.artifact_hash) {
+                bail!(
+                    "artifact hash prefix does not match computed sha256 in {}",
+                    meta_path.display()
+                );
+            }
+            metadata.sha256 = actual_sha256.clone();
+            let updated_metadata =
+                serde_json::to_vec(&metadata).context("failed to serialize hydrated metadata")?;
+            fs::write(&meta_path, updated_metadata)
+                .with_context(|| format!("failed to hydrate {}", meta_path.display()))?;
+        }
+        if !is_valid_sha256_digest(&metadata.sha256) {
+            bail!(
+                "invalid artifact sha256 in {}: {}",
+                meta_path.display(),
+                metadata.sha256
+            );
+        }
+        if !metadata.sha256.starts_with(&metadata.artifact_hash) {
+            bail!(
+                "artifact hash prefix does not match sha256 in {}",
+                meta_path.display()
+            );
+        }
+        if actual_sha256 != metadata.sha256 {
+            bail!(
+                "artifact metadata sha256 does not match APK {}",
                 hashed_path.display()
             );
         }
@@ -927,10 +963,10 @@ mod tests {
         let app_dir = root.join("data/apps/office-climate");
         fs::create_dir_all(&app_dir).expect("app dir");
         fs::write(app_dir.join("latest.apk"), b"apk").expect("latest");
-        fs::write(app_dir.join("1a2b3c4d.apk"), b"apk").expect("hashed");
+        fs::write(app_dir.join("dd37c2d7.apk"), b"apk").expect("hashed");
         fs::write(
             app_dir.join("meta.json"),
-            r#"{"artifact_hash":"1a2b3c4d","uploaded_at":"2026-06-05T00:00:00Z","size_bytes":3,"uploaded_by":"test@example.com"}"#,
+            r#"{"artifact_hash":"dd37c2d7","sha256":"dd37c2d7274f7ea982cb83390c36918fee9ce8889073c44b68cdc00bdb8c3e04","uploaded_at":"2026-06-05T00:00:00Z","size_bytes":3,"uploaded_by":"test@example.com"}"#,
         )
         .expect("metadata");
         fs::write(
@@ -1184,6 +1220,36 @@ mod tests {
                 .expect_err("invalid metadata should fail");
 
         assert!(error.to_string().contains("invalid artifact hash"));
+    }
+
+    #[test]
+    fn snapshot_hydrates_legacy_artifact_metadata_sha256() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let root = temp_dir.path();
+        let config_path = root.join("config.yaml");
+        fs::write(&config_path, "orchestrator:\n  port: 9001\n").expect("config");
+        let database_path = root.join("data/office_climate.db");
+        fs::create_dir_all(database_path.parent().expect("db parent")).expect("data dir");
+        db::migrate_database(&database_path).expect("office db");
+
+        let app_dir = root.join("data/apps/office-climate");
+        fs::create_dir_all(&app_dir).expect("app dir");
+        fs::write(app_dir.join("latest.apk"), b"apk").expect("latest");
+        fs::write(app_dir.join("dd37c2d7.apk"), b"apk").expect("hashed");
+        fs::write(
+            app_dir.join("meta.json"),
+            r#"{"artifact_hash":"dd37c2d7","uploaded_at":"2026-06-05T00:00:00Z","size_bytes":3,"uploaded_by":"test@example.com"}"#,
+        )
+        .expect("legacy metadata");
+
+        let config = test_config(root, config_path.clone(), database_path);
+        create_pre_cutover_snapshot(&config, &config_path, &root.join("snapshots"), None)
+            .expect("snapshot succeeds with legacy metadata");
+
+        let hydrated = fs::read_to_string(app_dir.join("meta.json")).expect("hydrated metadata");
+        assert!(hydrated.contains(
+            r#""sha256":"dd37c2d7274f7ea982cb83390c36918fee9ce8889073c44b68cdc00bdb8c3e04""#
+        ));
     }
 
     #[test]

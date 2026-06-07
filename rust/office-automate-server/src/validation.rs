@@ -27,7 +27,7 @@ use tokio_tungstenite::{
 };
 
 use crate::{
-    artifacts::is_valid_artifact_hash,
+    artifacts::{is_valid_artifact_hash, is_valid_sha256_digest},
     auth::AuthManager,
     config::AppConfig,
     db, erv, http, hvac,
@@ -1611,9 +1611,19 @@ async fn validate_artifact_interface(
             if !is_valid_artifact_hash(hash) {
                 bail!("artifact metadata contains invalid artifact_hash {hash:?}");
             }
+            let sha256 = metadata
+                .get("sha256")
+                .and_then(Value::as_str)
+                .context("artifact metadata missing sha256")?;
+            if !is_valid_sha256_digest(sha256) {
+                bail!("artifact metadata contains invalid sha256 {sha256:?}");
+            }
+            if !sha256.starts_with(hash) {
+                bail!("artifact metadata hash prefix does not match sha256");
+            }
             report.push_pass(
                 "artifact-interface",
-                format!("office-climate metadata exists with artifact_hash={hash}"),
+                format!("office-climate metadata exists with artifact_hash={hash} and full sha256"),
             );
         }
         StatusCode::NOT_FOUND => report.push_skip(
