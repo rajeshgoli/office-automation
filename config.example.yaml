@@ -55,6 +55,10 @@ thresholds:
 orchestrator:
   host: "127.0.0.1"
   port: 8080
+  # Admins can upload Android artifacts through /deploy. OAuth uses email addresses;
+  # Basic auth uses the configured auth_username. Leave empty to disable uploads.
+  admin_emails:
+    - "your_email@example.com"
   # Optional: Enable HTTP Basic Auth for remote access (recommended with Cloudflare Tunnel)
   # auth_username: "admin"
   # auth_password: "your_secure_password"

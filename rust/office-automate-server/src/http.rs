@@ -583,7 +583,9 @@ async fn auth_middleware(
         CloudflareAccessServiceAuth::AbsentOrUserAccess => {}
     }
 
-    if should_skip_auth(request.method(), request.uri().path(), auth_mode) {
+    let route_class = route_authorization_class(request.method(), request.uri().path());
+
+    if should_skip_auth(route_class, auth_mode) {
         return next.run(request).await;
     }
 
@@ -597,7 +599,7 @@ async fn auth_middleware(
     match auth_mode {
         HttpAuthMode::Open => next.run(request).await,
         HttpAuthMode::OAuth => {
-            if state.auth.is_trusted_request(&headers) {
+            if state.auth.is_trusted_request(&headers) && !has_cloudflare_proxy_context(&headers) {
                 request.extensions_mut().insert(AuthenticatedUser {
                     email: "trusted_network".to_string(),
                 });
@@ -622,7 +624,8 @@ async fn auth_middleware(
             next.run(request).await
         }
         HttpAuthMode::Basic => {
-            if state.auth.verify_basic_header(&headers) {
+            if let Some(user) = state.auth.verify_basic_header_user(&headers) {
+                request.extensions_mut().insert(user);
                 let mut response = next.run(request).await;
                 if let Some(cookie) = state.auth.issue_basic_websocket_cookie() {
                     if let Ok(cookie) = cookie.parse() {
@@ -643,25 +646,70 @@ async fn auth_middleware(
     }
 }
 
-fn should_skip_auth(method: &Method, path: &str, auth_mode: HttpAuthMode) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteAuthorizationClass {
+    Preflight,
+    PublicArtifact,
+    PublicStatic,
+    MobileBootstrap,
+    WebSocket,
+    AdminUpload,
+    Authenticated,
+}
+
+fn route_authorization_class(method: &Method, path: &str) -> RouteAuthorizationClass {
     if *method == Method::OPTIONS {
-        return true;
+        return RouteAuthorizationClass::Preflight;
     }
 
     if path == "/apk" || path.starts_with("/apps/") {
-        return true;
+        return RouteAuthorizationClass::PublicArtifact;
     }
 
-    matches!(auth_mode, HttpAuthMode::OAuth)
-        && (path == "/auth/login"
-            || path == "/auth/callback"
-            || path == "/auth/device/start"
-            || path == "/auth/device/poll"
-            || path == "/"
-            || path == "/index.html"
-            || path.starts_with("/assets/")
-            || path.ends_with(".png")
-            || path.ends_with(".json"))
+    if *method == Method::POST && path.starts_with("/deploy/") {
+        return RouteAuthorizationClass::AdminUpload;
+    }
+
+    if path == "/ws" {
+        return RouteAuthorizationClass::WebSocket;
+    }
+
+    if path == "/auth/login"
+        || path == "/auth/callback"
+        || path == "/auth/device/start"
+        || path == "/auth/device/poll"
+    {
+        return RouteAuthorizationClass::MobileBootstrap;
+    }
+
+    if path == "/"
+        || path == "/index.html"
+        || path.starts_with("/assets/")
+        || path.ends_with(".png")
+        || path.ends_with(".json")
+    {
+        return RouteAuthorizationClass::PublicStatic;
+    }
+
+    RouteAuthorizationClass::Authenticated
+}
+
+fn should_skip_auth(route_class: RouteAuthorizationClass, auth_mode: HttpAuthMode) -> bool {
+    matches!(
+        route_class,
+        RouteAuthorizationClass::Preflight | RouteAuthorizationClass::PublicArtifact
+    ) || (matches!(auth_mode, HttpAuthMode::OAuth)
+        && matches!(
+            route_class,
+            RouteAuthorizationClass::MobileBootstrap | RouteAuthorizationClass::PublicStatic
+        ))
+}
+
+fn has_cloudflare_proxy_context(headers: &HeaderMap) -> bool {
+    headers.contains_key("cf-access-jwt-assertion")
+        || headers.contains_key("cf-connecting-ip")
+        || headers.contains_key("cf-ray")
+        || headers.contains_key("cf-visitor")
 }
 
 fn artifact_upload_body_limit() -> usize {
@@ -770,9 +818,18 @@ async fn websocket(
     let mode = if has_valid_controller_ipc_token(&state.config, &auth_headers, Some(remote_addr)) {
         WebSocketAuth::Open
     } else {
-        state.auth.websocket_auth(&auth_headers)
+        websocket_auth_mode(&state, &auth_headers)
     };
     ws.on_upgrade(move |socket| websocket_session(socket, state, mode))
+}
+
+fn websocket_auth_mode(state: &AppState, headers: &HeaderMap) -> WebSocketAuth {
+    let mode = state.auth.websocket_auth(headers);
+    if mode == WebSocketAuth::TrustedNetwork && has_cloudflare_proxy_context(headers) {
+        WebSocketAuth::FirstMessage
+    } else {
+        mode
+    }
 }
 
 fn has_valid_controller_ipc_token(
@@ -2002,9 +2059,21 @@ async fn deploy_app(
     Path(app): Path<String>,
     multipart: Multipart,
 ) -> Response {
-    let user_email = user
-        .map(|Extension(user)| user.email)
-        .unwrap_or_else(|| "unknown".to_string());
+    let Some(Extension(user)) = user else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "Admin authentication required"})),
+        )
+            .into_response();
+    };
+    if !state.auth.is_admin_user(&user.email) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Admin access required"})),
+        )
+            .into_response();
+    }
+    let user_email = user.email;
     match state
         .artifacts
         .store_upload(&app, multipart, &user_email)
@@ -2558,6 +2627,7 @@ mod tests {
     fn oauth_config() -> AppConfig {
         AppConfig {
             orchestrator: OrchestratorConfig {
+                admin_emails: vec!["engineer@rajeshgo.li".to_string()],
                 google_oauth: Some(GoogleOAuthConfig {
                     client_id: "client".to_string(),
                     client_secret: "secret".to_string(),
@@ -3109,6 +3179,54 @@ mod tests {
         assert_eq!(value["login_url"], "/auth/login");
     }
 
+    #[test]
+    fn route_authorization_matrix_classifies_current_route_groups() {
+        assert_eq!(
+            route_authorization_class(&Method::OPTIONS, "/status"),
+            RouteAuthorizationClass::Preflight
+        );
+        assert_eq!(
+            route_authorization_class(&Method::GET, "/apps/office-climate/latest.apk"),
+            RouteAuthorizationClass::PublicArtifact
+        );
+        assert_eq!(
+            route_authorization_class(&Method::GET, "/apk"),
+            RouteAuthorizationClass::PublicArtifact
+        );
+        assert_eq!(
+            route_authorization_class(&Method::GET, "/"),
+            RouteAuthorizationClass::PublicStatic
+        );
+        assert_eq!(
+            route_authorization_class(&Method::GET, "/assets/app.js"),
+            RouteAuthorizationClass::PublicStatic
+        );
+        assert_eq!(
+            route_authorization_class(&Method::GET, "/auth/login"),
+            RouteAuthorizationClass::MobileBootstrap
+        );
+        assert_eq!(
+            route_authorization_class(&Method::POST, "/auth/device/start"),
+            RouteAuthorizationClass::MobileBootstrap
+        );
+        assert_eq!(
+            route_authorization_class(&Method::GET, "/ws"),
+            RouteAuthorizationClass::WebSocket
+        );
+        assert_eq!(
+            route_authorization_class(&Method::POST, "/deploy/office-climate"),
+            RouteAuthorizationClass::AdminUpload
+        );
+        assert_eq!(
+            route_authorization_class(&Method::GET, "/status"),
+            RouteAuthorizationClass::Authenticated
+        );
+        assert_eq!(
+            route_authorization_class(&Method::POST, "/erv"),
+            RouteAuthorizationClass::Authenticated
+        );
+    }
+
     #[tokio::test]
     async fn controller_ipc_token_allows_local_edge_calls() {
         let mut config = oauth_config();
@@ -3142,6 +3260,137 @@ mod tests {
         let response = app(config).oneshot(request).await.expect("response");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn deploy_requires_explicit_admin_identity() {
+        let boundary = "deploy-boundary";
+        let response = app(test_config())
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/deploy/office-climate")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(multipart_body(boundary, b"apk-bytes")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let mut config = oauth_config();
+        config.orchestrator.admin_emails = vec!["admin@rajeshgo.li".to_string()];
+        config
+            .orchestrator
+            .google_oauth
+            .as_mut()
+            .expect("oauth")
+            .allowed_emails = vec![
+            "engineer@rajeshgo.li".to_string(),
+            "admin@rajeshgo.li".to_string(),
+        ];
+        let user_token = AuthManager::new(&config.orchestrator)
+            .expect("auth")
+            .generate_jwt("engineer@rajeshgo.li")
+            .expect("token");
+        let response = app(config.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/deploy/office-climate")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
+                    .body(Body::from(multipart_body(boundary, b"apk-bytes")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app(config.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/deploy/office-climate")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .header("x-forwarded-for", "127.0.0.1")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))))
+                    .body(Body::from(multipart_body(boundary, b"apk-bytes")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let admin_token = AuthManager::new(&config.orchestrator)
+            .expect("auth")
+            .generate_jwt("admin@rajeshgo.li")
+            .expect("token");
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/deploy/office-climate")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                    .body(Body::from(multipart_body(boundary, b"apk-bytes")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn basic_deploy_requires_configured_admin_principal() {
+        let boundary = "deploy-boundary";
+        let mut config = basic_config();
+        let response = app(config.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/deploy/office-climate")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+                    .body(Body::from(multipart_body(boundary, b"apk-bytes")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        config.orchestrator.admin_emails = vec!["user".to_string()];
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/deploy/office-climate")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+                    .body(Body::from(multipart_body(boundary, b"apk-bytes")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -3304,6 +3553,59 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn oauth_cloudflare_loopback_request_cannot_use_trusted_network_bypass() {
+        let response = app(oauth_config())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .header("x-forwarded-for", "127.0.0.1")
+                    .header("cf-connecting-ip", "127.0.0.1")
+                    .header("cf-ray", "test-ray")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn websocket_cloudflare_context_cannot_use_trusted_network_bypass() {
+        let config = oauth_config();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            unix_timestamp_now(),
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let (state, _) = build_app_state(
+            config.clone(),
+            QingpingState::default(),
+            state_machine,
+            yolink,
+            ErvState::new(config.runtime.database_path.clone()),
+            HvacState::new(config.runtime.database_path.clone()),
+            Arc::new(FakeErvWriter::default()),
+            Arc::new(FakeHvacWriter::default()),
+        )
+        .expect("app state");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "127.0.0.1".parse().expect("header"));
+
+        assert_eq!(
+            websocket_auth_mode(&state, &headers),
+            WebSocketAuth::TrustedNetwork
+        );
+
+        headers.insert("cf-connecting-ip", "127.0.0.1".parse().expect("header"));
+        assert_eq!(
+            websocket_auth_mode(&state, &headers),
+            WebSocketAuth::FirstMessage
+        );
     }
 
     #[tokio::test]

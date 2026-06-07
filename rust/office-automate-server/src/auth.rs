@@ -38,6 +38,7 @@ pub struct AuthManager {
 struct AuthInner {
     oauth: Option<OAuthRuntime>,
     basic: Option<BasicCredentials>,
+    admin_emails: HashSet<String>,
     pending_oauth: RwLock<HashMap<String, PendingOAuthState>>,
     device_flows: RwLock<HashMap<String, DeviceFlowState>>,
     invalidated_tokens: RwLock<HashSet<String>>,
@@ -159,6 +160,11 @@ impl AuthManager {
             inner: Arc::new(AuthInner {
                 oauth,
                 basic,
+                admin_emails: config
+                    .admin_emails
+                    .iter()
+                    .map(|email| email.to_ascii_lowercase())
+                    .collect(),
                 pending_oauth: RwLock::new(HashMap::new()),
                 device_flows: RwLock::new(HashMap::new()),
                 invalidated_tokens: RwLock::new(HashSet::new()),
@@ -187,6 +193,12 @@ impl AuthManager {
 
     pub fn basic_enabled(&self) -> bool {
         self.inner.basic.is_some()
+    }
+
+    pub fn is_admin_user(&self, email: &str) -> bool {
+        self.inner
+            .admin_emails
+            .contains(&email.to_ascii_lowercase())
     }
 
     pub fn is_trusted_request(&self, headers: &HeaderMap) -> bool {
@@ -257,26 +269,36 @@ impl AuthManager {
     }
 
     pub fn verify_basic_header(&self, headers: &HeaderMap) -> bool {
+        self.verify_basic_header_user(headers).is_some()
+    }
+
+    pub fn verify_basic_header_user(&self, headers: &HeaderMap) -> Option<AuthenticatedUser> {
         let Some(credentials) = &self.inner.basic else {
-            return false;
+            return None;
         };
         let Some(header_value) = headers.get(header::AUTHORIZATION).and_then(header_to_str) else {
-            return false;
+            return None;
         };
         let Some(encoded) = header_value.strip_prefix("Basic ") else {
-            return false;
+            return None;
         };
         let Ok(decoded) = general_purpose::STANDARD.decode(encoded) else {
-            return false;
+            return None;
         };
         let Ok(decoded) = String::from_utf8(decoded) else {
-            return false;
+            return None;
         };
         let Some((username, password)) = decoded.split_once(':') else {
-            return false;
+            return None;
         };
 
-        username == credentials.username && password == credentials.password
+        if username == credentials.username && password == credentials.password {
+            Some(AuthenticatedUser {
+                email: credentials.username.clone(),
+            })
+        } else {
+            None
+        }
     }
 
     pub fn issue_basic_websocket_cookie(&self) -> Option<String> {
