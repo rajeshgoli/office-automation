@@ -175,26 +175,7 @@ async fn complete_device_pairing(
     let csr_public_key_pem = match extract_public_key_from_csr_with_openssl(&payload.csr_pem) {
         Ok(public_key_pem) => public_key_pem,
         Err(error) => {
-            let exhausted = record_pairing_failure(
-                &state,
-                pairing_code,
-                Some(&remote_addr),
-                "pairing_csr_rejected",
-                &error.to_string(),
-            );
-            return (
-                if exhausted {
-                    StatusCode::TOO_MANY_REQUESTS
-                } else {
-                    StatusCode::BAD_REQUEST
-                },
-                Json(serde_json::json!({"error": if exhausted {
-                    "Too many invalid pairing attempts"
-                } else {
-                    "Invalid device CSR"
-                }})),
-            )
-                .into_response();
+            return invalid_csr_response(&state, pairing_code, Some(&remote_addr), &error);
         }
     };
     let certificate_pem = match sign_csr_with_openssl(
@@ -205,11 +186,7 @@ async fn complete_device_pairing(
     ) {
         Ok(pem) => pem,
         Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": error.to_string()})),
-            )
-                .into_response();
+            return invalid_csr_response(&state, pairing_code, Some(&remote_addr), &error);
         }
     };
 
@@ -268,6 +245,34 @@ fn record_pairing_failure(
     )
     .map(|failure| failure.map(|failure| failure.exhausted).unwrap_or(false))
     .unwrap_or(false)
+}
+
+fn invalid_csr_response(
+    state: &PairingState,
+    pairing_code: &str,
+    remote_addr: Option<&str>,
+    error: &anyhow::Error,
+) -> Response {
+    let exhausted = record_pairing_failure(
+        state,
+        pairing_code,
+        remote_addr,
+        "pairing_csr_rejected",
+        &error.to_string(),
+    );
+    (
+        if exhausted {
+            StatusCode::TOO_MANY_REQUESTS
+        } else {
+            StatusCode::BAD_REQUEST
+        },
+        Json(serde_json::json!({"error": if exhausted {
+            "Too many invalid pairing attempts"
+        } else {
+            "Invalid device CSR"
+        }})),
+    )
+        .into_response()
 }
 
 fn extract_public_key_from_csr_with_openssl(csr_pem: &str) -> Result<String> {
