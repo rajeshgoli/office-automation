@@ -416,11 +416,11 @@ fn validate_security_edge_config(
 ) -> Result<()> {
     match options.edge_config.as_deref() {
         Some(path) => {
-            let edge_config = edge::PublicEdgeConfig::load(path)?;
+            let edge_config = edge::PublicEdgeConfig::load_with_env(path, |_| None)?;
             report.push_pass(
                 "public-edge-config",
                 format!(
-                    "edge config {} binds to {}:{}, uses loopback controller IPC, and has no trusted-network bypass",
+                    "raw edge config {} binds to {}:{}, uses loopback controller IPC, and has no trusted-network bypass",
                     path.display(),
                     edge_config.orchestrator.host,
                     edge_config.orchestrator.port
@@ -711,9 +711,15 @@ fn validate_launchd_plist(path: &Path, label: &str, expected_user: Option<&str>)
     validate_not_group_world_writable(path)?;
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read launchd plist {}", path.display()))?;
-    if !contents.contains(label) {
+    let actual_label = plist_string_value(&contents, "Label").with_context(|| {
+        format!(
+            "launchd plist {} is missing string value for Label",
+            path.display()
+        )
+    })?;
+    if actual_label != label {
         bail!(
-            "launchd plist {} does not contain label {label}",
+            "launchd plist {} has Label={actual_label}, expected {label}",
             path.display()
         );
     }
@@ -721,14 +727,39 @@ fn validate_launchd_plist(path: &Path, label: &str, expected_user: Option<&str>)
         if expected_user.trim().is_empty() {
             bail!("expected launchd user for {label} must not be empty");
         }
-        if !contents.contains("UserName") || !contents.contains(expected_user) {
+        let actual_user = plist_string_value(&contents, "UserName").with_context(|| {
+            format!(
+                "launchd plist {} is missing string value for UserName",
+                path.display()
+            )
+        })?;
+        if actual_user != expected_user {
             bail!(
-                "launchd plist {} must run label {label} as UserName={expected_user}",
+                "launchd plist {} must run label {label} as UserName={expected_user}, found {actual_user}",
                 path.display()
             );
         }
     }
     Ok(())
+}
+
+fn plist_string_value(contents: &str, key: &str) -> Option<String> {
+    let key_tag = format!("<key>{key}</key>");
+    let key_start = contents.find(&key_tag)?;
+    let after_key = &contents[key_start + key_tag.len()..];
+    let string_start = after_key.find("<string>")? + "<string>".len();
+    let after_string = &after_key[string_start..];
+    let string_end = after_string.find("</string>")?;
+    Some(xml_unescape_plist_string(&after_string[..string_end]))
+}
+
+fn xml_unescape_plist_string(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 fn security_protected_paths(
@@ -3826,6 +3857,101 @@ ingress:
                 .to_string()
                 .contains("TCP port")
         );
+    }
+
+    #[test]
+    fn security_edge_config_validation_ignores_env_style_overrides() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("edge.yaml");
+        fs::write(
+            &config_path,
+            r#"
+orchestrator:
+  host: "0.0.0.0"
+  google_oauth: {}
+controller:
+  base_url: "http://127.0.0.1:9001"
+  token: "controller-token"
+runtime:
+  frontend_dist: "/tmp/frontend"
+"#,
+        )
+        .expect("edge config");
+
+        edge::PublicEdgeConfig::load_with_env(&config_path, |key| match key {
+            "OFFICE_AUTOMATE_EDGE_HOST" => Some("127.0.0.1".to_string()),
+            _ => None,
+        })
+        .expect("ambient override would make this config pass");
+
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+        let error = validate_security_edge_config(
+            Some("https://office.example.test"),
+            &SecurityValidationOptions {
+                edge_config: Some(config_path),
+                ..SecurityValidationOptions::default()
+            },
+            &mut report,
+        )
+        .expect_err("security validation must reject the raw non-loopback edge config");
+
+        assert!(error.to_string().contains("must bind HTTP to loopback"));
+    }
+
+    #[test]
+    fn launchd_plist_validation_reads_actual_username_key() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let plist_path = temp_dir.path().join("com.office-automate.edge.plist");
+        fs::write(
+            &plist_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.office-automate.edge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/office-automate-server</string>
+    <string>--note=_office_edge</string>
+  </array>
+  <key>UserName</key>
+  <string>root</string>
+</dict>
+</plist>
+"#,
+        )
+        .expect("plist");
+
+        let error = validate_launchd_plist(
+            &plist_path,
+            "com.office-automate.edge",
+            Some("_office_edge"),
+        )
+        .expect_err("actual UserName must be compared, not substring-matched");
+        assert!(error.to_string().contains("found root"));
+
+        fs::write(
+            &plist_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.office-automate.edge</string>
+  <key>UserName</key>
+  <string>_office_edge</string>
+</dict>
+</plist>
+"#,
+        )
+        .expect("plist");
+        validate_launchd_plist(
+            &plist_path,
+            "com.office-automate.edge",
+            Some("_office_edge"),
+        )
+        .expect("matching UserName passes");
     }
 
     #[test]
