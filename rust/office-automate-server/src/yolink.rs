@@ -21,6 +21,13 @@ use crate::{
     status::Status,
 };
 
+const MAX_YOLINK_MQTT_PAYLOAD_BYTES: usize = 8 * 1024;
+const MAX_YOLINK_ID_BYTES: usize = 128;
+const MAX_YOLINK_NAME_BYTES: usize = 128;
+const MAX_YOLINK_TOKEN_BYTES: usize = 512;
+const MAX_YOLINK_DETAIL_STRING_BYTES: usize = 128;
+const MAX_YOLINK_DETAIL_FIELDS: usize = 16;
+
 pub type DeviceIngressHook = Arc<dyn Fn(Option<StateTransition>) + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +137,23 @@ enum DeviceRole {
     Motion,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ValidatedYoLinkEvent {
+    role: DeviceRole,
+    device_name: String,
+    details: Value,
+    state: ValidatedYoLinkState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidatedYoLinkState {
+    Open,
+    Closed,
+    Error,
+    Alert,
+    Normal,
+}
+
 impl YoLinkState {
     pub fn new(state_machine: Arc<RwLock<StateMachine>>, database_path: PathBuf) -> Self {
         Self {
@@ -202,39 +226,48 @@ impl YoLinkState {
         event_data: Value,
         now: f64,
     ) -> Result<Option<YoLinkAppliedEvent>> {
-        let Some((role, device_name)) = self.record_device_event(device_id, &event_data) else {
+        let Some(validated) = self.validate_event(device_id, &event_data)? else {
             return Ok(None);
         };
+        self.record_device_event(device_id, &validated.details);
 
-        let Some(state_value) = event_data.get("state").and_then(Value::as_str) else {
-            return Ok(None);
-        };
-
-        let (device_type, event, transition) = match role {
-            DeviceRole::Door => {
-                let is_open = state_value == "open";
-                let transition = self
-                    .state_machine
-                    .write()
-                    .expect("state machine lock poisoned")
-                    .update_door(is_open, now);
-                ("door", if is_open { "open" } else { "closed" }, transition)
-            }
-            DeviceRole::Window => {
-                let is_open = state_value == "open";
-                let transition = self
-                    .state_machine
-                    .write()
-                    .expect("state machine lock poisoned")
-                    .update_window(is_open, now);
-                (
-                    "window",
-                    if is_open { "open" } else { "closed" },
-                    transition,
-                )
-            }
+        let (device_type, event, transition) = match validated.role {
+            DeviceRole::Door => match validated.state {
+                ValidatedYoLinkState::Open | ValidatedYoLinkState::Closed => {
+                    let is_open = validated.state == ValidatedYoLinkState::Open;
+                    let transition = self
+                        .state_machine
+                        .write()
+                        .expect("state machine lock poisoned")
+                        .update_door(is_open, now);
+                    ("door", if is_open { "open" } else { "closed" }, transition)
+                }
+                ValidatedYoLinkState::Error => ("door", "error", None),
+                ValidatedYoLinkState::Alert | ValidatedYoLinkState::Normal => {
+                    unreachable!("validated door state cannot be motion-only")
+                }
+            },
+            DeviceRole::Window => match validated.state {
+                ValidatedYoLinkState::Open | ValidatedYoLinkState::Closed => {
+                    let is_open = validated.state == ValidatedYoLinkState::Open;
+                    let transition = self
+                        .state_machine
+                        .write()
+                        .expect("state machine lock poisoned")
+                        .update_window(is_open, now);
+                    (
+                        "window",
+                        if is_open { "open" } else { "closed" },
+                        transition,
+                    )
+                }
+                ValidatedYoLinkState::Error => ("window", "error", None),
+                ValidatedYoLinkState::Alert | ValidatedYoLinkState::Normal => {
+                    unreachable!("validated window state cannot be motion-only")
+                }
+            },
             DeviceRole::Motion => {
-                let detected = state_value == "alert";
+                let detected = validated.state == ValidatedYoLinkState::Alert;
                 let transition = self
                     .state_machine
                     .write()
@@ -252,8 +285,8 @@ impl YoLinkState {
             &self.database_path,
             device_type,
             event,
-            Some(&device_name),
-            Some(&event_data),
+            Some(&validated.device_name),
+            Some(&validated.details),
         ) {
             tracing::warn!(
                 "failed to persist YoLink {device_type} event after state update: {error:#}"
@@ -264,17 +297,17 @@ impl YoLinkState {
         Ok(Some(YoLinkAppliedEvent {
             device_type: device_type.to_string(),
             event: event.to_string(),
-            device_name,
+            device_name: validated.device_name,
             transition,
         }))
     }
 
-    fn record_device_event(
+    fn validate_event(
         &self,
         device_id: &str,
         event_data: &Value,
-    ) -> Option<(DeviceRole, String)> {
-        let mut inner = self.inner.write().expect("yolink state lock poisoned");
+    ) -> Result<Option<ValidatedYoLinkEvent>> {
+        let inner = self.inner.read().expect("yolink state lock poisoned");
         let role = if inner.door_device_id.as_deref() == Some(device_id) {
             DeviceRole::Door
         } else if inner.window_device_id.as_deref() == Some(device_id) {
@@ -282,21 +315,36 @@ impl YoLinkState {
         } else if inner.motion_device_id.as_deref() == Some(device_id) {
             DeviceRole::Motion
         } else {
-            return None;
+            return Ok(None);
         };
-        let device = inner.devices.get_mut(device_id)?;
-        device.merge_state(event_data);
-        Some((role, device.name.clone()))
+        let Some(device) = inner.devices.get(device_id) else {
+            return Ok(None);
+        };
+        let state = validate_yolink_state(role, event_data)?;
+        let details = sanitize_yolink_event_details(event_data)?;
+        Ok(Some(ValidatedYoLinkEvent {
+            role,
+            device_name: device.name.clone(),
+            details,
+            state,
+        }))
+    }
+
+    fn record_device_event(&self, device_id: &str, event_data: &Value) {
+        let mut inner = self.inner.write().expect("yolink state lock poisoned");
+        if let Some(device) = inner.devices.get_mut(device_id) {
+            device.merge_state(event_data);
+        }
     }
 
     pub fn restore_from_database(&self, now: f64) -> Result<()> {
-        if let Some(state) = db::get_latest_device_state(&self.database_path, "door")? {
+        if let Some(state) = db::get_latest_contact_device_state(&self.database_path, "door")? {
             self.state_machine
                 .write()
                 .expect("state machine lock poisoned")
                 .update_door(state == "open", now);
         }
-        if let Some(state) = db::get_latest_device_state(&self.database_path, "window")? {
+        if let Some(state) = db::get_latest_contact_device_state(&self.database_path, "window")? {
             self.state_machine
                 .write()
                 .expect("state machine lock poisoned")
@@ -469,24 +517,30 @@ pub fn parse_devices(value: &Value) -> Result<Vec<YoLinkDevice>> {
     devices
         .iter()
         .map(|device| {
-            let device_id = device
-                .get("deviceId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("YoLink device missing deviceId"))?;
+            let device_id = bounded_yolink_text(
+                device
+                    .get("deviceId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("YoLink device missing deviceId"))?,
+                "deviceId",
+                MAX_YOLINK_ID_BYTES,
+            )?;
             let device_type =
                 DeviceType::from_api(device.get("type").and_then(Value::as_str).unwrap_or(""));
+            let name = device
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(device_id);
+            let name = bounded_yolink_text(name, "name", MAX_YOLINK_NAME_BYTES)?;
+            let token = device
+                .get("token")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let token = bounded_yolink_optional_text(token, "token", MAX_YOLINK_TOKEN_BYTES)?;
             Ok(YoLinkDevice {
                 device_id: device_id.to_string(),
-                name: device
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or(device_id)
-                    .to_string(),
-                token: device
-                    .get("token")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                name: name.to_string(),
+                token: token.to_string(),
                 device_type,
                 state: serde_json::Map::new(),
             })
@@ -494,10 +548,17 @@ pub fn parse_devices(value: &Value) -> Result<Vec<YoLinkDevice>> {
         .collect()
 }
 
-pub fn parse_mqtt_report_payload(payload: &[u8]) -> serde_json::Result<Option<YoLinkReport>> {
-    let value: Value = serde_json::from_slice(payload)?;
+pub fn parse_mqtt_report_payload(payload: &[u8]) -> Result<Option<YoLinkReport>> {
+    if payload.len() > MAX_YOLINK_MQTT_PAYLOAD_BYTES {
+        bail!(
+            "YoLink MQTT payload exceeds {} byte limit",
+            MAX_YOLINK_MQTT_PAYLOAD_BYTES
+        );
+    }
+    let value: Value = serde_json::from_slice(payload).context("failed to parse YoLink JSON")?;
     let data = value.get("data").cloned().unwrap_or_else(|| json!({}));
     if let Some(device_id) = value.get("deviceId").and_then(Value::as_str) {
+        let device_id = bounded_yolink_text(device_id, "deviceId", MAX_YOLINK_ID_BYTES)?;
         return Ok(Some(YoLinkReport {
             device_id: device_id.to_string(),
             data,
@@ -507,6 +568,7 @@ pub fn parse_mqtt_report_payload(payload: &[u8]) -> serde_json::Result<Option<Yo
     let Some(device_id) = data.get("deviceId").and_then(Value::as_str) else {
         return Ok(None);
     };
+    let device_id = bounded_yolink_text(device_id, "data.deviceId", MAX_YOLINK_ID_BYTES)?;
     Ok(Some(YoLinkReport {
         device_id: device_id.to_string(),
         data: normalize_report_data(data),
@@ -521,6 +583,75 @@ fn normalize_report_data(data: Value) -> Value {
         return data;
     }
     state.clone()
+}
+
+fn bounded_yolink_text<'a>(value: &'a str, field: &str, max_bytes: usize) -> Result<&'a str> {
+    if value.trim().is_empty() {
+        bail!("YoLink {field} must not be empty");
+    }
+    if value.len() > max_bytes {
+        bail!("YoLink {field} exceeds {max_bytes} byte limit");
+    }
+    Ok(value)
+}
+
+fn bounded_yolink_optional_text<'a>(
+    value: &'a str,
+    field: &str,
+    max_bytes: usize,
+) -> Result<&'a str> {
+    if value.len() > max_bytes {
+        bail!("YoLink {field} exceeds {max_bytes} byte limit");
+    }
+    Ok(value)
+}
+
+fn validate_yolink_state(role: DeviceRole, event_data: &Value) -> Result<ValidatedYoLinkState> {
+    let Some(state) = event_data.get("state").and_then(Value::as_str) else {
+        bail!("YoLink report missing scalar state");
+    };
+    match (role, state) {
+        (DeviceRole::Door | DeviceRole::Window, "open") => Ok(ValidatedYoLinkState::Open),
+        (DeviceRole::Door | DeviceRole::Window, "closed") => Ok(ValidatedYoLinkState::Closed),
+        (DeviceRole::Door | DeviceRole::Window, "error") => Ok(ValidatedYoLinkState::Error),
+        (DeviceRole::Motion, "alert") => Ok(ValidatedYoLinkState::Alert),
+        (DeviceRole::Motion, "normal") => Ok(ValidatedYoLinkState::Normal),
+        (DeviceRole::Door | DeviceRole::Window, other) => {
+            bail!("YoLink door/window report has invalid state {other:?}")
+        }
+        (DeviceRole::Motion, other) => bail!("YoLink motion report has invalid state {other:?}"),
+    }
+}
+
+fn sanitize_yolink_event_details(event_data: &Value) -> Result<Value> {
+    let Some(object) = event_data.as_object() else {
+        bail!("YoLink report data must be an object");
+    };
+
+    let mut sanitized = serde_json::Map::new();
+    for (key, value) in object.iter().take(MAX_YOLINK_DETAIL_FIELDS) {
+        if key.len() > MAX_YOLINK_DETAIL_STRING_BYTES {
+            continue;
+        }
+        let Some(value) = sanitize_yolink_detail_value(value) else {
+            continue;
+        };
+        sanitized.insert(key.clone(), value);
+    }
+
+    if !sanitized.contains_key("state") {
+        bail!("YoLink sanitized report missing state");
+    }
+
+    Ok(Value::Object(sanitized))
+}
+
+fn sanitize_yolink_detail_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => Some(value.clone()),
+        Value::String(text) if text.len() <= MAX_YOLINK_DETAIL_STRING_BYTES => Some(value.clone()),
+        Value::String(_) | Value::Array(_) | Value::Object(_) => None,
+    }
 }
 
 pub fn reconnect_delay(config: &YoLinkConfig) -> Duration {
@@ -1037,6 +1168,128 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unbounded_yolink_cloud_and_mqtt_inputs() {
+        let oversized_payload = vec![b' '; MAX_YOLINK_MQTT_PAYLOAD_BYTES + 1];
+        assert!(
+            parse_mqtt_report_payload(&oversized_payload)
+                .expect_err("oversized payload rejected")
+                .to_string()
+                .contains("payload exceeds")
+        );
+
+        let oversized_device_id = "d".repeat(MAX_YOLINK_ID_BYTES + 1);
+        assert!(
+            parse_devices(&json!({
+                "data": {
+                    "devices": [
+                        {"deviceId": oversized_device_id, "name": "Office Door", "token": "door-token", "type": "DoorSensor"}
+                    ]
+                }
+            }))
+            .expect_err("oversized inventory id rejected")
+            .to_string()
+            .contains("deviceId")
+        );
+    }
+
+    #[test]
+    fn rejects_role_invalid_yolink_state_without_mutating_or_logging() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+        let yolink = test_state(db_path.clone());
+        yolink.apply_devices(sample_devices());
+
+        let error = yolink
+            .apply_event("door-1", json!({"state": "alert"}), 1_010.0)
+            .expect_err("door cannot accept motion state");
+
+        assert!(error.to_string().contains("invalid state"));
+        let machine = yolink
+            .state_machine
+            .read()
+            .expect("state machine lock poisoned");
+        assert!(!machine.sensors.door_open);
+        drop(machine);
+        let history = db::read_history(&db_path, 24, 10).expect("history");
+        assert!(history.device_events.is_empty());
+    }
+
+    #[test]
+    fn logs_documented_door_error_without_state_machine_transition() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+        let yolink = test_state(db_path.clone());
+        yolink.apply_devices(sample_devices());
+
+        let applied = yolink
+            .apply_event("door-1", json!({"state": "error", "battery": 4}), 1_010.0)
+            .expect("door error report")
+            .expect("applied");
+
+        assert_eq!(applied.device_type, "door");
+        assert_eq!(applied.event, "error");
+        assert!(applied.transition.is_none());
+
+        let machine = yolink
+            .state_machine
+            .read()
+            .expect("state machine lock poisoned");
+        assert!(!machine.sensors.door_open);
+        drop(machine);
+
+        let device = yolink.device("door-1").expect("door device");
+        assert_eq!(device.state["state"], "error");
+        assert_eq!(device.state["battery"], 4);
+
+        let history = db::read_history(&db_path, 24, 10).expect("history");
+        assert_eq!(history.device_events.len(), 1);
+        assert_eq!(history.device_events[0]["device_type"], "door");
+        assert_eq!(history.device_events[0]["event"], "error");
+        let details = history.device_events[0]["details"]
+            .as_str()
+            .expect("details string");
+        let details: Value = serde_json::from_str(details).expect("details json");
+        assert_eq!(details["state"], "error");
+    }
+
+    #[test]
+    fn logs_only_sanitized_scalar_yolink_event_details() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+        let yolink = test_state(db_path.clone());
+        yolink.apply_devices(sample_devices());
+        let oversized_text = "x".repeat(MAX_YOLINK_DETAIL_STRING_BYTES + 1);
+
+        yolink
+            .apply_event(
+                "door-1",
+                json!({
+                    "state": "open",
+                    "battery": 4,
+                    "nested": {"unexpected": true},
+                    "oversized": oversized_text,
+                }),
+                1_010.0,
+            )
+            .expect("door event")
+            .expect("applied");
+
+        let history = db::read_history(&db_path, 24, 10).expect("history");
+        assert_eq!(history.device_events.len(), 1);
+        let details = history.device_events[0]["details"]
+            .as_str()
+            .expect("details string");
+        let details: Value = serde_json::from_str(details).expect("details json");
+        assert_eq!(details["state"], "open");
+        assert_eq!(details["battery"], 4);
+        assert!(details.get("nested").is_none());
+        assert!(details.get("oversized").is_none());
+    }
+
+    #[test]
     fn applies_door_window_and_motion_events_to_state_machine_and_database() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("office_climate.db");
@@ -1276,8 +1529,12 @@ mod tests {
         migrate_database(&db_path).expect("migration");
         db::log_device_event(&db_path, "door", "open", Some("Office Door"), None)
             .expect("log door");
+        db::log_device_event(&db_path, "door", "error", Some("Office Door"), None)
+            .expect("log door error");
         db::log_device_event(&db_path, "window", "closed", Some("Office Window"), None)
             .expect("log window");
+        db::log_device_event(&db_path, "window", "error", Some("Office Window"), None)
+            .expect("log window error");
         db::log_device_event(&db_path, "motion", "detected", Some("Office Motion"), None)
             .expect("log motion");
 
