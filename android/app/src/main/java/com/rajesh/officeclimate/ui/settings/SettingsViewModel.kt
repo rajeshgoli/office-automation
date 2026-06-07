@@ -74,6 +74,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         _uiState.value = state.copy(enrolling = true, error = null, enrollmentStatus = null)
         viewModelScope.launch {
             try {
+                settingsRepo.saveServerUrl(state.serverUrl)
                 val result = deviceEnrollmentRepository.enrollDevice(
                     pairingUrl = state.pairingUrl,
                     pairingCode = state.pairingCode,
