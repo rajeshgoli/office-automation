@@ -9,6 +9,8 @@ use serde_json::{Value, json};
 
 use crate::status::Status;
 
+pub(crate) const MAX_QINGPING_PAYLOAD_BYTES: usize = 8 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QingpingReading {
     pub device_name: String,
@@ -108,7 +110,14 @@ pub fn qingping_interval_payload(interval_seconds: i64) -> Value {
 pub fn parse_qingping_payload(
     payload: &[u8],
     configured_mac: &str,
-) -> Result<Option<QingpingReading>, serde_json::Error> {
+) -> anyhow::Result<Option<QingpingReading>> {
+    if payload.len() > MAX_QINGPING_PAYLOAD_BYTES {
+        anyhow::bail!(
+            "Qingping payload exceeds {} byte limit",
+            MAX_QINGPING_PAYLOAD_BYTES
+        );
+    }
+
     let value: Value = serde_json::from_slice(payload)?;
     let Some(sensor_data) = sensor_data(&value) else {
         return Ok(None);
@@ -128,10 +137,14 @@ pub fn parse_qingping_payload(
         .and_then(Value::as_str)
         .map(normalize_device_mac)
         .filter(|mac| !mac.is_empty())
-        .unwrap_or(configured_mac);
+        .unwrap_or_else(|| configured_mac.clone());
+    if mac_hint != configured_mac {
+        anyhow::bail!(
+            "Qingping payload MAC {mac_hint} does not match configured MAC {configured_mac}"
+        );
+    }
     let tvoc = nested_i64(sensor_data, "tvoc_index").or_else(|| nested_i64(sensor_data, "tvoc"));
-
-    Ok(Some(QingpingReading {
+    let reading = QingpingReading {
         device_name: "Qingping Air Monitor".to_string(),
         mac_hint,
         temp_c: nested_f64(sensor_data, "temperature"),
@@ -143,7 +156,10 @@ pub fn parse_qingping_payload(
         noise_db: nested_i64(sensor_data, "noise"),
         timestamp: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
         raw_data: String::from_utf8_lossy(payload).to_string(),
-    }))
+    };
+    validate_qingping_reading(&reading)?;
+
+    Ok(Some(reading))
 }
 
 fn sensor_data(value: &Value) -> Option<&Value> {
@@ -176,6 +192,47 @@ fn nested_i64(sensor_data: &Value, name: &str) -> Option<i64> {
         .or_else(|| value.as_f64().map(|number| number.round() as i64))
 }
 
+fn validate_qingping_reading(reading: &QingpingReading) -> anyhow::Result<()> {
+    validate_optional_f64("temperature", reading.temp_c, -20.0, 60.0)?;
+    validate_optional_f64("humidity", reading.humidity, 0.0, 100.0)?;
+    validate_optional_i64("co2", reading.co2_ppm, 0, 10_000)?;
+    validate_optional_i64("pm25", reading.pm25, 0, 1_000)?;
+    validate_optional_i64("pm10", reading.pm10, 0, 1_000)?;
+    validate_optional_i64("tvoc", reading.tvoc, 0, 1_000)?;
+    validate_optional_i64("noise", reading.noise_db, 0, 130)?;
+    Ok(())
+}
+
+fn validate_optional_f64(
+    field: &str,
+    value: Option<f64>,
+    min: f64,
+    max: f64,
+) -> anyhow::Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if !(min..=max).contains(&value) {
+        anyhow::bail!("Qingping {field} value {value} outside expected range {min}..={max}");
+    }
+    Ok(())
+}
+
+fn validate_optional_i64(
+    field: &str,
+    value: Option<i64>,
+    min: i64,
+    max: i64,
+) -> anyhow::Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if !(min..=max).contains(&value) {
+        anyhow::bail!("Qingping {field} value {value} outside expected range {min}..={max}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,7 +252,7 @@ mod tests {
             }]
         }"#;
 
-        let reading = parse_qingping_payload(payload, "112233445566")
+        let reading = parse_qingping_payload(payload, "aa:bb:cc:dd:ee:ff")
             .expect("parse")
             .expect("reading");
 
@@ -256,8 +313,47 @@ mod tests {
 
         let error = parse_qingping_payload(b"{not-json", "aa:bb").expect_err("malformed payload");
 
-        assert!(error.is_syntax());
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
         assert_eq!(state.latest(), Some(existing));
+    }
+
+    #[test]
+    fn rejects_mismatched_payload_mac() {
+        let payload = br#"{
+            "mac": "aa:bb:cc:dd:ee:ff",
+            "sensorData": [{"co2": {"value": 612}}]
+        }"#;
+
+        let error = parse_qingping_payload(payload, "11:22:33:44:55:66")
+            .expect_err("mismatched mac rejected");
+
+        assert!(error.to_string().contains("does not match configured MAC"));
+    }
+
+    #[test]
+    fn rejects_oversized_payload_before_storage() {
+        let payload = vec![b' '; MAX_QINGPING_PAYLOAD_BYTES + 1];
+
+        let error = parse_qingping_payload(&payload, "aa:bb:cc:dd:ee:ff")
+            .expect_err("oversized payload rejected");
+
+        assert!(error.to_string().contains("payload exceeds"));
+    }
+
+    #[test]
+    fn rejects_out_of_range_sensor_values() {
+        let payload = br#"{
+            "sensorData": [{
+                "temperature": {"value": 22.5},
+                "humidity": {"value": 47.1},
+                "co2": {"value": 50000}
+            }]
+        }"#;
+
+        let error = parse_qingping_payload(payload, "aa:bb:cc:dd:ee:ff")
+            .expect_err("out-of-range co2 rejected");
+
+        assert!(error.to_string().contains("outside expected range"));
     }
 
     #[test]
