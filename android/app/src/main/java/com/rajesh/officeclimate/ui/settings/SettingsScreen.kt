@@ -1,7 +1,5 @@
 package com.rajesh.officeclimate.ui.settings
 
-import android.net.Uri
-import androidx.browser.customtabs.CustomTabsIntent
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -18,7 +16,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
@@ -30,7 +27,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -45,7 +41,6 @@ fun SettingsScreen(
     viewModel: SettingsViewModel = viewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
-    val context = LocalContext.current
     var showServerUrl by remember { mutableStateOf(false) }
     var showAdvancedEnrollment by remember { mutableStateOf(false) }
 
@@ -78,8 +73,8 @@ fun SettingsScreen(
         Text(
             text = when {
                 state.deviceCertificateAlias.isNotBlank() -> "Device enrolled as ${state.deviceCertificateAlias}"
-                state.isLoggedIn -> "Signed in as ${state.userEmail}"
-                else -> "Sign in to your climate server"
+                state.isLoggedIn -> "Device enrolled"
+                else -> "Enroll this device"
             },
             style = MaterialTheme.typography.bodyMedium,
             color = if (state.isLoggedIn) Emerald else TextSecondary,
@@ -172,40 +167,6 @@ fun SettingsScreen(
             }
 
             Spacer(Modifier.height(12.dp))
-
-            if (state.userEmail.isNotBlank()) {
-                OutlinedButton(
-                    onClick = viewModel::logout,
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Red),
-                ) {
-                    Text("Sign Out")
-                }
-            }
-        } else {
-            Button(
-                onClick = {
-                    viewModel.getOAuthUrl { authUrl ->
-                        if (authUrl != null) {
-                            val customTabsIntent = CustomTabsIntent.Builder().build()
-                            customTabsIntent.launchUrl(context, Uri.parse(authUrl))
-                        }
-                    }
-                },
-                enabled = !state.loading && state.serverUrl.isNotBlank(),
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(containerColor = Emerald),
-            ) {
-                if (state.loading) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.height(20.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.background,
-                    )
-                } else {
-                    Text("Browser Sign-In", color = MaterialTheme.colorScheme.background)
-                }
-            }
         }
 
         state.error?.let { error ->

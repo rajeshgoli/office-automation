@@ -29,7 +29,7 @@ class WebSocketManager(
     private val _connected = MutableStateFlow(false)
     val connected: StateFlow<Boolean> = _connected
 
-    fun connect(url: String, token: String) {
+    fun connect(url: String) {
         shouldReconnect = true
 
         val wsUrl = url
@@ -37,12 +37,8 @@ class WebSocketManager(
             .replace("http://", "ws://")
             .trimEnd('/') + "/ws"
 
-        val requestBuilder = Request.Builder().url(wsUrl)
-        if (token.isNotBlank()) {
-            requestBuilder.header("Authorization", "Bearer $token")
-        }
-
-        webSocket = client.newWebSocket(requestBuilder.build(), object : WebSocketListener() {
+        val request = Request.Builder().url(wsUrl).build()
+        webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 Log.d(TAG, "WebSocket connected")
                 _connected.value = true
@@ -61,23 +57,23 @@ class WebSocketManager(
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 Log.w(TAG, "WebSocket failure: ${t.message}")
                 _connected.value = false
-                scheduleReconnect(url, token)
+                scheduleReconnect(url)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.d(TAG, "WebSocket closed: $reason")
                 _connected.value = false
-                scheduleReconnect(url, token)
+                scheduleReconnect(url)
             }
         })
     }
 
-    private fun scheduleReconnect(url: String, token: String) {
+    private fun scheduleReconnect(url: String) {
         if (!shouldReconnect) return
         Thread {
             Thread.sleep(reconnectDelay)
             reconnectDelay = (reconnectDelay * 2).coerceAtMost(Defaults.WS_RECONNECT_MAX_MS)
-            if (shouldReconnect) connect(url, token)
+            if (shouldReconnect) connect(url)
         }.start()
     }
 

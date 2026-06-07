@@ -41,7 +41,6 @@ class ClimateRepository(
     private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
 
     private var currentUrl = ""
-    private var currentToken = ""
 
     private lateinit var apiService: ApiService
     private lateinit var wsManager: WebSocketManager
@@ -77,8 +76,7 @@ class ClimateRepository(
     private suspend fun ensureInitialized() {
         if (::apiService.isInitialized) return
         val url = settingsRepository.serverUrl.first()
-        val token = settingsRepository.jwtToken.first()
-        rebuild(url, token)
+        rebuild(url)
     }
 
     fun stop() {
@@ -87,12 +85,10 @@ class ClimateRepository(
         if (::wsManager.isInitialized) wsManager.disconnect()
     }
 
-    private suspend fun rebuild(url: String, token: String) {
+    private suspend fun rebuild(url: String) {
         currentUrl = url
-        currentToken = token
 
         val client = httpClientFactory.create(
-            tokenProvider = { currentToken },
             includeLogging = true,
             connectTimeoutSeconds = 10,
             readTimeoutSeconds = 10,
@@ -153,7 +149,7 @@ class ClimateRepository(
     private fun startWebSocket() {
         if (!::wsManager.isInitialized) return
 
-        wsManager.connect(currentUrl, currentToken)
+        wsManager.connect(currentUrl)
 
         wsCollectJob?.cancel()
         wsCollectJob = scope.launch {
@@ -249,9 +245,8 @@ class ClimateRepository(
         apiService.getProjectLeverage(days)
     }
 
-    suspend fun testConnection(url: String, token: String): Result<ApiStatus> = runCatching {
+    suspend fun testConnection(url: String): Result<ApiStatus> = runCatching {
         val client = httpClientFactory.create(
-            tokenProvider = { token },
             connectTimeoutSeconds = 5,
             readTimeoutSeconds = 5,
         )
@@ -269,8 +264,7 @@ class ClimateRepository(
         scope.launch {
             stop()
             val url = settingsRepository.serverUrl.first()
-            val token = settingsRepository.jwtToken.first()
-            rebuild(url, token)
+            rebuild(url)
             startPolling()
             startWebSocket()
         }

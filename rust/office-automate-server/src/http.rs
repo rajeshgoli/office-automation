@@ -894,18 +894,30 @@ async fn websocket(
     State(state): State<AppState>,
     ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
+    user: Option<Extension<AuthenticatedUser>>,
     ws: WebSocketUpgrade,
 ) -> Response {
     let auth_headers = auth_headers_with_peer(&headers, Some(remote_addr));
     let mode = if has_valid_controller_ipc_token(&state.config, &auth_headers, Some(remote_addr)) {
         WebSocketAuth::Open
     } else {
-        websocket_auth_mode(&state, &auth_headers)
+        websocket_auth_mode(
+            &state,
+            &auth_headers,
+            user.as_ref().map(|Extension(user)| user),
+        )
     };
     ws.on_upgrade(move |socket| websocket_session(socket, state, mode))
 }
 
-fn websocket_auth_mode(state: &AppState, headers: &HeaderMap) -> WebSocketAuth {
+fn websocket_auth_mode(
+    state: &AppState,
+    headers: &HeaderMap,
+    middleware_user: Option<&AuthenticatedUser>,
+) -> WebSocketAuth {
+    if middleware_user.is_some() {
+        return WebSocketAuth::Open;
+    }
     let mode = state.auth.websocket_auth(headers);
     if mode == WebSocketAuth::TrustedNetwork && has_cloudflare_proxy_context(headers) {
         WebSocketAuth::FirstMessage
@@ -3873,14 +3885,48 @@ mod tests {
         headers.insert("x-forwarded-for", "127.0.0.1".parse().expect("header"));
 
         assert_eq!(
-            websocket_auth_mode(&state, &headers),
+            websocket_auth_mode(&state, &headers, None),
             WebSocketAuth::TrustedNetwork
         );
 
         headers.insert("cf-connecting-ip", "127.0.0.1".parse().expect("header"));
         assert_eq!(
-            websocket_auth_mode(&state, &headers),
+            websocket_auth_mode(&state, &headers, None),
             WebSocketAuth::FirstMessage
+        );
+    }
+
+    #[test]
+    fn websocket_middleware_authenticated_user_receives_initial_status_immediately() {
+        let config = oauth_config();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            unix_timestamp_now(),
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let (state, _) = build_app_state(
+            config.clone(),
+            QingpingState::default(),
+            state_machine,
+            yolink,
+            ErvState::new(config.runtime.database_path.clone()),
+            HvacState::new(config.runtime.database_path.clone()),
+            Arc::new(FakeErvWriter::default()),
+            Arc::new(FakeHvacWriter::default()),
+        )
+        .expect("app state");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cf-access-jwt-assertion",
+            "signed-access-jwt".parse().expect("header"),
+        );
+        let user = AuthenticatedUser {
+            email: "cloudflare_mtls:device-1".to_string(),
+        };
+
+        assert_eq!(
+            websocket_auth_mode(&state, &headers, Some(&user)),
+            WebSocketAuth::Open
         );
     }
 
