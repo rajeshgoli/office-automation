@@ -179,7 +179,7 @@ if [[ -f "$database_path" ]]; then
   capture sqlite/office-climate-quick-check.txt sqlite3 "$database_path" "PRAGMA quick_check;"
   capture sqlite/recent-device-events.txt sqlite3 "$database_path" "SELECT timestamp, device_type, event, device_name FROM device_events ORDER BY timestamp DESC LIMIT 100;"
   capture sqlite/recent-climate-actions.txt sqlite3 "$database_path" "SELECT timestamp, action, reason FROM climate_actions ORDER BY timestamp DESC LIMIT 100;"
-  capture sqlite/recent-device-registration-audit.txt sqlite3 "$database_path" "SELECT created_at, event, device_id, details FROM device_registration_audit ORDER BY created_at DESC LIMIT 100;"
+  capture sqlite/recent-device-registration-audit.txt sqlite3 "$database_path" "SELECT timestamp, event, device_id, details FROM device_registration_audit ORDER BY timestamp DESC LIMIT 100;"
 fi
 
 copy_if_file "$config_path" "$evidence_dir/plists"
