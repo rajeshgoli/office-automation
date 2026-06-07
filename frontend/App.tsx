@@ -12,7 +12,7 @@ import {
 import { STATUS_CONFIG } from './constants';
 import VitalTile from './components/VitalTile';
 import CO2Chart from './components/CO2Chart';
-import { fetchStatus, ApiStatus, toFahrenheit, StatusWebSocket, setERVSpeed, setHVACMode, setPresence, setHVACTemperatureBands, ERVSpeed as ApiERVSpeed, HVACMode, HVACTemperatureBands, isAuthenticated, logout, getUserEmail, checkTrustedNetwork } from './api';
+import { fetchStatus, ApiStatus, toFahrenheit, StatusWebSocket, setERVSpeed, setHVACMode, setPresence, setHVACTemperatureBands, ERVSpeed as ApiERVSpeed, HVACMode, HVACTemperatureBands, logout, checkTrustedNetwork } from './api';
 import Login from './Login';
 import HistoricalCharts from './HistoricalCharts';
 import OfficeReplay from './OfficeReplay';
@@ -156,23 +156,16 @@ const App: React.FC = () => {
     setUserEmail(null);
   };
 
-  // Check authentication on load - try trusted network first, then token
+  // Check authentication on load through the server-side session.
   useEffect(() => {
     if (!authChecking) return;
 
     checkTrustedNetwork().then((isTrusted) => {
       if (isTrusted) {
-        // Trusted network - no token needed
         setAuthenticated(true);
-        setUserEmail('Local Network');
-        setAuthChecking(false);
-      } else if (isAuthenticated()) {
-        // Not trusted network, but have a token - use it
-        setAuthenticated(true);
-        setUserEmail(getUserEmail());
+        setUserEmail('Authenticated');
         setAuthChecking(false);
       } else {
-        // No trusted network, no token - need login
         setAuthChecking(false);
       }
     });

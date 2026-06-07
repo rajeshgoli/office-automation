@@ -29,6 +29,9 @@ const GOOGLE_TOKENINFO_URL: &str = "https://oauth2.googleapis.com/tokeninfo";
 const OAUTH_SCOPE: &str = "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
 const BASIC_WS_COOKIE: &str = "office_basic_ws";
 const BASIC_WS_COOKIE_MAX_AGE_SECONDS: i64 = 600;
+pub const OAUTH_SESSION_COOKIE: &str = "office_auth";
+pub const OAUTH_CSRF_COOKIE: &str = "office_csrf";
+pub const OAUTH_CSRF_HEADER: &str = "x-csrf-token";
 
 #[derive(Clone)]
 pub struct AuthManager {
@@ -96,6 +99,18 @@ pub enum WebSocketAuth {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedUser {
     pub email: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthCredentialSource {
+    Bearer,
+    SessionCookie,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedOAuthRequest {
+    pub user: AuthenticatedUser,
+    pub source: OAuthCredentialSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +241,35 @@ impl AuthManager {
             .map(|email| AuthenticatedUser { email })
     }
 
+    pub fn verify_oauth_request(&self, headers: &HeaderMap) -> Option<VerifiedOAuthRequest> {
+        if let Some(user) = self.verify_bearer_header(headers) {
+            return Some(VerifiedOAuthRequest {
+                user,
+                source: OAuthCredentialSource::Bearer,
+            });
+        }
+
+        let token = oauth_session_cookie(headers)?;
+        self.verify_jwt(token).map(|email| VerifiedOAuthRequest {
+            user: AuthenticatedUser { email },
+            source: OAuthCredentialSource::SessionCookie,
+        })
+    }
+
+    pub fn bearer_or_session_token<'a>(&self, headers: &'a HeaderMap) -> Option<&'a str> {
+        bearer_token(headers).or_else(|| oauth_session_cookie(headers))
+    }
+
+    pub fn verify_oauth_csrf(&self, headers: &HeaderMap) -> bool {
+        let Some(header_token) = headers.get(OAUTH_CSRF_HEADER).and_then(header_to_str) else {
+            return false;
+        };
+        let Some(cookie_token) = cookie_value(headers, OAUTH_CSRF_COOKIE) else {
+            return false;
+        };
+        !header_token.is_empty() && header_token == cookie_token
+    }
+
     pub async fn verify_cloudflare_access_assertion(
         &self,
         token: &str,
@@ -317,6 +361,29 @@ impl AuthManager {
         ))
     }
 
+    pub fn issue_oauth_session_cookies(&self, token: &str, secure: bool) -> Option<Vec<String>> {
+        let oauth = self.inner.oauth.as_ref()?;
+        let max_age = oauth.token_expiry_days.max(1) * 24 * 60 * 60;
+        let csrf_token = random_url_token(32);
+        let secure_attribute = secure.then_some("; Secure").unwrap_or("");
+        Some(vec![
+            format!(
+                "{OAUTH_SESSION_COOKIE}={token}; Max-Age={max_age}; Path=/; HttpOnly{secure_attribute}; SameSite=Lax"
+            ),
+            format!(
+                "{OAUTH_CSRF_COOKIE}={csrf_token}; Max-Age={max_age}; Path=/{secure_attribute}; SameSite=Lax"
+            ),
+        ])
+    }
+
+    pub fn clear_oauth_session_cookies(secure: bool) -> [String; 2] {
+        let secure_attribute = secure.then_some("; Secure").unwrap_or("");
+        [
+            format!("office_auth=; Max-Age=0; Path=/; HttpOnly{secure_attribute}; SameSite=Lax"),
+            format!("office_csrf=; Max-Age=0; Path=/{secure_attribute}; SameSite=Lax"),
+        ]
+    }
+
     pub fn verify_basic_websocket_auth(&self, headers: &HeaderMap) -> bool {
         self.verify_basic_header(headers) || self.verify_basic_websocket_cookie(headers)
     }
@@ -391,7 +458,7 @@ impl AuthManager {
             if self.is_trusted_request(headers) {
                 return WebSocketAuth::TrustedNetwork;
             }
-            if self.verify_bearer_header(headers).is_some() {
+            if self.verify_oauth_request(headers).is_some() {
                 return WebSocketAuth::UpgradeBearer;
             }
             WebSocketAuth::FirstMessage
@@ -512,6 +579,7 @@ impl AuthManager {
             email,
             jwt,
             platform: pending.platform,
+            secure_cookie: pending.redirect_uri.starts_with("https://"),
             refresh_token: token_response.refresh_token,
             access_token: token_response.access_token,
         }))
@@ -671,6 +739,7 @@ pub struct FinishedOAuthLogin {
     pub email: String,
     pub jwt: String,
     pub platform: Option<String>,
+    pub secure_cookie: bool,
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
 }
@@ -713,6 +782,10 @@ pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .get(header::AUTHORIZATION)
         .and_then(header_to_str)?
         .strip_prefix("Bearer ")
+}
+
+fn oauth_session_cookie(headers: &HeaderMap) -> Option<&str> {
+    cookie_value(headers, OAUTH_SESSION_COOKIE)
 }
 
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<&str> {

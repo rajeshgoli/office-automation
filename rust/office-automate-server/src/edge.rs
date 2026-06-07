@@ -15,7 +15,7 @@ use axum::{
         ConnectInfo, OriginalUri, Path, Query, Request, State, WebSocketUpgrade,
         ws::{CloseFrame, Message, WebSocket},
     },
-    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, get_service, post},
@@ -30,13 +30,13 @@ use tokio_tungstenite::{
     tungstenite::{Message as TungsteniteMessage, client::IntoClientRequest},
 };
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::{AllowOrigin, CorsLayer},
     services::ServeDir,
     trace::TraceLayer,
 };
 
 use crate::{
-    auth::{AuthManager, HttpAuthMode, WebSocketAuth, bearer_token},
+    auth::{AuthManager, HttpAuthMode, OAUTH_CSRF_HEADER, OAuthCredentialSource, WebSocketAuth},
     config::OrchestratorConfig,
     http::CONTROLLER_IPC_TOKEN_HEADER,
 };
@@ -95,6 +95,7 @@ struct EdgeState {
     auth: AuthManager,
     controller: ControllerClient,
     frontend_dist: PathBuf,
+    public_url: Option<String>,
     rate_limiter: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
 }
 
@@ -181,6 +182,7 @@ pub fn app(config: PublicEdgeConfig) -> Result<Router> {
         auth: AuthManager::new(&config.orchestrator)?,
         controller: ControllerClient::new(&config.controller)?,
         frontend_dist: config.runtime.frontend_dist.clone(),
+        public_url: config.runtime.public_url.clone(),
         rate_limiter: Arc::new(Mutex::new(HashMap::new())),
     };
     Ok(router_from_state(state))
@@ -231,10 +233,7 @@ fn validate_public_edge_config(config: &PublicEdgeConfig) -> Result<()> {
 }
 
 fn router_from_state(state: EdgeState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+    let cors = cors_layer(state.public_url.as_deref());
     let assets_dir = state.frontend_dist.join("assets");
 
     Router::new()
@@ -277,8 +276,71 @@ fn router_from_state(state: EdgeState) -> Router {
             edge_auth_middleware,
         ))
         .with_state(state)
+        .layer(middleware::from_fn(security_headers_middleware))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
+}
+
+fn cors_layer(public_url: Option<&str>) -> CorsLayer {
+    CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            HeaderName::from_static(OAUTH_CSRF_HEADER),
+        ])
+        .allow_origin(allowed_cors_origins(public_url))
+        .allow_credentials(true)
+}
+
+fn allowed_cors_origins(public_url: Option<&str>) -> AllowOrigin {
+    match public_origin_header(public_url) {
+        Some(origin) => AllowOrigin::exact(origin),
+        None => AllowOrigin::list(local_dev_origins()),
+    }
+}
+
+fn public_origin_header(public_url: Option<&str>) -> Option<HeaderValue> {
+    let url = Url::parse(public_url?).ok()?;
+    let host = url.host_str()?;
+    let origin = match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    };
+    HeaderValue::from_str(&origin).ok()
+}
+
+fn local_dev_origins() -> [HeaderValue; 3] {
+    [
+        HeaderValue::from_static("http://localhost:9002"),
+        HeaderValue::from_static("http://127.0.0.1:9002"),
+        HeaderValue::from_static("http://[::1]:9002"),
+    ]
+}
+
+async fn security_headers_middleware(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
 }
 
 async fn edge_auth_middleware(
@@ -301,8 +363,8 @@ async fn edge_auth_middleware(
         return next.run(request).await;
     }
 
-    let Some(user) = state.auth.verify_bearer_header(&headers) else {
-        let missing = bearer_token(&headers).is_none();
+    let Some(verified) = state.auth.verify_oauth_request(&headers) else {
+        let missing = state.auth.bearer_or_session_token(&headers).is_none();
         let message = if missing {
             "Authentication required"
         } else {
@@ -315,6 +377,18 @@ async fn edge_auth_middleware(
             .into_response();
     };
 
+    if verified.source == OAuthCredentialSource::SessionCookie
+        && requires_csrf(request.method())
+        && !state.auth.verify_oauth_csrf(&headers)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "CSRF token required"})),
+        )
+            .into_response();
+    }
+
+    let user = verified.user;
     if is_control_route(request.method(), request.uri().path()) {
         let actor = rate_limit_actor(remote_addr, &user.email, request.uri().path());
         if !allow_control_request(&state, actor) {
@@ -727,6 +801,13 @@ fn should_skip_auth(method: &Method, path: &str, auth_mode: HttpAuthMode) -> boo
             || path.ends_with(".json"))
 }
 
+fn requires_csrf(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    )
+}
+
 fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
     headers
         .get(header::UPGRADE)
@@ -833,14 +914,7 @@ async fn auth_callback(
             )
             .body(Body::empty())
             .expect("valid android redirect response"),
-        Ok(Some(login)) => {
-            let token = script_json_string(&login.jwt);
-            let email = script_json_string(&login.email);
-            Html(format!(
-                "<html><head><script>localStorage.setItem('auth_token', {token});localStorage.setItem('user_email', {email});window.location.href = '/';</script></head><body><p>Login successful! Redirecting...</p></body></html>",
-            ))
-            .into_response()
-        }
+        Ok(Some(login)) => browser_login_response(&state.auth, &login.jwt, login.secure_cookie),
         Ok(None) => (
             StatusCode::FORBIDDEN,
             Html("<html><body><h1>Login Failed</h1><p>Email not authorized</p></body></html>"),
@@ -857,7 +931,7 @@ async fn auth_callback(
 }
 
 async fn auth_logout(State(state): State<EdgeState>, headers: HeaderMap) -> Response {
-    let Some(token) = bearer_token(&headers) else {
+    let Some(token) = state.auth.bearer_or_session_token(&headers) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "No token provided"})),
@@ -866,7 +940,9 @@ async fn auth_logout(State(state): State<EdgeState>, headers: HeaderMap) -> Resp
     };
 
     state.auth.invalidate_token(token);
-    Json(json!({"ok": true, "message": "Logged out"})).into_response()
+    let mut response = Json(json!({"ok": true, "message": "Logged out"})).into_response();
+    append_clear_oauth_cookies(&mut response, oauth_cookie_secure_from_headers(&headers));
+    response
 }
 
 async fn auth_device_start(State(state): State<EdgeState>) -> Response {
@@ -968,12 +1044,41 @@ fn escape_html_text(value: &str) -> String {
         .collect()
 }
 
-fn script_json_string(value: &str) -> String {
-    serde_json::to_string(value)
-        .expect("string serializes")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('&', "\\u0026")
+fn browser_login_response(auth: &AuthManager, token: &str, secure_cookie: bool) -> Response {
+    let mut response = Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, "/")
+        .body(Body::empty())
+        .expect("valid browser login response");
+    if let Some(cookies) = auth.issue_oauth_session_cookies(token, secure_cookie) {
+        for cookie in cookies {
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                cookie.parse().expect("valid OAuth session cookie"),
+            );
+        }
+    }
+    response
+}
+
+fn append_clear_oauth_cookies(response: &mut Response, secure_cookie: bool) {
+    for cookie in AuthManager::clear_oauth_session_cookies(secure_cookie) {
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            cookie.parse().expect("valid clear cookie"),
+        );
+    }
+}
+
+fn oauth_cookie_secure_from_headers(headers: &HeaderMap) -> bool {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok());
+    crate::auth::resolve_redirect_scheme(host, forwarded_proto) == "https"
 }
 
 fn is_loopback_bind_host(host: &str) -> bool {
@@ -1016,6 +1121,23 @@ mod tests {
                 public_url: Some("https://office.example.test".to_string()),
             },
         }
+    }
+
+    fn oauth_cookie_header(auth: &AuthManager, token: &str) -> (String, String) {
+        let cookies = auth
+            .issue_oauth_session_cookies(token, true)
+            .expect("oauth cookies");
+        let cookie_header = cookies
+            .iter()
+            .map(|cookie| cookie.split(';').next().expect("cookie pair"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let csrf_token = cookie_header
+            .split("; ")
+            .find_map(|cookie| cookie.strip_prefix("office_csrf="))
+            .expect("csrf cookie")
+            .to_string();
+        (cookie_header, csrf_token)
     }
 
     #[test]
@@ -1165,6 +1287,135 @@ qingping:
             .expect("body");
         let payload: Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(payload["source"], "controller");
+    }
+
+    #[tokio::test]
+    async fn edge_sets_security_headers_and_exact_cors_origin() {
+        let app = app(edge_config("http://127.0.0.1:9".to_string())).expect("edge app");
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/auth/login")
+                    .header(header::HOST, "office.example.test")
+                    .header(header::ORIGIN, "https://office.example.test")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .expect("cors origin"),
+            "https://office.example.test"
+        );
+        assert!(
+            response
+                .headers()
+                .contains_key(header::CONTENT_SECURITY_POLICY)
+        );
+        assert!(
+            response
+                .headers()
+                .contains_key(header::STRICT_TRANSPORT_SECURITY)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .expect("nosniff"),
+            "nosniff"
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_allows_local_dev_cors_origin_when_public_url_unset() {
+        let mut config = edge_config("http://127.0.0.1:9".to_string());
+        config.runtime.public_url = None;
+        let app = app(config).expect("edge app");
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/auth/login")
+                    .header(header::ORIGIN, "http://localhost:9002")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .expect("cors origin"),
+            "http://localhost:9002"
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_session_cookie_requires_csrf_before_forwarding_post() {
+        let controller = Router::new().route(
+            "/presence",
+            axum::routing::post(|headers: HeaderMap| async move {
+                let token = headers
+                    .get(CONTROLLER_IPC_TOKEN_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("");
+                if token == "controller-token" {
+                    Json(json!({"ok": true})).into_response()
+                } else {
+                    StatusCode::UNAUTHORIZED.into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind controller");
+        let address = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, controller).await.expect("controller");
+        });
+
+        let config = edge_config(format!("http://{address}"));
+        let auth = AuthManager::new(&config.orchestrator).expect("auth");
+        let token = auth.generate_jwt("engineer@example.test").expect("token");
+        let (cookie_header, csrf_token) = oauth_cookie_header(&auth, &token);
+        let app = app(config).expect("edge app");
+        let payload = json!({"state": "away"}).to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/presence")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie_header.as_str())
+                    .body(Body::from(payload.clone()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/presence")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, cookie_header)
+                    .header(OAUTH_CSRF_HEADER, csrf_token)
+                    .body(Body::from(payload))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
