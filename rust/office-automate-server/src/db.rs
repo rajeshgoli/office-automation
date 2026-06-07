@@ -15,6 +15,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{config::AppConfig, qingping::QingpingReading};
 
+pub const DEVICE_PAIRING_MAX_FAILED_ATTEMPTS: i64 = 5;
+
 const SESSION_OUTPUT_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS session_output (
     session_id TEXT PRIMARY KEY,
@@ -153,13 +155,28 @@ pub fn migrate_database(database_path: &Path) -> Result<()> {
                 created_at DATETIME NOT NULL,
                 expires_at DATETIME NOT NULL,
                 paired_at DATETIME,
-                revoked_at DATETIME
+                revoked_at DATETIME,
+                failed_attempts INTEGER NOT NULL DEFAULT 0,
+                last_failed_attempt_at DATETIME
             );
             CREATE INDEX IF NOT EXISTS idx_device_registrations_created_at ON device_registrations(created_at);
             CREATE INDEX IF NOT EXISTS idx_device_registrations_expires_at ON device_registrations(expires_at);
             CREATE INDEX IF NOT EXISTS idx_device_registrations_revoked_at ON device_registrations(revoked_at);
             CREATE INDEX IF NOT EXISTS idx_device_registrations_common_name ON device_registrations(common_name);
             CREATE INDEX IF NOT EXISTS idx_device_registrations_device_name ON device_registrations(device_name);
+
+            CREATE TABLE IF NOT EXISTS device_registration_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME NOT NULL,
+                device_id TEXT,
+                device_name TEXT,
+                event TEXT NOT NULL,
+                remote_addr TEXT,
+                details TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_device_registration_audit_timestamp ON device_registration_audit(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_device_registration_audit_device_id ON device_registration_audit(device_id);
+            CREATE INDEX IF NOT EXISTS idx_device_registration_audit_event ON device_registration_audit(event);
 
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY,
@@ -178,6 +195,18 @@ pub fn migrate_database(database_path: &Path) -> Result<()> {
         "sensor_readings",
         "noise_db",
         "ALTER TABLE sensor_readings ADD COLUMN noise_db INTEGER",
+    )?;
+    ensure_column(
+        &connection,
+        "device_registrations",
+        "failed_attempts",
+        "ALTER TABLE device_registrations ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &connection,
+        "device_registrations",
+        "last_failed_attempt_at",
+        "ALTER TABLE device_registrations ADD COLUMN last_failed_attempt_at DATETIME",
     )?;
 
     Ok(())
@@ -248,6 +277,27 @@ pub struct DeviceRegistration {
     pub expires_at: String,
     pub paired_at: Option<String>,
     pub revoked_at: Option<String>,
+    pub failed_attempts: i64,
+    pub last_failed_attempt_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceRegistrationAuditEvent {
+    pub id: i64,
+    pub timestamp: String,
+    pub device_id: Option<String>,
+    pub device_name: Option<String>,
+    pub event: String,
+    pub remote_addr: Option<String>,
+    pub details: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevicePairingFailure {
+    pub device_id: String,
+    pub device_name: String,
+    pub failed_attempts: i64,
+    pub exhausted: bool,
 }
 
 pub fn create_device_registration(
@@ -276,6 +326,8 @@ pub fn create_device_registration(
         expires_at,
         paired_at: None,
         revoked_at: None,
+        failed_attempts: 0,
+        last_failed_attempt_at: None,
     };
 
     connection
@@ -283,9 +335,10 @@ pub fn create_device_registration(
             r#"
             INSERT INTO device_registrations (
                 device_id, device_name, pairing_code, public_key_fingerprint,
-                common_name, created_at, expires_at, paired_at, revoked_at
+                common_name, created_at, expires_at, paired_at, revoked_at,
+                failed_attempts, last_failed_attempt_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 registration.device_id,
@@ -297,9 +350,23 @@ pub fn create_device_registration(
                 registration.expires_at,
                 registration.paired_at,
                 registration.revoked_at,
+                registration.failed_attempts,
+                registration.last_failed_attempt_at,
             ],
         )
         .context("failed to create device registration")?;
+    insert_device_registration_audit_event(
+        &connection,
+        &registration.created_at,
+        Some(&registration.device_id),
+        Some(&registration.device_name),
+        "registration_created",
+        None,
+        Some(&json!({
+            "expires_at": registration.expires_at,
+            "max_failed_attempts": DEVICE_PAIRING_MAX_FAILED_ATTEMPTS,
+        })),
+    )?;
 
     Ok(registration)
 }
@@ -311,7 +378,8 @@ pub fn list_device_registrations(database_path: &Path) -> Result<Vec<DeviceRegis
         .prepare(
             r#"
             SELECT device_id, device_name, pairing_code, public_key_fingerprint,
-                   common_name, created_at, expires_at, paired_at, revoked_at
+                   common_name, created_at, expires_at, paired_at, revoked_at,
+                   failed_attempts, last_failed_attempt_at
             FROM device_registrations
             ORDER BY created_at DESC
             "#,
@@ -330,6 +398,8 @@ pub fn list_device_registrations(database_path: &Path) -> Result<Vec<DeviceRegis
                 expires_at: row.get(6)?,
                 paired_at: row.get(7)?,
                 revoked_at: row.get(8)?,
+                failed_attempts: row.get(9)?,
+                last_failed_attempt_at: row.get(10)?,
             })
         })
         .context("failed to query device registrations")?;
@@ -352,14 +422,16 @@ pub fn pending_device_registration_by_pairing_code(
         .query_row(
             r#"
             SELECT device_id, device_name, pairing_code, public_key_fingerprint,
-                   common_name, created_at, expires_at, paired_at, revoked_at
+                   common_name, created_at, expires_at, paired_at, revoked_at,
+                   failed_attempts, last_failed_attempt_at
             FROM device_registrations
             WHERE pairing_code = ?
               AND revoked_at IS NULL
               AND paired_at IS NULL
               AND expires_at > ?
+              AND failed_attempts < ?
             "#,
-            params![pairing_code, now],
+            params![pairing_code, now, DEVICE_PAIRING_MAX_FAILED_ATTEMPTS],
             |row| {
                 Ok(DeviceRegistration {
                     device_id: row.get(0)?,
@@ -371,6 +443,8 @@ pub fn pending_device_registration_by_pairing_code(
                     expires_at: row.get(6)?,
                     paired_at: row.get(7)?,
                     revoked_at: row.get(8)?,
+                    failed_attempts: row.get(9)?,
+                    last_failed_attempt_at: row.get(10)?,
                 })
             },
         )
@@ -388,7 +462,8 @@ pub fn find_active_device_registration_by_common_name(
         .prepare(
             r#"
             SELECT device_id, device_name, pairing_code, public_key_fingerprint,
-                   common_name, created_at, expires_at, paired_at, revoked_at
+                   common_name, created_at, expires_at, paired_at, revoked_at,
+                   failed_attempts, last_failed_attempt_at
             FROM device_registrations
             WHERE common_name = ?
               AND paired_at IS NOT NULL
@@ -410,6 +485,8 @@ pub fn find_active_device_registration_by_common_name(
                 expires_at: row.get(6)?,
                 paired_at: row.get(7)?,
                 revoked_at: row.get(8)?,
+                failed_attempts: row.get(9)?,
+                last_failed_attempt_at: row.get(10)?,
             })
         })
         .with_context(|| format!("failed to look up active device common name {common_name}"))?;
@@ -434,6 +511,14 @@ pub fn revoke_device_registration(database_path: &Path, device_id: &str) -> Resu
     let connection = Connection::open(database_path)
         .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
     let updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let device_name = connection
+        .query_row(
+            "SELECT device_name FROM device_registrations WHERE device_id = ?",
+            params![device_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .context("failed to look up device before revoke")?;
     let changed = connection
         .execute(
             r#"
@@ -444,6 +529,17 @@ pub fn revoke_device_registration(database_path: &Path, device_id: &str) -> Resu
             params![updated_at, device_id],
         )
         .with_context(|| format!("failed to revoke device {device_id}"))?;
+    if changed > 0 {
+        insert_device_registration_audit_event(
+            &connection,
+            &updated_at,
+            Some(device_id),
+            device_name.as_deref(),
+            "device_revoked",
+            None,
+            None,
+        )?;
+    }
     Ok(changed > 0)
 }
 
@@ -452,35 +548,40 @@ pub fn complete_device_registration(
     pairing_code: &str,
     public_key: &str,
     common_name: &str,
+    remote_addr: Option<&str>,
 ) -> Result<Option<DeviceRegistration>> {
     if common_name.trim().is_empty() {
         anyhow::bail!("device certificate common name must not be empty");
     }
 
     let fingerprint = fingerprint_public_key(public_key);
-    let connection = Connection::open(database_path)
+    let mut connection = Connection::open(database_path)
         .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let transaction = connection
+        .transaction()
+        .context("failed to start device registration transaction")?;
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let device_name = match connection
+    let (device_id, device_name) = match transaction
         .query_row(
             r#"
-            SELECT device_name
+            SELECT device_id, device_name
             FROM device_registrations
             WHERE pairing_code = ?
               AND revoked_at IS NULL
               AND paired_at IS NULL
               AND expires_at > ?
+              AND failed_attempts < ?
             "#,
-            params![pairing_code, now],
-            |row| row.get::<_, String>(0),
+            params![pairing_code, now, DEVICE_PAIRING_MAX_FAILED_ATTEMPTS],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
         .context("failed to check device registration eligibility")?
     {
-        Some(device_name) => device_name,
+        Some(row) => row,
         None => return Ok(None),
     };
-    connection
+    transaction
         .execute(
             r#"
             UPDATE device_registrations
@@ -494,7 +595,7 @@ pub fn complete_device_registration(
         .with_context(|| {
             format!("failed to revoke prior registrations for device name {device_name}")
         })?;
-    let changed = connection
+    let changed = transaction
         .execute(
             r#"
             UPDATE device_registrations
@@ -516,11 +617,24 @@ pub fn complete_device_registration(
         return Ok(None);
     }
 
-    let registration = connection
+    insert_device_registration_audit_event(
+        &transaction,
+        &now,
+        Some(&device_id),
+        Some(&device_name),
+        "pairing_completed",
+        remote_addr,
+        Some(&json!({
+            "public_key_fingerprint": fingerprint,
+        })),
+    )?;
+
+    let registration = transaction
         .query_row(
             r#"
             SELECT device_id, device_name, pairing_code, public_key_fingerprint,
-                   common_name, created_at, expires_at, paired_at, revoked_at
+                   common_name, created_at, expires_at, paired_at, revoked_at,
+                   failed_attempts, last_failed_attempt_at
             FROM device_registrations
             WHERE pairing_code = ?
             "#,
@@ -536,12 +650,206 @@ pub fn complete_device_registration(
                     expires_at: row.get(6)?,
                     paired_at: row.get(7)?,
                     revoked_at: row.get(8)?,
+                    failed_attempts: row.get(9)?,
+                    last_failed_attempt_at: row.get(10)?,
                 })
             },
         )
         .context("failed to reload completed device registration")?;
+    transaction
+        .commit()
+        .context("failed to commit device registration transaction")?;
 
     Ok(Some(registration))
+}
+
+pub fn record_device_pairing_failure(
+    database_path: &Path,
+    pairing_code: &str,
+    event: &str,
+    remote_addr: Option<&str>,
+    details: Option<&Value>,
+) -> Result<Option<DevicePairingFailure>> {
+    let mut connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let transaction = connection
+        .transaction()
+        .context("failed to start device pairing failure transaction")?;
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let candidate = transaction
+        .query_row(
+            r#"
+            SELECT device_id, device_name, failed_attempts
+            FROM device_registrations
+            WHERE pairing_code = ?
+              AND revoked_at IS NULL
+              AND paired_at IS NULL
+              AND expires_at > ?
+            "#,
+            params![pairing_code, now],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .context("failed to look up pairing code for failure accounting")?;
+
+    let Some((device_id, device_name, failed_attempts)) = candidate else {
+        insert_device_registration_audit_event(
+            &transaction,
+            &now,
+            None,
+            None,
+            event,
+            remote_addr,
+            Some(&json!({
+                "pairing_code_hash": fingerprint_public_key(pairing_code),
+                "reason": "unknown_expired_or_inactive_code",
+            })),
+        )?;
+        transaction
+            .commit()
+            .context("failed to commit unknown pairing failure audit")?;
+        return Ok(None);
+    };
+
+    let next_failed_attempts = failed_attempts + 1;
+    let exhausted = next_failed_attempts >= DEVICE_PAIRING_MAX_FAILED_ATTEMPTS;
+    transaction
+        .execute(
+            r#"
+            UPDATE device_registrations
+            SET failed_attempts = ?,
+                last_failed_attempt_at = ?,
+                revoked_at = CASE WHEN ? THEN ? ELSE revoked_at END
+            WHERE device_id = ?
+              AND revoked_at IS NULL
+              AND paired_at IS NULL
+            "#,
+            params![next_failed_attempts, now, exhausted, now, device_id,],
+        )
+        .context("failed to record device pairing failure")?;
+
+    insert_device_registration_audit_event(
+        &transaction,
+        &now,
+        Some(&device_id),
+        Some(&device_name),
+        event,
+        remote_addr,
+        Some(&json!({
+            "failed_attempts": next_failed_attempts,
+            "max_failed_attempts": DEVICE_PAIRING_MAX_FAILED_ATTEMPTS,
+            "exhausted": exhausted,
+            "details": details,
+        })),
+    )?;
+    transaction
+        .commit()
+        .context("failed to commit device pairing failure audit")?;
+
+    Ok(Some(DevicePairingFailure {
+        device_id,
+        device_name,
+        failed_attempts: next_failed_attempts,
+        exhausted,
+    }))
+}
+
+pub fn log_unknown_device_pairing_attempt(
+    database_path: &Path,
+    pairing_code: &str,
+    remote_addr: Option<&str>,
+    reason: &str,
+) -> Result<()> {
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    insert_device_registration_audit_event(
+        &connection,
+        &now,
+        None,
+        None,
+        "pairing_code_rejected",
+        remote_addr,
+        Some(&json!({
+            "pairing_code_hash": fingerprint_public_key(pairing_code),
+            "reason": reason,
+        })),
+    )
+}
+
+pub fn list_device_registration_audit_events(
+    database_path: &Path,
+) -> Result<Vec<DeviceRegistrationAuditEvent>> {
+    let connection = Connection::open(database_path)
+        .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT id, timestamp, device_id, device_name, event, remote_addr, details
+            FROM device_registration_audit
+            ORDER BY id ASC
+            "#,
+        )
+        .context("failed to prepare device registration audit query")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(DeviceRegistrationAuditEvent {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                device_id: row.get(2)?,
+                device_name: row.get(3)?,
+                event: row.get(4)?,
+                remote_addr: row.get(5)?,
+                details: row.get(6)?,
+            })
+        })
+        .context("failed to query device registration audit")?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(row.context("failed to read device registration audit row")?);
+    }
+    Ok(events)
+}
+
+fn insert_device_registration_audit_event(
+    connection: &Connection,
+    timestamp: &str,
+    device_id: Option<&str>,
+    device_name: Option<&str>,
+    event: &str,
+    remote_addr: Option<&str>,
+    details: Option<&Value>,
+) -> Result<()> {
+    let details = details
+        .map(serde_json::to_string)
+        .transpose()
+        .context("failed to encode device registration audit details")?;
+    connection
+        .execute(
+            r#"
+            INSERT INTO device_registration_audit (
+                timestamp, device_id, device_name, event, remote_addr, details
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                timestamp,
+                device_id,
+                device_name,
+                event,
+                remote_addr,
+                details
+            ],
+        )
+        .context("failed to insert device registration audit event")?;
+    Ok(())
 }
 
 fn random_device_id() -> String {
@@ -2288,6 +2596,7 @@ mod tests {
             &registration.pairing_code,
             "public-key",
             "device-1",
+            Some("192.168.5.50:51234"),
         )
         .expect("complete registration")
         .expect("registration completed");
@@ -2305,6 +2614,7 @@ mod tests {
             &replacement.pairing_code,
             "replacement-key",
             "device-2",
+            None,
         )
         .expect("complete replacement")
         .expect("replacement completed");
@@ -2339,6 +2649,98 @@ mod tests {
             find_active_device_registration_by_common_name(&db_path, "device-2")
                 .expect("find active device after revoke");
         assert!(active_after_revoke.is_none());
+
+        let audit_events =
+            list_device_registration_audit_events(&db_path).expect("list device audit events");
+        assert!(audit_events.iter().any(|event| {
+            event.event == "registration_created"
+                && event.device_id.as_deref() == Some(registration.device_id.as_str())
+        }));
+        assert!(audit_events.iter().any(|event| {
+            event.event == "pairing_completed"
+                && event.device_id.as_deref() == Some(replacement.device_id.as_str())
+        }));
+        assert!(audit_events.iter().any(|event| {
+            event.event == "device_revoked"
+                && event.device_id.as_deref() == Some(replacement.device_id.as_str())
+        }));
+    }
+
+    #[test]
+    fn pairing_failures_exhaust_pending_registration_and_audit_without_raw_code() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+
+        let registration =
+            create_device_registration(&db_path, "phone", 15).expect("create registration");
+        for attempt in 1..=DEVICE_PAIRING_MAX_FAILED_ATTEMPTS {
+            let failure = record_device_pairing_failure(
+                &db_path,
+                &registration.pairing_code,
+                "pairing_csr_rejected",
+                Some("192.168.5.50:51234"),
+                Some(&json!({"error": "invalid csr"})),
+            )
+            .expect("record pairing failure")
+            .expect("known registration");
+            assert_eq!(failure.failed_attempts, attempt);
+            assert_eq!(
+                failure.exhausted,
+                attempt == DEVICE_PAIRING_MAX_FAILED_ATTEMPTS
+            );
+        }
+
+        let pending =
+            pending_device_registration_by_pairing_code(&db_path, &registration.pairing_code)
+                .expect("query pending registration");
+        assert!(pending.is_none());
+
+        let completed = complete_device_registration(
+            &db_path,
+            &registration.pairing_code,
+            "public-key",
+            "device-1",
+            None,
+        )
+        .expect("complete exhausted registration");
+        assert!(completed.is_none());
+
+        log_unknown_device_pairing_attempt(
+            &db_path,
+            "BAD999",
+            Some("192.168.5.51:61234"),
+            "unknown_expired_or_already_paired",
+        )
+        .expect("log unknown attempt");
+
+        let devices = list_device_registrations(&db_path).expect("list devices");
+        let device = devices
+            .iter()
+            .find(|device| device.device_id == registration.device_id)
+            .expect("device row");
+        assert_eq!(device.failed_attempts, DEVICE_PAIRING_MAX_FAILED_ATTEMPTS);
+        assert!(device.last_failed_attempt_at.is_some());
+        assert!(device.revoked_at.is_some());
+
+        let audit_events =
+            list_device_registration_audit_events(&db_path).expect("list device audit events");
+        let failure_events = audit_events
+            .iter()
+            .filter(|event| event.event == "pairing_csr_rejected")
+            .count();
+        assert_eq!(failure_events, DEVICE_PAIRING_MAX_FAILED_ATTEMPTS as usize);
+        let unknown_event = audit_events
+            .iter()
+            .find(|event| event.event == "pairing_code_rejected")
+            .expect("unknown code audit event");
+        assert!(
+            !unknown_event
+                .details
+                .as_deref()
+                .unwrap_or_default()
+                .contains("BAD999")
+        );
     }
 
     #[test]

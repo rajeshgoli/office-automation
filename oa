@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="${OFFICE_AUTOMATE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+export OFFICE_AUTOMATE_ROOT="$root"
+manifest="$root/rust/office-automate-server/Cargo.toml"
+
+if [[ -z "${OFFICE_AUTOMATE_CONFIG:-}" && -f "$root/config.yaml" ]]; then
+  export OFFICE_AUTOMATE_CONFIG="$root/config.yaml"
+fi
+
+bin="${OFFICE_AUTOMATE_SERVER_BIN:-$root/target/release/office-automate-server}"
+if [[ ! -x "$bin" ]]; then
+  bin="$root/target/debug/office-automate-server"
+fi
+
+if [[ ! -x "$bin" ]]; then
+  cargo build --manifest-path "$manifest"
+  bin="$root/target/debug/office-automate-server"
+fi
+
+exec "$bin" "$@"

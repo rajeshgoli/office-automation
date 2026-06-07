@@ -92,8 +92,10 @@ pub struct RegisterDeviceArgs {
 pub struct RevokeDeviceArgs {
     #[arg(long, env = "OFFICE_AUTOMATE_CONFIG")]
     pub config: PathBuf,
-    #[arg(long)]
-    pub device_id: String,
+    #[arg(value_name = "DEVICE_ID")]
+    pub device_id: Option<String>,
+    #[arg(long = "device-id")]
+    pub device_id_flag: Option<String>,
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
@@ -359,7 +361,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             } else {
                 for device in devices {
                     println!(
-                        "device_id={} name={} code={} paired_at={} revoked_at={} expires_at={} fingerprint={}",
+                        "device_id={} name={} code={} paired_at={} revoked_at={} expires_at={} fingerprint={} failed_attempts={}/{} last_failed_at={}",
                         device.device_id,
                         device.device_name,
                         device.pairing_code,
@@ -367,6 +369,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                         device.revoked_at.as_deref().unwrap_or("-"),
                         device.expires_at,
                         device.public_key_fingerprint.as_deref().unwrap_or("-"),
+                        device.failed_attempts,
+                        db::DEVICE_PAIRING_MAX_FAILED_ATTEMPTS,
+                        device.last_failed_attempt_at.as_deref().unwrap_or("-"),
                     );
                 }
             }
@@ -374,11 +379,15 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Command::RevokeDevice(args) => {
             let config = AppConfig::load(&args.config)?;
-            let revoked = device::revoke_device(&config.runtime.database_path, &args.device_id)?;
+            let device_id = args
+                .device_id
+                .or(args.device_id_flag)
+                .context("revoke-device requires DEVICE_ID or --device-id")?;
+            let revoked = device::revoke_device(&config.runtime.database_path, &device_id)?;
             if revoked {
-                println!("device revoked: {}", args.device_id);
+                println!("device revoked: {device_id}");
             } else {
-                println!("device not found or already revoked: {}", args.device_id);
+                println!("device not found or already revoked: {device_id}");
             }
             Ok(())
         }
@@ -603,6 +612,68 @@ mod tests {
         match cli.command {
             Command::Migrate(args) => assert_eq!(args.config, PathBuf::from("/tmp/office.yaml")),
             other => panic!("expected migrate command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_register_device_command_with_config() {
+        let cli = Cli::try_parse_from([
+            "office-automate-server",
+            "register-device",
+            "--config",
+            "/tmp/office.yaml",
+            "--device-name",
+            "phone",
+        ])
+        .expect("register-device command should parse");
+
+        match cli.command {
+            Command::RegisterDevice(args) => {
+                assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
+                assert_eq!(args.device_name, "phone");
+                assert_eq!(args.expires_in_minutes, 15);
+            }
+            other => panic!("expected register-device command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_revoke_device_positional_and_flag_forms() {
+        let positional = Cli::try_parse_from([
+            "office-automate-server",
+            "revoke-device",
+            "--config",
+            "/tmp/office.yaml",
+            "device-1",
+        ])
+        .expect("revoke-device positional command should parse");
+
+        match positional.command {
+            Command::RevokeDevice(args) => {
+                assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
+                assert_eq!(args.device_id.as_deref(), Some("device-1"));
+                assert_eq!(args.device_id_flag, None);
+            }
+            other => panic!("expected revoke-device command, got {other:?}"),
+        }
+
+        let flagged = Cli::try_parse_from([
+            "office-automate-server",
+            "revoke-device",
+            "--config",
+            "/tmp/office.yaml",
+            "--device-id",
+            "device-2",
+        ])
+        .expect("revoke-device flag command should parse");
+
+        match flagged.command {
+            Command::RevokeDevice(args) => {
+                assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
+                assert_eq!(args.device_id, None);
+                assert_eq!(args.device_id_flag.as_deref(), Some("device-2"));
+            }
+            other => panic!("expected revoke-device command, got {other:?}"),
         }
     }
 
