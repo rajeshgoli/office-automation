@@ -33,7 +33,7 @@ use tokio_tungstenite::{
 use crate::{
     artifacts::{is_valid_artifact_hash, is_valid_sha256_digest},
     auth::AuthManager,
-    config::AppConfig,
+    config::{AppConfig, OrchestratorConfig},
     db, edge, erv, http, hvac,
     state::StateMachine,
     yolink::{self, YoLinkCloudClient, YoLinkState},
@@ -488,7 +488,7 @@ async fn validate_security_authenticated_access(
     .context(
         "security validation for a public URL requires Cloudflare Access service-token headers for authenticated public probes",
     )?;
-    let office_auth = interface_probe_auth(config)?;
+    let office_auth = security_public_office_auth(config, options)?;
     if !office_auth.supports_public_http_auth() {
         bail!("security validation requires Office auth that can be probed over the public URL");
     }
@@ -510,6 +510,28 @@ async fn validate_security_authenticated_access(
         format!("authenticated /status reached origin through Cloudflare Access and Office auth: {public_url}"),
     );
     Ok(())
+}
+
+fn security_public_office_auth(
+    config: &AppConfig,
+    options: &SecurityValidationOptions,
+) -> Result<InterfaceProbeAuth> {
+    let Some(edge_config_path) = options.edge_config.as_deref() else {
+        return interface_probe_auth(config);
+    };
+    let edge_config = edge::PublicEdgeConfig::load_with_env(edge_config_path, |_| None)
+        .with_context(|| {
+            format!(
+                "failed to load raw edge config {} for authenticated public Office probe",
+                edge_config_path.display()
+            )
+        })?;
+    interface_probe_auth_for_orchestrator(&edge_config.orchestrator).with_context(|| {
+        format!(
+            "failed to build authenticated public Office probe auth from edge config {}",
+            edge_config_path.display()
+        )
+    })
 }
 
 fn validate_security_launchd(
@@ -2964,7 +2986,13 @@ impl InterfaceProbeAuth {
 }
 
 fn interface_probe_auth(config: &AppConfig) -> Result<InterfaceProbeAuth> {
-    if let Some(oauth) = &config.orchestrator.google_oauth {
+    interface_probe_auth_for_orchestrator(&config.orchestrator)
+}
+
+fn interface_probe_auth_for_orchestrator(
+    orchestrator: &OrchestratorConfig,
+) -> Result<InterfaceProbeAuth> {
+    if let Some(oauth) = &orchestrator.google_oauth {
         if oauth
             .jwt_secret
             .as_deref()
@@ -2977,7 +3005,7 @@ fn interface_probe_auth(config: &AppConfig) -> Result<InterfaceProbeAuth> {
                 .context("OAuth WebSocket validation requires at least one allowed email")?
                 .trim()
                 .to_ascii_lowercase();
-            let token = AuthManager::new(&config.orchestrator)?
+            let token = AuthManager::new(orchestrator)?
                 .generate_jwt(&email)
                 .context("failed to generate validation WebSocket JWT")?;
             return Ok(InterfaceProbeAuth::OAuthFirstMessage { token, email });
@@ -2993,8 +3021,8 @@ fn interface_probe_auth(config: &AppConfig) -> Result<InterfaceProbeAuth> {
     }
 
     match (
-        config.orchestrator.auth_username.as_deref(),
-        config.orchestrator.auth_password.as_deref(),
+        orchestrator.auth_username.as_deref(),
+        orchestrator.auth_password.as_deref(),
     ) {
         (Some(username), Some(password))
             if !username.trim().is_empty() && !password.trim().is_empty() =>
@@ -4067,6 +4095,65 @@ mod tests {
         .expect_err("public security validation should require Access service-token credentials");
 
         assert!(error.to_string().contains("service-token headers"));
+    }
+
+    #[test]
+    fn security_public_office_auth_uses_edge_config_when_supplied() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        let mut config = test_config(&db_path);
+        config.orchestrator.google_oauth = Some(GoogleOAuthConfig {
+            client_id: "controller-client".to_string(),
+            client_secret: "controller-secret".to_string(),
+            allowed_emails: vec!["controller@example.test".to_string()],
+            jwt_secret: Some("controller-jwt-secret".to_string()),
+            ..GoogleOAuthConfig::default()
+        });
+
+        let edge_config_path = temp_dir.path().join("edge.yaml");
+        fs::write(
+            &edge_config_path,
+            r#"
+orchestrator:
+  host: "127.0.0.1"
+  port: 19190
+  google_oauth:
+    client_id: "edge-client"
+    client_secret: "edge-secret"
+    allowed_emails:
+      - "edge@example.test"
+    jwt_secret: "edge-jwt-secret"
+controller:
+  base_url: "http://127.0.0.1:9001"
+  token: "controller-token"
+runtime:
+  frontend_dist: "/tmp/frontend"
+"#,
+        )
+        .expect("edge config");
+
+        let auth = security_public_office_auth(
+            &config,
+            &SecurityValidationOptions {
+                edge_config: Some(edge_config_path.clone()),
+                ..SecurityValidationOptions::default()
+            },
+        )
+        .expect("edge probe auth");
+        let InterfaceProbeAuth::OAuthFirstMessage { token, email } = auth else {
+            panic!("expected edge OAuth probe auth, got {auth:?}");
+        };
+
+        assert_eq!(email, "edge@example.test");
+        let edge_config =
+            edge::PublicEdgeConfig::load_with_env(&edge_config_path, |_| None).expect("edge load");
+        let edge_auth = AuthManager::new(&edge_config.orchestrator).expect("edge auth");
+        let controller_auth = AuthManager::new(&config.orchestrator).expect("controller auth");
+        assert_eq!(
+            edge_auth.verify_jwt(&token),
+            Some("edge@example.test".to_string())
+        );
+        assert_eq!(controller_auth.verify_jwt(&token), None);
     }
 
     #[test]
