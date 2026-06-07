@@ -10,7 +10,26 @@ yolink:
 qingping:
   mqtt_broker: "localhost"  # or IP of your MQTT broker
   mqtt_port: 1883
+  mqtt_username: "qingping"
+  mqtt_password: "replace-with-random-device-password"
   device_mac: "AA:BB:CC:DD:EE:FF"
+
+# Android artifact upload hardening. Set this to the SHA-256 digest of the
+# office-climate release signing certificate. The deploy endpoint rejects APKs
+# signed by any other cert when this is configured.
+artifacts:
+  office_climate_signing_cert_sha256: "replace-with-release-signing-cert-sha256"
+  # Optional if apksigner is not on PATH.
+  # apksigner_path: "/absolute/path/to/apksigner"
+
+# Cloudflare Access device policy sync. The Android Service Auth policy should
+# use Common Name selectors, not a broad Valid Certificate selector. The same
+# Rust binary updates that allowlist during oa register-device/revoke-device.
+cloudflare_access:
+  account_id: "cloudflare-account-id"
+  app_id: "optional-access-application-id"
+  device_policy_id: "cloudflare-device-mtls-policy-id"
+  api_token: "cloudflare-api-token-with-access-apps-policies-write"
 
 # Airlink ERV (Tuya-based)
 # Option 1: LocalTuya

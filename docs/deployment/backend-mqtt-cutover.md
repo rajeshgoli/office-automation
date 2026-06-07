@@ -58,6 +58,7 @@ The Cloudflare evidence file must use the schema from `docs/deployment/shadow-mo
 - the exact hostname is protected by an Access application,
 - no policy action is Bypass,
 - no policy includes public users,
+- the Android Service Auth policy uses per-device Common Name selectors and does not include a broad Valid Certificate selector,
 - no wildcard DNS record points at Office Automate,
 - the tunnel routes only to the loopback or Unix-socket origin,
 - no Cloudflare private-network routes exist for this tunnel,
@@ -73,6 +74,7 @@ export OFFICE_AUTOMATE_LEGACY_STOPPED_AT="$(date -Iseconds)"
 Apply the selected MQTT feed strategy:
 
 - `atomic-switch`: move Qingping to the Rust embedded broker in the same window that Python active control stops and Rust active control starts.
+- Configure Qingping Private MQTT with the `qingping.mqtt_username` and `qingping.mqtt_password` values from `config.yaml`; production security validation fails if the broker is anonymous.
 
 Start the Rust backend and Cloudflare Tunnel services with launchd or the equivalent foreground commands:
 

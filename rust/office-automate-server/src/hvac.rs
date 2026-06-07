@@ -910,6 +910,8 @@ mod tests {
             presence: crate::config::PresenceConfig::default(),
             qingping: crate::config::QingpingConfig::default(),
             yolink: crate::config::YoLinkConfig::default(),
+            artifacts: crate::config::ArtifactConfig::default(),
+            cloudflare_access: crate::config::CloudflareAccessConfig::default(),
             erv: crate::config::ErvConfig::default(),
             mitsubishi: crate::config::MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),

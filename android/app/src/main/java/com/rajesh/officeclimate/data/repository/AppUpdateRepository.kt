@@ -47,6 +47,9 @@ class AppUpdateRepository(
         if (!isValidArtifactHash(serverArtifactHash)) {
             return null
         }
+        if (!metadata.revokedAt.isNullOrBlank()) {
+            return null
+        }
         val serverSha256 = metadata.sha256?.trim()?.lowercase() ?: return null
         if (!isValidSha256(serverSha256) || !serverSha256.startsWith(serverArtifactHash)) {
             return null
