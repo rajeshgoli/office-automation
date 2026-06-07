@@ -33,8 +33,11 @@ struct PairingState {
 
 #[derive(Debug, Deserialize)]
 pub struct CompleteDeviceRequest {
+    #[serde(default)]
     pub pairing_code: String,
+    #[serde(default)]
     pub csr_pem: String,
+    #[serde(default)]
     pub public_key_pem: String,
     #[serde(default)]
     pub common_name: Option<String>,
@@ -362,4 +365,19 @@ authorityKeyIdentifier = keyid,issuer
     }
 
     fs::read_to_string(&cert_path).context("failed to read signed certificate")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_device_request_defaults_omitted_proof_fields() {
+        let payload: CompleteDeviceRequest =
+            serde_json::from_str(r#"{"pairing_code":"ABC123"}"#).expect("deserialize payload");
+
+        assert_eq!(payload.pairing_code, "ABC123");
+        assert_eq!(payload.csr_pem, "");
+        assert_eq!(payload.public_key_pem, "");
+    }
 }
