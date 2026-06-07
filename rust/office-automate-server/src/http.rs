@@ -2323,7 +2323,7 @@ async fn auth_callback(
             )
             .body(Body::empty())
             .expect("valid android redirect response"),
-        Ok(Some(login)) => browser_login_response(&state.auth, &login.jwt),
+        Ok(Some(login)) => browser_login_response(&state.auth, &login.jwt, login.secure_cookie),
         Ok(None) => (
             StatusCode::FORBIDDEN,
             Html("<html><body><h1>Login Failed</h1><p>Email not authorized</p></body></html>"),
@@ -2361,13 +2361,13 @@ fn script_json_string(value: &str) -> String {
         .replace('&', "\\u0026")
 }
 
-fn browser_login_response(auth: &AuthManager, token: &str) -> Response {
+fn browser_login_response(auth: &AuthManager, token: &str, secure_cookie: bool) -> Response {
     let mut response = Response::builder()
         .status(StatusCode::FOUND)
         .header(header::LOCATION, "/")
         .body(Body::empty())
         .expect("valid browser login response");
-    if let Some(cookies) = auth.issue_oauth_session_cookies(token) {
+    if let Some(cookies) = auth.issue_oauth_session_cookies(token, secure_cookie) {
         for cookie in cookies {
             response.headers_mut().append(
                 header::SET_COOKIE,
@@ -2378,8 +2378,8 @@ fn browser_login_response(auth: &AuthManager, token: &str) -> Response {
     response
 }
 
-fn append_clear_oauth_cookies(response: &mut Response) {
-    for cookie in AuthManager::clear_oauth_session_cookies() {
+fn append_clear_oauth_cookies(response: &mut Response, secure_cookie: bool) {
+    for cookie in AuthManager::clear_oauth_session_cookies(secure_cookie) {
         response.headers_mut().append(
             header::SET_COOKIE,
             cookie.parse().expect("valid clear cookie"),
@@ -2406,8 +2406,19 @@ async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Respo
 
     state.auth.invalidate_token(token);
     let mut response = Json(json!({"ok": true, "message": "Logged out"})).into_response();
-    append_clear_oauth_cookies(&mut response);
+    append_clear_oauth_cookies(&mut response, oauth_cookie_secure_from_headers(&headers));
     response
+}
+
+fn oauth_cookie_secure_from_headers(headers: &HeaderMap) -> bool {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok());
+    crate::auth::resolve_redirect_scheme(host, forwarded_proto) == "https"
 }
 
 async fn auth_device_start(State(state): State<AppState>) -> Response {
@@ -2758,7 +2769,7 @@ mod tests {
 
     fn oauth_cookie_header(auth: &AuthManager, token: &str) -> (String, String) {
         let cookies = auth
-            .issue_oauth_session_cookies(token)
+            .issue_oauth_session_cookies(token, true)
             .expect("oauth cookies");
         let cookie_header = cookies
             .iter()
@@ -3304,7 +3315,7 @@ mod tests {
         let config = oauth_config();
         let auth = AuthManager::new(&config.orchestrator).expect("auth");
         let token = auth.generate_jwt("engineer@rajeshgo.li").expect("token");
-        let response = browser_login_response(&auth, &token);
+        let response = browser_login_response(&auth, &token, true);
 
         assert_eq!(response.status(), StatusCode::FOUND);
         assert_eq!(
@@ -3333,6 +3344,33 @@ mod tests {
                     && cookie.contains("Secure")
                     && cookie.contains("SameSite=Lax"))
         );
+    }
+
+    #[test]
+    fn browser_login_response_allows_nonsecure_cookies_for_local_http_oauth() {
+        let config = oauth_config();
+        let auth = AuthManager::new(&config.orchestrator).expect("auth");
+        let token = auth.generate_jwt("engineer@rajeshgo.li").expect("token");
+        let response = browser_login_response(&auth, &token, false);
+
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("cookie").to_string())
+            .collect::<Vec<_>>();
+        assert!(cookies.iter().any(|cookie| {
+            cookie.starts_with("office_auth=")
+                && cookie.contains("HttpOnly")
+                && !cookie.contains("Secure")
+                && cookie.contains("SameSite=Lax")
+        }));
+        assert!(cookies.iter().any(|cookie| {
+            cookie.starts_with("office_csrf=")
+                && !cookie.contains("HttpOnly")
+                && !cookie.contains("Secure")
+                && cookie.contains("SameSite=Lax")
+        }));
     }
 
     #[tokio::test]

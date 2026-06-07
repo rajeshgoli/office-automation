@@ -914,7 +914,7 @@ async fn auth_callback(
             )
             .body(Body::empty())
             .expect("valid android redirect response"),
-        Ok(Some(login)) => browser_login_response(&state.auth, &login.jwt),
+        Ok(Some(login)) => browser_login_response(&state.auth, &login.jwt, login.secure_cookie),
         Ok(None) => (
             StatusCode::FORBIDDEN,
             Html("<html><body><h1>Login Failed</h1><p>Email not authorized</p></body></html>"),
@@ -941,7 +941,7 @@ async fn auth_logout(State(state): State<EdgeState>, headers: HeaderMap) -> Resp
 
     state.auth.invalidate_token(token);
     let mut response = Json(json!({"ok": true, "message": "Logged out"})).into_response();
-    append_clear_oauth_cookies(&mut response);
+    append_clear_oauth_cookies(&mut response, oauth_cookie_secure_from_headers(&headers));
     response
 }
 
@@ -1044,13 +1044,13 @@ fn escape_html_text(value: &str) -> String {
         .collect()
 }
 
-fn browser_login_response(auth: &AuthManager, token: &str) -> Response {
+fn browser_login_response(auth: &AuthManager, token: &str, secure_cookie: bool) -> Response {
     let mut response = Response::builder()
         .status(StatusCode::FOUND)
         .header(header::LOCATION, "/")
         .body(Body::empty())
         .expect("valid browser login response");
-    if let Some(cookies) = auth.issue_oauth_session_cookies(token) {
+    if let Some(cookies) = auth.issue_oauth_session_cookies(token, secure_cookie) {
         for cookie in cookies {
             response.headers_mut().append(
                 header::SET_COOKIE,
@@ -1061,13 +1061,24 @@ fn browser_login_response(auth: &AuthManager, token: &str) -> Response {
     response
 }
 
-fn append_clear_oauth_cookies(response: &mut Response) {
-    for cookie in AuthManager::clear_oauth_session_cookies() {
+fn append_clear_oauth_cookies(response: &mut Response, secure_cookie: bool) {
+    for cookie in AuthManager::clear_oauth_session_cookies(secure_cookie) {
         response.headers_mut().append(
             header::SET_COOKIE,
             cookie.parse().expect("valid clear cookie"),
         );
     }
+}
+
+fn oauth_cookie_secure_from_headers(headers: &HeaderMap) -> bool {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok());
+    crate::auth::resolve_redirect_scheme(host, forwarded_proto) == "https"
 }
 
 fn is_loopback_bind_host(host: &str) -> bool {
@@ -1114,7 +1125,7 @@ mod tests {
 
     fn oauth_cookie_header(auth: &AuthManager, token: &str) -> (String, String) {
         let cookies = auth
-            .issue_oauth_session_cookies(token)
+            .issue_oauth_session_cookies(token, true)
             .expect("oauth cookies");
         let cookie_header = cookies
             .iter()

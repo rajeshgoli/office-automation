@@ -361,24 +361,26 @@ impl AuthManager {
         ))
     }
 
-    pub fn issue_oauth_session_cookies(&self, token: &str) -> Option<Vec<String>> {
+    pub fn issue_oauth_session_cookies(&self, token: &str, secure: bool) -> Option<Vec<String>> {
         let oauth = self.inner.oauth.as_ref()?;
         let max_age = oauth.token_expiry_days.max(1) * 24 * 60 * 60;
         let csrf_token = random_url_token(32);
+        let secure_attribute = secure.then_some("; Secure").unwrap_or("");
         Some(vec![
             format!(
-                "{OAUTH_SESSION_COOKIE}={token}; Max-Age={max_age}; Path=/; HttpOnly; Secure; SameSite=Lax"
+                "{OAUTH_SESSION_COOKIE}={token}; Max-Age={max_age}; Path=/; HttpOnly{secure_attribute}; SameSite=Lax"
             ),
             format!(
-                "{OAUTH_CSRF_COOKIE}={csrf_token}; Max-Age={max_age}; Path=/; Secure; SameSite=Lax"
+                "{OAUTH_CSRF_COOKIE}={csrf_token}; Max-Age={max_age}; Path=/{secure_attribute}; SameSite=Lax"
             ),
         ])
     }
 
-    pub fn clear_oauth_session_cookies() -> [&'static str; 2] {
+    pub fn clear_oauth_session_cookies(secure: bool) -> [String; 2] {
+        let secure_attribute = secure.then_some("; Secure").unwrap_or("");
         [
-            "office_auth=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax",
-            "office_csrf=; Max-Age=0; Path=/; Secure; SameSite=Lax",
+            format!("office_auth=; Max-Age=0; Path=/; HttpOnly{secure_attribute}; SameSite=Lax"),
+            format!("office_csrf=; Max-Age=0; Path=/{secure_attribute}; SameSite=Lax"),
         ]
     }
 
@@ -577,6 +579,7 @@ impl AuthManager {
             email,
             jwt,
             platform: pending.platform,
+            secure_cookie: pending.redirect_uri.starts_with("https://"),
             refresh_token: token_response.refresh_token,
             access_token: token_response.access_token,
         }))
@@ -736,6 +739,7 @@ pub struct FinishedOAuthLogin {
     pub email: String,
     pub jwt: String,
     pub platform: Option<String>,
+    pub secure_cookie: bool,
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
 }
