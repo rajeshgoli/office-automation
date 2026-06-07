@@ -32,14 +32,6 @@ class SettingsRepository(private val context: Context) {
         prefs[Keys.SERVER_URL] ?: Defaults.SERVER_URL
     }
 
-    val jwtToken: Flow<String> = context.dataStore.data.map { prefs ->
-        prefs[Keys.JWT_TOKEN] ?: ""
-    }
-
-    val userEmail: Flow<String> = context.dataStore.data.map { prefs ->
-        prefs[Keys.USER_EMAIL] ?: ""
-    }
-
     val deviceCertificateAlias: Flow<String> = context.dataStore.data.map { prefs ->
         prefs[Keys.DEVICE_CERTIFICATE_ALIAS] ?: ""
     }
@@ -48,13 +40,8 @@ class SettingsRepository(private val context: Context) {
         prefs[Keys.DEVICE_CERTIFICATE_CHAIN_PEM] ?: ""
     }
 
-    val isLoggedIn: Flow<Boolean> = context.dataStore.data.map { prefs ->
-        !prefs[Keys.JWT_TOKEN].isNullOrBlank()
-    }
-
     val isAuthenticated: Flow<Boolean> = context.dataStore.data.map { prefs ->
-        !prefs[Keys.JWT_TOKEN].isNullOrBlank() ||
-            hasValidDeviceCredential(prefs)
+        hasValidDeviceCredential(prefs)
     }
 
     val dismissedUpdateArtifactHash: Flow<String?> = context.dataStore.data.map { prefs ->
@@ -72,13 +59,6 @@ class SettingsRepository(private val context: Context) {
         }
         context.dataStore.edit { prefs ->
             prefs[Keys.SERVER_URL] = normalized
-        }
-    }
-
-    suspend fun saveAuth(token: String, email: String) {
-        context.dataStore.edit { prefs ->
-            prefs[Keys.JWT_TOKEN] = token
-            prefs[Keys.USER_EMAIL] = email
         }
     }
 
@@ -112,15 +92,17 @@ class SettingsRepository(private val context: Context) {
         }
     }
 
-    suspend fun clearInvalidDeviceCredentialIfNeeded() {
+    suspend fun clearLegacyAuthAndInvalidDeviceCredentialIfNeeded() {
         context.dataStore.edit { prefs ->
+            prefs.remove(Keys.JWT_TOKEN)
+            prefs.remove(Keys.USER_EMAIL)
+            prefs.remove(Keys.LEGACY_DEVICE_PRIVATE_KEY_PKCS8)
             if (
                 !prefs[Keys.DEVICE_CERTIFICATE_ALIAS].isNullOrBlank() &&
                     !hasValidDeviceCredential(prefs)
             ) {
                 prefs.remove(Keys.DEVICE_CERTIFICATE_ALIAS)
                 prefs.remove(Keys.DEVICE_CERTIFICATE_CHAIN_PEM)
-                prefs.remove(Keys.LEGACY_DEVICE_PRIVATE_KEY_PKCS8)
             }
         }
     }

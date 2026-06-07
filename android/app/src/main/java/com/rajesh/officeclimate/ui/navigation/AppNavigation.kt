@@ -18,7 +18,6 @@ import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Insights
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
@@ -30,7 +29,6 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
-import com.rajesh.officeclimate.MainActivity
 import com.rajesh.officeclimate.data.repository.SettingsRepository
 import com.rajesh.officeclimate.ui.dashboard.DashboardScreen
 import com.rajesh.officeclimate.ui.history.HistoryScreen
@@ -39,7 +37,6 @@ import com.rajesh.officeclimate.ui.projects.ProjectsScreen
 import com.rajesh.officeclimate.ui.settings.SettingsScreen
 import com.rajesh.officeclimate.ui.settings.SettingsViewModel
 import com.rajesh.officeclimate.ui.theme.*
-import kotlinx.coroutines.flow.StateFlow
 
 object Routes {
     const val SETTINGS = "settings"
@@ -64,7 +61,7 @@ private val navItems = listOf(
 )
 
 @Composable
-fun AppNavigation(authResult: StateFlow<MainActivity.AuthResult?>) {
+fun AppNavigation() {
     val navController = rememberNavController()
     val context = LocalContext.current
     val settingsRepo = SettingsRepository(context)
@@ -138,18 +135,6 @@ fun AppNavigation(authResult: StateFlow<MainActivity.AuthResult?>) {
         ) {
             composable(Routes.SETTINGS) {
                 val settingsViewModel: SettingsViewModel = viewModel()
-                val auth by authResult.collectAsState()
-
-                LaunchedEffect(auth) {
-                    auth?.let { result ->
-                        settingsViewModel.onAuthCallback(result.token, result.email) {
-                            navController.navigate(Routes.DASHBOARD) {
-                                popUpTo(Routes.SETTINGS) { inclusive = true }
-                            }
-                        }
-                        (context as? MainActivity)?.clearAuthResult()
-                    }
-                }
 
                 SettingsScreen(
                     onNavigateToDashboard = {

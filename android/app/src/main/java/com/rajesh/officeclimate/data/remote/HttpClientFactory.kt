@@ -23,7 +23,6 @@ class HttpClientFactory(
     private val settingsRepository: com.rajesh.officeclimate.data.repository.SettingsRepository,
 ) {
     suspend fun create(
-        tokenProvider: (() -> String)? = null,
         includeLogging: Boolean = false,
         connectTimeoutSeconds: Long = 10,
         readTimeoutSeconds: Long = 30,
@@ -33,10 +32,6 @@ class HttpClientFactory(
             .followSslRedirects(false)
             .connectTimeout(connectTimeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
             .readTimeout(readTimeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
-
-        tokenProvider?.let { provider ->
-            builder.addInterceptor(AuthInterceptor(provider))
-        }
 
         if (includeLogging) {
             builder.addInterceptor(
