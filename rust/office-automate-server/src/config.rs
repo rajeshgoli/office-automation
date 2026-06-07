@@ -56,6 +56,7 @@ pub struct TelemetryConfig {
 pub struct OrchestratorConfig {
     pub host: String,
     pub port: u16,
+    pub admin_emails: Vec<String>,
     pub auth_username: Option<String>,
     pub auth_password: Option<String>,
     pub google_oauth: Option<GoogleOAuthConfig>,
@@ -67,6 +68,7 @@ impl Default for OrchestratorConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: 8080,
+            admin_emails: Vec::new(),
             auth_username: None,
             auth_password: None,
             google_oauth: None,
@@ -480,6 +482,15 @@ impl AppConfig {
             file_config.orchestrator.controller_ipc_token = Some(token);
         }
 
+        if let Some(admin_emails) = env_lookup("OFFICE_AUTOMATE_ADMIN_EMAILS") {
+            file_config.orchestrator.admin_emails = admin_emails
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+
         if let Some(repos) = env_lookup("OFFICE_AUTOMATE_TELEMETRY_REPOS") {
             file_config.telemetry.repos = repos
                 .split(',')
@@ -645,6 +656,7 @@ mod tests {
 
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 8080);
+        assert!(config.admin_emails.is_empty());
     }
 
     #[test]
@@ -750,6 +762,9 @@ thresholds:
             "OFFICE_AUTOMATE_TELEMETRY_DAYS" => Some("14".to_string()),
             "OFFICE_AUTOMATE_PUBLIC_URL" => Some("https://office.example.com".to_string()),
             "OFFICE_AUTOMATE_CONTROLLER_IPC_TOKEN" => Some("edge-ipc-token".to_string()),
+            "OFFICE_AUTOMATE_ADMIN_EMAILS" => {
+                Some("rajesh@example.com,ops@example.com".to_string())
+            }
             _ => None,
         })
         .expect("load config");
@@ -846,6 +861,10 @@ thresholds:
         assert_eq!(
             config.orchestrator.controller_ipc_token.as_deref(),
             Some("edge-ipc-token")
+        );
+        assert_eq!(
+            config.orchestrator.admin_emails,
+            vec!["rajesh@example.com", "ops@example.com"]
         );
         assert_eq!(config.thresholds.hvac_heat_on_temp_f, 70);
         assert_eq!(config.thresholds.hvac_cool_setpoint_f, 77);
