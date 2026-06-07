@@ -240,6 +240,28 @@ The validation passes only if the tunnel/edge users can read the material they n
 
 `com.office-automate.server` owns the embedded MQTT broker for Qingping. Configure the physical Qingping device's Private Access MQTT host to the primary host LAN address and port from `qingping.mqtt_broker` and `qingping.mqtt_port`. The Rust server subscribes to `qingping/<device_mac>/up` and publishes interval commands to `qingping/<device_mac>/down`; no separate MQTT bridge or legacy broker is part of the target deployment.
 
+## Android Device Enrollment
+
+Use the repo-root `oa` wrapper for local device administration. It executes the same Rust `office-automate-server` binary and defaults `OFFICE_AUTOMATE_CONFIG` to `config.yaml` when run from the checkout:
+
+```bash
+./oa migrate
+./oa register-device --device-name phone
+./oa list-devices
+./oa revoke-device <device-id>
+```
+
+`register-device` starts a short-lived LAN pairing listener, prints a six-character one-time code, and records audit events for registration creation, successful pairing, rejected codes, rejected CSR/proof attempts, and revocation. A pending code is invalidated after five failed CSR/proof attempts. Unknown-code audit entries store a hash of the submitted code, not the raw code.
+
+The default device mTLS CA files are repo-local and gitignored:
+
+| Path | Purpose |
+| --- | --- |
+| `certs/device-ca.pem` | CA certificate uploaded to Cloudflare Access as the client-certificate root. |
+| `certs/device-ca.key` | Local signing key used only by `oa register-device`; do not upload it to Cloudflare. |
+
+Override these paths with `--device-ca-cert`, `--device-ca-key`, `OFFICE_AUTOMATE_DEVICE_CA_CERT`, or `OFFICE_AUTOMATE_DEVICE_CA_KEY` if a deployment keeps private key material elsewhere.
+
 ## Cloudflare Tunnel Notes
 
 The tunnel template only starts `cloudflared`; it does not define DNS, public hostnames, TLS, credentials, or application authorization. Configure those through Cloudflare and the `cloudflared` config file. The tunnel should forward only to the local Rust edge origin, and the edge/controller pair should continue enforcing OAuth/JWT plus the local controller IPC token. Public deployments must not use `trusted_networks`.

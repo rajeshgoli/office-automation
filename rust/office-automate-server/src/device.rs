@@ -1,14 +1,15 @@
 use std::{
-    fs,
+    env, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -18,14 +19,16 @@ use tokio::net::TcpListener;
 
 use crate::db::{self, DeviceRegistration};
 
-const DEFAULT_DEVICE_CA_CERT: &str = "/Users/rajesh/.office-automate/device-ca/device-ca.pem";
-const DEFAULT_DEVICE_CA_KEY: &str = "/Users/rajesh/.office-automate/device-ca/device-ca.key";
+const DEFAULT_DEVICE_CA_CERT: &str = "certs/device-ca.pem";
+const DEFAULT_DEVICE_CA_KEY: &str = "certs/device-ca.key";
+const MAX_UNKNOWN_PAIRING_ATTEMPTS: u32 = 25;
 
 #[derive(Debug, Clone)]
 struct PairingState {
     database_path: PathBuf,
     ca_cert_path: PathBuf,
     ca_key_path: PathBuf,
+    unknown_attempts: Arc<Mutex<u32>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +80,7 @@ pub async fn serve_pairing_listener(
         database_path,
         ca_cert_path: ca_cert_path.unwrap_or_else(default_device_ca_cert_path),
         ca_key_path: ca_key_path.unwrap_or_else(default_device_ca_key_path),
+        unknown_attempts: Arc::new(Mutex::new(0)),
     };
 
     let app = Router::new()
@@ -87,17 +91,27 @@ pub async fn serve_pairing_listener(
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("failed to bind pairing listener at {bind_addr}"))?;
-    axum::serve(listener, app)
-        .await
-        .context("pairing listener exited with an error")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("pairing listener exited with an error")
 }
 
 pub fn default_device_ca_cert_path() -> PathBuf {
-    PathBuf::from(DEFAULT_DEVICE_CA_CERT)
+    default_repo_local_path(DEFAULT_DEVICE_CA_CERT)
 }
 
 pub fn default_device_ca_key_path() -> PathBuf {
-    PathBuf::from(DEFAULT_DEVICE_CA_KEY)
+    default_repo_local_path(DEFAULT_DEVICE_CA_KEY)
+}
+
+fn default_repo_local_path(relative_path: &str) -> PathBuf {
+    env::var_os("OFFICE_AUTOMATE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(relative_path)
 }
 
 async fn pairing_health() -> impl IntoResponse {
@@ -106,8 +120,10 @@ async fn pairing_health() -> impl IntoResponse {
 
 async fn complete_device_pairing(
     State(state): State<PairingState>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<CompleteDeviceRequest>,
 ) -> Response {
+    let remote_addr = remote_addr.to_string();
     let pairing_code = payload.pairing_code.trim();
     if pairing_code.is_empty() {
         return (
@@ -120,6 +136,24 @@ async fn complete_device_pairing(
         match db::pending_device_registration_by_pairing_code(&state.database_path, pairing_code) {
             Ok(Some(registration)) => registration,
             Ok(None) => {
+                let attempts = increment_unknown_attempts(&state);
+                let _ = db::log_unknown_device_pairing_attempt(
+                    &state.database_path,
+                    pairing_code,
+                    Some(&remote_addr),
+                    if attempts > MAX_UNKNOWN_PAIRING_ATTEMPTS {
+                        "too_many_unknown_attempts"
+                    } else {
+                        "unknown_expired_or_already_paired"
+                    },
+                );
+                if attempts > MAX_UNKNOWN_PAIRING_ATTEMPTS {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(serde_json::json!({"error": "Too many invalid pairing attempts"})),
+                    )
+                        .into_response();
+                }
                 return (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({"error": "Unknown, expired, or already paired code"})),
@@ -134,7 +168,46 @@ async fn complete_device_pairing(
                     .into_response();
             }
         };
+    if payload.public_key_pem.trim().is_empty() {
+        record_pairing_failure(
+            &state,
+            pairing_code,
+            Some(&remote_addr),
+            "pairing_public_key_rejected",
+            "missing public_key_pem",
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing public_key_pem"})),
+        )
+            .into_response();
+    }
     let certificate_common_name = pending_registration.device_id.clone();
+    let csr_public_key_pem = match extract_public_key_from_csr_with_openssl(&payload.csr_pem) {
+        Ok(public_key_pem) => public_key_pem,
+        Err(error) => {
+            let exhausted = record_pairing_failure(
+                &state,
+                pairing_code,
+                Some(&remote_addr),
+                "pairing_csr_rejected",
+                &error.to_string(),
+            );
+            return (
+                if exhausted {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                Json(serde_json::json!({"error": if exhausted {
+                    "Too many invalid pairing attempts"
+                } else {
+                    "Invalid device CSR"
+                }})),
+            )
+                .into_response();
+        }
+    };
     let certificate_pem = match sign_csr_with_openssl(
         &state.ca_cert_path,
         &state.ca_key_path,
@@ -154,8 +227,9 @@ async fn complete_device_pairing(
     match db::complete_device_registration(
         &state.database_path,
         pairing_code,
-        &payload.public_key_pem,
+        &csr_public_key_pem,
         &certificate_common_name,
+        Some(&remote_addr),
     ) {
         Ok(Some(registration)) => Json(CompleteDeviceResponse {
             device_id: registration.device_id,
@@ -178,6 +252,57 @@ async fn complete_device_pairing(
         )
             .into_response(),
     }
+}
+
+fn increment_unknown_attempts(state: &PairingState) -> u32 {
+    let mut attempts = state
+        .unknown_attempts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *attempts += 1;
+    *attempts
+}
+
+fn record_pairing_failure(
+    state: &PairingState,
+    pairing_code: &str,
+    remote_addr: Option<&str>,
+    event: &str,
+    error: &str,
+) -> bool {
+    db::record_device_pairing_failure(
+        &state.database_path,
+        pairing_code,
+        event,
+        remote_addr,
+        Some(&serde_json::json!({"error": error})),
+    )
+    .map(|failure| failure.map(|failure| failure.exhausted).unwrap_or(false))
+    .unwrap_or(false)
+}
+
+fn extract_public_key_from_csr_with_openssl(csr_pem: &str) -> Result<String> {
+    let temp_dir =
+        tempfile::tempdir().context("failed to create temporary CSR validation directory")?;
+    let csr_path = temp_dir.path().join("device.csr.pem");
+    fs::write(&csr_path, csr_pem).context("failed to write CSR")?;
+
+    let output = Command::new("openssl")
+        .arg("req")
+        .arg("-in")
+        .arg(&csr_path)
+        .arg("-pubkey")
+        .arg("-noout")
+        .output()
+        .context("failed to invoke openssl for CSR public key extraction")?;
+
+    if !output.status.success() {
+        bail!("openssl failed to read CSR public key");
+    }
+
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_string())
+        .context("openssl returned non-UTF-8 CSR public key")
 }
 
 fn sign_csr_with_openssl(
