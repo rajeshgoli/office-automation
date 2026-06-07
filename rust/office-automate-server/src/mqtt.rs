@@ -18,8 +18,8 @@ use crate::{
     config::AppConfig,
     db,
     qingping::{
-        QingpingState, parse_qingping_payload, qingping_down_topic, qingping_interval_payload,
-        qingping_up_topic,
+        MAX_QINGPING_PAYLOAD_BYTES, QingpingState, parse_qingping_payload, qingping_down_topic,
+        qingping_interval_payload, qingping_up_topic,
     },
 };
 
@@ -210,7 +210,7 @@ pub(crate) fn build_broker_config(host: &str, port: u16) -> Result<BrokerConfig>
             next_connection_delay_ms: 1,
             connections: ConnectionSettings {
                 connection_timeout_ms: 60_000,
-                max_payload_size: 20_480,
+                max_payload_size: MAX_QINGPING_PAYLOAD_BYTES,
                 max_inflight_count: 100,
                 auth: None,
                 external_auth: None,
@@ -264,7 +264,10 @@ mod tests {
         let server = v4.get("qingping").expect("qingping server");
 
         assert_eq!(server.listen, "127.0.0.1:2883".parse().expect("addr"));
-        assert_eq!(server.connections.max_payload_size, 20_480);
+        assert_eq!(
+            server.connections.max_payload_size,
+            MAX_QINGPING_PAYLOAD_BYTES
+        );
         assert_eq!(config.router.max_connections, 128);
     }
 
