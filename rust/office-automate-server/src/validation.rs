@@ -2,9 +2,13 @@ use std::{
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, RwLock},
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose};
@@ -29,8 +33,8 @@ use tokio_tungstenite::{
 use crate::{
     artifacts::{is_valid_artifact_hash, is_valid_sha256_digest},
     auth::AuthManager,
-    config::AppConfig,
-    db, erv, http, hvac,
+    config::{AppConfig, OrchestratorConfig},
+    db, edge, erv, http, hvac,
     state::StateMachine,
     yolink::{self, YoLinkCloudClient, YoLinkState},
 };
@@ -99,6 +103,31 @@ pub struct RollbackValidationOptions {
     pub rollback_log: PathBuf,
     pub manual_legacy_public_verified_at: Option<String>,
     pub max_air_quality_age_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SecurityValidationOptions {
+    pub public_url: Option<String>,
+    pub cloudflared_config: Option<PathBuf>,
+    pub cloudflare_evidence: Option<PathBuf>,
+    pub cloudflare_access_client_id: Option<String>,
+    pub cloudflare_access_client_secret: Option<String>,
+    pub edge_config: Option<PathBuf>,
+    pub server_launchd_plist: Option<PathBuf>,
+    pub edge_launchd_plist: Option<PathBuf>,
+    pub tunnel_launchd_plist: Option<PathBuf>,
+    pub tunnel_user: Option<String>,
+    pub edge_user: Option<String>,
+    pub secret_files: Vec<PathBuf>,
+    pub protected_paths: Vec<PathBuf>,
+    pub tunnel_readable_paths: Vec<PathBuf>,
+    pub tunnel_private_paths: Vec<PathBuf>,
+    pub edge_readable_paths: Vec<PathBuf>,
+    pub edge_private_paths: Vec<PathBuf>,
+    pub tunnel_origin_probes: Vec<String>,
+    pub edge_ipc_probes: Vec<String>,
+    pub denied_lan_probes: Vec<String>,
+    pub lan_control_user: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +295,26 @@ pub async fn run_rollback_validation(
     Ok(report)
 }
 
+pub async fn run_security_validation(
+    config: &AppConfig,
+    options: SecurityValidationOptions,
+) -> Result<ShadowValidationReport> {
+    let mut report = ShadowValidationReport { checks: Vec::new() };
+    let public_url = options
+        .public_url
+        .as_deref()
+        .or(config.runtime.public_url.as_deref());
+
+    validate_http_startup_config(config, public_url, &mut report)?;
+    validate_security_file_permissions(config, &options, &mut report)?;
+    validate_security_edge_config(public_url, &options, &mut report)?;
+    validate_security_cloudflare(config, public_url, &options, &mut report).await?;
+    validate_security_launchd(public_url, &options, &mut report)?;
+    validate_security_role_boundaries(config, public_url, &options, &mut report)?;
+
+    Ok(report)
+}
+
 fn validate_active_write_gates(
     config: &AppConfig,
     report: &mut ShadowValidationReport,
@@ -296,6 +345,855 @@ fn validate_http_startup_config(
         "HTTP listener startup config is safe for configured public/local exposure",
     );
     Ok(())
+}
+
+fn validate_security_file_permissions(
+    config: &AppConfig,
+    options: &SecurityValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    validate_strict_private_file(&config.runtime.config_path, "controller config")?;
+    report.push_pass(
+        "controller-config-permissions",
+        format!(
+            "{} is owner-only readable/writable",
+            config.runtime.config_path.display()
+        ),
+    );
+
+    for path in [
+        &config.runtime.data_dir,
+        &config.runtime.artifacts_dir,
+        &config.runtime.database_path,
+        &config.runtime.telemetry_db_path,
+        &config.runtime.tool_usage_db_path,
+        &config.runtime.session_tool_usage_db_path,
+        &config.runtime.engram_db_path,
+    ] {
+        validate_not_group_world_writable(path)?;
+    }
+    report.push_pass(
+        "runtime-file-permissions",
+        "data, artifact, SQLite, and telemetry paths are not group/world writable",
+    );
+
+    let mut strict_paths = options.secret_files.clone();
+    if let Some(path) = options.edge_config.as_ref() {
+        strict_paths.push(path.clone());
+    }
+    if let Some(path) = options.cloudflared_config.as_ref() {
+        validate_not_group_world_writable(path)?;
+        if let Some(credentials_file) = cloudflared_credentials_file(path)? {
+            strict_paths.push(credentials_file);
+        }
+    }
+
+    strict_paths.sort();
+    strict_paths.dedup();
+    if strict_paths.is_empty() {
+        report.push_skip(
+            "extra-secret-file-permissions",
+            "no --secret-file, --edge-config, or --cloudflared-config supplied",
+        );
+    } else {
+        for path in &strict_paths {
+            validate_strict_private_file(path, "secret/config file")?;
+        }
+        report.push_pass(
+            "extra-secret-file-permissions",
+            format!(
+                "validated {} owner-only secret/config files",
+                strict_paths.len()
+            ),
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_security_edge_config(
+    public_url: Option<&str>,
+    options: &SecurityValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    match options.edge_config.as_deref() {
+        Some(path) => {
+            let edge_config = edge::PublicEdgeConfig::load_with_env(path, |_| None)?;
+            report.push_pass(
+                "public-edge-config",
+                format!(
+                    "raw edge config {} binds to {}:{}, uses loopback controller IPC, and has no trusted-network bypass",
+                    path.display(),
+                    edge_config.orchestrator.host,
+                    edge_config.orchestrator.port
+                ),
+            );
+        }
+        None if public_url.is_some() => {
+            bail!("security validation for a public URL requires --edge-config");
+        }
+        None => report.push_skip(
+            "public-edge-config",
+            "no public URL or --edge-config supplied",
+        ),
+    }
+    Ok(())
+}
+
+async fn validate_security_cloudflare(
+    config: &AppConfig,
+    public_url: Option<&str>,
+    options: &SecurityValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let Some(public_url) = public_url else {
+        report.push_skip(
+            "cloudflare-security",
+            "no public URL configured; Cloudflare Access/tunnel probes were not required",
+        );
+        return Ok(());
+    };
+
+    validate_cloudflared_public_config_required(
+        options.cloudflared_config.as_deref(),
+        public_url,
+        report,
+    )?;
+    validate_cloudflared_origin_targets_edge(
+        options.cloudflared_config.as_deref(),
+        options.edge_config.as_deref(),
+        public_url,
+        report,
+    )?;
+    validate_cloudflare_drift_evidence_required(
+        options.cloudflare_evidence.as_deref(),
+        public_url,
+        report,
+    )?;
+    validate_public_access_blocks_unauthenticated(public_url, report).await?;
+    validate_security_authenticated_access(config, public_url, options, report).await?;
+    Ok(())
+}
+
+async fn validate_security_authenticated_access(
+    config: &AppConfig,
+    public_url: &str,
+    options: &SecurityValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let access_auth = public_access_probe_auth(
+        options.cloudflare_access_client_id.as_deref(),
+        options.cloudflare_access_client_secret.as_deref(),
+    )?
+    .context(
+        "security validation for a public URL requires Cloudflare Access service-token headers for authenticated public probes",
+    )?;
+    let office_auth = security_public_office_auth(config, options)?;
+    if !office_auth.supports_public_http_auth() {
+        bail!("security validation requires Office auth that can be probed over the public URL");
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("failed to create security validation HTTP client")?;
+    let public_status = get_public_json(
+        &client,
+        public_url,
+        "/status",
+        Some(&office_auth),
+        Some(&access_auth),
+    )
+    .await?;
+    validate_status_shape(&public_status)?;
+    report.push_pass(
+        "cloudflare-authenticated-access",
+        format!("authenticated /status reached origin through Cloudflare Access and Office auth: {public_url}"),
+    );
+    Ok(())
+}
+
+fn security_public_office_auth(
+    config: &AppConfig,
+    options: &SecurityValidationOptions,
+) -> Result<InterfaceProbeAuth> {
+    let Some(edge_config_path) = options.edge_config.as_deref() else {
+        return interface_probe_auth(config);
+    };
+    let edge_config = edge::PublicEdgeConfig::load_with_env(edge_config_path, |_| None)
+        .with_context(|| {
+            format!(
+                "failed to load raw edge config {} for authenticated public Office probe",
+                edge_config_path.display()
+            )
+        })?;
+    interface_probe_auth_for_orchestrator(&edge_config.orchestrator).with_context(|| {
+        format!(
+            "failed to build authenticated public Office probe auth from edge config {}",
+            edge_config_path.display()
+        )
+    })
+}
+
+fn validate_security_launchd(
+    public_url: Option<&str>,
+    options: &SecurityValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if let Some(path) = options.server_launchd_plist.as_deref() {
+        validate_launchd_plist(path, "com.office-automate.server", None, &["serve"])?;
+        report.push_pass(
+            "server-launchd-plist",
+            format!("validated controller launchd plist {}", path.display()),
+        );
+    } else {
+        report.push_skip("server-launchd-plist", "no --server-launchd-plist supplied");
+    }
+
+    match options.edge_launchd_plist.as_deref() {
+        Some(path) => {
+            validate_launchd_plist(
+                path,
+                "com.office-automate.edge",
+                options.edge_user.as_deref(),
+                &["serve-edge"],
+            )?;
+            report.push_pass(
+                "edge-launchd-plist",
+                format!("validated edge launchd plist {}", path.display()),
+            );
+        }
+        None if public_url.is_some() => {
+            bail!("security validation for a public URL requires --edge-launchd-plist");
+        }
+        None => report.push_skip("edge-launchd-plist", "no --edge-launchd-plist supplied"),
+    }
+
+    match options.tunnel_launchd_plist.as_deref() {
+        Some(path) => {
+            validate_launchd_plist(
+                path,
+                "com.office-automate.tunnel",
+                options.tunnel_user.as_deref(),
+                &["tunnel", "--no-autoupdate", "--config", "run"],
+            )?;
+            report.push_pass(
+                "tunnel-launchd-plist",
+                format!("validated tunnel launchd plist {}", path.display()),
+            );
+        }
+        None if public_url.is_some() => {
+            bail!("security validation for a public URL requires --tunnel-launchd-plist");
+        }
+        None => report.push_skip("tunnel-launchd-plist", "no --tunnel-launchd-plist supplied"),
+    }
+
+    Ok(())
+}
+
+fn validate_security_role_boundaries(
+    config: &AppConfig,
+    public_url: Option<&str>,
+    options: &SecurityValidationOptions,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let Some(public_url) = public_url else {
+        report.push_skip(
+            "edge-tunnel-boundary-probes",
+            "no public URL configured; edge/tunnel OS boundary probes were not required",
+        );
+        return Ok(());
+    };
+
+    let tunnel_user = options
+        .tunnel_user
+        .as_deref()
+        .context("security validation for a public URL requires --tunnel-user")?;
+    let edge_user = options
+        .edge_user
+        .as_deref()
+        .context("security validation for a public URL requires --edge-user")?;
+    if options.tunnel_origin_probes.is_empty() {
+        bail!("security validation for {public_url} requires at least one --tunnel-origin-probe");
+    }
+    if options.edge_ipc_probes.is_empty() {
+        bail!("security validation for {public_url} requires at least one --edge-ipc-probe");
+    }
+    if options.denied_lan_probes.is_empty() {
+        bail!("security validation for {public_url} requires at least one --denied-lan-probe");
+    }
+
+    let protected_paths = security_protected_paths(config, options);
+    validate_user_read_denied(
+        tunnel_user,
+        &protected_paths,
+        "tunnel-user-read-denial",
+        report,
+    )?;
+    validate_user_read_denied(edge_user, &protected_paths, "edge-user-read-denial", report)?;
+
+    let mut tunnel_readable = options.tunnel_readable_paths.clone();
+    let mut tunnel_private = options.tunnel_private_paths.clone();
+    if let Some(path) = options.cloudflared_config.as_ref() {
+        tunnel_readable.push(path.clone());
+        if let Some(credentials_file) = cloudflared_credentials_file(path)? {
+            tunnel_readable.push(credentials_file.clone());
+            tunnel_private.push(credentials_file);
+        }
+    }
+    validate_user_read_allowed(
+        tunnel_user,
+        &tunnel_readable,
+        "tunnel-user-readable-files",
+        report,
+    )?;
+
+    let mut edge_readable = options.edge_readable_paths.clone();
+    let mut edge_private = options.edge_private_paths.clone();
+    if let Some(path) = options.edge_config.as_ref() {
+        edge_readable.push(path.clone());
+        edge_private.push(path.clone());
+    }
+    validate_user_read_allowed(
+        edge_user,
+        &edge_readable,
+        "edge-user-readable-files",
+        report,
+    )?;
+    validate_user_read_denied(
+        edge_user,
+        &tunnel_private,
+        "edge-user-tunnel-private-denial",
+        report,
+    )?;
+    validate_user_read_denied(
+        tunnel_user,
+        &edge_private,
+        "tunnel-user-edge-private-denial",
+        report,
+    )?;
+
+    validate_user_connect_allowed(
+        tunnel_user,
+        &options.tunnel_origin_probes,
+        "tunnel-origin-connectivity",
+        report,
+    )?;
+    validate_user_connect_allowed(
+        edge_user,
+        &options.edge_ipc_probes,
+        "edge-ipc-connectivity",
+        report,
+    )?;
+    validate_control_connectivity(
+        options.lan_control_user.as_deref(),
+        &options.denied_lan_probes,
+        "lan-control-connectivity",
+        report,
+    )?;
+    validate_user_connect_denied(
+        tunnel_user,
+        &options.denied_lan_probes,
+        "tunnel-user-lan-denial",
+        report,
+    )?;
+    validate_user_connect_denied(
+        edge_user,
+        &options.denied_lan_probes,
+        "edge-user-lan-denial",
+        report,
+    )?;
+
+    Ok(())
+}
+
+fn validate_strict_private_file(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("{label} is missing or unreadable: {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{label} must be a file: {}", path.display());
+    }
+    validate_not_group_world_writable(path)?;
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            bail!(
+                "{label} must be owner-only with no group/world permissions: {} mode={mode:o}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_not_group_world_writable(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to stat security-sensitive path {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o022 != 0 {
+            bail!(
+                "security-sensitive path must not be group/world writable: {} mode={mode:o}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cloudflared_credentials_file(config_path: &Path) -> Result<Option<PathBuf>> {
+    let contents = fs::read_to_string(config_path).with_context(|| {
+        format!(
+            "failed to read cloudflared config {}",
+            config_path.display()
+        )
+    })?;
+    let root: YamlValue = serde_yaml::from_str(&contents).with_context(|| {
+        format!(
+            "failed to parse cloudflared config {}",
+            config_path.display()
+        )
+    })?;
+    let Some(credentials_file) = yaml_mapping_value(&root, "credentials-file")
+        .and_then(YamlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(credentials_file);
+    if path.is_absolute() {
+        Ok(Some(path))
+    } else {
+        Ok(Some(
+            config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(path),
+        ))
+    }
+}
+
+fn validate_launchd_plist(
+    path: &Path,
+    label: &str,
+    expected_user: Option<&str>,
+    required_argument_sequence: &[&str],
+) -> Result<()> {
+    validate_not_group_world_writable(path)?;
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read launchd plist {}", path.display()))?;
+    let actual_label = plist_string_value(&contents, "Label").with_context(|| {
+        format!(
+            "launchd plist {} is missing string value for Label",
+            path.display()
+        )
+    })?;
+    if actual_label != label {
+        bail!(
+            "launchd plist {} has Label={actual_label}, expected {label}",
+            path.display()
+        );
+    }
+    if let Some(expected_user) = expected_user {
+        if expected_user.trim().is_empty() {
+            bail!("expected launchd user for {label} must not be empty");
+        }
+        let actual_user = plist_string_value(&contents, "UserName").with_context(|| {
+            format!(
+                "launchd plist {} is missing string value for UserName",
+                path.display()
+            )
+        })?;
+        if actual_user != expected_user {
+            bail!(
+                "launchd plist {} must run label {label} as UserName={expected_user}, found {actual_user}",
+                path.display()
+            );
+        }
+    }
+    let program_arguments =
+        plist_array_string_values(&contents, "ProgramArguments").with_context(|| {
+            format!(
+                "launchd plist {} is missing string array value for ProgramArguments",
+                path.display()
+            )
+        })?;
+    validate_launchd_command_arguments(&program_arguments, required_argument_sequence)
+        .with_context(|| {
+            format!(
+                "launchd plist {} ProgramArguments do not match label {label}",
+                path.display()
+            )
+        })?;
+    Ok(())
+}
+
+fn plist_string_value(contents: &str, key: &str) -> Option<String> {
+    let key_tag = format!("<key>{key}</key>");
+    let key_start = contents.find(&key_tag)?;
+    let after_key = &contents[key_start + key_tag.len()..];
+    let string_start = after_key.find("<string>")? + "<string>".len();
+    let after_string = &after_key[string_start..];
+    let string_end = after_string.find("</string>")?;
+    Some(xml_unescape_plist_string(&after_string[..string_end]))
+}
+
+fn xml_unescape_plist_string(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn plist_array_string_values(contents: &str, key: &str) -> Option<Vec<String>> {
+    let key_tag = format!("<key>{key}</key>");
+    let key_start = contents.find(&key_tag)?;
+    let after_key = &contents[key_start + key_tag.len()..];
+    let array_start = after_key.find("<array>")? + "<array>".len();
+    let after_array = &after_key[array_start..];
+    let array_end = after_array.find("</array>")?;
+    let array_contents = &after_array[..array_end];
+    let mut values = Vec::new();
+    let mut rest = array_contents;
+    while let Some(start) = rest.find("<string>") {
+        let after_start = &rest[start + "<string>".len()..];
+        let Some(end) = after_start.find("</string>") else {
+            return None;
+        };
+        values.push(xml_unescape_plist_string(&after_start[..end]));
+        rest = &after_start[end + "</string>".len()..];
+    }
+    Some(values)
+}
+
+fn validate_launchd_command_arguments(
+    program_arguments: &[String],
+    required_sequence: &[&str],
+) -> Result<()> {
+    if required_sequence.is_empty() {
+        return Ok(());
+    }
+    let Some(executable) = program_arguments.first() else {
+        bail!("ProgramArguments must include an executable path");
+    };
+    if executable.trim().is_empty() {
+        bail!("ProgramArguments executable path must not be empty");
+    }
+    match required_sequence {
+        ["serve"] => validate_server_launchd_arguments(program_arguments, "serve"),
+        ["serve-edge"] => validate_server_launchd_arguments(program_arguments, "serve-edge"),
+        ["tunnel", "--no-autoupdate", "--config", "run"] => {
+            validate_tunnel_launchd_arguments(program_arguments)
+        }
+        other => bail!("unsupported launchd ProgramArguments pattern {other:?}"),
+    }
+}
+
+fn validate_server_launchd_arguments(program_arguments: &[String], subcommand: &str) -> Result<()> {
+    if program_arguments.len() < 4 {
+        bail!(
+            "ProgramArguments for {subcommand} must include executable, subcommand, --config, and config path; found {:?}",
+            program_arguments
+        );
+    }
+    if program_arguments.get(1).map(String::as_str) != Some(subcommand) {
+        bail!(
+            "ProgramArguments argv[1] must be {subcommand:?}; found {:?}",
+            program_arguments.get(1)
+        );
+    }
+    if program_arguments.get(2).map(String::as_str) != Some("--config") {
+        bail!(
+            "ProgramArguments argv[2] must be \"--config\" for {subcommand}; found {:?}",
+            program_arguments.get(2)
+        );
+    }
+    let config_path = program_arguments
+        .get(3)
+        .context("ProgramArguments missing config path")?;
+    if config_path.trim().is_empty() || config_path.starts_with('-') {
+        bail!("ProgramArguments config path for {subcommand} is invalid: {config_path:?}");
+    }
+    Ok(())
+}
+
+fn validate_tunnel_launchd_arguments(program_arguments: &[String]) -> Result<()> {
+    if program_arguments.len() < 6 {
+        bail!(
+            "ProgramArguments for cloudflared tunnel must include executable, tunnel, --no-autoupdate, --config, config path, and run; found {:?}",
+            program_arguments
+        );
+    }
+    let expected = [
+        (1usize, "tunnel"),
+        (2usize, "--no-autoupdate"),
+        (3usize, "--config"),
+        (5usize, "run"),
+    ];
+    for (index, expected) in expected {
+        if program_arguments.get(index).map(String::as_str) != Some(expected) {
+            bail!(
+                "ProgramArguments argv[{index}] must be {expected:?}; found {:?}",
+                program_arguments.get(index)
+            );
+        }
+    }
+    let config_path = program_arguments
+        .get(4)
+        .context("ProgramArguments missing cloudflared config path")?;
+    if config_path.trim().is_empty() || config_path.starts_with('-') {
+        bail!("ProgramArguments cloudflared config path is invalid: {config_path:?}");
+    }
+    Ok(())
+}
+
+fn security_protected_paths(
+    config: &AppConfig,
+    options: &SecurityValidationOptions,
+) -> Vec<PathBuf> {
+    let mut paths = vec![
+        config.runtime.config_path.clone(),
+        config.runtime.data_dir.clone(),
+        config.runtime.database_path.clone(),
+        config.runtime.telemetry_db_path.clone(),
+        config.runtime.tool_usage_db_path.clone(),
+        config.runtime.session_tool_usage_db_path.clone(),
+        config.runtime.engram_db_path.clone(),
+        config.runtime.engram_registry_path.clone(),
+    ];
+    paths.extend(config.telemetry.repos.iter().cloned());
+    paths.extend(config.telemetry.codex_events_db.iter().cloned());
+    paths.extend(config.telemetry.session_manager_sessions.iter().cloned());
+    paths.extend(options.protected_paths.iter().cloned());
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn validate_user_read_allowed(
+    user: &str,
+    paths: &[PathBuf],
+    check_name: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if paths.is_empty() {
+        report.push_skip(check_name, "no readable paths supplied");
+        return Ok(());
+    }
+    ensure_user_probe_runnable(user)?;
+    for path in paths {
+        if path.as_os_str().is_empty() {
+            bail!("{check_name} contains an empty path");
+        }
+        let path_text = path.to_string_lossy();
+        run_as_user(user, &["test", "-r", path_text.as_ref()])?;
+    }
+    report.push_pass(
+        check_name,
+        format!("validated {} paths are readable by {user}", paths.len()),
+    );
+    Ok(())
+}
+
+fn validate_user_read_denied(
+    user: &str,
+    paths: &[PathBuf],
+    check_name: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if paths.is_empty() {
+        report.push_skip(check_name, "no protected paths supplied");
+        return Ok(());
+    }
+    ensure_user_probe_runnable(user)?;
+    let mut checked = 0usize;
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let path_text = path.to_string_lossy();
+        if run_as_user_status(user, &["test", "-r", path_text.as_ref()])? {
+            bail!(
+                "{check_name}: quarantined user {user} can read protected path {}",
+                path.display()
+            );
+        }
+        if run_as_user_status(user, &["test", "-x", path_text.as_ref()])? {
+            bail!(
+                "{check_name}: quarantined user {user} can traverse/execute protected path {}",
+                path.display()
+            );
+        }
+        checked += 1;
+    }
+    if checked == 0 {
+        report.push_skip(
+            check_name,
+            "protected paths were absent on this host; no read-denial probe was run",
+        );
+    } else {
+        report.push_pass(
+            check_name,
+            format!("validated {checked} protected paths are denied to {user}"),
+        );
+    }
+    Ok(())
+}
+
+fn validate_user_connect_allowed(
+    user: &str,
+    endpoints: &[String],
+    check_name: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if endpoints.is_empty() {
+        report.push_skip(check_name, "no allowed connectivity probes supplied");
+        return Ok(());
+    }
+    ensure_user_probe_runnable(user)?;
+    for endpoint in endpoints {
+        run_connect_probe_as(Some(user), endpoint)
+            .with_context(|| format!("{check_name}: {user} could not connect to {endpoint}"))?;
+    }
+    report.push_pass(
+        check_name,
+        format!(
+            "validated {} endpoints are reachable by {user}",
+            endpoints.len()
+        ),
+    );
+    Ok(())
+}
+
+fn validate_control_connectivity(
+    user: Option<&str>,
+    endpoints: &[String],
+    check_name: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if endpoints.is_empty() {
+        report.push_skip(check_name, "no LAN control probes supplied");
+        return Ok(());
+    }
+    if let Some(user) = user {
+        ensure_user_probe_runnable(user)?;
+    }
+    for endpoint in endpoints {
+        run_connect_probe_as(user, endpoint).with_context(|| {
+            format!(
+                "{check_name}: LAN control endpoint {endpoint} was not reachable by {}",
+                user.unwrap_or("current user")
+            )
+        })?;
+    }
+    report.push_pass(
+        check_name,
+        format!(
+            "validated {} LAN endpoints are reachable before denial checks",
+            endpoints.len()
+        ),
+    );
+    Ok(())
+}
+
+fn validate_user_connect_denied(
+    user: &str,
+    endpoints: &[String],
+    check_name: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if endpoints.is_empty() {
+        report.push_skip(check_name, "no denied LAN connectivity probes supplied");
+        return Ok(());
+    }
+    ensure_user_probe_runnable(user)?;
+    for endpoint in endpoints {
+        if run_connect_probe_status_as(Some(user), endpoint)? {
+            bail!("{check_name}: quarantined user {user} can connect to LAN endpoint {endpoint}");
+        }
+    }
+    report.push_pass(
+        check_name,
+        format!(
+            "validated {} LAN endpoints are denied to {user}",
+            endpoints.len()
+        ),
+    );
+    Ok(())
+}
+
+fn ensure_user_probe_runnable(user: &str) -> Result<()> {
+    if user.trim().is_empty() {
+        bail!("probe user must not be empty");
+    }
+    run_as_user(user, &["true"])
+        .with_context(|| format!("cannot run passwordless sudo probes as user {user}"))
+}
+
+fn run_as_user(user: &str, args: &[&str]) -> Result<()> {
+    if run_as_user_status(user, args)? {
+        Ok(())
+    } else {
+        bail!("sudo probe failed for user {user}");
+    }
+}
+
+fn run_as_user_status(user: &str, args: &[&str]) -> Result<bool> {
+    let status = Command::new("sudo")
+        .arg("-n")
+        .arg("-u")
+        .arg(user)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run sudo probe as {user}"))?;
+    Ok(status.success())
+}
+
+fn run_connect_probe_as(user: Option<&str>, endpoint: &str) -> Result<()> {
+    if run_connect_probe_status_as(user, endpoint)? {
+        Ok(())
+    } else {
+        bail!("connectivity probe failed for {endpoint}");
+    }
+}
+
+fn run_connect_probe_status_as(user: Option<&str>, endpoint: &str) -> Result<bool> {
+    let (host, port) = split_host_port(endpoint)?;
+    let mut command = if let Some(user) = user {
+        let mut command = Command::new("sudo");
+        command.arg("-n").arg("-u").arg(user).arg("nc");
+        command
+    } else {
+        Command::new("nc")
+    };
+    let status = command
+        .arg("-G")
+        .arg("2")
+        .arg("-z")
+        .arg(host)
+        .arg(port)
+        .status()
+        .with_context(|| format!("failed to run nc probe for {endpoint}"))?;
+    Ok(status.success())
+}
+
+fn split_host_port(endpoint: &str) -> Result<(&str, &str)> {
+    let (host, port) = endpoint
+        .rsplit_once(':')
+        .with_context(|| format!("endpoint must be HOST:PORT: {endpoint}"))?;
+    if host.trim().is_empty() || port.trim().is_empty() {
+        bail!("endpoint must be HOST:PORT: {endpoint}");
+    }
+    port.parse::<u16>()
+        .with_context(|| format!("endpoint port must be a TCP port number: {endpoint}"))?;
+    Ok((host, port))
 }
 
 fn validate_rollback_active_write_gates(
@@ -1365,6 +2263,155 @@ fn validate_cloudflared_public_config(
     Ok(())
 }
 
+fn validate_cloudflared_origin_targets_edge(
+    cloudflared_config: Option<&Path>,
+    edge_config: Option<&Path>,
+    public_url: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let cloudflared_config = cloudflared_config.context(
+        "security validation for a public URL requires --cloudflared-config before origin/edge comparison",
+    )?;
+    let edge_config_path = edge_config.context(
+        "security validation for a public URL requires --edge-config before origin/edge comparison",
+    )?;
+    let edge_config = edge::PublicEdgeConfig::load_with_env(edge_config_path, |_| None)?;
+    let origin_service =
+        cloudflared_origin_service_for_public_host(cloudflared_config, public_url)?;
+    validate_origin_service_matches_edge(&origin_service, &edge_config).with_context(|| {
+        format!(
+            "cloudflared config {} must route public traffic to serve-edge from {}",
+            cloudflared_config.display(),
+            edge_config_path.display()
+        )
+    })?;
+    report.push_pass(
+        "cloudflare-tunnel-edge-origin",
+        format!(
+            "cloudflared origin {origin_service} targets serve-edge listener {}:{}",
+            edge_config.orchestrator.host, edge_config.orchestrator.port
+        ),
+    );
+    Ok(())
+}
+
+fn cloudflared_origin_service_for_public_host(
+    cloudflared_config: &Path,
+    public_url: &str,
+) -> Result<String> {
+    let public_host = cloudflare_public_host(public_url)?;
+    let contents = fs::read_to_string(cloudflared_config).with_context(|| {
+        format!(
+            "failed to read cloudflared config {}",
+            cloudflared_config.display()
+        )
+    })?;
+    let root: YamlValue = serde_yaml::from_str(&contents).with_context(|| {
+        format!(
+            "failed to parse cloudflared config {}",
+            cloudflared_config.display()
+        )
+    })?;
+    let ingress = yaml_mapping_value(&root, "ingress")
+        .and_then(YamlValue::as_sequence)
+        .with_context(|| {
+            format!(
+                "cloudflared config missing ingress sequence: {}",
+                cloudflared_config.display()
+            )
+        })?;
+
+    let mut service = None;
+    for rule in ingress {
+        let Some(mapping) = rule.as_mapping() else {
+            continue;
+        };
+        let Some(hostname) = yaml_mapping_str(mapping, "hostname") else {
+            continue;
+        };
+        if hostname.eq_ignore_ascii_case(&public_host) {
+            if service.is_some() {
+                bail!(
+                    "cloudflared config contains more than one origin rule for {public_host:?}: {}",
+                    cloudflared_config.display()
+                );
+            }
+            service = Some(
+                yaml_mapping_str(mapping, "service")
+                    .context("matching cloudflared ingress rule missing service")?
+                    .to_string(),
+            );
+        }
+    }
+    service.with_context(|| {
+        format!(
+            "cloudflared config {} has no origin rule for public hostname {public_host:?}",
+            cloudflared_config.display()
+        )
+    })
+}
+
+fn validate_origin_service_matches_edge(
+    origin_service: &str,
+    edge_config: &edge::PublicEdgeConfig,
+) -> Result<()> {
+    if origin_service.starts_with("unix:") {
+        bail!(
+            "cloudflared origin uses a Unix socket, but serve-edge is configured as a TCP listener"
+        );
+    }
+    let parsed = Url::parse(origin_service).with_context(|| {
+        format!(
+            "cloudflared origin must be an http:// URL targeting serve-edge, got {origin_service:?}"
+        )
+    })?;
+    if parsed.scheme() != "http" {
+        bail!(
+            "cloudflared origin must use http:// for serve-edge, got {:?}",
+            parsed.scheme()
+        );
+    }
+    let origin_host = parsed
+        .host_str()
+        .context("cloudflared origin URL must include a host")?;
+    if !loopback_hosts_match(&edge_config.orchestrator.host, origin_host) {
+        bail!(
+            "cloudflared origin host {origin_host:?} does not match serve-edge host {:?}",
+            edge_config.orchestrator.host
+        );
+    }
+    let origin_port = parsed
+        .port_or_known_default()
+        .context("cloudflared origin URL must include or imply a TCP port")?;
+    if origin_port != edge_config.orchestrator.port {
+        bail!(
+            "cloudflared origin port {origin_port} does not match serve-edge port {}",
+            edge_config.orchestrator.port
+        );
+    }
+    Ok(())
+}
+
+fn loopback_hosts_match(expected: &str, actual: &str) -> bool {
+    fn normalized_loopback_host(host: &str) -> Option<std::net::IpAddr> {
+        let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+        if host.eq_ignore_ascii_case("localhost") {
+            return Some(std::net::IpAddr::from([127, 0, 0, 1]));
+        }
+        host.parse::<std::net::IpAddr>()
+            .ok()
+            .filter(std::net::IpAddr::is_loopback)
+    }
+
+    match (
+        normalized_loopback_host(expected),
+        normalized_loopback_host(actual),
+    ) {
+        (Some(_), Some(_)) => true,
+        _ => expected.eq_ignore_ascii_case(actual),
+    }
+}
+
 fn cloudflare_public_host(public_url: &str) -> Result<String> {
     Ok(Url::parse(public_url)
         .with_context(|| format!("invalid Cloudflare public URL {public_url}"))?
@@ -1996,7 +3043,13 @@ impl InterfaceProbeAuth {
 }
 
 fn interface_probe_auth(config: &AppConfig) -> Result<InterfaceProbeAuth> {
-    if let Some(oauth) = &config.orchestrator.google_oauth {
+    interface_probe_auth_for_orchestrator(&config.orchestrator)
+}
+
+fn interface_probe_auth_for_orchestrator(
+    orchestrator: &OrchestratorConfig,
+) -> Result<InterfaceProbeAuth> {
+    if let Some(oauth) = &orchestrator.google_oauth {
         if oauth
             .jwt_secret
             .as_deref()
@@ -2009,7 +3062,7 @@ fn interface_probe_auth(config: &AppConfig) -> Result<InterfaceProbeAuth> {
                 .context("OAuth WebSocket validation requires at least one allowed email")?
                 .trim()
                 .to_ascii_lowercase();
-            let token = AuthManager::new(&config.orchestrator)?
+            let token = AuthManager::new(orchestrator)?
                 .generate_jwt(&email)
                 .context("failed to generate validation WebSocket JWT")?;
             return Ok(InterfaceProbeAuth::OAuthFirstMessage { token, email });
@@ -2025,8 +3078,8 @@ fn interface_probe_auth(config: &AppConfig) -> Result<InterfaceProbeAuth> {
     }
 
     match (
-        config.orchestrator.auth_username.as_deref(),
-        config.orchestrator.auth_password.as_deref(),
+        orchestrator.auth_username.as_deref(),
+        orchestrator.auth_password.as_deref(),
     ) {
         (Some(username), Some(password))
             if !username.trim().is_empty() && !password.trim().is_empty() =>
@@ -2251,6 +3304,8 @@ mod tests {
         },
         db,
     };
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn test_config(database_path: &Path) -> AppConfig {
         let root = database_path
@@ -3073,6 +4128,91 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn security_authenticated_access_requires_access_service_token() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        let mut config = test_config(&db_path);
+        config.orchestrator.google_oauth = Some(GoogleOAuthConfig {
+            client_id: "client".to_string(),
+            client_secret: "secret".to_string(),
+            allowed_emails: vec!["engineer@example.test".to_string()],
+            jwt_secret: Some("stable-test-secret".to_string()),
+            ..GoogleOAuthConfig::default()
+        });
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+
+        let error = validate_security_authenticated_access(
+            &config,
+            "https://office.example.test",
+            &SecurityValidationOptions::default(),
+            &mut report,
+        )
+        .await
+        .expect_err("public security validation should require Access service-token credentials");
+
+        assert!(error.to_string().contains("service-token headers"));
+    }
+
+    #[test]
+    fn security_public_office_auth_uses_edge_config_when_supplied() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        let mut config = test_config(&db_path);
+        config.orchestrator.google_oauth = Some(GoogleOAuthConfig {
+            client_id: "controller-client".to_string(),
+            client_secret: "controller-secret".to_string(),
+            allowed_emails: vec!["controller@example.test".to_string()],
+            jwt_secret: Some("controller-jwt-secret".to_string()),
+            ..GoogleOAuthConfig::default()
+        });
+
+        let edge_config_path = temp_dir.path().join("edge.yaml");
+        fs::write(
+            &edge_config_path,
+            r#"
+orchestrator:
+  host: "127.0.0.1"
+  port: 19190
+  google_oauth:
+    client_id: "edge-client"
+    client_secret: "edge-secret"
+    allowed_emails:
+      - "edge@example.test"
+    jwt_secret: "edge-jwt-secret"
+controller:
+  base_url: "http://127.0.0.1:9001"
+  token: "controller-token"
+runtime:
+  frontend_dist: "/tmp/frontend"
+"#,
+        )
+        .expect("edge config");
+
+        let auth = security_public_office_auth(
+            &config,
+            &SecurityValidationOptions {
+                edge_config: Some(edge_config_path.clone()),
+                ..SecurityValidationOptions::default()
+            },
+        )
+        .expect("edge probe auth");
+        let InterfaceProbeAuth::OAuthFirstMessage { token, email } = auth else {
+            panic!("expected edge OAuth probe auth, got {auth:?}");
+        };
+
+        assert_eq!(email, "edge@example.test");
+        let edge_config =
+            edge::PublicEdgeConfig::load_with_env(&edge_config_path, |_| None).expect("edge load");
+        let edge_auth = AuthManager::new(&edge_config.orchestrator).expect("edge auth");
+        let controller_auth = AuthManager::new(&config.orchestrator).expect("controller auth");
+        assert_eq!(
+            edge_auth.verify_jwt(&token),
+            Some("edge@example.test".to_string())
+        );
+        assert_eq!(controller_auth.verify_jwt(&token), None);
+    }
+
     #[test]
     fn websocket_url_maps_http_schemes_to_ws() {
         assert_eq!(
@@ -3083,6 +4223,342 @@ mod tests {
             websocket_url("https://office.example.test/").expect("public ws url"),
             "wss://office.example.test/ws"
         );
+    }
+
+    #[test]
+    fn security_file_permission_validation_requires_owner_only_secret_files() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let secret_path = temp_dir.path().join("secret.yaml");
+        fs::write(&secret_path, "token: secret").expect("secret file");
+
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600))
+                .expect("set secure mode");
+        }
+        validate_strict_private_file(&secret_path, "test secret").expect("secure secret passes");
+
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o640))
+                .expect("set insecure mode");
+            let error = validate_strict_private_file(&secret_path, "test secret")
+                .expect_err("group-readable secret should fail");
+            assert!(error.to_string().contains("owner-only"));
+        }
+    }
+
+    #[test]
+    fn cloudflared_credentials_file_resolves_relative_to_config() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("cloudflared.yml");
+        fs::write(
+            &config_path,
+            r#"
+tunnel: office
+credentials-file: creds/tunnel.json
+ingress:
+  - hostname: office.example.test
+    service: http://127.0.0.1:19190
+  - service: http_status:404
+"#,
+        )
+        .expect("cloudflared config");
+
+        assert_eq!(
+            cloudflared_credentials_file(&config_path).expect("credentials file"),
+            Some(temp_dir.path().join("creds/tunnel.json"))
+        );
+    }
+
+    #[test]
+    fn cloudflared_origin_must_target_validated_edge_listener() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let edge_config_path = temp_dir.path().join("edge.yaml");
+        fs::write(
+            &edge_config_path,
+            r#"
+orchestrator:
+  host: "127.0.0.1"
+  port: 19190
+  google_oauth:
+    client_id: "client"
+    client_secret: "secret"
+    allowed_emails:
+      - "engineer@example.test"
+    jwt_secret: "stable-test-secret"
+controller:
+  base_url: "http://127.0.0.1:9001"
+  token: "controller-token"
+runtime:
+  frontend_dist: "/tmp/frontend"
+"#,
+        )
+        .expect("edge config");
+        let cloudflared_config_path = temp_dir.path().join("cloudflared.yml");
+        fs::write(
+            &cloudflared_config_path,
+            r#"
+ingress:
+  - hostname: office.example.test
+    service: http://127.0.0.1:9001
+  - service: http_status:404
+"#,
+        )
+        .expect("cloudflared config");
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+        let error = validate_cloudflared_origin_targets_edge(
+            Some(&cloudflared_config_path),
+            Some(&edge_config_path),
+            "https://office.example.test",
+            &mut report,
+        )
+        .expect_err("controller origin must not satisfy edge-origin validation");
+        assert!(error.to_string().contains("serve-edge"));
+        let error_chain = format!("{error:?}");
+        assert!(
+            error_chain.contains("port 9001"),
+            "expected origin-port mismatch in error chain: {error_chain}"
+        );
+
+        fs::write(
+            &cloudflared_config_path,
+            r#"
+ingress:
+  - hostname: office.example.test
+    service: http://127.0.0.1:19190
+  - service: http_status:404
+"#,
+        )
+        .expect("cloudflared config");
+        validate_cloudflared_origin_targets_edge(
+            Some(&cloudflared_config_path),
+            Some(&edge_config_path),
+            "https://office.example.test",
+            &mut report,
+        )
+        .expect("edge origin should pass");
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "cloudflare-tunnel-edge-origin")
+        );
+    }
+
+    #[test]
+    fn split_host_port_rejects_malformed_endpoints() {
+        assert_eq!(
+            split_host_port("127.0.0.1:19190").expect("host port"),
+            ("127.0.0.1", "19190")
+        );
+        assert!(
+            split_host_port("127.0.0.1")
+                .expect_err("missing port should fail")
+                .to_string()
+                .contains("HOST:PORT")
+        );
+        assert!(
+            split_host_port("127.0.0.1:not-a-port")
+                .expect_err("bad port should fail")
+                .to_string()
+                .contains("TCP port")
+        );
+    }
+
+    #[test]
+    fn security_edge_config_validation_ignores_env_style_overrides() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("edge.yaml");
+        fs::write(
+            &config_path,
+            r#"
+orchestrator:
+  host: "0.0.0.0"
+  google_oauth: {}
+controller:
+  base_url: "http://127.0.0.1:9001"
+  token: "controller-token"
+runtime:
+  frontend_dist: "/tmp/frontend"
+"#,
+        )
+        .expect("edge config");
+
+        edge::PublicEdgeConfig::load_with_env(&config_path, |key| match key {
+            "OFFICE_AUTOMATE_EDGE_HOST" => Some("127.0.0.1".to_string()),
+            _ => None,
+        })
+        .expect("ambient override would make this config pass");
+
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+        let error = validate_security_edge_config(
+            Some("https://office.example.test"),
+            &SecurityValidationOptions {
+                edge_config: Some(config_path),
+                ..SecurityValidationOptions::default()
+            },
+            &mut report,
+        )
+        .expect_err("security validation must reject the raw non-loopback edge config");
+
+        assert!(error.to_string().contains("must bind HTTP to loopback"));
+    }
+
+    #[test]
+    fn launchd_plist_validation_reads_actual_username_key() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let plist_path = temp_dir.path().join("com.office-automate.edge.plist");
+        fs::write(
+            &plist_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.office-automate.edge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/office-automate-server</string>
+    <string>--note=_office_edge</string>
+  </array>
+  <key>UserName</key>
+  <string>root</string>
+</dict>
+</plist>
+"#,
+        )
+        .expect("plist");
+
+        let error = validate_launchd_plist(
+            &plist_path,
+            "com.office-automate.edge",
+            Some("_office_edge"),
+            &["serve-edge"],
+        )
+        .expect_err("actual UserName must be compared, not substring-matched");
+        assert!(error.to_string().contains("found root"));
+
+        fs::write(
+            &plist_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	  <key>Label</key>
+	  <string>com.office-automate.edge</string>
+	  <key>UserName</key>
+	  <string>_office_edge</string>
+	  <key>ProgramArguments</key>
+	  <array>
+	    <string>/usr/local/bin/office-automate-server</string>
+	    <string>serve</string>
+	  </array>
+	</dict>
+	</plist>
+	"#,
+        )
+        .expect("plist");
+        let error = validate_launchd_plist(
+            &plist_path,
+            "com.office-automate.edge",
+            Some("_office_edge"),
+            &["serve-edge"],
+        )
+        .expect_err("wrong public edge subcommand should fail");
+        assert!(error.to_string().contains("ProgramArguments"));
+
+        fs::write(
+            &plist_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.office-automate.edge</string>
+  <key>UserName</key>
+  <string>_office_edge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/office-automate-server</string>
+    <string>serve</string>
+    <string>--config</string>
+    <string>serve-edge</string>
+  </array>
+</dict>
+</plist>
+"#,
+        )
+        .expect("plist");
+        let error = validate_launchd_plist(
+            &plist_path,
+            "com.office-automate.edge",
+            Some("_office_edge"),
+            &["serve-edge"],
+        )
+        .expect_err("serve-edge in a later argument must not satisfy argv[1]");
+        assert!(error.to_string().contains("ProgramArguments"));
+
+        fs::write(
+            &plist_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.office-automate.edge</string>
+  <key>UserName</key>
+  <string>_office_edge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/office-automate-server</string>
+    <string>serve-edge</string>
+    <string>--config</string>
+    <string>/var/lib/office-automate/edge/config.yaml</string>
+  </array>
+</dict>
+</plist>
+"#,
+        )
+        .expect("plist");
+        validate_launchd_plist(
+            &plist_path,
+            "com.office-automate.edge",
+            Some("_office_edge"),
+            &["serve-edge"],
+        )
+        .expect("matching UserName and ProgramArguments pass");
+    }
+
+    #[test]
+    fn launchd_tunnel_arguments_require_exact_command_shape() {
+        validate_launchd_command_arguments(
+            &[
+                "/usr/local/bin/cloudflared".to_string(),
+                "tunnel".to_string(),
+                "--no-autoupdate".to_string(),
+                "--config".to_string(),
+                "/var/lib/cloudflared/config.yml".to_string(),
+                "run".to_string(),
+                "office".to_string(),
+            ],
+            &["tunnel", "--no-autoupdate", "--config", "run"],
+        )
+        .expect("valid cloudflared command shape passes");
+
+        let error = validate_launchd_command_arguments(
+            &[
+                "/usr/local/bin/cloudflared".to_string(),
+                "tunnel".to_string(),
+                "--config".to_string(),
+                "run".to_string(),
+                "--no-autoupdate".to_string(),
+                "/var/lib/cloudflared/config.yml".to_string(),
+            ],
+            &["tunnel", "--no-autoupdate", "--config", "run"],
+        )
+        .expect_err("loose ordered/unordered tunnel tokens must not pass");
+        assert!(error.to_string().contains("argv[2]"));
     }
 
     #[test]

@@ -8,7 +8,8 @@ use crate::{
     db, device, edge, erv, http, hvac, migration, presence, telemetry,
     validation::{
         self, CutoverValidationOptions, MqttCutoverStrategy, MqttRollbackState,
-        RestoreVerification, RollbackValidationOptions, ShadowValidationOptions,
+        RestoreVerification, RollbackValidationOptions, SecurityValidationOptions,
+        ShadowValidationOptions,
     },
 };
 
@@ -142,6 +143,8 @@ pub enum ValidateTarget {
     Cutover(CutoverValidationArgs),
     /// Validate rollback from Rust active control to the legacy controller.
     Rollback(RollbackValidationArgs),
+    /// Validate public security posture and edge/tunnel containment.
+    Security(SecurityValidationArgs),
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
@@ -259,6 +262,73 @@ pub struct RollbackValidationArgs {
     /// Maximum accepted age for legacy /status air_quality.last_update.
     #[arg(long, default_value_t = 300)]
     pub max_air_quality_age_seconds: u64,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct SecurityValidationArgs {
+    /// Public Cloudflare URL for the production Office hostname.
+    #[arg(long, env = "OFFICE_AUTOMATE_PUBLIC_URL")]
+    pub public_url: Option<String>,
+    /// Local cloudflared config to validate for exact hostname and final deny ingress.
+    #[arg(long, env = "CLOUDFLARED_CONFIG")]
+    pub cloudflared_config: Option<PathBuf>,
+    /// Sanitized Cloudflare API/Terraform/dashboard evidence JSON.
+    #[arg(long, env = "OFFICE_AUTOMATE_CLOUDFLARE_EVIDENCE")]
+    pub cloudflare_evidence: Option<PathBuf>,
+    /// Cloudflare Access service-token client id for authenticated public validation.
+    #[arg(long, env = "OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_CLIENT_ID")]
+    pub cloudflare_access_client_id: Option<String>,
+    /// Cloudflare Access service-token client secret for authenticated public validation.
+    #[arg(long, env = "OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_CLIENT_SECRET")]
+    pub cloudflare_access_client_secret: Option<String>,
+    /// Public edge config file.
+    #[arg(long, env = "OFFICE_AUTOMATE_EDGE_CONFIG")]
+    pub edge_config: Option<PathBuf>,
+    /// Controller launchd plist to inspect.
+    #[arg(long, env = "OFFICE_AUTOMATE_SERVER_PLIST")]
+    pub server_launchd_plist: Option<PathBuf>,
+    /// Public edge launchd plist to inspect.
+    #[arg(long, env = "OFFICE_AUTOMATE_EDGE_PLIST")]
+    pub edge_launchd_plist: Option<PathBuf>,
+    /// Cloudflared launchd plist to inspect.
+    #[arg(long, env = "OFFICE_AUTOMATE_TUNNEL_PLIST")]
+    pub tunnel_launchd_plist: Option<PathBuf>,
+    /// Dedicated cloudflared tunnel user for sudo-based boundary probes.
+    #[arg(long, env = "OFFICE_AUTOMATE_TUNNEL_USER")]
+    pub tunnel_user: Option<String>,
+    /// Dedicated public edge user for sudo-based boundary probes.
+    #[arg(long, env = "OFFICE_AUTOMATE_EDGE_USER")]
+    pub edge_user: Option<String>,
+    /// Additional secret/config file that must be owner-only. Repeatable.
+    #[arg(long = "secret-file")]
+    pub secret_files: Vec<PathBuf>,
+    /// Path tunnel/edge users must not read or traverse. Repeatable.
+    #[arg(long = "protected-path")]
+    pub protected_paths: Vec<PathBuf>,
+    /// Path tunnel user must be able to read, usually cloudflared config/creds. Repeatable.
+    #[arg(long = "tunnel-readable")]
+    pub tunnel_readable_paths: Vec<PathBuf>,
+    /// Path edge user must not read, usually tunnel-only credentials. Repeatable.
+    #[arg(long = "tunnel-private")]
+    pub tunnel_private_paths: Vec<PathBuf>,
+    /// Path edge user must be able to read, usually edge config/static assets. Repeatable.
+    #[arg(long = "edge-readable")]
+    pub edge_readable_paths: Vec<PathBuf>,
+    /// Path tunnel user must not read, usually edge-only config. Repeatable.
+    #[arg(long = "edge-private")]
+    pub edge_private_paths: Vec<PathBuf>,
+    /// Loopback origin endpoint tunnel user may reach, formatted HOST:PORT. Repeatable.
+    #[arg(long = "tunnel-origin-probe")]
+    pub tunnel_origin_probes: Vec<String>,
+    /// Loopback controller IPC endpoint edge user may reach, formatted HOST:PORT. Repeatable.
+    #[arg(long = "edge-ipc-probe")]
+    pub edge_ipc_probes: Vec<String>,
+    /// LAN/RFC1918 endpoint tunnel and edge users must not reach, formatted HOST:PORT. Repeatable.
+    #[arg(long = "denied-lan-probe")]
+    pub denied_lan_probes: Vec<String>,
+    /// Optional user that must be able to reach denied LAN probes before denial checks.
+    #[arg(long, env = "OFFICE_AUTOMATE_LAN_CONTROL_USER")]
+    pub lan_control_user: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -560,6 +630,39 @@ async fn run_validate(config: &AppConfig, target: ValidateTarget) -> Result<()> 
             )
             .await?;
             println!("Rollback validation complete: checks={}", report.len());
+            for check in report.checks {
+                println!("- {:?}: {} - {}", check.status, check.name, check.detail);
+            }
+        }
+        ValidateTarget::Security(args) => {
+            let report = validation::run_security_validation(
+                config,
+                SecurityValidationOptions {
+                    public_url: args.public_url,
+                    cloudflared_config: args.cloudflared_config,
+                    cloudflare_evidence: args.cloudflare_evidence,
+                    cloudflare_access_client_id: args.cloudflare_access_client_id,
+                    cloudflare_access_client_secret: args.cloudflare_access_client_secret,
+                    edge_config: args.edge_config,
+                    server_launchd_plist: args.server_launchd_plist,
+                    edge_launchd_plist: args.edge_launchd_plist,
+                    tunnel_launchd_plist: args.tunnel_launchd_plist,
+                    tunnel_user: args.tunnel_user,
+                    edge_user: args.edge_user,
+                    secret_files: args.secret_files,
+                    protected_paths: args.protected_paths,
+                    tunnel_readable_paths: args.tunnel_readable_paths,
+                    tunnel_private_paths: args.tunnel_private_paths,
+                    edge_readable_paths: args.edge_readable_paths,
+                    edge_private_paths: args.edge_private_paths,
+                    tunnel_origin_probes: args.tunnel_origin_probes,
+                    edge_ipc_probes: args.edge_ipc_probes,
+                    denied_lan_probes: args.denied_lan_probes,
+                    lan_control_user: args.lan_control_user,
+                },
+            )
+            .await?;
+            println!("Security validation complete: checks={}", report.len());
             for check in report.checks {
                 println!("- {:?}: {} - {}", check.status, check.name, check.detail);
             }
@@ -1079,6 +1182,108 @@ mod tests {
                         assert_eq!(rollback.max_air_quality_age_seconds, 120);
                     }
                     other => panic!("expected rollback validation target, got {other:?}"),
+                }
+            }
+            other => panic!("expected validate command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_validate_security_command() {
+        let cli = Cli::try_parse_from([
+            "office-automate-server",
+            "validate",
+            "--config",
+            "/tmp/office.yaml",
+            "security",
+            "--public-url",
+            "https://office.example.test",
+            "--cloudflared-config",
+            "/tmp/cloudflared.yml",
+            "--cloudflare-evidence",
+            "/tmp/cloudflare-evidence.json",
+            "--cloudflare-access-client-id",
+            "access-client-id",
+            "--cloudflare-access-client-secret",
+            "access-client-secret",
+            "--edge-config",
+            "/tmp/edge.yaml",
+            "--server-launchd-plist",
+            "/tmp/server.plist",
+            "--edge-launchd-plist",
+            "/tmp/edge.plist",
+            "--tunnel-launchd-plist",
+            "/tmp/tunnel.plist",
+            "--tunnel-user",
+            "_office_tunnel",
+            "--edge-user",
+            "_office_edge",
+            "--secret-file",
+            "/tmp/secret.yaml",
+            "--protected-path",
+            "/tmp/controller-data",
+            "--tunnel-readable",
+            "/tmp/tunnel-credentials.json",
+            "--tunnel-private",
+            "/tmp/tunnel-credentials.json",
+            "--edge-readable",
+            "/tmp/edge.yaml",
+            "--edge-private",
+            "/tmp/edge.yaml",
+            "--tunnel-origin-probe",
+            "127.0.0.1:19190",
+            "--edge-ipc-probe",
+            "127.0.0.1:19191",
+            "--denied-lan-probe",
+            "192.168.5.1:80",
+            "--lan-control-user",
+            "rajesh",
+        ])
+        .expect("validate security command should parse");
+
+        match cli.command {
+            Command::Validate(args) => {
+                assert_eq!(args.config, PathBuf::from("/tmp/office.yaml"));
+                match args.target {
+                    ValidateTarget::Security(security) => {
+                        assert_eq!(
+                            security.public_url.as_deref(),
+                            Some("https://office.example.test")
+                        );
+                        assert_eq!(
+                            security.cloudflared_config,
+                            Some(PathBuf::from("/tmp/cloudflared.yml"))
+                        );
+                        assert_eq!(
+                            security.cloudflare_evidence,
+                            Some(PathBuf::from("/tmp/cloudflare-evidence.json"))
+                        );
+                        assert_eq!(
+                            security.cloudflare_access_client_id.as_deref(),
+                            Some("access-client-id")
+                        );
+                        assert_eq!(
+                            security.cloudflare_access_client_secret.as_deref(),
+                            Some("access-client-secret")
+                        );
+                        assert_eq!(security.edge_config, Some(PathBuf::from("/tmp/edge.yaml")));
+                        assert_eq!(security.tunnel_user.as_deref(), Some("_office_tunnel"));
+                        assert_eq!(security.edge_user.as_deref(), Some("_office_edge"));
+                        assert_eq!(
+                            security.tunnel_origin_probes,
+                            vec!["127.0.0.1:19190".to_string()]
+                        );
+                        assert_eq!(
+                            security.edge_ipc_probes,
+                            vec!["127.0.0.1:19191".to_string()]
+                        );
+                        assert_eq!(
+                            security.denied_lan_probes,
+                            vec!["192.168.5.1:80".to_string()]
+                        );
+                        assert_eq!(security.lan_control_user.as_deref(), Some("rajesh"));
+                    }
+                    other => panic!("expected security validation target, got {other:?}"),
                 }
             }
             other => panic!("expected validate command, got {other:?}"),
