@@ -84,8 +84,8 @@ if [[ ! "$log_lines" =~ ^[0-9]+$ ]] || [[ "$log_lines" -lt 1 ]]; then
   exit 2
 fi
 
-if [[ "$allow_unencrypted_local" != true ]] && command -v fdesetup >/dev/null 2>&1; then
-  if ! fdesetup status 2>/dev/null | grep -q "FileVault is On"; then
+if [[ "$allow_unencrypted_local" != true ]]; then
+  if ! command -v fdesetup >/dev/null 2>&1 || ! fdesetup status 2>/dev/null | grep -q "FileVault is On"; then
     cat >&2 <<'MSG'
 FileVault is not reported as enabled.
 Raw incident evidence may contain secrets. Use an encrypted evidence directory
