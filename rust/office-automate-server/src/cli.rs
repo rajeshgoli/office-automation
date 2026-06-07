@@ -155,6 +155,9 @@ pub struct ShadowValidationArgs {
     /// Local cloudflared config to validate for exact hostname and final deny ingress.
     #[arg(long, env = "CLOUDFLARED_CONFIG")]
     pub cloudflared_config: Option<PathBuf>,
+    /// Sanitized Cloudflare API/Terraform/dashboard evidence JSON.
+    #[arg(long, env = "OFFICE_AUTOMATE_CLOUDFLARE_EVIDENCE")]
+    pub cloudflare_evidence: Option<PathBuf>,
     /// Cloudflare Access service-token client id for authenticated public validation.
     #[arg(long, env = "OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_CLIENT_ID")]
     pub cloudflare_access_client_id: Option<String>,
@@ -204,6 +207,9 @@ pub struct CutoverValidationArgs {
     /// Local cloudflared config to validate for exact hostname and final deny ingress.
     #[arg(long, env = "CLOUDFLARED_CONFIG")]
     pub cloudflared_config: Option<PathBuf>,
+    /// Sanitized Cloudflare API/Terraform/dashboard evidence JSON.
+    #[arg(long, env = "OFFICE_AUTOMATE_CLOUDFLARE_EVIDENCE")]
+    pub cloudflare_evidence: Option<PathBuf>,
     /// Cloudflare Access service-token client id for authenticated public validation.
     #[arg(long, env = "OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_CLIENT_ID")]
     pub cloudflare_access_client_id: Option<String>,
@@ -494,6 +500,7 @@ async fn run_validate(config: &AppConfig, target: ValidateTarget) -> Result<()> 
                     base_url: args.base_url,
                     public_url: args.public_url,
                     cloudflared_config: args.cloudflared_config,
+                    cloudflare_evidence: args.cloudflare_evidence,
                     cloudflare_access_client_id: args.cloudflare_access_client_id,
                     cloudflare_access_client_secret: args.cloudflare_access_client_secret,
                     manual_public_access_verified_at: args.manual_public_access_verified_at,
@@ -521,6 +528,7 @@ async fn run_validate(config: &AppConfig, target: ValidateTarget) -> Result<()> 
                     cutover_log: args.cutover_log,
                     manual_public_oauth_verified_at: args.manual_public_oauth_verified_at,
                     cloudflared_config: args.cloudflared_config,
+                    cloudflare_evidence: args.cloudflare_evidence,
                     cloudflare_access_client_id: args.cloudflare_access_client_id,
                     cloudflare_access_client_secret: args.cloudflare_access_client_secret,
                     max_air_quality_age_seconds: args.max_air_quality_age_seconds,
@@ -890,6 +898,8 @@ mod tests {
             "https://office.example.test",
             "--cloudflared-config",
             "/tmp/cloudflared.yml",
+            "--cloudflare-evidence",
+            "/tmp/cloudflare-evidence.json",
             "--cloudflare-access-client-id",
             "access-id",
             "--cloudflare-access-client-secret",
@@ -914,6 +924,10 @@ mod tests {
                         assert_eq!(
                             shadow.cloudflared_config,
                             Some(PathBuf::from("/tmp/cloudflared.yml"))
+                        );
+                        assert_eq!(
+                            shadow.cloudflare_evidence,
+                            Some(PathBuf::from("/tmp/cloudflare-evidence.json"))
                         );
                         assert_eq!(
                             shadow.cloudflare_access_client_id.as_deref(),
@@ -958,6 +972,8 @@ mod tests {
             "/tmp/cutover.md",
             "--cloudflared-config",
             "/tmp/cloudflared.yml",
+            "--cloudflare-evidence",
+            "/tmp/cloudflare-evidence.json",
             "--cloudflare-access-client-id",
             "access-id",
             "--cloudflare-access-client-secret",
@@ -981,6 +997,10 @@ mod tests {
                         assert_eq!(
                             cutover.cloudflared_config,
                             Some(PathBuf::from("/tmp/cloudflared.yml"))
+                        );
+                        assert_eq!(
+                            cutover.cloudflare_evidence,
+                            Some(PathBuf::from("/tmp/cloudflare-evidence.json"))
                         );
                         assert_eq!(
                             cutover.cloudflare_access_client_id.as_deref(),
