@@ -10,6 +10,7 @@ This procedure is for the cutover window only. Do not leave Python and Rust runn
 - Ticket #77 shadow validation completed against the Rust backend with Python still active.
 - ERV and HVAC active write gates were validated by their earlier tickets.
 - Cloudflare Tunnel config was validated with the deployed `cloudflared` binary.
+- Sanitized Cloudflare evidence was captured from API, Terraform, or dashboard state for the exact Office hostname.
 - Browser/PWA and mobile OAuth behavior was manually checked against the public Cloudflare URL when automated JWT validation is unavailable.
 
 Cloudflare Tunnel is the public transport. LocalTunnel is not part of this cutover.
@@ -26,6 +27,7 @@ export OFFICE_AUTOMATE_LEGACY_BASE_URL="http://legacy-host:9001"
 export OFFICE_AUTOMATE_CUTOVER_SNAPSHOT_DIR="/absolute/path/to/office-automate-precutover-YYYYMMDD-HHMMSS"
 export OFFICE_AUTOMATE_CUTOVER_LOG="/absolute/path/to/cutover-log.md"
 export OFFICE_AUTOMATE_MQTT_CUTOVER_STRATEGY="atomic-switch"
+export OFFICE_AUTOMATE_CLOUDFLARE_EVIDENCE="/absolute/path/to/cloudflare-evidence.json"
 ```
 
 The Rust config used for the active cutover must have:
@@ -50,6 +52,17 @@ cargo build --manifest-path rust/office-automate-server/Cargo.toml --release
 ./target/release/office-automate-server smoke --config "$OFFICE_AUTOMATE_CONFIG"
 cloudflared tunnel ingress validate --config "$CLOUDFLARED_CONFIG"
 ```
+
+The Cloudflare evidence file must use the schema from `docs/deployment/shadow-mode-validation.md` and prove:
+
+- the exact hostname is protected by an Access application,
+- no policy action is Bypass,
+- no policy includes public users,
+- no wildcard DNS record points at Office Automate,
+- the tunnel routes only to the loopback or Unix-socket origin,
+- no Cloudflare private-network routes exist for this tunnel,
+- the final ingress rule is `http_status:404`,
+- Access audit evidence includes unauthenticated blocks and authenticated successes.
 
 Stop the legacy Python backend and record the timestamp:
 
@@ -79,6 +92,7 @@ Run cutover validation after Rust is the only active climate controller:
   --base-url "$OFFICE_AUTOMATE_CUTOVER_BASE_URL" \
   --public-url "$OFFICE_AUTOMATE_PUBLIC_URL" \
   --cloudflared-config "$CLOUDFLARED_CONFIG" \
+  --cloudflare-evidence "$OFFICE_AUTOMATE_CLOUDFLARE_EVIDENCE" \
   --legacy-base-url "$OFFICE_AUTOMATE_LEGACY_BASE_URL" \
   --legacy-controller-stopped-at "$OFFICE_AUTOMATE_LEGACY_STOPPED_AT" \
   --mqtt-strategy "$OFFICE_AUTOMATE_MQTT_CUTOVER_STRATEGY" \
@@ -115,6 +129,7 @@ The command validates:
 - Local `/status` has fresh air-quality readings from the active Rust controller.
 - Local `/ws` returns the authenticated initial status frame.
 - The Cloudflare tunnel config publishes only the exact public hostname, routes it to a loopback/Unix origin, has no wildcard hostname/private-network route, and ends in `http_status:404`.
+- The Cloudflare evidence proves Access app/policy/DNS/tunnel/audit state and fails cutover on Bypass, public allow, wildcard DNS, private routes, hostname drift, or missing audit observations.
 - Unauthenticated public HTTP routes and `/ws` are blocked by Cloudflare Access before origin.
 - Public `/status` is fresh through Cloudflare Access and Office auth when automated service-token validation is possible, or manual Access plus Office verification is recorded.
 - The cutover log is written with timestamps, checks, and rollback point.

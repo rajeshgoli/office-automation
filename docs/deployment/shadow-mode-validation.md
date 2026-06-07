@@ -19,6 +19,7 @@ export OFFICE_AUTOMATE_CONFIG="/absolute/path/to/office-automate.yaml"
 export OFFICE_AUTOMATE_SHADOW_BASE_URL="http://127.0.0.1:9001"
 export OFFICE_AUTOMATE_SHADOW_PUBLIC_URL="https://office.example.com"
 export CLOUDFLARED_CONFIG="/absolute/path/to/cloudflared/config.yml"
+export OFFICE_AUTOMATE_CLOUDFLARE_EVIDENCE="/absolute/path/to/cloudflare-evidence.json"
 ```
 
 The Office Automate config used for this ticket must have:
@@ -63,6 +64,50 @@ cloudflared tunnel ingress validate --config "$CLOUDFLARED_CONFIG"
 
 If the installed `cloudflared` uses a different subcommand shape, run the deployed version's equivalent ingress validation. The tunnel should forward the shadow hostname to `OFFICE_AUTOMATE_SHADOW_BASE_URL`, and application auth remains enforced by `office-automate-server`.
 
+## Capture Cloudflare Drift Evidence
+
+Local `cloudflared` YAML validation is necessary but not enough. Capture a sanitized Cloudflare API export, Terraform export, or dashboard screenshot manifest that proves the account-side state for the exact public hostname:
+
+```json
+{
+  "source": "cloudflare_api",
+  "captured_at": "2026-06-07T14:30:00-07:00",
+  "hostname": "office.example.com",
+  "access_application": {
+    "hostname": "office.example.com",
+    "require_access": true,
+    "policies": [
+      {
+        "name": "allow-device-mtls",
+        "action": "Service Auth",
+        "includes_public": false
+      },
+      {
+        "name": "allow-rajesh",
+        "action": "Allow",
+        "includes_public": false
+      }
+    ]
+  },
+  "dns": {
+    "wildcard_records": []
+  },
+  "tunnel": {
+    "hostname": "office.example.com",
+    "origin_service": "http://127.0.0.1:9001",
+    "private_network_routes": [],
+    "final_ingress_service": "http_status:404"
+  },
+  "access_audit": {
+    "checked_at": "2026-06-07T14:35:00-07:00",
+    "unauthenticated_blocks_seen": true,
+    "authenticated_success_seen": true
+  }
+}
+```
+
+The evidence file must not contain API tokens, service-token secrets, tunnel credential JSON, bearer tokens, or raw Access log payloads. Store the raw export/screenshots privately and keep only this sanitized manifest in the deployment log directory.
+
 ## Run Shadow Validation
 
 Run the Rust validation command:
@@ -74,6 +119,7 @@ Run the Rust validation command:
   --base-url "$OFFICE_AUTOMATE_SHADOW_BASE_URL" \
   --public-url "$OFFICE_AUTOMATE_SHADOW_PUBLIC_URL" \
   --cloudflared-config "$CLOUDFLARED_CONFIG" \
+  --cloudflare-evidence "$OFFICE_AUTOMATE_CLOUDFLARE_EVIDENCE" \
   --max-air-quality-age-seconds 300
 ```
 
@@ -105,6 +151,7 @@ The command validates:
 - `/history`, `/history/project-leverage`, `/apps/office-climate/meta.json`, and `/auth/login` retain their expected interface behavior.
 - `/ws` accepts the configured auth mode and delivers the initial status frame.
 - The Cloudflare tunnel config publishes only the exact public hostname, routes it to a loopback/Unix origin, has no wildcard hostname/private-network route, and ends in `http_status:404` when supplied.
+- The sanitized Cloudflare evidence proves the Access app, no Bypass/public policies, exact hostname, no wildcard DNS, no private routes, final deny rule, and Access audit allow/deny observations when supplied.
 - Unauthenticated public HTTP routes and `/ws` are blocked by Cloudflare Access before origin when a public URL is supplied.
 - Public `/status` reaches Rust through Cloudflare Access and Office auth when a service token or manual verification timestamp is supplied.
 

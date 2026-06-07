@@ -13,7 +13,7 @@ use futures_util::{SinkExt, StreamExt};
 use ipnet::IpNet;
 use reqwest::{StatusCode, Url};
 use rusqlite::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use serde_yaml::Value as YamlValue;
 use tokio::time::timeout;
@@ -42,6 +42,7 @@ pub struct ShadowValidationOptions {
     pub base_url: Option<String>,
     pub public_url: Option<String>,
     pub cloudflared_config: Option<PathBuf>,
+    pub cloudflare_evidence: Option<PathBuf>,
     pub cloudflare_access_client_id: Option<String>,
     pub cloudflare_access_client_secret: Option<String>,
     pub manual_public_access_verified_at: Option<String>,
@@ -56,6 +57,7 @@ impl Default for ShadowValidationOptions {
             base_url: None,
             public_url: None,
             cloudflared_config: None,
+            cloudflare_evidence: None,
             cloudflare_access_client_id: None,
             cloudflare_access_client_secret: None,
             manual_public_access_verified_at: None,
@@ -77,6 +79,7 @@ pub struct CutoverValidationOptions {
     pub cutover_log: PathBuf,
     pub manual_public_oauth_verified_at: Option<String>,
     pub cloudflared_config: Option<PathBuf>,
+    pub cloudflare_evidence: Option<PathBuf>,
     pub cloudflare_access_client_id: Option<String>,
     pub cloudflare_access_client_secret: Option<String>,
     pub max_air_quality_age_seconds: u64,
@@ -623,6 +626,11 @@ async fn validate_http_interfaces(
             public_url,
             report,
         )?;
+        validate_cloudflare_drift_evidence_optional(
+            options.cloudflare_evidence.as_deref(),
+            public_url,
+            report,
+        )?;
         validate_public_access_blocks_unauthenticated(public_url, report).await?;
         let access_auth = public_access_probe_auth(
             options.cloudflare_access_client_id.as_deref(),
@@ -705,6 +713,11 @@ async fn validate_cutover_http_interfaces(
     validate_websocket_interface(base_url, &auth, report).await?;
     validate_cloudflared_public_config_required(
         options.cloudflared_config.as_deref(),
+        public_url,
+        report,
+    )?;
+    validate_cloudflare_drift_evidence_required(
+        options.cloudflare_evidence.as_deref(),
         public_url,
         report,
     )?;
@@ -1036,16 +1049,229 @@ fn validate_cloudflared_public_config_required(
     validate_cloudflared_public_config(cloudflared_config, public_url, report)
 }
 
+#[derive(Debug, Deserialize)]
+struct CloudflareDriftEvidence {
+    source: Option<String>,
+    captured_at: Option<String>,
+    hostname: Option<String>,
+    access_application: Option<CloudflareAccessApplicationEvidence>,
+    dns: Option<CloudflareDnsEvidence>,
+    tunnel: Option<CloudflareTunnelEvidence>,
+    access_audit: Option<CloudflareAccessAuditEvidence>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudflareAccessApplicationEvidence {
+    hostname: Option<String>,
+    require_access: Option<bool>,
+    policies: Option<Vec<CloudflareAccessPolicyEvidence>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudflareAccessPolicyEvidence {
+    name: Option<String>,
+    action: Option<String>,
+    includes_public: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudflareDnsEvidence {
+    wildcard_records: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudflareTunnelEvidence {
+    hostname: Option<String>,
+    origin_service: Option<String>,
+    private_network_routes: Option<Vec<String>>,
+    final_ingress_service: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudflareAccessAuditEvidence {
+    checked_at: Option<String>,
+    unauthenticated_blocks_seen: Option<bool>,
+    authenticated_success_seen: Option<bool>,
+}
+
+fn validate_cloudflare_drift_evidence_optional(
+    cloudflare_evidence: Option<&Path>,
+    public_url: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if let Some(cloudflare_evidence) = cloudflare_evidence {
+        validate_cloudflare_drift_evidence(cloudflare_evidence, public_url, report)
+    } else {
+        report.push_skip(
+            "cloudflare-drift-evidence",
+            "no --cloudflare-evidence supplied; Cloudflare account/API state was not validated",
+        );
+        Ok(())
+    }
+}
+
+fn validate_cloudflare_drift_evidence_required(
+    cloudflare_evidence: Option<&Path>,
+    public_url: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let cloudflare_evidence = cloudflare_evidence.context(
+        "cutover validation requires --cloudflare-evidence or OFFICE_AUTOMATE_CLOUDFLARE_EVIDENCE",
+    )?;
+    validate_cloudflare_drift_evidence(cloudflare_evidence, public_url, report)
+}
+
+fn validate_cloudflare_drift_evidence(
+    cloudflare_evidence: &Path,
+    public_url: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let public_host = cloudflare_public_host(public_url)?;
+    let contents = fs::read_to_string(cloudflare_evidence).with_context(|| {
+        format!(
+            "failed to read Cloudflare evidence {}",
+            cloudflare_evidence.display()
+        )
+    })?;
+    let evidence: CloudflareDriftEvidence = serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "failed to parse Cloudflare evidence JSON {}",
+            cloudflare_evidence.display()
+        )
+    })?;
+
+    let source = required_evidence_str(&evidence.source, "source")?;
+    match normalize_evidence_token(source).as_str() {
+        "cloudflare_api"
+        | "api"
+        | "terraform_export"
+        | "terraform"
+        | "dashboard_screenshot_manifest"
+        | "dashboard" => {}
+        _ => bail!("unsupported Cloudflare evidence source {source:?}"),
+    }
+    let captured_at = required_evidence_str(&evidence.captured_at, "captured_at")?;
+    validate_manual_verification_timestamp(captured_at, "Cloudflare evidence captured_at")?;
+    validate_evidence_hostname(
+        "hostname",
+        required_evidence_str(&evidence.hostname, "hostname")?,
+        &public_host,
+    )?;
+
+    let access_application = evidence
+        .access_application
+        .as_ref()
+        .context("Cloudflare evidence missing access_application")?;
+    validate_evidence_hostname(
+        "access_application.hostname",
+        required_evidence_str(&access_application.hostname, "access_application.hostname")?,
+        &public_host,
+    )?;
+    if access_application.require_access != Some(true) {
+        bail!("Cloudflare evidence must prove require_access=true for the Access application");
+    }
+    let policies = access_application
+        .policies
+        .as_deref()
+        .context("Cloudflare evidence missing access_application.policies")?;
+    if policies.is_empty() {
+        bail!("Cloudflare evidence Access application must include at least one policy");
+    }
+    let mut has_forwarding_policy = false;
+    for policy in policies {
+        let name = required_evidence_str(&policy.name, "access_application.policies[].name")?;
+        let action = required_evidence_str(&policy.action, "access_application.policies[].action")?;
+        let normalized_action = normalize_evidence_token(action);
+        if normalized_action == "bypass" {
+            bail!("Cloudflare evidence policy {name:?} uses Bypass, which is not allowed");
+        }
+        if policy.includes_public != Some(false) {
+            bail!(
+                "Cloudflare evidence policy {name:?} must prove includes_public=false; public allow rules are not allowed"
+            );
+        }
+        if matches!(normalized_action.as_str(), "allow" | "service_auth") {
+            has_forwarding_policy = true;
+        }
+    }
+    if !has_forwarding_policy {
+        bail!("Cloudflare evidence must include at least one Allow or Service Auth policy");
+    }
+
+    let dns = evidence
+        .dns
+        .as_ref()
+        .context("Cloudflare evidence missing dns")?;
+    let wildcard_records = dns
+        .wildcard_records
+        .as_deref()
+        .context("Cloudflare evidence missing dns.wildcard_records")?;
+    if !wildcard_records.is_empty() {
+        bail!(
+            "Cloudflare evidence shows wildcard DNS records for Office Automate: {}",
+            wildcard_records.join(", ")
+        );
+    }
+
+    let tunnel = evidence
+        .tunnel
+        .as_ref()
+        .context("Cloudflare evidence missing tunnel")?;
+    validate_evidence_hostname(
+        "tunnel.hostname",
+        required_evidence_str(&tunnel.hostname, "tunnel.hostname")?,
+        &public_host,
+    )?;
+    let origin_service = required_evidence_str(&tunnel.origin_service, "tunnel.origin_service")?;
+    validate_cloudflared_origin_service(origin_service)
+        .context("Cloudflare evidence tunnel.origin_service is unsafe")?;
+    let private_network_routes = tunnel
+        .private_network_routes
+        .as_deref()
+        .context("Cloudflare evidence missing tunnel.private_network_routes")?;
+    if !private_network_routes.is_empty() {
+        bail!(
+            "Cloudflare evidence shows private network routes on the Office tunnel: {}",
+            private_network_routes.join(", ")
+        );
+    }
+    let final_ingress_service = required_evidence_str(
+        &tunnel.final_ingress_service,
+        "tunnel.final_ingress_service",
+    )?;
+    if final_ingress_service != "http_status:404" {
+        bail!("Cloudflare evidence tunnel.final_ingress_service must be http_status:404");
+    }
+
+    let access_audit = evidence
+        .access_audit
+        .as_ref()
+        .context("Cloudflare evidence missing access_audit")?;
+    let checked_at = required_evidence_str(&access_audit.checked_at, "access_audit.checked_at")?;
+    validate_manual_verification_timestamp(checked_at, "Cloudflare Access audit checked_at")?;
+    if access_audit.unauthenticated_blocks_seen != Some(true) {
+        bail!("Cloudflare evidence must prove Access audit logs include unauthenticated blocks");
+    }
+    if access_audit.authenticated_success_seen != Some(true) {
+        bail!("Cloudflare evidence must prove Access audit logs include authenticated successes");
+    }
+
+    report.push_pass(
+        "cloudflare-drift-evidence",
+        format!(
+            "Cloudflare evidence {} proves exact hostname {public_host}, Access policies, DNS, tunnel route, and audit allow/deny state",
+            cloudflare_evidence.display()
+        ),
+    );
+    Ok(())
+}
+
 fn validate_cloudflared_public_config(
     cloudflared_config: &Path,
     public_url: &str,
     report: &mut ShadowValidationReport,
 ) -> Result<()> {
-    let public_host = Url::parse(public_url)
-        .with_context(|| format!("invalid Cloudflare public URL {public_url}"))?
-        .host_str()
-        .context("Cloudflare public URL must include a hostname")?
-        .to_ascii_lowercase();
+    let public_host = cloudflare_public_host(public_url)?;
     let contents = fs::read_to_string(cloudflared_config).with_context(|| {
         format!(
             "failed to read cloudflared config {}",
@@ -1136,6 +1362,39 @@ fn validate_cloudflared_public_config(
             cloudflared_config.display()
         ),
     );
+    Ok(())
+}
+
+fn cloudflare_public_host(public_url: &str) -> Result<String> {
+    Ok(Url::parse(public_url)
+        .with_context(|| format!("invalid Cloudflare public URL {public_url}"))?
+        .host_str()
+        .context("Cloudflare public URL must include a hostname")?
+        .to_ascii_lowercase())
+}
+
+fn required_evidence_str<'a>(value: &'a Option<String>, field: &str) -> Result<&'a str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("Cloudflare evidence missing {field}"))
+}
+
+fn normalize_evidence_token(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace([' ', '-'], "_")
+}
+
+fn validate_evidence_hostname(field: &str, value: &str, public_host: &str) -> Result<()> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.contains('*') {
+        bail!("Cloudflare evidence {field} uses wildcard hostname {value:?}");
+    }
+    if value != public_host {
+        bail!(
+            "Cloudflare evidence {field}={value:?} does not match public hostname {public_host:?}"
+        );
+    }
     Ok(())
 }
 
@@ -2150,6 +2409,7 @@ mod tests {
                 cutover_log: temp_dir.path().join("cutover.md"),
                 manual_public_oauth_verified_at: None,
                 cloudflared_config: None,
+                cloudflare_evidence: None,
                 cloudflare_access_client_id: None,
                 cloudflare_access_client_secret: None,
                 max_air_quality_age_seconds: 300,
@@ -2240,6 +2500,7 @@ mod tests {
             cutover_log: temp_dir.path().join("cutover.md"),
             manual_public_oauth_verified_at: None,
             cloudflared_config: None,
+            cloudflare_evidence: None,
             cloudflare_access_client_id: None,
             cloudflare_access_client_secret: None,
             max_air_quality_age_seconds: 300,
@@ -2397,6 +2658,7 @@ mod tests {
             cutover_log: temp_dir.path().join("logs").join("cutover.md"),
             manual_public_oauth_verified_at: Some("2026-06-06T03:10:00-07:00".to_string()),
             cloudflared_config: None,
+            cloudflare_evidence: None,
             cloudflare_access_client_id: None,
             cloudflare_access_client_secret: None,
             max_air_quality_age_seconds: 300,
@@ -2539,6 +2801,158 @@ mod tests {
                 "expected {expected:?} in {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn cloudflare_drift_evidence_accepts_fail_closed_account_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let evidence_path = temp_dir.path().join("cloudflare-evidence.json");
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec(&valid_cloudflare_drift_evidence()).expect("evidence json"),
+        )
+        .expect("write evidence");
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+
+        validate_cloudflare_drift_evidence(
+            &evidence_path,
+            "https://office.example.test",
+            &mut report,
+        )
+        .expect("evidence should pass");
+
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "cloudflare-drift-evidence")
+        );
+    }
+
+    #[test]
+    fn cloudflare_drift_evidence_rejects_unsafe_account_drift() {
+        let mut bypass_policy = valid_cloudflare_drift_evidence();
+        bypass_policy["access_application"]["policies"][0]["action"] = json!("Bypass");
+
+        let mut public_policy = valid_cloudflare_drift_evidence();
+        public_policy["access_application"]["policies"][0]["includes_public"] = json!(true);
+
+        let mut wildcard_dns = valid_cloudflare_drift_evidence();
+        wildcard_dns["dns"]["wildcard_records"] = json!(["*.example.test"]);
+
+        let mut private_route = valid_cloudflare_drift_evidence();
+        private_route["tunnel"]["private_network_routes"] = json!(["192.168.5.0/24"]);
+
+        let mut missing_audit = valid_cloudflare_drift_evidence();
+        missing_audit["access_audit"]["unauthenticated_blocks_seen"] = json!(false);
+
+        let cases = [
+            (bypass_policy, "Bypass"),
+            (public_policy, "includes_public=false"),
+            (wildcard_dns, "wildcard DNS"),
+            (private_route, "private network routes"),
+            (missing_audit, "unauthenticated blocks"),
+        ];
+
+        for (index, (evidence, expected)) in cases.into_iter().enumerate() {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let evidence_path = temp_dir
+                .path()
+                .join(format!("cloudflare-evidence-{index}.json"));
+            fs::write(
+                &evidence_path,
+                serde_json::to_vec(&evidence).expect("evidence json"),
+            )
+            .expect("write evidence");
+            let mut report = ShadowValidationReport { checks: Vec::new() };
+
+            let error = validate_cloudflare_drift_evidence(
+                &evidence_path,
+                "https://office.example.test",
+                &mut report,
+            )
+            .expect_err("unsafe Cloudflare evidence should fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloudflare_drift_evidence_rejects_wrong_hostname_and_origin() {
+        let mut wrong_hostname = valid_cloudflare_drift_evidence();
+        wrong_hostname["hostname"] = json!("other.example.test");
+
+        let mut private_origin = valid_cloudflare_drift_evidence();
+        private_origin["tunnel"]["origin_service"] = json!("http://192.168.5.10:9001");
+
+        let cases = [
+            (wrong_hostname, "does not match public hostname"),
+            (private_origin, "tunnel.origin_service is unsafe"),
+        ];
+
+        for (index, (evidence, expected)) in cases.into_iter().enumerate() {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let evidence_path = temp_dir
+                .path()
+                .join(format!("cloudflare-evidence-{index}.json"));
+            fs::write(
+                &evidence_path,
+                serde_json::to_vec(&evidence).expect("evidence json"),
+            )
+            .expect("write evidence");
+            let mut report = ShadowValidationReport { checks: Vec::new() };
+
+            let error = validate_cloudflare_drift_evidence(
+                &evidence_path,
+                "https://office.example.test",
+                &mut report,
+            )
+            .expect_err("unsafe Cloudflare evidence should fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error:?}"
+            );
+        }
+    }
+
+    fn valid_cloudflare_drift_evidence() -> Value {
+        json!({
+            "source": "cloudflare_api",
+            "captured_at": "2026-06-07T14:30:00-07:00",
+            "hostname": "office.example.test",
+            "access_application": {
+                "hostname": "office.example.test",
+                "require_access": true,
+                "policies": [
+                    {
+                        "name": "allow-device-mtls",
+                        "action": "Service Auth",
+                        "includes_public": false
+                    },
+                    {
+                        "name": "allow-rajesh",
+                        "action": "Allow",
+                        "includes_public": false
+                    }
+                ]
+            },
+            "dns": {
+                "wildcard_records": []
+            },
+            "tunnel": {
+                "hostname": "office.example.test",
+                "origin_service": "http://127.0.0.1:9001",
+                "private_network_routes": [],
+                "final_ingress_service": "http_status:404"
+            },
+            "access_audit": {
+                "checked_at": "2026-06-07T14:35:00-07:00",
+                "unauthenticated_blocks_seen": true,
+                "authenticated_success_seen": true
+            }
+        })
     }
 
     #[test]
