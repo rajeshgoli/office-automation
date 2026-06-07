@@ -157,6 +157,10 @@ Run cutover validation with Cloudflare evidence and Access service credentials:
 
 ```bash
 ./oa validate cutover \
+  --legacy-controller-stopped-at "$OFFICE_AUTOMATE_LEGACY_STOPPED_AT" \
+  --mqtt-strategy "$OFFICE_AUTOMATE_MQTT_CUTOVER_STRATEGY" \
+  --snapshot-dir "$OFFICE_AUTOMATE_CUTOVER_SNAPSHOT_DIR" \
+  --cutover-log "$OFFICE_AUTOMATE_CUTOVER_LOG" \
   --cloudflared-config "$CLOUDFLARED_CONFIG" \
   --cloudflare-evidence "$OFFICE_AUTOMATE_CLOUDFLARE_EVIDENCE" \
   --cloudflare-access-client-id "$OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_CLIENT_ID" \

@@ -152,6 +152,33 @@ copy_if_file() {
   fi
 }
 
+capture_file_permissions() {
+  local output="$evidence_dir/commands/file-permissions.txt"
+  local db_dir
+  db_dir="$(dirname "$database_path")"
+  local paths=(
+    "$config_path"
+    "$database_path"
+    "$db_dir"
+    data
+    data/apps
+    logs
+    certs
+    /var/lib/office-automate
+    /var/log/office-automate
+  )
+  shopt -s nullglob
+  paths+=(data/*.db logs/* certs/* /var/lib/office-automate/* /var/log/office-automate/*)
+  shopt -u nullglob
+  {
+    printf '$ stat -f "%%Sp %%Su %%Sg %%N"'
+    printf ' %q' "${paths[@]}"
+    printf '\n\n'
+    stat -f "%Sp %Su %Sg %N" "${paths[@]}" 2>/dev/null || true
+  } >"$output" 2>&1 || true
+  chmod 600 "$output"
+}
+
 echo "Office Automate incident evidence"
 echo "evidence_dir=$evidence_dir"
 echo "raw evidence may contain secrets; do not paste it into tickets, chats, PRs, or issue comments"
@@ -177,7 +204,7 @@ capture commands/launchctl-gui-tunnel.txt launchctl print "gui/$(id -u)/com.offi
 capture_shell commands/ps-eww.raw.secret.txt 'pids="$(pgrep -f "office-automate-server|cloudflared" | tr "\n" " ")"; if [[ -n "$pids" ]]; then for pid in $pids; do ps eww -p "$pid"; done; fi'
 redact_file "$evidence_dir/commands/ps-eww.raw.secret.txt" "$evidence_dir/redacted/ps-eww.redacted.txt"
 
-capture_shell commands/file-permissions.txt 'stat -f "%Sp %Su %Sg %N" config.yaml data data/*.db data/apps logs logs/* certs certs/* /var/lib/office-automate /var/lib/office-automate/* /var/log/office-automate /var/log/office-automate/* 2>/dev/null'
+capture_file_permissions
 capture hashes/server-binary.sha256 shasum -a 256 "$server_bin"
 capture_shell hashes/artifacts.sha256 'if [[ -d data/apps ]]; then find data/apps -maxdepth 3 -type f -print0 | xargs -0 shasum -a 256; fi'
 
