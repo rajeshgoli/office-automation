@@ -186,7 +186,11 @@ async fn complete_device_pairing(
     ) {
         Ok(pem) => pem,
         Err(error) => {
-            return invalid_csr_response(&state, pairing_code, Some(&remote_addr), &error);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response();
         }
     };
 
@@ -281,6 +285,8 @@ fn extract_public_key_from_csr_with_openssl(csr_pem: &str) -> Result<String> {
     let csr_path = temp_dir.path().join("device.csr.pem");
     fs::write(&csr_path, csr_pem).context("failed to write CSR")?;
 
+    verify_csr_self_signature_with_openssl(&csr_path)?;
+
     let output = Command::new("openssl")
         .arg("req")
         .arg("-in")
@@ -297,6 +303,27 @@ fn extract_public_key_from_csr_with_openssl(csr_pem: &str) -> Result<String> {
     String::from_utf8(output.stdout)
         .map(|value| value.trim().to_string())
         .context("openssl returned non-UTF-8 CSR public key")
+}
+
+fn verify_csr_self_signature_with_openssl(csr_path: &Path) -> Result<()> {
+    let output = Command::new("openssl")
+        .arg("req")
+        .arg("-in")
+        .arg(csr_path)
+        .arg("-verify")
+        .arg("-noout")
+        .output()
+        .context("failed to invoke openssl for CSR verification")?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!(
+        "openssl failed to verify CSR self-signature: {}",
+        stderr.trim()
+    )
 }
 
 fn sign_csr_with_openssl(
