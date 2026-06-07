@@ -459,6 +459,12 @@ async fn validate_security_cloudflare(
         public_url,
         report,
     )?;
+    validate_cloudflared_origin_targets_edge(
+        options.cloudflared_config.as_deref(),
+        options.edge_config.as_deref(),
+        public_url,
+        report,
+    )?;
     validate_cloudflare_drift_evidence_required(
         options.cloudflare_evidence.as_deref(),
         public_url,
@@ -2176,6 +2182,155 @@ fn validate_cloudflared_public_config(
         ),
     );
     Ok(())
+}
+
+fn validate_cloudflared_origin_targets_edge(
+    cloudflared_config: Option<&Path>,
+    edge_config: Option<&Path>,
+    public_url: &str,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    let cloudflared_config = cloudflared_config.context(
+        "security validation for a public URL requires --cloudflared-config before origin/edge comparison",
+    )?;
+    let edge_config_path = edge_config.context(
+        "security validation for a public URL requires --edge-config before origin/edge comparison",
+    )?;
+    let edge_config = edge::PublicEdgeConfig::load_with_env(edge_config_path, |_| None)?;
+    let origin_service =
+        cloudflared_origin_service_for_public_host(cloudflared_config, public_url)?;
+    validate_origin_service_matches_edge(&origin_service, &edge_config).with_context(|| {
+        format!(
+            "cloudflared config {} must route public traffic to serve-edge from {}",
+            cloudflared_config.display(),
+            edge_config_path.display()
+        )
+    })?;
+    report.push_pass(
+        "cloudflare-tunnel-edge-origin",
+        format!(
+            "cloudflared origin {origin_service} targets serve-edge listener {}:{}",
+            edge_config.orchestrator.host, edge_config.orchestrator.port
+        ),
+    );
+    Ok(())
+}
+
+fn cloudflared_origin_service_for_public_host(
+    cloudflared_config: &Path,
+    public_url: &str,
+) -> Result<String> {
+    let public_host = cloudflare_public_host(public_url)?;
+    let contents = fs::read_to_string(cloudflared_config).with_context(|| {
+        format!(
+            "failed to read cloudflared config {}",
+            cloudflared_config.display()
+        )
+    })?;
+    let root: YamlValue = serde_yaml::from_str(&contents).with_context(|| {
+        format!(
+            "failed to parse cloudflared config {}",
+            cloudflared_config.display()
+        )
+    })?;
+    let ingress = yaml_mapping_value(&root, "ingress")
+        .and_then(YamlValue::as_sequence)
+        .with_context(|| {
+            format!(
+                "cloudflared config missing ingress sequence: {}",
+                cloudflared_config.display()
+            )
+        })?;
+
+    let mut service = None;
+    for rule in ingress {
+        let Some(mapping) = rule.as_mapping() else {
+            continue;
+        };
+        let Some(hostname) = yaml_mapping_str(mapping, "hostname") else {
+            continue;
+        };
+        if hostname.eq_ignore_ascii_case(&public_host) {
+            if service.is_some() {
+                bail!(
+                    "cloudflared config contains more than one origin rule for {public_host:?}: {}",
+                    cloudflared_config.display()
+                );
+            }
+            service = Some(
+                yaml_mapping_str(mapping, "service")
+                    .context("matching cloudflared ingress rule missing service")?
+                    .to_string(),
+            );
+        }
+    }
+    service.with_context(|| {
+        format!(
+            "cloudflared config {} has no origin rule for public hostname {public_host:?}",
+            cloudflared_config.display()
+        )
+    })
+}
+
+fn validate_origin_service_matches_edge(
+    origin_service: &str,
+    edge_config: &edge::PublicEdgeConfig,
+) -> Result<()> {
+    if origin_service.starts_with("unix:") {
+        bail!(
+            "cloudflared origin uses a Unix socket, but serve-edge is configured as a TCP listener"
+        );
+    }
+    let parsed = Url::parse(origin_service).with_context(|| {
+        format!(
+            "cloudflared origin must be an http:// URL targeting serve-edge, got {origin_service:?}"
+        )
+    })?;
+    if parsed.scheme() != "http" {
+        bail!(
+            "cloudflared origin must use http:// for serve-edge, got {:?}",
+            parsed.scheme()
+        );
+    }
+    let origin_host = parsed
+        .host_str()
+        .context("cloudflared origin URL must include a host")?;
+    if !loopback_hosts_match(&edge_config.orchestrator.host, origin_host) {
+        bail!(
+            "cloudflared origin host {origin_host:?} does not match serve-edge host {:?}",
+            edge_config.orchestrator.host
+        );
+    }
+    let origin_port = parsed
+        .port_or_known_default()
+        .context("cloudflared origin URL must include or imply a TCP port")?;
+    if origin_port != edge_config.orchestrator.port {
+        bail!(
+            "cloudflared origin port {origin_port} does not match serve-edge port {}",
+            edge_config.orchestrator.port
+        );
+    }
+    Ok(())
+}
+
+fn loopback_hosts_match(expected: &str, actual: &str) -> bool {
+    fn normalized_loopback_host(host: &str) -> Option<std::net::IpAddr> {
+        let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+        if host.eq_ignore_ascii_case("localhost") {
+            return Some(std::net::IpAddr::from([127, 0, 0, 1]));
+        }
+        host.parse::<std::net::IpAddr>()
+            .ok()
+            .filter(std::net::IpAddr::is_loopback)
+    }
+
+    match (
+        normalized_loopback_host(expected),
+        normalized_loopback_host(actual),
+    ) {
+        (Some(_), Some(_)) => true,
+        _ => expected.eq_ignore_ascii_case(actual),
+    }
 }
 
 fn cloudflare_public_host(public_url: &str) -> Result<String> {
@@ -3969,6 +4124,81 @@ ingress:
         assert_eq!(
             cloudflared_credentials_file(&config_path).expect("credentials file"),
             Some(temp_dir.path().join("creds/tunnel.json"))
+        );
+    }
+
+    #[test]
+    fn cloudflared_origin_must_target_validated_edge_listener() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let edge_config_path = temp_dir.path().join("edge.yaml");
+        fs::write(
+            &edge_config_path,
+            r#"
+orchestrator:
+  host: "127.0.0.1"
+  port: 19190
+  google_oauth:
+    client_id: "client"
+    client_secret: "secret"
+    allowed_emails:
+      - "engineer@example.test"
+    jwt_secret: "stable-test-secret"
+controller:
+  base_url: "http://127.0.0.1:9001"
+  token: "controller-token"
+runtime:
+  frontend_dist: "/tmp/frontend"
+"#,
+        )
+        .expect("edge config");
+        let cloudflared_config_path = temp_dir.path().join("cloudflared.yml");
+        fs::write(
+            &cloudflared_config_path,
+            r#"
+ingress:
+  - hostname: office.example.test
+    service: http://127.0.0.1:9001
+  - service: http_status:404
+"#,
+        )
+        .expect("cloudflared config");
+        let mut report = ShadowValidationReport { checks: Vec::new() };
+        let error = validate_cloudflared_origin_targets_edge(
+            Some(&cloudflared_config_path),
+            Some(&edge_config_path),
+            "https://office.example.test",
+            &mut report,
+        )
+        .expect_err("controller origin must not satisfy edge-origin validation");
+        assert!(error.to_string().contains("serve-edge"));
+        let error_chain = format!("{error:?}");
+        assert!(
+            error_chain.contains("port 9001"),
+            "expected origin-port mismatch in error chain: {error_chain}"
+        );
+
+        fs::write(
+            &cloudflared_config_path,
+            r#"
+ingress:
+  - hostname: office.example.test
+    service: http://127.0.0.1:19190
+  - service: http_status:404
+"#,
+        )
+        .expect("cloudflared config");
+        validate_cloudflared_origin_targets_edge(
+            Some(&cloudflared_config_path),
+            Some(&edge_config_path),
+            "https://office.example.test",
+            &mut report,
+        )
+        .expect("edge origin should pass");
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "cloudflare-tunnel-edge-origin")
         );
     }
 
