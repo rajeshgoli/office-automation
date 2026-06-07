@@ -171,20 +171,6 @@ async fn complete_device_pairing(
                     .into_response();
             }
         };
-    if payload.public_key_pem.trim().is_empty() {
-        record_pairing_failure(
-            &state,
-            pairing_code,
-            Some(&remote_addr),
-            "pairing_public_key_rejected",
-            "missing public_key_pem",
-        );
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Missing public_key_pem"})),
-        )
-            .into_response();
-    }
     let certificate_common_name = pending_registration.device_id.clone();
     let csr_public_key_pem = match extract_public_key_from_csr_with_openssl(&payload.csr_pem) {
         Ok(public_key_pem) => public_key_pem,
