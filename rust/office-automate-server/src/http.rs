@@ -30,7 +30,11 @@ use tokio::{
     task::JoinHandle,
     time::{self, timeout},
 };
-use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    services::ServeDir,
+    trace::TraceLayer,
+};
 
 use crate::{
     artifacts::ARTIFACT_MAX_SIZE_BYTES,
@@ -451,17 +455,22 @@ fn router_from_state(state: AppState) -> Router {
 }
 
 fn cors_layer(public_url: Option<&str>) -> CorsLayer {
-    let mut layer = CorsLayer::new()
+    CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([
             header::CONTENT_TYPE,
             header::AUTHORIZATION,
             HeaderName::from_static(OAUTH_CSRF_HEADER),
-        ]);
-    if let Some(origin) = public_origin_header(public_url) {
-        layer = layer.allow_origin(origin).allow_credentials(true);
+        ])
+        .allow_origin(allowed_cors_origins(public_url))
+        .allow_credentials(true)
+}
+
+fn allowed_cors_origins(public_url: Option<&str>) -> AllowOrigin {
+    match public_origin_header(public_url) {
+        Some(origin) => AllowOrigin::exact(origin),
+        None => AllowOrigin::list(local_dev_origins()),
     }
-    layer
 }
 
 fn public_origin_header(public_url: Option<&str>) -> Option<HeaderValue> {
@@ -472,6 +481,14 @@ fn public_origin_header(public_url: Option<&str>) -> Option<HeaderValue> {
         None => format!("{}://{host}", url.scheme()),
     };
     HeaderValue::from_str(&origin).ok()
+}
+
+fn local_dev_origins() -> [HeaderValue; 3] {
+    [
+        HeaderValue::from_static("http://localhost:9002"),
+        HeaderValue::from_static("http://127.0.0.1:9002"),
+        HeaderValue::from_static("http://[::1]:9002"),
+    ]
 }
 
 async fn security_headers_middleware(request: Request, next: Next) -> Response {
@@ -3356,6 +3373,48 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn local_dev_cors_origin_allowed_when_public_url_unset() {
+        let response = app(oauth_config())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/auth/login")
+                    .header(header::ORIGIN, "http://localhost:9002")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .expect("cors origin"),
+            "http://localhost:9002"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_local_dev_cors_origin_blocked_when_public_url_unset() {
+        let response = app(oauth_config())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/auth/login")
+                    .header(header::ORIGIN, "https://evil.example.test")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert!(
+            !response
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        );
     }
 
     #[test]
