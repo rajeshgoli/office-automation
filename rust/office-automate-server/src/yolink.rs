@@ -717,13 +717,12 @@ async fn listen_yolink_mqtt(
 ) -> Result<()> {
     let mut options = MqttOptions::new(
         "office-automate-yolink",
-        config.mqtt_host.clone(),
-        config.mqtt_port,
+        (config.mqtt_host.as_str(), config.mqtt_port),
     );
     options.set_credentials(access_token, "");
-    options.set_keep_alive(Duration::from_secs(30));
+    options.set_keep_alive(30);
 
-    let (client, mut event_loop) = AsyncClient::new(options, 10);
+    let (client, mut event_loop) = AsyncClient::builder(options).capacity(10).build();
     let topic = format!("yl-home/{home_id}/+/report");
     client
         .subscribe(topic.clone(), QoS::AtLeastOnce)
