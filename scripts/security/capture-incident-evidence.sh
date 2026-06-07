@@ -130,9 +130,10 @@ redact_file() {
     return
   fi
   sed -E \
-    -e 's/((secret|token|password|key|credential|authorization|cookie|client_secret|jwt)[A-Za-z0-9_.:-]*[=:])[[:graph:]]+/\1<redacted>/Ig' \
+    -e 's/([Aa]uthorization[[:space:]]*[:=][[:space:]]*)[^[:space:]]+([[:space:]][^[:space:]]+)?/\1<redacted>/g' \
     -e 's/(Bearer )[A-Za-z0-9._~+\/=-]+/\1<redacted>/Ig' \
-    -e 's/(cf-access-[A-Za-z0-9_-]+: )[A-Za-z0-9._~+\/=-]+/\1<redacted>/Ig' \
+    -e "s/((secret|token|password|key|credential|cookie|client_secret|jwt)[A-Za-z0-9_.-]*[[:space:]]*[:=][[:space:]]*)(\"[^\"]*\"|[^[:space:]]+)/\1<redacted>/Ig" \
+    -e 's/(cf-access-[A-Za-z0-9_-]+:[[:space:]]*)[A-Za-z0-9._~+\/=-]+/\1<redacted>/Ig' \
     "$source" >"$dest" || true
   chmod 600 "$dest"
 }
