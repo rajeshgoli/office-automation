@@ -40,6 +40,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     init {
         viewModelScope.launch {
+            settingsRepo.clearInvalidDeviceCredentialIfNeeded()
             _uiState.value = _uiState.value.copy(
                 serverUrl = settingsRepo.serverUrl.first(),
                 userEmail = settingsRepo.userEmail.first(),
@@ -64,7 +65,12 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     fun saveServerUrl() {
         viewModelScope.launch {
-            settingsRepo.saveServerUrl(_uiState.value.serverUrl)
+            try {
+                settingsRepo.saveServerUrl(_uiState.value.serverUrl)
+                _uiState.value = _uiState.value.copy(error = null)
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(error = e.message)
+            }
         }
     }
 
@@ -164,10 +170,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun logout() {
         viewModelScope.launch {
             settingsRepo.clearAuth()
-            val deviceCertificateAlias = settingsRepo.deviceCertificateAlias.first()
             _uiState.value = _uiState.value.copy(
                 userEmail = "",
-                isLoggedIn = deviceCertificateAlias.isNotBlank(),
+                isLoggedIn = settingsRepo.isAuthenticated.first(),
             )
         }
     }
