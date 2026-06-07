@@ -98,8 +98,12 @@ fi
 
 timestamp="$(date -u +"%Y%m%dT%H%M%SZ")"
 evidence_dir="$output_root/$timestamp"
+if [[ ! -d "$output_root" ]]; then
+  mkdir -p "$output_root"
+  chmod 700 "$output_root"
+fi
 mkdir -p "$evidence_dir"/{commands,hashes,logs,plists,redacted,sqlite}
-chmod 700 "$output_root" "$evidence_dir"
+chmod 700 "$evidence_dir"
 
 capture() {
   local output="$1"
@@ -141,9 +145,10 @@ redact_file() {
 copy_if_file() {
   local source="$1"
   local dest_dir="$2"
+  local dest_name="${3:-$(basename "$source")}"
   if [[ -f "$source" ]]; then
-    cp "$source" "$dest_dir/"
-    chmod 600 "$dest_dir/$(basename "$source")"
+    cp "$source" "$dest_dir/$dest_name"
+    chmod 600 "$dest_dir/$dest_name"
   fi
 }
 
@@ -187,9 +192,9 @@ copy_if_file "$config_path" "$evidence_dir/plists"
 copy_if_file "$HOME/Library/LaunchAgents/com.office-automate.server.plist" "$evidence_dir/plists"
 copy_if_file "$HOME/Library/LaunchAgents/com.office-automate.telemetry.plist" "$evidence_dir/plists"
 copy_if_file "$HOME/Library/LaunchAgents/com.office-automate.project-leverage.plist" "$evidence_dir/plists"
-copy_if_file "$HOME/Library/LaunchAgents/com.office-automate.tunnel.plist" "$evidence_dir/plists"
-copy_if_file "/Library/LaunchDaemons/com.office-automate.edge.plist" "$evidence_dir/plists"
-copy_if_file "/Library/LaunchDaemons/com.office-automate.tunnel.plist" "$evidence_dir/plists"
+copy_if_file "$HOME/Library/LaunchAgents/com.office-automate.tunnel.plist" "$evidence_dir/plists" "user-com.office-automate.tunnel.plist"
+copy_if_file "/Library/LaunchDaemons/com.office-automate.edge.plist" "$evidence_dir/plists" "system-com.office-automate.edge.plist"
+copy_if_file "/Library/LaunchDaemons/com.office-automate.tunnel.plist" "$evidence_dir/plists" "system-com.office-automate.tunnel.plist"
 if [[ -n "$cloudflared_config" ]]; then
   copy_if_file "$cloudflared_config" "$evidence_dir/plists"
   capture hashes/cloudflared-config.sha256 shasum -a 256 "$cloudflared_config"
