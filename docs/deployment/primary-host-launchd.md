@@ -21,6 +21,7 @@ Render the templates with deployment-specific absolute paths before loading them
 | Placeholder | Meaning |
 | --- | --- |
 | `__OFFICE_AUTOMATE_ROOT__` | Repository checkout or release directory. |
+| `__OFFICE_AUTOMATE_PYTHON__` | Python interpreter with `paho-mqtt` installed, usually the repo virtualenv Python. |
 | `__OFFICE_AUTOMATE_SERVER_BIN__` | Absolute path to the Rust `office-automate-server` binary. |
 | `__OFFICE_AUTOMATE_CONFIG__` | Absolute path to the deployment config file. |
 | `__OFFICE_AUTOMATE_EDGE_CONFIG__` | Absolute path to the edge-only config file. This file must not contain device, telemetry, repo, or climate database settings. |
@@ -234,6 +235,10 @@ scripts/security/validate-edge-quarantine.sh \
 ```
 
 The validation passes only if the tunnel/edge users can read the material they need, cannot read or traverse controller config/data/repos/telemetry, cannot read or traverse each other's private credentials unless explicitly required, can reach the approved loopback origin, and cannot connect to LAN/RFC1918 endpoints that the control user can reach.
+
+## Qingping MQTT
+
+`com.office-automate.server` owns the embedded MQTT broker for Qingping. Configure the physical Qingping device's Private Access MQTT host to the primary host LAN address and port from `qingping.mqtt_broker` and `qingping.mqtt_port`. The Rust server subscribes to `qingping/<device_mac>/up` and publishes interval commands to `qingping/<device_mac>/down`; no separate MQTT bridge or legacy broker is part of the target deployment.
 
 ## Cloudflare Tunnel Notes
 

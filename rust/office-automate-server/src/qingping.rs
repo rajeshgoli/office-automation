@@ -1,8 +1,11 @@
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use chrono::Local;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::status::Status;
 
@@ -30,6 +33,7 @@ impl QingpingReading {
 #[derive(Debug, Clone, Default)]
 pub struct QingpingState {
     latest: Arc<RwLock<Option<QingpingReading>>>,
+    interval_configured: Arc<AtomicBool>,
 }
 
 impl QingpingState {
@@ -44,7 +48,13 @@ impl QingpingState {
             .clone()
     }
 
+    pub fn mark_interval_configured(&self) {
+        self.interval_configured.store(true, Ordering::SeqCst);
+    }
+
     pub fn overlay_status(&self, status: &mut Status) {
+        status.air_quality.interval_configured = self.interval_configured.load(Ordering::SeqCst);
+
         let Some(reading) = self.latest() else {
             return;
         };
@@ -75,6 +85,24 @@ pub fn normalize_device_mac(device_mac: &str) -> String {
 
 pub fn qingping_up_topic(device_mac: &str) -> String {
     format!("qingping/{}/up", normalize_device_mac(device_mac))
+}
+
+pub fn qingping_down_topic(device_mac: &str) -> String {
+    format!("qingping/{}/down", normalize_device_mac(device_mac))
+}
+
+pub fn qingping_interval_payload(interval_seconds: i64) -> Value {
+    json!({
+        "id": 1,
+        "need_ack": 1,
+        "type": "17",
+        "setting": {
+            "report_interval": interval_seconds,
+            "collect_interval": interval_seconds,
+            "co2_sampling_interval": interval_seconds,
+            "pm_sampling_interval": interval_seconds,
+        }
+    })
 }
 
 pub fn parse_qingping_payload(
@@ -230,5 +258,50 @@ mod tests {
 
         assert!(error.is_syntax());
         assert_eq!(state.latest(), Some(existing));
+    }
+
+    #[test]
+    fn interval_configured_overlays_status_after_successful_command() {
+        let state = QingpingState::default();
+        let mut status = Status {
+            state: "away".to_string(),
+            is_present: false,
+            presence_signal_active: false,
+            safety_interlock: false,
+            erv_should_run: false,
+            verifying_departure: false,
+            in_door_open_mode: false,
+            sensors: crate::status::SensorsStatus::default(),
+            air_quality: crate::status::AirQualityStatus::default(),
+            erv: crate::status::ErvStatus::default(),
+            hvac: crate::status::HvacStatus::default(),
+            manual_override: crate::status::ManualOverrideStatus::default(),
+            notifications: Vec::new(),
+        };
+
+        state.overlay_status(&mut status);
+        assert!(!status.air_quality.interval_configured);
+
+        state.mark_interval_configured();
+        state.overlay_status(&mut status);
+        assert!(status.air_quality.interval_configured);
+    }
+
+    #[test]
+    fn interval_command_matches_qingping_down_topic_contract() {
+        assert_eq!(
+            qingping_down_topic("aa:bb-cc:dd:ee:ff"),
+            "qingping/AABBCCDDEEFF/down"
+        );
+
+        let payload = qingping_interval_payload(30);
+
+        assert_eq!(payload["id"], 1);
+        assert_eq!(payload["need_ack"], 1);
+        assert_eq!(payload["type"], "17");
+        assert_eq!(payload["setting"]["report_interval"], 30);
+        assert_eq!(payload["setting"]["collect_interval"], 30);
+        assert_eq!(payload["setting"]["co2_sampling_interval"], 30);
+        assert_eq!(payload["setting"]["pm_sampling_interval"], 30);
     }
 }

@@ -21,8 +21,7 @@ export OFFICE_AUTOMATE_ROLLBACK_LOG="/absolute/path/to/rollback-log.md"
 For MQTT rollback state, choose the value that matches the rollback:
 
 - `not-moved`: Qingping never moved off the legacy-compatible MQTT path.
-- `repointed-legacy`: Qingping device or bridge was repointed to the legacy broker.
-- `legacy-mirror`: bridge/mirror forwarding keeps the legacy controller receiving fresh reports.
+- `repointed-legacy`: Qingping device was repointed to the legacy broker.
 
 For snapshot restore verification, choose one:
 

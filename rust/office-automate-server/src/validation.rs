@@ -100,14 +100,12 @@ pub struct RollbackValidationOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MqttCutoverStrategy {
-    BridgeMirror,
     AtomicSwitch,
 }
 
 impl MqttCutoverStrategy {
     fn as_str(self) -> &'static str {
         match self {
-            Self::BridgeMirror => "bridge-mirror",
             Self::AtomicSwitch => "atomic-switch",
         }
     }
@@ -117,7 +115,6 @@ impl MqttCutoverStrategy {
 pub enum MqttRollbackState {
     NotMoved,
     RepointedLegacy,
-    LegacyMirror,
 }
 
 impl MqttRollbackState {
@@ -125,7 +122,6 @@ impl MqttRollbackState {
         match self {
             Self::NotMoved => "not-moved",
             Self::RepointedLegacy => "repointed-legacy",
-            Self::LegacyMirror => "legacy-mirror",
         }
     }
 }
@@ -408,7 +404,7 @@ async fn validate_legacy_controller_stopped(
 
 fn validate_mqtt_cutover_strategy(
     config: &AppConfig,
-    strategy: MqttCutoverStrategy,
+    _strategy: MqttCutoverStrategy,
     report: &mut ShadowValidationReport,
 ) -> Result<()> {
     let device_mac = config
@@ -420,14 +416,7 @@ fn validate_mqtt_cutover_strategy(
             "cutover validation requires qingping.device_mac so the active feed can be audited",
         )?;
 
-    let detail = match strategy {
-        MqttCutoverStrategy::BridgeMirror => {
-            "bridge/mirror strategy recorded; active controller must continue receiving mirrored fresh readings"
-        }
-        MqttCutoverStrategy::AtomicSwitch => {
-            "atomic switch strategy recorded; Qingping feed moves in the same window as active-controller cutover"
-        }
-    };
+    let detail = "atomic switch strategy recorded; Qingping feed moves in the same window as active-controller cutover";
     report.push_pass(
         "mqtt-feed-strategy",
         format!(
@@ -864,12 +853,7 @@ fn validate_mqtt_rollback_state(
 
     let detail = match state {
         MqttRollbackState::NotMoved => "Qingping feed never moved off the legacy-compatible path",
-        MqttRollbackState::RepointedLegacy => {
-            "Qingping device or bridge was repointed to the legacy broker"
-        }
-        MqttRollbackState::LegacyMirror => {
-            "bridge/mirror forwarding keeps the legacy controller receiving fresh reports"
-        }
+        MqttRollbackState::RepointedLegacy => "Qingping device was repointed to the legacy broker",
     };
     report.push_pass(
         "mqtt-feed-rollback",
@@ -2291,12 +2275,12 @@ mod tests {
         let mut report = ShadowValidationReport { checks: Vec::new() };
 
         let error =
-            validate_mqtt_cutover_strategy(&config, MqttCutoverStrategy::BridgeMirror, &mut report)
+            validate_mqtt_cutover_strategy(&config, MqttCutoverStrategy::AtomicSwitch, &mut report)
                 .expect_err("missing device mac should fail");
         assert!(error.to_string().contains("qingping.device_mac"));
 
         config.qingping.device_mac = Some("AA:BB:CC:DD:EE:FF".to_string());
-        validate_mqtt_cutover_strategy(&config, MqttCutoverStrategy::BridgeMirror, &mut report)
+        validate_mqtt_cutover_strategy(&config, MqttCutoverStrategy::AtomicSwitch, &mut report)
             .expect("strategy passes");
         let detail = report
             .checks
@@ -2305,7 +2289,7 @@ mod tests {
             .expect("mqtt check")
             .detail
             .as_str();
-        assert!(detail.contains("bridge/mirror strategy"));
+        assert!(detail.contains("atomic switch strategy"));
         assert!(detail.contains("127.0.0.1:1883"));
     }
 

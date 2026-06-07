@@ -4,17 +4,23 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
+use rumqttc::{AsyncClient, Event, MqttOptions, Outgoing, QoS};
 use rumqttd::{
     Broker, Config as BrokerConfig, ConnectionSettings, Notification, RouterConfig, ServerSettings,
 };
+use tokio::time;
 
 use crate::{
     config::AppConfig,
     db,
-    qingping::{QingpingState, parse_qingping_payload, qingping_up_topic},
+    qingping::{
+        QingpingState, parse_qingping_payload, qingping_down_topic, qingping_interval_payload,
+        qingping_up_topic,
+    },
 };
 
 pub struct MqttRuntime {
@@ -23,6 +29,64 @@ pub struct MqttRuntime {
 }
 
 pub type SensorIngressHook = Arc<dyn Fn() + Send + Sync + 'static>;
+
+pub async fn publish_qingping_interval(config: &AppConfig, interval_seconds: i64) -> Result<()> {
+    let device_mac = config
+        .qingping
+        .device_mac
+        .as_deref()
+        .context("qingping.device_mac is required to publish interval commands")?;
+    let topic = qingping_down_topic(device_mac);
+    let payload = serde_json::to_vec(&qingping_interval_payload(interval_seconds))
+        .context("failed to serialize Qingping interval command")?;
+    publish_local_qingping_command(
+        &config.runtime.mqtt_host,
+        config.runtime.mqtt_port,
+        &topic,
+        payload,
+    )
+    .await
+    .with_context(|| format!("failed to publish Qingping interval command to {topic}"))?;
+    Ok(())
+}
+
+async fn publish_local_qingping_command(
+    host: &str,
+    port: u16,
+    topic: &str,
+    payload: Vec<u8>,
+) -> Result<()> {
+    let client_id = format!(
+        "office-automate-qingping-command-{}",
+        chrono::Local::now().timestamp_millis()
+    );
+    let mut options = MqttOptions::new(client_id, host.trim(), port);
+    options.set_keep_alive(Duration::from_secs(5));
+
+    let (client, mut event_loop) = AsyncClient::new(options, 10);
+    client
+        .publish(topic, QoS::AtMostOnce, false, payload)
+        .await
+        .context("failed to queue MQTT publish")?;
+
+    time::timeout(Duration::from_secs(5), async {
+        loop {
+            match event_loop
+                .poll()
+                .await
+                .context("MQTT publish poll failed")?
+            {
+                Event::Outgoing(Outgoing::Publish(_)) => return Ok::<_, anyhow::Error>(()),
+                Event::Incoming(_) | Event::Outgoing(_) => {}
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for MQTT publish")??;
+
+    let _ = client.disconnect().await;
+    Ok(())
+}
 
 pub fn start_qingping_ingress(
     config: &AppConfig,

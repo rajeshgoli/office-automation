@@ -1713,7 +1713,10 @@ struct QingpingIntervalRequest {
     interval: i64,
 }
 
-async fn qingping_interval(Json(payload): Json<QingpingIntervalRequest>) -> Response {
+async fn qingping_interval(
+    State(state): State<AppState>,
+    Json(payload): Json<QingpingIntervalRequest>,
+) -> Response {
     if payload.interval < 15 {
         return (
             StatusCode::BAD_REQUEST,
@@ -1722,11 +1725,26 @@ async fn qingping_interval(Json(payload): Json<QingpingIntervalRequest>) -> Resp
             .into_response();
     }
 
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({"ok": false, "error": "MQTT command path is not enabled yet"})),
-    )
-        .into_response()
+    match mqtt::publish_qingping_interval(&state.config, payload.interval).await {
+        Ok(()) => {
+            state.qingping.mark_interval_configured();
+            broadcast_status(&state);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "interval": payload.interval,
+                    "message": format!("Device configured to report every {} seconds", payload.interval),
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": error.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
