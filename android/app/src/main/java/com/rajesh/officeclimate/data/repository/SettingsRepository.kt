@@ -10,6 +10,8 @@ import androidx.datastore.preferences.preferencesDataStore
 import com.rajesh.officeclimate.util.Defaults
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import java.net.URI
+import java.security.KeyStore
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
 
@@ -21,7 +23,7 @@ class SettingsRepository(private val context: Context) {
         val USER_EMAIL = stringPreferencesKey("user_email")
         val DEVICE_CERTIFICATE_ALIAS = stringPreferencesKey("device_certificate_alias")
         val DEVICE_CERTIFICATE_CHAIN_PEM = stringPreferencesKey("device_certificate_chain_pem")
-        val DEVICE_PRIVATE_KEY_PKCS8 = stringPreferencesKey("device_private_key_pkcs8")
+        val LEGACY_DEVICE_PRIVATE_KEY_PKCS8 = stringPreferencesKey("device_private_key_pkcs8")
         val DISMISSED_UPDATE_ARTIFACT_HASH = stringPreferencesKey("dismissed_update_artifact_hash")
         val DISMISSED_APP_NOTIFICATION_IDS = stringSetPreferencesKey("dismissed_app_notification_ids")
     }
@@ -46,21 +48,13 @@ class SettingsRepository(private val context: Context) {
         prefs[Keys.DEVICE_CERTIFICATE_CHAIN_PEM] ?: ""
     }
 
-    val devicePrivateKeyPkcs8: Flow<String> = context.dataStore.data.map { prefs ->
-        prefs[Keys.DEVICE_PRIVATE_KEY_PKCS8] ?: ""
-    }
-
     val isLoggedIn: Flow<Boolean> = context.dataStore.data.map { prefs ->
         !prefs[Keys.JWT_TOKEN].isNullOrBlank()
     }
 
     val isAuthenticated: Flow<Boolean> = context.dataStore.data.map { prefs ->
         !prefs[Keys.JWT_TOKEN].isNullOrBlank() ||
-            (
-                !prefs[Keys.DEVICE_CERTIFICATE_ALIAS].isNullOrBlank() &&
-                    !prefs[Keys.DEVICE_CERTIFICATE_CHAIN_PEM].isNullOrBlank() &&
-                    !prefs[Keys.DEVICE_PRIVATE_KEY_PKCS8].isNullOrBlank()
-                )
+            hasValidDeviceCredential(prefs)
     }
 
     val dismissedUpdateArtifactHash: Flow<String?> = context.dataStore.data.map { prefs ->
@@ -72,8 +66,12 @@ class SettingsRepository(private val context: Context) {
     }
 
     suspend fun saveServerUrl(serverUrl: String) {
+        val normalized = serverUrl.trimEnd('/')
+        require(isSecurePublicUrl(normalized)) {
+            "Public server URL must use HTTPS. Use the local pairing URL only for device enrollment."
+        }
         context.dataStore.edit { prefs ->
-            prefs[Keys.SERVER_URL] = serverUrl.trimEnd('/')
+            prefs[Keys.SERVER_URL] = normalized
         }
     }
 
@@ -96,12 +94,6 @@ class SettingsRepository(private val context: Context) {
         }
     }
 
-    suspend fun saveDevicePrivateKeyPkcs8(privateKeyPkcs8: String) {
-        context.dataStore.edit { prefs ->
-            prefs[Keys.DEVICE_PRIVATE_KEY_PKCS8] = privateKeyPkcs8.trim()
-        }
-    }
-
     suspend fun clearDeviceCertificateAlias() {
         context.dataStore.edit { prefs ->
             prefs.remove(Keys.DEVICE_CERTIFICATE_ALIAS)
@@ -116,7 +108,20 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun clearDevicePrivateKeyPkcs8() {
         context.dataStore.edit { prefs ->
-            prefs.remove(Keys.DEVICE_PRIVATE_KEY_PKCS8)
+            prefs.remove(Keys.LEGACY_DEVICE_PRIVATE_KEY_PKCS8)
+        }
+    }
+
+    suspend fun clearInvalidDeviceCredentialIfNeeded() {
+        context.dataStore.edit { prefs ->
+            if (
+                !prefs[Keys.DEVICE_CERTIFICATE_ALIAS].isNullOrBlank() &&
+                    !hasValidDeviceCredential(prefs)
+            ) {
+                prefs.remove(Keys.DEVICE_CERTIFICATE_ALIAS)
+                prefs.remove(Keys.DEVICE_CERTIFICATE_CHAIN_PEM)
+                prefs.remove(Keys.LEGACY_DEVICE_PRIVATE_KEY_PKCS8)
+            }
         }
     }
 
@@ -139,5 +144,27 @@ class SettingsRepository(private val context: Context) {
             dismissed.add(id)
             prefs[Keys.DISMISSED_APP_NOTIFICATION_IDS] = dismissed
         }
+    }
+
+    private fun isSecurePublicUrl(url: String): Boolean {
+        val uri = runCatching { URI(url) }.getOrNull() ?: return false
+        return uri.scheme.equals("https", ignoreCase = true)
+    }
+
+    private fun hasValidDeviceCredential(prefs: Preferences): Boolean {
+        val alias = prefs[Keys.DEVICE_CERTIFICATE_ALIAS]?.trim().orEmpty()
+        val certificateChain = prefs[Keys.DEVICE_CERTIFICATE_CHAIN_PEM]?.trim().orEmpty()
+        return alias.isNotBlank() && certificateChain.isNotBlank() && hasDevicePrivateKey(alias)
+    }
+
+    private fun hasDevicePrivateKey(alias: String): Boolean =
+        runCatching {
+            KeyStore.getInstance(ANDROID_KEYSTORE)
+                .apply { load(null) }
+                .getKey(alias, null) != null
+        }.getOrDefault(false)
+
+    private companion object {
+        const val ANDROID_KEYSTORE = "AndroidKeyStore"
     }
 }

@@ -1,5 +1,7 @@
 package com.rajesh.officeclimate.data.repository
 
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
 import com.rajesh.officeclimate.data.remote.HttpClientFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -17,10 +19,11 @@ import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 import org.bouncycastle.pkcs.PKCS10CertificationRequest
 import org.bouncycastle.pkcs.jcajce.JcaPKCS10CertificationRequestBuilder
 import java.io.StringWriter
+import java.net.URI
 import java.security.KeyPair
 import java.security.KeyPairGenerator
+import java.security.KeyStore
 import java.security.spec.ECGenParameterSpec
-import java.util.Base64
 import java.util.UUID
 
 @Serializable
@@ -59,8 +62,9 @@ class DeviceEnrollmentRepository(
         pairingCode: String,
         deviceName: String,
     ): DeviceEnrollmentResult = withContext(Dispatchers.IO) {
+        validatePairingUrl(pairingUrl)
         val alias = "office-device-${UUID.randomUUID()}"
-        val keyPair = generateKeyPair()
+        val keyPair = generateKeyPair(alias)
         try {
             val requestBody = DeviceEnrollmentRequest(
                 pairingCode = pairingCode.trim(),
@@ -89,9 +93,9 @@ class DeviceEnrollmentRepository(
                 }
 
                 val payload = json.decodeFromString(DeviceEnrollmentResponse.serializer(), body)
-                settingsRepository.saveDeviceCertificateChainPem(payload.certificatePem)
-                settingsRepository.saveDevicePrivateKeyPkcs8(encodePrivateKeyPkcs8(keyPair))
+                settingsRepository.saveDeviceCertificateChainPem(payload.certificateChainPem)
                 settingsRepository.saveDeviceCertificateAlias(alias)
+                settingsRepository.clearDevicePrivateKeyPkcs8()
                 return@withContext DeviceEnrollmentResult(
                     alias = alias,
                     deviceId = payload.deviceId,
@@ -101,14 +105,23 @@ class DeviceEnrollmentRepository(
                 )
             }
         } catch (e: Exception) {
-            clearDeviceCredential()
+            clearDeviceCredential(alias)
             throw e
         }
     }
 
-    private fun generateKeyPair(): KeyPair {
-        val keyPairGenerator = KeyPairGenerator.getInstance("EC")
-        keyPairGenerator.initialize(ECGenParameterSpec("secp256r1"))
+    private fun generateKeyPair(alias: String): KeyPair {
+        val keyPairGenerator = KeyPairGenerator.getInstance(
+            KeyProperties.KEY_ALGORITHM_EC,
+            ANDROID_KEYSTORE,
+        )
+        keyPairGenerator.initialize(
+            KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
+                .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+                .setDigests(KeyProperties.DIGEST_SHA256)
+                .setUserAuthenticationRequired(false)
+                .build(),
+        )
         return keyPairGenerator.generateKeyPair()
     }
 
@@ -132,12 +145,36 @@ class DeviceEnrollmentRepository(
         return writer.toString()
     }
 
-    private fun encodePrivateKeyPkcs8(keyPair: KeyPair): String =
-        Base64.getEncoder().encodeToString(keyPair.private.encoded)
-
-    private suspend fun clearDeviceCredential() {
+    private suspend fun clearDeviceCredential(alias: String) {
+        deleteDeviceKey(alias)
         settingsRepository.clearDeviceCertificateAlias()
         settingsRepository.clearDeviceCertificateChainPem()
         settingsRepository.clearDevicePrivateKeyPkcs8()
+    }
+
+    private fun deleteDeviceKey(alias: String) {
+        runCatching {
+            KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }.deleteEntry(alias)
+        }
+    }
+
+    private fun validatePairingUrl(pairingUrl: String) {
+        val uri = runCatching { URI(pairingUrl.trim()) }.getOrNull()
+            ?: throw IllegalArgumentException("Pairing URL is not valid.")
+        val scheme = uri.scheme?.lowercase()
+        if (scheme == "https") {
+            return
+        }
+        if (scheme == "http" && uri.host == LOCAL_PAIRING_HOST) {
+            return
+        }
+        throw IllegalArgumentException(
+            "HTTP pairing is only allowed for $LOCAL_PAIRING_HOST. Use the default pairing URL or an HTTPS endpoint.",
+        )
+    }
+
+    private companion object {
+        const val ANDROID_KEYSTORE = "AndroidKeyStore"
+        const val LOCAL_PAIRING_HOST = "192.168.5.10"
     }
 }

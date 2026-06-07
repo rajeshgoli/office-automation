@@ -6,15 +6,12 @@ import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import java.io.ByteArrayInputStream
 import java.net.Socket
-import java.security.KeyFactory
 import java.security.Principal
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.SecureRandom
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
-import java.security.spec.PKCS8EncodedKeySpec
-import java.util.Base64
 import javax.net.ssl.SSLEngine
 import javax.net.ssl.X509ExtendedKeyManager
 import javax.net.ssl.TrustManagerFactory
@@ -51,9 +48,8 @@ class HttpClientFactory(
 
         val alias = settingsRepository.deviceCertificateAlias.first().trim()
         val certificateChainPem = settingsRepository.deviceCertificateChainPem.first().trim()
-        val privateKeyPkcs8 = settingsRepository.devicePrivateKeyPkcs8.first().trim()
-        if (alias.isNotBlank() && certificateChainPem.isNotBlank() && privateKeyPkcs8.isNotBlank()) {
-            runCatching { loadClientCertificate(alias, certificateChainPem, privateKeyPkcs8) }
+        if (alias.isNotBlank() && certificateChainPem.isNotBlank()) {
+            runCatching { loadClientCertificate(alias, certificateChainPem) }
                 .onSuccess { sslConfig ->
                     sslConfig?.let { (sslSocketFactory, trustManager) ->
                         builder.sslSocketFactory(sslSocketFactory, trustManager)
@@ -70,13 +66,12 @@ class HttpClientFactory(
     private fun loadClientCertificate(
         alias: String,
         certificateChainPem: String,
-        privateKeyPkcs8: String,
     ): Pair<SSLSocketFactory, X509TrustManager>? {
         val certificateChain = decodeCertificates(certificateChainPem)
         if (certificateChain.isEmpty()) {
             return null
         }
-        val privateKey = decodePrivateKey(privateKeyPkcs8)
+        val privateKey = loadPrivateKey(alias) ?: return null
 
         val keyManager = SingleAliasKeyManager(
             alias = alias,
@@ -109,13 +104,14 @@ class HttpClientFactory(
             .filterIsInstance<X509Certificate>()
     }
 
-    private fun decodePrivateKey(privateKeyPkcs8: String): PrivateKey {
-        val keyBytes = Base64.getDecoder().decode(privateKeyPkcs8)
-        return KeyFactory.getInstance("EC").generatePrivate(PKCS8EncodedKeySpec(keyBytes))
-    }
+    private fun loadPrivateKey(alias: String): PrivateKey? =
+        KeyStore.getInstance(ANDROID_KEYSTORE)
+            .apply { load(null) }
+            .getKey(alias, null) as? PrivateKey
 
     private companion object {
         const val TAG = "HttpClientFactory"
+        const val ANDROID_KEYSTORE = "AndroidKeyStore"
     }
 
     private class SingleAliasKeyManager(
