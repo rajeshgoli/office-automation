@@ -823,14 +823,13 @@ fn validate_launchd_plist(
                 path.display()
             )
         })?;
-    validate_argument_sequence(&program_arguments, required_argument_sequence).with_context(
-        || {
+    validate_launchd_command_arguments(&program_arguments, required_argument_sequence)
+        .with_context(|| {
             format!(
                 "launchd plist {} ProgramArguments do not match label {label}",
                 path.display()
             )
-        },
-    )?;
+        })?;
     Ok(())
 }
 
@@ -874,27 +873,85 @@ fn plist_array_string_values(contents: &str, key: &str) -> Option<Vec<String>> {
     Some(values)
 }
 
-fn validate_argument_sequence(
+fn validate_launchd_command_arguments(
     program_arguments: &[String],
     required_sequence: &[&str],
 ) -> Result<()> {
     if required_sequence.is_empty() {
         return Ok(());
     }
-    let mut next_required_index = 0usize;
-    for argument in program_arguments {
-        if argument == required_sequence[next_required_index] {
-            next_required_index += 1;
-            if next_required_index == required_sequence.len() {
-                return Ok(());
-            }
+    let Some(executable) = program_arguments.first() else {
+        bail!("ProgramArguments must include an executable path");
+    };
+    if executable.trim().is_empty() {
+        bail!("ProgramArguments executable path must not be empty");
+    }
+    match required_sequence {
+        ["serve"] => validate_server_launchd_arguments(program_arguments, "serve"),
+        ["serve-edge"] => validate_server_launchd_arguments(program_arguments, "serve-edge"),
+        ["tunnel", "--no-autoupdate", "--config", "run"] => {
+            validate_tunnel_launchd_arguments(program_arguments)
+        }
+        other => bail!("unsupported launchd ProgramArguments pattern {other:?}"),
+    }
+}
+
+fn validate_server_launchd_arguments(program_arguments: &[String], subcommand: &str) -> Result<()> {
+    if program_arguments.len() < 4 {
+        bail!(
+            "ProgramArguments for {subcommand} must include executable, subcommand, --config, and config path; found {:?}",
+            program_arguments
+        );
+    }
+    if program_arguments.get(1).map(String::as_str) != Some(subcommand) {
+        bail!(
+            "ProgramArguments argv[1] must be {subcommand:?}; found {:?}",
+            program_arguments.get(1)
+        );
+    }
+    if program_arguments.get(2).map(String::as_str) != Some("--config") {
+        bail!(
+            "ProgramArguments argv[2] must be \"--config\" for {subcommand}; found {:?}",
+            program_arguments.get(2)
+        );
+    }
+    let config_path = program_arguments
+        .get(3)
+        .context("ProgramArguments missing config path")?;
+    if config_path.trim().is_empty() || config_path.starts_with('-') {
+        bail!("ProgramArguments config path for {subcommand} is invalid: {config_path:?}");
+    }
+    Ok(())
+}
+
+fn validate_tunnel_launchd_arguments(program_arguments: &[String]) -> Result<()> {
+    if program_arguments.len() < 6 {
+        bail!(
+            "ProgramArguments for cloudflared tunnel must include executable, tunnel, --no-autoupdate, --config, config path, and run; found {:?}",
+            program_arguments
+        );
+    }
+    let expected = [
+        (1usize, "tunnel"),
+        (2usize, "--no-autoupdate"),
+        (3usize, "--config"),
+        (5usize, "run"),
+    ];
+    for (index, expected) in expected {
+        if program_arguments.get(index).map(String::as_str) != Some(expected) {
+            bail!(
+                "ProgramArguments argv[{index}] must be {expected:?}; found {:?}",
+                program_arguments.get(index)
+            );
         }
     }
-    bail!(
-        "ProgramArguments missing required ordered arguments {:?}; found {:?}",
-        required_sequence,
-        program_arguments
-    )
+    let config_path = program_arguments
+        .get(4)
+        .context("ProgramArguments missing cloudflared config path")?;
+    if config_path.trim().is_empty() || config_path.starts_with('-') {
+        bail!("ProgramArguments cloudflared config path is invalid: {config_path:?}");
+    }
+    Ok(())
 }
 
 fn security_protected_paths(
@@ -4424,6 +4481,37 @@ runtime:
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/office-automate-server</string>
+    <string>serve</string>
+    <string>--config</string>
+    <string>serve-edge</string>
+  </array>
+</dict>
+</plist>
+"#,
+        )
+        .expect("plist");
+        let error = validate_launchd_plist(
+            &plist_path,
+            "com.office-automate.edge",
+            Some("_office_edge"),
+            &["serve-edge"],
+        )
+        .expect_err("serve-edge in a later argument must not satisfy argv[1]");
+        assert!(error.to_string().contains("ProgramArguments"));
+
+        fs::write(
+            &plist_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.office-automate.edge</string>
+  <key>UserName</key>
+  <string>_office_edge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/office-automate-server</string>
     <string>serve-edge</string>
     <string>--config</string>
     <string>/var/lib/office-automate/edge/config.yaml</string>
@@ -4440,6 +4528,37 @@ runtime:
             &["serve-edge"],
         )
         .expect("matching UserName and ProgramArguments pass");
+    }
+
+    #[test]
+    fn launchd_tunnel_arguments_require_exact_command_shape() {
+        validate_launchd_command_arguments(
+            &[
+                "/usr/local/bin/cloudflared".to_string(),
+                "tunnel".to_string(),
+                "--no-autoupdate".to_string(),
+                "--config".to_string(),
+                "/var/lib/cloudflared/config.yml".to_string(),
+                "run".to_string(),
+                "office".to_string(),
+            ],
+            &["tunnel", "--no-autoupdate", "--config", "run"],
+        )
+        .expect("valid cloudflared command shape passes");
+
+        let error = validate_launchd_command_arguments(
+            &[
+                "/usr/local/bin/cloudflared".to_string(),
+                "tunnel".to_string(),
+                "--config".to_string(),
+                "run".to_string(),
+                "--no-autoupdate".to_string(),
+                "/var/lib/cloudflared/config.yml".to_string(),
+            ],
+            &["tunnel", "--no-autoupdate", "--config", "run"],
+        )
+        .expect_err("loose ordered/unordered tunnel tokens must not pass");
+        assert!(error.to_string().contains("argv[2]"));
     }
 
     #[test]
