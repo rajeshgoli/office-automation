@@ -60,10 +60,10 @@ async fn publish_local_qingping_command(
         "office-automate-qingping-command-{}",
         chrono::Local::now().timestamp_millis()
     );
-    let mut options = MqttOptions::new(client_id, host.trim(), port);
-    options.set_keep_alive(Duration::from_secs(5));
+    let mut options = MqttOptions::new(client_id, (host.trim(), port));
+    options.set_keep_alive(5);
 
-    let (client, mut event_loop) = AsyncClient::new(options, 10);
+    let (client, mut event_loop) = AsyncClient::builder(options).capacity(10).build();
     client
         .publish(topic, QoS::AtMostOnce, false, payload)
         .await
