@@ -5,12 +5,10 @@ import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.rajesh.officeclimate.data.model.DeviceFlowStartResponse
 import com.rajesh.officeclimate.data.repository.DeviceEnrollmentRepository
 import com.rajesh.officeclimate.data.repository.OfficeAuthRepository
 import com.rajesh.officeclimate.data.repository.SettingsRepository
 import com.rajesh.officeclimate.util.Defaults
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
@@ -122,12 +120,12 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             try {
                 settingsRepo.saveServerUrl(_uiState.value.serverUrl)
-                val flow = officeAuthRepository.startDeviceFlow()
+                val login = officeAuthRepository.startBrowserLogin()
                 _uiState.value = _uiState.value.copy(
-                    signInStatus = "Complete Google sign-in with code ${flow.userCode}.",
+                    signingIn = false,
+                    signInStatus = "Complete Google sign-in in the browser.",
                 )
-                openVerificationUrl(flow)
-                pollDeviceFlow(flow)
+                openVerificationUrl(login.authorizationUrl)
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(
                     signingIn = false,
@@ -137,54 +135,10 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    private fun openVerificationUrl(flow: DeviceFlowStartResponse) {
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(flow.verificationUrl)).apply {
+    private fun openVerificationUrl(url: String) {
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         getApplication<Application>().startActivity(intent)
-    }
-
-    private suspend fun pollDeviceFlow(flow: DeviceFlowStartResponse) {
-        val expiresAt = System.currentTimeMillis() + flow.expiresIn * 1000L
-        var intervalMillis = flow.interval.coerceAtLeast(1) * 1000L
-
-        while (System.currentTimeMillis() < expiresAt) {
-            delay(intervalMillis)
-            val response = officeAuthRepository.pollDeviceFlow(flow.deviceCode)
-            when (response.status) {
-                "success" -> {
-                    val token = response.accessToken
-                        ?: throw IllegalStateException("OAuth response did not include a token")
-                    val email = response.email
-                        ?: throw IllegalStateException("OAuth response did not include an email")
-                    settingsRepo.saveAuth(token, email)
-                    _uiState.value = _uiState.value.copy(
-                        signingIn = false,
-                        isLoggedIn = true,
-                        userEmail = email,
-                        signInStatus = "Signed in as $email.",
-                        error = null,
-                    )
-                    return
-                }
-                "pending" -> {
-                    _uiState.value = _uiState.value.copy(
-                        signInStatus = "Waiting for Google sign-in code ${flow.userCode}.",
-                    )
-                }
-                "slow_down" -> {
-                    intervalMillis += 5_000L
-                    _uiState.value = _uiState.value.copy(
-                        signInStatus = "Google asked us to poll more slowly.",
-                    )
-                }
-                "expired" -> throw IllegalStateException("Google sign-in code expired")
-                "forbidden" -> throw IllegalStateException(response.message ?: "Email not allowed")
-                "invalid" -> throw IllegalStateException(response.message ?: "Unknown device code")
-                else -> throw IllegalStateException(response.message ?: "Google sign-in failed")
-            }
-        }
-
-        throw IllegalStateException("Google sign-in code expired")
     }
 }

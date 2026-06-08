@@ -171,8 +171,8 @@ class HttpClientFactory(
         private fun supportsKeyType(keyType: String?): Boolean {
             val requested = keyType?.uppercase().orEmpty()
             return when (certificateKeyType) {
-                "EC", "ECDSA" -> requested == "EC" || requested == "ECDSA"
-                "RSA" -> requested == "RSA" || requested == "RSASSA-PSS"
+                "EC", "ECDSA" -> requested == "EC" || requested == "ECDSA" || requested.startsWith("EC_")
+                "RSA" -> requested == "RSA" || requested == "RSASSA-PSS" || requested.startsWith("RSA_")
                 else -> requested == certificateKeyType
             }
         }

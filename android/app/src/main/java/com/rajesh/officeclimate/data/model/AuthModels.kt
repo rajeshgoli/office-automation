@@ -4,6 +4,12 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 @Serializable
+data class BrowserLoginStartResponse(
+    @SerialName("authorization_url") val authorizationUrl: String,
+    val state: String,
+)
+
+@Serializable
 data class DeviceFlowStartResponse(
     @SerialName("device_code") val deviceCode: String,
     @SerialName("user_code") val userCode: String,

@@ -1,5 +1,6 @@
 package com.rajesh.officeclimate.data.repository
 
+import com.rajesh.officeclimate.data.model.BrowserLoginStartResponse
 import com.rajesh.officeclimate.data.model.DeviceFlowPollRequest
 import com.rajesh.officeclimate.data.model.DeviceFlowPollResponse
 import com.rajesh.officeclimate.data.model.DeviceFlowStartResponse
@@ -16,6 +17,9 @@ class OfficeAuthRepository(
 ) {
     private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
     private val httpClientFactory = HttpClientFactory(settingsRepository)
+
+    suspend fun startBrowserLogin(): BrowserLoginStartResponse =
+        apiService().startBrowserLogin()
 
     suspend fun startDeviceFlow(): DeviceFlowStartResponse =
         apiService().startDeviceFlow()

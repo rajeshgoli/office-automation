@@ -18,6 +18,7 @@ import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Insights
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
@@ -61,7 +62,7 @@ private val navItems = listOf(
 )
 
 @Composable
-fun AppNavigation() {
+fun AppNavigation(authCallbackCount: Int = 0) {
     val navController = rememberNavController()
     val context = LocalContext.current
     val settingsRepo = SettingsRepository(context)
@@ -81,6 +82,14 @@ fun AppNavigation() {
         Routes.PRODUCTIVITY,
         Routes.PROJECTS,
     )
+
+    LaunchedEffect(authCallbackCount, isAuthenticated) {
+        if (authCallbackCount > 0 && isAuthenticated == true && currentRoute == Routes.SETTINGS) {
+            navController.navigate(Routes.DASHBOARD) {
+                popUpTo(Routes.SETTINGS) { inclusive = true }
+            }
+        }
+    }
 
     Scaffold(
         containerColor = Background,
