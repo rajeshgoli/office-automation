@@ -3,6 +3,9 @@ package com.rajesh.officeclimate.data.remote
 import com.rajesh.officeclimate.data.model.ApiStatus
 import com.rajesh.officeclimate.data.model.AppArtifactMetadata
 import com.rajesh.officeclimate.data.model.DailyStatsResponse
+import com.rajesh.officeclimate.data.model.DeviceFlowPollRequest
+import com.rajesh.officeclimate.data.model.DeviceFlowPollResponse
+import com.rajesh.officeclimate.data.model.DeviceFlowStartResponse
 import com.rajesh.officeclimate.data.model.LeverageResponse
 import com.rajesh.officeclimate.data.model.OHLCResponse
 import com.rajesh.officeclimate.data.model.OpeningsResponse
@@ -24,6 +27,12 @@ interface ApiService {
 
     @GET("apps/office-climate/meta.json")
     suspend fun getAppArtifactMetadata(): AppArtifactMetadata
+
+    @POST("auth/device/start")
+    suspend fun startDeviceFlow(): DeviceFlowStartResponse
+
+    @POST("auth/device/poll")
+    suspend fun pollDeviceFlow(@Body body: DeviceFlowPollRequest): DeviceFlowPollResponse
 
     @POST("erv")
     suspend fun setErvSpeed(@Body body: Map<String, String>): JsonObject

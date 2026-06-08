@@ -79,7 +79,11 @@ class DeviceEnrollmentRepository(
                 )
                 .build()
 
-            val response = httpClientFactory.create(connectTimeoutSeconds = 10, readTimeoutSeconds = 20)
+            val response = httpClientFactory.create(
+                includeBearerAuth = false,
+                connectTimeoutSeconds = 10,
+                readTimeoutSeconds = 20,
+            )
                 .newCall(request)
                 .execute()
 

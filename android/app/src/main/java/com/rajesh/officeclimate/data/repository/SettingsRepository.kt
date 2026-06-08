@@ -40,8 +40,20 @@ class SettingsRepository(private val context: Context) {
         prefs[Keys.DEVICE_CERTIFICATE_CHAIN_PEM] ?: ""
     }
 
-    val isAuthenticated: Flow<Boolean> = context.dataStore.data.map { prefs ->
+    val jwtToken: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[Keys.JWT_TOKEN] ?: ""
+    }
+
+    val userEmail: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[Keys.USER_EMAIL] ?: ""
+    }
+
+    val hasDeviceCredential: Flow<Boolean> = context.dataStore.data.map { prefs ->
         hasValidDeviceCredential(prefs)
+    }
+
+    val isAuthenticated: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        hasValidDeviceCredential(prefs) && !prefs[Keys.JWT_TOKEN].isNullOrBlank()
     }
 
     val dismissedUpdateArtifactHash: Flow<String?> = context.dataStore.data.map { prefs ->
@@ -94,8 +106,6 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun clearLegacyAuthAndInvalidDeviceCredentialIfNeeded() {
         context.dataStore.edit { prefs ->
-            prefs.remove(Keys.JWT_TOKEN)
-            prefs.remove(Keys.USER_EMAIL)
             prefs.remove(Keys.LEGACY_DEVICE_PRIVATE_KEY_PKCS8)
             if (
                 !prefs[Keys.DEVICE_CERTIFICATE_ALIAS].isNullOrBlank() &&
@@ -103,7 +113,16 @@ class SettingsRepository(private val context: Context) {
             ) {
                 prefs.remove(Keys.DEVICE_CERTIFICATE_ALIAS)
                 prefs.remove(Keys.DEVICE_CERTIFICATE_CHAIN_PEM)
+                prefs.remove(Keys.JWT_TOKEN)
+                prefs.remove(Keys.USER_EMAIL)
             }
+        }
+    }
+
+    suspend fun saveAuth(token: String, email: String) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.JWT_TOKEN] = token.trim()
+            prefs[Keys.USER_EMAIL] = email.trim()
         }
     }
 

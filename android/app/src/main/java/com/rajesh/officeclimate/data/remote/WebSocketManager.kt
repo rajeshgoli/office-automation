@@ -18,6 +18,7 @@ import java.util.concurrent.TimeUnit
 class WebSocketManager(
     private val client: OkHttpClient,
     private val json: Json,
+    private val authToken: String,
 ) {
     private var webSocket: WebSocket? = null
     private var reconnectDelay = Defaults.WS_RECONNECT_BASE_MS
@@ -37,7 +38,11 @@ class WebSocketManager(
             .replace("http://", "ws://")
             .trimEnd('/') + "/ws"
 
-        val request = Request.Builder().url(wsUrl).build()
+        val requestBuilder = Request.Builder().url(wsUrl)
+        if (authToken.isNotBlank()) {
+            requestBuilder.header("Authorization", "Bearer $authToken")
+        }
+        val request = requestBuilder.build()
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 Log.d(TAG, "WebSocket connected")
