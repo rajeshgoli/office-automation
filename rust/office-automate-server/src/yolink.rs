@@ -926,6 +926,8 @@ mod tests {
             presence: PresenceConfig::default(),
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),
+            artifacts: crate::config::ArtifactConfig::default(),
+            cloudflare_access: crate::config::CloudflareAccessConfig::default(),
             erv: ErvConfig {
                 device_type: "tuya".to_string(),
                 ip: "192.0.2.10".to_string(),

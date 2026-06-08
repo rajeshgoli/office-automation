@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::{
+    artifacts::{ARTIFACT_MAX_SIZE_BYTES, ArtifactStore, ArtifactUploadPolicy},
     config::AppConfig,
     db, device, edge, erv, http, hvac, migration, presence, telemetry,
     validation::{
@@ -35,6 +36,10 @@ pub enum Command {
     ListDevices(ConfigArgs),
     /// Revoke an enrolled device registration.
     RevokeDevice(RevokeDeviceArgs),
+    /// Mark the current app artifact revoked so clients refuse it.
+    RevokeArtifact(RevokeArtifactArgs),
+    /// Roll latest app artifact back to a known content-addressed APK.
+    RollbackArtifact(RollbackArtifactArgs),
     /// Run local dependency checks without changing device state.
     Smoke(SmokeArgs),
     /// Run local telemetry collectors.
@@ -97,6 +102,30 @@ pub struct RevokeDeviceArgs {
     pub device_id: Option<String>,
     #[arg(long = "device-id")]
     pub device_id_flag: Option<String>,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct RevokeArtifactArgs {
+    #[arg(long, env = "OFFICE_AUTOMATE_CONFIG")]
+    pub config: PathBuf,
+    #[arg(long, default_value = "office-climate")]
+    pub app: String,
+    #[arg(long)]
+    pub reason: String,
+    #[arg(long)]
+    pub replacement_artifact_hash: Option<String>,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct RollbackArtifactArgs {
+    #[arg(long, env = "OFFICE_AUTOMATE_CONFIG")]
+    pub config: PathBuf,
+    #[arg(long, default_value = "office-climate")]
+    pub app: String,
+    #[arg(long)]
+    pub artifact_hash: String,
+    #[arg(long)]
+    pub reason: String,
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
@@ -299,6 +328,9 @@ pub struct SecurityValidationArgs {
     /// Dedicated public edge user for sudo-based boundary probes.
     #[arg(long, env = "OFFICE_AUTOMATE_EDGE_USER")]
     pub edge_user: Option<String>,
+    /// Dedicated controller/device-ingress user for launchd and containment validation.
+    #[arg(long, env = "OFFICE_AUTOMATE_CONTROLLER_USER")]
+    pub controller_user: Option<String>,
     /// Additional secret/config file that must be owner-only. Repeatable.
     #[arg(long = "secret-file")]
     pub secret_files: Vec<PathBuf>,
@@ -426,6 +458,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 args.listen,
                 args.device_ca_cert,
                 args.device_ca_key,
+                config.cloudflare_access,
             )
             .await
         }
@@ -459,11 +492,68 @@ pub async fn run(cli: Cli) -> Result<()> {
                 .device_id
                 .or(args.device_id_flag)
                 .context("revoke-device requires DEVICE_ID or --device-id")?;
-            let revoked = device::revoke_device(&config.runtime.database_path, &device_id)?;
+            let revoked = device::revoke_device(
+                &config.runtime.database_path,
+                &config.cloudflare_access,
+                &device_id,
+            )
+            .await?;
             if revoked {
                 println!("device revoked: {device_id}");
             } else {
                 println!("device not found or already revoked: {device_id}");
+            }
+            Ok(())
+        }
+        Command::RevokeArtifact(args) => {
+            let config = AppConfig::load(&args.config)?;
+            let store = artifact_store(&config);
+            match store
+                .revoke_current(
+                    &args.app,
+                    &args.reason,
+                    args.replacement_artifact_hash.as_deref(),
+                )
+                .await?
+            {
+                Some(metadata) => {
+                    println!(
+                        "artifact revoked: app={} artifact_hash={} revoked_at={} replacement={}",
+                        args.app,
+                        metadata.artifact_hash,
+                        metadata.revoked_at.as_deref().unwrap_or("-"),
+                        metadata.replacement_artifact_hash.as_deref().unwrap_or("-")
+                    );
+                }
+                None => println!("artifact metadata not found: app={}", args.app),
+            }
+            Ok(())
+        }
+        Command::RollbackArtifact(args) => {
+            let config = AppConfig::load(&args.config)?;
+            let store = artifact_store(&config);
+            match store
+                .rollback_to(
+                    &args.app,
+                    &args.artifact_hash,
+                    &args.reason,
+                    "local_operator",
+                )
+                .await?
+            {
+                Some(metadata) => println!(
+                    "artifact rolled back: app={} artifact_hash={} previous={}",
+                    args.app,
+                    metadata.artifact_hash,
+                    metadata
+                        .rolled_back_from_artifact_hash
+                        .as_deref()
+                        .unwrap_or("-")
+                ),
+                None => println!(
+                    "rollback artifact not found: app={} artifact_hash={}",
+                    args.app, args.artifact_hash
+                ),
             }
             Ok(())
         }
@@ -499,6 +589,21 @@ pub async fn run(cli: Cli) -> Result<()> {
             run_validate(&config, args.target).await
         }
     }
+}
+
+fn artifact_store(config: &AppConfig) -> ArtifactStore {
+    ArtifactStore::with_upload_policy(
+        config.runtime.artifacts_dir.clone(),
+        config.runtime.legacy_apk_path.clone(),
+        ARTIFACT_MAX_SIZE_BYTES,
+        ArtifactUploadPolicy {
+            expected_office_climate_signing_cert_sha256: config
+                .artifacts
+                .office_climate_signing_cert_sha256
+                .clone(),
+            apksigner_path: config.artifacts.apksigner_path.clone(),
+        },
+    )
 }
 
 async fn run_smoke(config: &AppConfig, target: Option<SmokeTarget>) -> Result<()> {
@@ -649,6 +754,7 @@ async fn run_validate(config: &AppConfig, target: ValidateTarget) -> Result<()> 
                     tunnel_launchd_plist: args.tunnel_launchd_plist,
                     tunnel_user: args.tunnel_user,
                     edge_user: args.edge_user,
+                    controller_user: args.controller_user,
                     secret_files: args.secret_files,
                     protected_paths: args.protected_paths,
                     tunnel_readable_paths: args.tunnel_readable_paths,

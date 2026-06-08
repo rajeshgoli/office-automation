@@ -80,7 +80,9 @@ Local `cloudflared` YAML validation is necessary but not enough. Capture a sanit
       {
         "name": "allow-device-mtls",
         "action": "Service Auth",
-        "includes_public": false
+        "includes_public": false,
+        "includes_common_name": true,
+        "includes_valid_certificate": false
       },
       {
         "name": "allow-rajesh",
@@ -151,7 +153,7 @@ The command validates:
 - `/history`, `/history/project-leverage`, `/apps/office-climate/meta.json`, and `/auth/login` retain their expected interface behavior.
 - `/ws` accepts the configured auth mode and delivers the initial status frame.
 - The Cloudflare tunnel config publishes only the exact public hostname, routes it to a loopback/Unix origin, has no wildcard hostname/private-network route, and ends in `http_status:404` when supplied.
-- The sanitized Cloudflare evidence proves the Access app, no Bypass/public policies, exact hostname, no wildcard DNS, no private routes, final deny rule, and Access audit allow/deny observations when supplied.
+- The sanitized Cloudflare evidence proves the Access app, no Bypass/public policies, device mTLS through per-device Common Name selectors rather than broad Valid Certificate, exact hostname, no wildcard DNS, no private routes, final deny rule, and Access audit allow/deny observations when supplied.
 - Unauthenticated public HTTP routes and `/ws` are blocked by Cloudflare Access before origin when a public URL is supplied.
 - Public `/status` reaches Rust through Cloudflare Access and Office auth when a service token or manual verification timestamp is supplied.
 

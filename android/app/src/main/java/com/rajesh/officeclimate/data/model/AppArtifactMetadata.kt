@@ -12,4 +12,8 @@ data class AppArtifactMetadata(
     @SerialName("uploaded_by") val uploadedBy: String? = null,
     @SerialName("version_code") val versionCode: Long? = null,
     @SerialName("version_name") val versionName: String? = null,
+    @SerialName("signing_cert_sha256") val signingCertSha256: String? = null,
+    @SerialName("revoked_at") val revokedAt: String? = null,
+    @SerialName("revocation_reason") val revocationReason: String? = null,
+    @SerialName("replacement_artifact_hash") val replacementArtifactHash: String? = null,
 )

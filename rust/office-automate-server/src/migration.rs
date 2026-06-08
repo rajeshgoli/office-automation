@@ -883,6 +883,8 @@ mod tests {
             presence: PresenceConfig::default(),
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),
+            artifacts: crate::config::ArtifactConfig::default(),
+            cloudflare_access: crate::config::CloudflareAccessConfig::default(),
             erv: ErvConfig::default(),
             mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),

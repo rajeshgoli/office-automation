@@ -17,7 +17,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::db::{self, DeviceRegistration};
+use crate::{
+    cloudflare::{self, DevicePolicyAction},
+    config::CloudflareAccessConfig,
+    db::{self, DeviceRegistration},
+};
 
 const DEFAULT_DEVICE_CA_CERT: &str = "certs/device-ca.pem";
 const DEFAULT_DEVICE_CA_KEY: &str = "certs/device-ca.key";
@@ -28,6 +32,7 @@ struct PairingState {
     database_path: PathBuf,
     ca_cert_path: PathBuf,
     ca_key_path: PathBuf,
+    cloudflare_access: CloudflareAccessConfig,
     unknown_attempts: Arc<Mutex<u32>>,
 }
 
@@ -69,7 +74,23 @@ pub fn list_devices(database_path: &Path) -> Result<Vec<DeviceRegistration>> {
     db::list_device_registrations(database_path)
 }
 
-pub fn revoke_device(database_path: &Path, device_id: &str) -> Result<bool> {
+pub async fn revoke_device(
+    database_path: &Path,
+    cloudflare_access: &CloudflareAccessConfig,
+    device_id: &str,
+) -> Result<bool> {
+    if let Some(common_name) = db::list_device_registrations(database_path)?
+        .into_iter()
+        .find(|device| device.device_id == device_id)
+        .and_then(|device| device.common_name)
+    {
+        cloudflare::sync_device_common_name(
+            cloudflare_access,
+            &common_name,
+            DevicePolicyAction::Revoke,
+        )
+        .await?;
+    }
     db::revoke_device_registration(database_path, device_id)
 }
 
@@ -78,11 +99,13 @@ pub async fn serve_pairing_listener(
     bind_addr: SocketAddr,
     ca_cert_path: Option<PathBuf>,
     ca_key_path: Option<PathBuf>,
+    cloudflare_access: CloudflareAccessConfig,
 ) -> Result<()> {
     let state = PairingState {
         database_path,
         ca_cert_path: ca_cert_path.unwrap_or_else(default_device_ca_cert_path),
         ca_key_path: ca_key_path.unwrap_or_else(default_device_ca_key_path),
+        cloudflare_access,
         unknown_attempts: Arc::new(Mutex::new(0)),
     };
 
@@ -193,6 +216,19 @@ async fn complete_device_pairing(
                 .into_response();
         }
     };
+    if let Err(error) = cloudflare::sync_device_common_name(
+        &state.cloudflare_access,
+        &certificate_common_name,
+        DevicePolicyAction::Allow,
+    )
+    .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+            .into_response();
+    }
 
     match db::complete_device_registration(
         &state.database_path,

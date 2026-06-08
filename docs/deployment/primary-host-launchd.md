@@ -253,6 +253,17 @@ Use the repo-root `oa` wrapper for local device administration. It executes the 
 
 `register-device` starts a short-lived LAN pairing listener, prints a six-character one-time code, and records audit events for registration creation, successful pairing, rejected codes, rejected CSR/proof attempts, and revocation. A pending code is invalidated after five failed CSR/proof attempts. Unknown-code audit entries store a hash of the submitted code, not the raw code.
 
+For remote Android access, configure the Cloudflare Access Service Auth policy as a per-device Common Name allowlist, not as broad `Valid Certificate`. Set these on the trusted host before running `oa register-device` or `oa revoke-device`:
+
+```bash
+export OFFICE_AUTOMATE_CLOUDFLARE_ACCOUNT_ID="..."
+export OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_APP_ID="..."        # optional for reusable policies
+export OFFICE_AUTOMATE_CLOUDFLARE_DEVICE_POLICY_ID="..."
+export OFFICE_AUTOMATE_CLOUDFLARE_API_TOKEN="..."
+```
+
+When those values are configured, pairing adds the new device certificate CN to the Cloudflare policy before completing local enrollment. Revocation removes the CN from Cloudflare before marking the local registration revoked. If the Cloudflare update fails, the command fails instead of silently leaving stale edge access.
+
 The default device mTLS CA files are repo-local and gitignored:
 
 | Path | Purpose |
@@ -261,6 +272,19 @@ The default device mTLS CA files are repo-local and gitignored:
 | `certs/device-ca.key` | Local signing key used only by `oa register-device`; do not upload it to Cloudflare. |
 
 Override these paths with `--device-ca-cert`, `--device-ca-key`, `OFFICE_AUTOMATE_DEVICE_CA_CERT`, or `OFFICE_AUTOMATE_DEVICE_CA_KEY` if a deployment keeps private key material elsewhere.
+
+## Android Artifact Recovery
+
+Configure `OFFICE_AUTOMATE_ANDROID_SIGNING_CERT_SHA256` to the release signing certificate SHA-256 digest. When present, `/deploy/office-climate` verifies uploaded APKs with `apksigner verify --print-certs` before accepting them. Use `OFFICE_AUTOMATE_APKSIGNER` if `apksigner` is not on `PATH`.
+
+Local recovery commands:
+
+```bash
+./oa revoke-artifact --app office-climate --reason "bad release"
+./oa rollback-artifact --app office-climate --artifact-hash <known-good-8-char-hash> --reason "rollback"
+```
+
+Revoked metadata is served to clients, current APK redirects fail closed with HTTP 410, and revoked content-addressed hashes remain blocked through the artifact revocation index so rollback cannot re-expose a known-bad APK.
 
 ## Cloudflare Tunnel Notes
 

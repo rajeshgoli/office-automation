@@ -31,7 +31,7 @@ use tokio_tungstenite::{
 };
 
 use crate::{
-    artifacts::{is_valid_artifact_hash, is_valid_sha256_digest},
+    artifacts::{is_valid_artifact_hash, is_valid_sha256_digest, normalize_cert_digest},
     auth::AuthManager,
     config::{AppConfig, OrchestratorConfig},
     db, edge, erv, http, hvac,
@@ -118,6 +118,7 @@ pub struct SecurityValidationOptions {
     pub tunnel_launchd_plist: Option<PathBuf>,
     pub tunnel_user: Option<String>,
     pub edge_user: Option<String>,
+    pub controller_user: Option<String>,
     pub secret_files: Vec<PathBuf>,
     pub protected_paths: Vec<PathBuf>,
     pub tunnel_readable_paths: Vec<PathBuf>,
@@ -307,6 +308,7 @@ pub async fn run_security_validation(
 
     validate_http_startup_config(config, public_url, &mut report)?;
     validate_security_file_permissions(config, &options, &mut report)?;
+    validate_security_runtime_hardening(config, &mut report)?;
     validate_security_edge_config(public_url, &options, &mut report)?;
     validate_security_cloudflare(config, public_url, &options, &mut report).await?;
     validate_security_launchd(public_url, &options, &mut report)?;
@@ -406,6 +408,57 @@ fn validate_security_file_permissions(
                 strict_paths.len()
             ),
         );
+    }
+
+    Ok(())
+}
+
+fn validate_security_runtime_hardening(
+    config: &AppConfig,
+    report: &mut ShadowValidationReport,
+) -> Result<()> {
+    if !config.cloudflare_access.device_policy_sync_configured() {
+        bail!(
+            "security validation requires Cloudflare device policy sync: set OFFICE_AUTOMATE_CLOUDFLARE_ACCOUNT_ID, OFFICE_AUTOMATE_CLOUDFLARE_DEVICE_POLICY_ID, and OFFICE_AUTOMATE_CLOUDFLARE_API_TOKEN"
+        );
+    }
+    report.push_pass(
+        "cloudflare-device-policy-sync",
+        "Android device enrollment is tied to a Cloudflare Access Common Name policy allowlist",
+    );
+
+    let signer = config
+        .artifacts
+        .office_climate_signing_cert_sha256
+        .as_deref()
+        .context(
+            "security validation requires OFFICE_AUTOMATE_ANDROID_SIGNING_CERT_SHA256 for upload-side APK verification",
+        )?;
+    normalize_cert_digest(signer)?;
+    report.push_pass(
+        "artifact-upload-signature-policy",
+        "office-climate APK uploads require expected signing certificate SHA-256 verification",
+    );
+
+    match (
+        config.qingping.mqtt_username.as_deref().map(str::trim),
+        config.qingping.mqtt_password.as_deref().map(str::trim),
+    ) {
+        (Some(username), Some(password)) if !username.is_empty() && !password.is_empty() => {
+            report.push_pass(
+                "qingping-mqtt-auth",
+                "Qingping MQTT broker requires configured username/password credentials",
+            );
+        }
+        _ if config.qingping.device_mac.is_some() => {
+            bail!(
+                "security validation requires Qingping MQTT credentials when qingping.device_mac is configured"
+            );
+        }
+        _ => report.push_skip(
+            "qingping-mqtt-auth",
+            "Qingping device is not configured; MQTT auth was not required",
+        ),
     }
 
     Ok(())
@@ -539,14 +592,23 @@ fn validate_security_launchd(
     options: &SecurityValidationOptions,
     report: &mut ShadowValidationReport,
 ) -> Result<()> {
-    if let Some(path) = options.server_launchd_plist.as_deref() {
-        validate_launchd_plist(path, "com.office-automate.server", None, &["serve"])?;
-        report.push_pass(
-            "server-launchd-plist",
-            format!("validated controller launchd plist {}", path.display()),
-        );
-    } else {
-        report.push_skip("server-launchd-plist", "no --server-launchd-plist supplied");
+    match options.server_launchd_plist.as_deref() {
+        Some(path) => {
+            validate_launchd_plist(
+                path,
+                "com.office-automate.server",
+                options.controller_user.as_deref(),
+                &["serve"],
+            )?;
+            report.push_pass(
+                "server-launchd-plist",
+                format!("validated controller launchd plist {}", path.display()),
+            );
+        }
+        None if public_url.is_some() => {
+            bail!("security validation for a public URL requires --server-launchd-plist");
+        }
+        None => report.push_skip("server-launchd-plist", "no --server-launchd-plist supplied"),
     }
 
     match options.edge_launchd_plist.as_deref() {
@@ -612,6 +674,10 @@ fn validate_security_role_boundaries(
         .edge_user
         .as_deref()
         .context("security validation for a public URL requires --edge-user")?;
+    let controller_user = options
+        .controller_user
+        .as_deref()
+        .context("security validation for a public URL requires --controller-user")?;
     if options.tunnel_origin_probes.is_empty() {
         bail!("security validation for {public_url} requires at least one --tunnel-origin-probe");
     }
@@ -700,6 +766,12 @@ fn validate_security_role_boundaries(
         edge_user,
         &options.denied_lan_probes,
         "edge-user-lan-denial",
+        report,
+    )?;
+    validate_control_connectivity(
+        Some(controller_user),
+        &options.denied_lan_probes,
+        "controller-device-egress-connectivity",
         report,
     )?;
 
@@ -1970,6 +2042,8 @@ struct CloudflareAccessPolicyEvidence {
     name: Option<String>,
     action: Option<String>,
     includes_public: Option<bool>,
+    includes_valid_certificate: Option<bool>,
+    includes_common_name: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2076,6 +2150,7 @@ fn validate_cloudflare_drift_evidence(
         bail!("Cloudflare evidence Access application must include at least one policy");
     }
     let mut has_forwarding_policy = false;
+    let mut has_device_common_name_policy = false;
     for policy in policies {
         let name = required_evidence_str(&policy.name, "access_application.policies[].name")?;
         let action = required_evidence_str(&policy.action, "access_application.policies[].action")?;
@@ -2091,9 +2166,24 @@ fn validate_cloudflare_drift_evidence(
         if matches!(normalized_action.as_str(), "allow" | "service_auth") {
             has_forwarding_policy = true;
         }
+        if normalized_action == "service_auth" {
+            if policy.includes_valid_certificate == Some(true) {
+                bail!(
+                    "Cloudflare evidence policy {name:?} includes a broad Valid Certificate selector; use per-device Common Name selectors"
+                );
+            }
+            if policy.includes_common_name == Some(true) {
+                has_device_common_name_policy = true;
+            }
+        }
     }
     if !has_forwarding_policy {
         bail!("Cloudflare evidence must include at least one Allow or Service Auth policy");
+    }
+    if !has_device_common_name_policy {
+        bail!(
+            "Cloudflare evidence must include a Service Auth policy using per-device Common Name selectors"
+        );
     }
 
     let dns = evidence
@@ -3317,6 +3407,8 @@ mod tests {
             presence: crate::config::PresenceConfig::default(),
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),
+            artifacts: crate::config::ArtifactConfig::default(),
+            cloudflare_access: crate::config::CloudflareAccessConfig::default(),
             erv: ErvConfig::default(),
             mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
@@ -3892,6 +3984,10 @@ mod tests {
         let mut public_policy = valid_cloudflare_drift_evidence();
         public_policy["access_application"]["policies"][0]["includes_public"] = json!(true);
 
+        let mut broad_valid_certificate = valid_cloudflare_drift_evidence();
+        broad_valid_certificate["access_application"]["policies"][0]["includes_valid_certificate"] =
+            json!(true);
+
         let mut wildcard_dns = valid_cloudflare_drift_evidence();
         wildcard_dns["dns"]["wildcard_records"] = json!(["*.example.test"]);
 
@@ -3904,6 +4000,7 @@ mod tests {
         let cases = [
             (bypass_policy, "Bypass"),
             (public_policy, "includes_public=false"),
+            (broad_valid_certificate, "broad Valid Certificate"),
             (wildcard_dns, "wildcard DNS"),
             (private_route, "private network routes"),
             (missing_audit, "unauthenticated blocks"),
@@ -3984,7 +4081,9 @@ mod tests {
                     {
                         "name": "allow-device-mtls",
                         "action": "Service Auth",
-                        "includes_public": false
+                        "includes_public": false,
+                        "includes_common_name": true,
+                        "includes_valid_certificate": false
                     },
                     {
                         "name": "allow-rajesh",

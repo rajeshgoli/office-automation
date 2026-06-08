@@ -5,6 +5,12 @@
   <key>Label</key>
   <string>com.office-automate.server</string>
 
+  <key>UserName</key>
+  <string>__OFFICE_AUTOMATE_CONTROLLER_USER__</string>
+
+  <key>GroupName</key>
+  <string>__OFFICE_AUTOMATE_CONTROLLER_GROUP__</string>
+
   <key>ProgramArguments</key>
   <array>
     <string>__OFFICE_AUTOMATE_SERVER_BIN__</string>

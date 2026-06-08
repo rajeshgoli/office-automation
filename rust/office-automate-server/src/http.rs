@@ -38,7 +38,7 @@ use tower_http::{
 
 use crate::{
     artifacts::ARTIFACT_MAX_SIZE_BYTES,
-    artifacts::{ArtifactStore, is_valid_artifact_hash},
+    artifacts::{ArtifactStore, ArtifactUploadPolicy, is_valid_artifact_hash},
     auth::{
         AuthManager, AuthenticatedUser, HttpAuthMode, OAUTH_CSRF_HEADER, OAuthCredentialSource,
         WebSocketAuth,
@@ -360,9 +360,17 @@ fn build_app_state(
 ) -> Result<(AppState, ErvPolicyCoordinator)> {
     db::migrate_database(&config.runtime.database_path)?;
     let auth = AuthManager::new(&config.orchestrator)?;
-    let artifacts = ArtifactStore::new(
+    let artifacts = ArtifactStore::with_upload_policy(
         config.runtime.artifacts_dir.clone(),
         config.runtime.legacy_apk_path.clone(),
+        ARTIFACT_MAX_SIZE_BYTES,
+        ArtifactUploadPolicy {
+            expected_office_climate_signing_cert_sha256: config
+                .artifacts
+                .office_climate_signing_cert_sha256
+                .clone(),
+            apksigner_path: config.artifacts.apksigner_path.clone(),
+        },
     );
     let temperature_band_defaults = TemperatureBands::from_config(&config);
     let temperature_bands = load_hvac_temperature_bands(&config, temperature_band_defaults);
@@ -2197,6 +2205,17 @@ async fn latest_app_artifact(State(state): State<AppState>, Path(app): Path<Stri
     if !is_valid_artifact_hash(&metadata.artifact_hash) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    if metadata.revoked_at.is_some() {
+        return (
+            StatusCode::GONE,
+            Json(json!({
+                "error": "artifact revoked",
+                "artifact_hash": metadata.artifact_hash,
+                "replacement_artifact_hash": metadata.replacement_artifact_hash,
+            })),
+        )
+            .into_response();
+    }
 
     let mut response = Response::builder()
         .status(StatusCode::FOUND)
@@ -2365,6 +2384,7 @@ fn escape_html_text(value: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn script_json_string(value: &str) -> String {
     serde_json::to_string(value)
         .expect("string serializes")
@@ -2726,6 +2746,8 @@ mod tests {
             presence: crate::config::PresenceConfig::default(),
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),
+            artifacts: crate::config::ArtifactConfig::default(),
+            cloudflare_access: crate::config::CloudflareAccessConfig::default(),
             erv: ErvConfig::default(),
             mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
@@ -6113,6 +6135,71 @@ mod tests {
         assert_eq!(
             response.headers().get("x-content-type-options").unwrap(),
             "nosniff"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_upload_rejects_revoked_hash() {
+        let config = oauth_config();
+        let token = AuthManager::new(&config.orchestrator)
+            .expect("auth")
+            .generate_jwt("engineer@rajeshgo.li")
+            .expect("token");
+        let boundary = "test-boundary";
+        let bytes = b"bad-apk-bytes";
+
+        let response = app(config.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/deploy/office-climate")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(multipart_body(boundary, bytes)))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        crate::artifacts::ArtifactStore::new(
+            config.runtime.artifacts_dir.clone(),
+            config.runtime.legacy_apk_path.clone(),
+        )
+        .revoke_current("office-climate", "bad release", None)
+        .await
+        .expect("revoke current")
+        .expect("metadata");
+
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/deploy/office-climate")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(multipart_body(boundary, bytes)))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert!(
+            value["error"]
+                .as_str()
+                .expect("error")
+                .contains("is revoked")
         );
     }
 

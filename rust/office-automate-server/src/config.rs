@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub presence: PresenceConfig,
     pub qingping: QingpingConfig,
     pub yolink: YoLinkConfig,
+    pub artifacts: ArtifactConfig,
+    pub cloudflare_access: CloudflareAccessConfig,
     pub erv: ErvConfig,
     pub mitsubishi: MitsubishiConfig,
     pub thresholds: ThresholdsConfig,
@@ -108,6 +110,8 @@ impl Default for GoogleOAuthConfig {
 pub struct QingpingConfig {
     pub mqtt_broker: String,
     pub mqtt_port: u16,
+    pub mqtt_username: Option<String>,
+    pub mqtt_password: Option<String>,
     pub device_mac: Option<String>,
     pub report_interval: u64,
 }
@@ -117,9 +121,56 @@ impl Default for QingpingConfig {
         Self {
             mqtt_broker: "127.0.0.1".to_string(),
             mqtt_port: 1883,
+            mqtt_username: None,
+            mqtt_password: None,
             device_mac: None,
             report_interval: 60,
         }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ArtifactConfig {
+    pub office_climate_signing_cert_sha256: Option<String>,
+    pub apksigner_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CloudflareAccessConfig {
+    pub account_id: Option<String>,
+    pub app_id: Option<String>,
+    pub device_policy_id: Option<String>,
+    pub api_token: Option<String>,
+    pub api_base_url: String,
+}
+
+impl Default for CloudflareAccessConfig {
+    fn default() -> Self {
+        Self {
+            account_id: None,
+            app_id: None,
+            device_policy_id: None,
+            api_token: None,
+            api_base_url: "https://api.cloudflare.com/client/v4".to_string(),
+        }
+    }
+}
+
+impl CloudflareAccessConfig {
+    pub fn device_policy_sync_configured(&self) -> bool {
+        self.account_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .device_policy_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .api_token
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
     }
 }
 
@@ -365,6 +416,8 @@ struct FileConfig {
     presence: PresenceConfig,
     qingping: QingpingConfig,
     yolink: YoLinkConfig,
+    artifacts: ArtifactConfig,
+    cloudflare_access: CloudflareAccessConfig,
     erv: ErvConfig,
     mitsubishi: MitsubishiConfig,
     thresholds: ThresholdsConfig,
@@ -411,6 +464,14 @@ impl AppConfig {
             file_config.qingping.mqtt_port = port
                 .parse()
                 .with_context(|| format!("invalid OFFICE_AUTOMATE_MQTT_PORT value {port:?}"))?;
+        }
+
+        if let Some(username) = env_lookup("OFFICE_AUTOMATE_QINGPING_MQTT_USERNAME") {
+            file_config.qingping.mqtt_username = Some(username);
+        }
+
+        if let Some(password) = env_lookup("OFFICE_AUTOMATE_QINGPING_MQTT_PASSWORD") {
+            file_config.qingping.mqtt_password = Some(password);
         }
 
         if let Some(uaid) = env_lookup("OFFICE_AUTOMATE_YOLINK_UAID") {
@@ -480,6 +541,34 @@ impl AppConfig {
 
         if let Some(token) = env_lookup("OFFICE_AUTOMATE_CONTROLLER_IPC_TOKEN") {
             file_config.orchestrator.controller_ipc_token = Some(token);
+        }
+
+        if let Some(cert_sha256) = env_lookup("OFFICE_AUTOMATE_ANDROID_SIGNING_CERT_SHA256") {
+            file_config.artifacts.office_climate_signing_cert_sha256 = Some(cert_sha256);
+        }
+
+        if let Some(path) = env_lookup("OFFICE_AUTOMATE_APKSIGNER") {
+            file_config.artifacts.apksigner_path = Some(PathBuf::from(path));
+        }
+
+        if let Some(account_id) = env_lookup("OFFICE_AUTOMATE_CLOUDFLARE_ACCOUNT_ID") {
+            file_config.cloudflare_access.account_id = Some(account_id);
+        }
+
+        if let Some(app_id) = env_lookup("OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_APP_ID") {
+            file_config.cloudflare_access.app_id = Some(app_id);
+        }
+
+        if let Some(policy_id) = env_lookup("OFFICE_AUTOMATE_CLOUDFLARE_DEVICE_POLICY_ID") {
+            file_config.cloudflare_access.device_policy_id = Some(policy_id);
+        }
+
+        if let Some(api_token) = env_lookup("OFFICE_AUTOMATE_CLOUDFLARE_API_TOKEN") {
+            file_config.cloudflare_access.api_token = Some(api_token);
+        }
+
+        if let Some(api_base_url) = env_lookup("OFFICE_AUTOMATE_CLOUDFLARE_API_BASE_URL") {
+            file_config.cloudflare_access.api_base_url = api_base_url;
         }
 
         if let Some(admin_emails) = env_lookup("OFFICE_AUTOMATE_ADMIN_EMAILS") {
@@ -613,6 +702,8 @@ impl AppConfig {
             presence: file_config.presence,
             qingping: file_config.qingping,
             yolink: file_config.yolink,
+            artifacts: file_config.artifacts,
+            cloudflare_access: file_config.cloudflare_access,
             erv: file_config.erv,
             mitsubishi: file_config.mitsubishi,
             thresholds: file_config.thresholds,
