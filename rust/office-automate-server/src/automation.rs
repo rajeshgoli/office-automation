@@ -133,6 +133,9 @@ impl ErvPolicyCoordinator {
                 reason,
                 ..
             } => {
+                if !self.erv.local_retry_allowed(now) {
+                    return Ok(());
+                }
                 self.apply_policy_erv_speed(
                     erv_speed_from_ventilation(target_speed),
                     &reason,
@@ -251,6 +254,7 @@ impl ErvPolicyCoordinator {
             || !self.config.erv.active_control_enabled
             || !self.config.erv.is_configured()
             || snapshot.local_key_invalid
+            || !self.erv.local_retry_allowed(unix_timestamp_now())
         {
             return false;
         }
@@ -349,7 +353,15 @@ fn unix_timestamp_now() -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, path::PathBuf, sync::Mutex, time::Duration};
+    use std::{
+        collections::VecDeque,
+        path::PathBuf,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use anyhow::Result;
     use serde_json::json;
@@ -369,6 +381,7 @@ mod tests {
 
     struct FakeErvWriter {
         smoke_results: Mutex<VecDeque<Result<ErvDeviceStatus>>>,
+        smoke_calls: AtomicUsize,
         writes: Mutex<Vec<ErvFanSpeed>>,
         set_delay: Duration,
     }
@@ -377,6 +390,7 @@ mod tests {
         fn new(smoke_results: Vec<Result<ErvDeviceStatus>>) -> Self {
             Self {
                 smoke_results: Mutex::new(smoke_results.into()),
+                smoke_calls: AtomicUsize::new(0),
                 writes: Mutex::new(Vec::new()),
                 set_delay: Duration::ZERO,
             }
@@ -390,6 +404,10 @@ mod tests {
         fn writes(&self) -> Vec<ErvFanSpeed> {
             self.writes.lock().expect("writes lock").clone()
         }
+
+        fn smoke_calls(&self) -> usize {
+            self.smoke_calls.load(Ordering::SeqCst)
+        }
     }
 
     impl ErvSpeedWriter for FakeErvWriter {
@@ -397,6 +415,7 @@ mod tests {
             &'a self,
             _config: &'a ErvConfig,
         ) -> BoxFutureResult<'a, ErvDeviceStatus> {
+            self.smoke_calls.fetch_add(1, Ordering::SeqCst);
             let result = self
                 .smoke_results
                 .lock()
@@ -687,6 +706,53 @@ mod tests {
                 .air_quality_sample_counts(),
             (1, 1)
         );
+    }
+
+    #[tokio::test]
+    async fn automated_policy_write_respects_local_failure_backoff() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let config = test_config(database_path.clone());
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            1_000.0,
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .set_manual_presence(true, 1_001.0);
+        let qingping = QingpingState::default();
+        qingping.apply_reading(qingping_reading(2100));
+        let erv = ErvState::new(database_path);
+        let writer = Arc::new(FakeErvWriter::new(vec![Err(anyhow::anyhow!(
+            "Connection reset by peer"
+        ))]));
+        let policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
+        let (status_broadcast, _) = broadcast::channel(4);
+        let coordinator = ErvPolicyCoordinator::new(
+            config,
+            state_machine,
+            qingping,
+            erv,
+            policy,
+            writer.clone(),
+            status_broadcast,
+        );
+
+        coordinator
+            .evaluate_erv_policy(false)
+            .await
+            .expect_err("first automated write should fail");
+        assert_eq!(writer.smoke_calls(), 1);
+        assert!(writer.writes().is_empty());
+
+        coordinator
+            .evaluate_erv_policy(false)
+            .await
+            .expect("second policy evaluation respects backoff");
+        assert_eq!(writer.smoke_calls(), 1);
+        assert!(writer.writes().is_empty());
     }
 
     #[tokio::test]

@@ -1144,7 +1144,7 @@ async fn apply_occupancy_signal(
                 transition,
                 now,
                 transition.is_some(),
-                true,
+                transition.is_some(),
             ))
         })
         .await;
@@ -4215,6 +4215,55 @@ mod tests {
         let history = db::read_history(&config.runtime.database_path, 1, 10).expect("history");
         assert_eq!(history.occupancy_history[0]["state"], "present");
         assert_eq!(history.occupancy_history[0]["trigger"], "internal_presence");
+    }
+
+    #[tokio::test]
+    async fn internal_presence_heartbeat_without_transition_does_not_probe_erv() {
+        let mut config = configured_erv_config(true);
+        config.mitsubishi = configured_hvac_config(false).mitsubishi;
+        let qingping = qingping_with_co2(450);
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            now - 10.0,
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .set_manual_presence(true, now - 5.0);
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let erv_writer = Arc::new(FakeErvWriter::new(
+            vec![Err(anyhow::anyhow!("should not smoke ERV"))],
+            vec![],
+        ));
+        let (state, _) = build_app_state(
+            config,
+            qingping,
+            state_machine,
+            yolink,
+            erv_state,
+            HvacState::default(),
+            erv_writer.clone(),
+            Arc::new(FakeHvacWriter::default()),
+        )
+        .expect("app state");
+
+        apply_presence_snapshot(
+            &state,
+            PresenceSnapshot {
+                last_active_timestamp: now,
+                external_monitor: true,
+                idle_seconds: 0.1,
+                display_count: 2,
+                external_displays: vec!["Studio Display".to_string()],
+            },
+        )
+        .await
+        .expect("presence heartbeat");
+
+        assert_eq!(erv_writer.smoke_calls(), 0);
+        assert!(erv_writer.write_speeds().is_empty());
     }
 
     #[tokio::test]
