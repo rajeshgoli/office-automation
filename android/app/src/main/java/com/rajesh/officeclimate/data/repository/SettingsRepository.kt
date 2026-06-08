@@ -23,7 +23,7 @@ class SettingsRepository(private val context: Context) {
         val USER_EMAIL = stringPreferencesKey("user_email")
         val DEVICE_CERTIFICATE_ALIAS = stringPreferencesKey("device_certificate_alias")
         val DEVICE_CERTIFICATE_CHAIN_PEM = stringPreferencesKey("device_certificate_chain_pem")
-        val LEGACY_DEVICE_PRIVATE_KEY_PKCS8 = stringPreferencesKey("device_private_key_pkcs8")
+        val DEVICE_PRIVATE_KEY_PKCS8 = stringPreferencesKey("device_private_key_pkcs8")
         val DISMISSED_UPDATE_ARTIFACT_HASH = stringPreferencesKey("dismissed_update_artifact_hash")
         val DISMISSED_APP_NOTIFICATION_IDS = stringSetPreferencesKey("dismissed_app_notification_ids")
     }
@@ -38,6 +38,10 @@ class SettingsRepository(private val context: Context) {
 
     val deviceCertificateChainPem: Flow<String> = context.dataStore.data.map { prefs ->
         prefs[Keys.DEVICE_CERTIFICATE_CHAIN_PEM] ?: ""
+    }
+
+    val devicePrivateKeyPkcs8: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[Keys.DEVICE_PRIVATE_KEY_PKCS8] ?: ""
     }
 
     val jwtToken: Flow<String> = context.dataStore.data.map { prefs ->
@@ -86,6 +90,12 @@ class SettingsRepository(private val context: Context) {
         }
     }
 
+    suspend fun saveDevicePrivateKeyPkcs8(privateKeyPkcs8: String) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.DEVICE_PRIVATE_KEY_PKCS8] = privateKeyPkcs8.trim()
+        }
+    }
+
     suspend fun clearDeviceCertificateAlias() {
         context.dataStore.edit { prefs ->
             prefs.remove(Keys.DEVICE_CERTIFICATE_ALIAS)
@@ -100,13 +110,12 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun clearDevicePrivateKeyPkcs8() {
         context.dataStore.edit { prefs ->
-            prefs.remove(Keys.LEGACY_DEVICE_PRIVATE_KEY_PKCS8)
+            prefs.remove(Keys.DEVICE_PRIVATE_KEY_PKCS8)
         }
     }
 
     suspend fun clearLegacyAuthAndInvalidDeviceCredentialIfNeeded() {
         context.dataStore.edit { prefs ->
-            prefs.remove(Keys.LEGACY_DEVICE_PRIVATE_KEY_PKCS8)
             if (
                 !prefs[Keys.DEVICE_CERTIFICATE_ALIAS].isNullOrBlank() &&
                     !hasValidDeviceCredential(prefs)
@@ -155,17 +164,7 @@ class SettingsRepository(private val context: Context) {
     private fun hasValidDeviceCredential(prefs: Preferences): Boolean {
         val alias = prefs[Keys.DEVICE_CERTIFICATE_ALIAS]?.trim().orEmpty()
         val certificateChain = prefs[Keys.DEVICE_CERTIFICATE_CHAIN_PEM]?.trim().orEmpty()
-        return alias.isNotBlank() && certificateChain.isNotBlank() && hasDevicePrivateKey(alias)
-    }
-
-    private fun hasDevicePrivateKey(alias: String): Boolean =
-        runCatching {
-            KeyStore.getInstance(ANDROID_KEYSTORE)
-                .apply { load(null) }
-                .getKey(alias, null) != null
-        }.getOrDefault(false)
-
-    private companion object {
-        const val ANDROID_KEYSTORE = "AndroidKeyStore"
+        val privateKeyPkcs8 = prefs[Keys.DEVICE_PRIVATE_KEY_PKCS8]?.trim().orEmpty()
+        return alias.isNotBlank() && certificateChain.isNotBlank() && privateKeyPkcs8.isNotBlank()
     }
 }
