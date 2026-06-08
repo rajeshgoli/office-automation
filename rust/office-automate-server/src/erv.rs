@@ -22,6 +22,8 @@ const DP_POWER: &str = "1";
 const DP_SUPPLY_SPEED: &str = "101";
 const DP_EXHAUST_SPEED: &str = "102";
 const LOCAL_KEY_ERROR_THRESHOLD: u64 = 5;
+const LOCAL_FAILURE_BASE_RETRY_SECONDS: f64 = 5.0 * 60.0;
+const LOCAL_FAILURE_MAX_RETRY_SECONDS: f64 = 60.0 * 60.0;
 pub const ERV_MANUAL_OVERRIDE_SECONDS: i64 = 30 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +165,8 @@ struct ErvInner {
     notification: Option<AppNotification>,
     last_speed_changed_at: Option<f64>,
     manual_override: Option<ErvManualOverride>,
+    consecutive_local_failures: u64,
+    next_local_retry_at: Option<f64>,
 }
 
 impl ErvState {
@@ -305,6 +309,14 @@ impl ErvState {
             last_speed_changed_at: inner.last_speed_changed_at,
             local_key_invalid: inner.control.local_key_invalid,
         }
+    }
+
+    pub fn local_retry_allowed(&self, now: f64) -> bool {
+        self.inner
+            .read()
+            .expect("ERV state lock poisoned")
+            .next_local_retry_at
+            .map_or(true, |retry_at| now >= retry_at)
     }
 
     pub async fn smoke_status_with<W>(
@@ -475,7 +487,9 @@ impl ErvState {
             inner.control.using_cloud = false;
             inner.control.local_key_invalid = false;
             inner.control.local_key_invalid_since = None;
+            inner.consecutive_local_failures = 0;
             inner.control.consecutive_local_key_errors = 0;
+            inner.next_local_retry_at = None;
 
             if was_invalid {
                 inner.notification = Some(recovered_notification(&now));
@@ -505,6 +519,11 @@ impl ErvState {
             inner.control.last_error = Some(format!("Local status failed: {message}"));
             inner.control.last_error_at = Some(now.clone());
             inner.control.using_cloud = false;
+            inner.consecutive_local_failures = inner.consecutive_local_failures.saturating_add(1);
+            inner.next_local_retry_at = Some(
+                unix_timestamp_now()
+                    + local_failure_retry_delay_seconds(inner.consecutive_local_failures),
+            );
 
             if !is_local_key_error(message) {
                 inner.control.consecutive_local_key_errors = 0;
@@ -560,6 +579,11 @@ impl ErvState {
     }
 }
 
+fn local_failure_retry_delay_seconds(consecutive_failures: u64) -> f64 {
+    let exponent = consecutive_failures.saturating_sub(1).min(8) as i32;
+    (LOCAL_FAILURE_BASE_RETRY_SECONDS * 2f64.powi(exponent)).min(LOCAL_FAILURE_MAX_RETRY_SECONDS)
+}
+
 pub fn start_erv_status_poll(config: &AppConfig, erv: ErvState) -> Option<JoinHandle<()>> {
     if !config.erv.is_configured() {
         tracing::info!("ERV local Tuya config is incomplete; read-only ERV polling disabled");
@@ -572,6 +596,9 @@ pub fn start_erv_status_poll(config: &AppConfig, erv: ErvState) -> Option<JoinHa
         let mut interval = time::interval(Duration::from_secs(config.poll_interval_seconds.max(5)));
         loop {
             interval.tick().await;
+            if !erv.local_retry_allowed(unix_timestamp_now()) {
+                continue;
+            }
             if let Err(error) = erv.refresh_with(&config, &reader).await {
                 tracing::warn!("ERV read-only status poll failed: {error:#}");
             }
@@ -1066,6 +1093,29 @@ mod tests {
             .await
             .expect("broadcast timeout")
             .expect("broadcast message");
+    }
+
+    #[tokio::test]
+    async fn local_status_failure_sets_immediate_retry_backoff() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let reader = FakeErvReader::new(vec![
+            Err(anyhow!("Connection reset by peer")),
+            Err(anyhow!("Connection reset by peer")),
+        ]);
+
+        assert!(state.refresh_with(&test_config(), &reader).await.is_err());
+
+        let now = unix_timestamp_now();
+        assert!(!state.local_retry_allowed(now));
+        assert!(state.local_retry_allowed(now + LOCAL_FAILURE_BASE_RETRY_SECONDS + 1.0));
+
+        assert!(state.refresh_with(&test_config(), &reader).await.is_err());
+        let now = unix_timestamp_now();
+        assert!(!state.local_retry_allowed(now + LOCAL_FAILURE_BASE_RETRY_SECONDS + 1.0));
+        assert!(state.local_retry_allowed(now + (LOCAL_FAILURE_BASE_RETRY_SECONDS * 2.0) + 1.0));
     }
 
     #[tokio::test]
