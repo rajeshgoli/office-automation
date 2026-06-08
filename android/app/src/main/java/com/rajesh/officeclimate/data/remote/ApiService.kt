@@ -2,6 +2,7 @@ package com.rajesh.officeclimate.data.remote
 
 import com.rajesh.officeclimate.data.model.ApiStatus
 import com.rajesh.officeclimate.data.model.AppArtifactMetadata
+import com.rajesh.officeclimate.data.model.BrowserLoginStartResponse
 import com.rajesh.officeclimate.data.model.DailyStatsResponse
 import com.rajesh.officeclimate.data.model.DeviceFlowPollRequest
 import com.rajesh.officeclimate.data.model.DeviceFlowPollResponse
@@ -27,6 +28,9 @@ interface ApiService {
 
     @GET("apps/office-climate/meta.json")
     suspend fun getAppArtifactMetadata(): AppArtifactMetadata
+
+    @GET("auth/login")
+    suspend fun startBrowserLogin(@Query("platform") platform: String = "android"): BrowserLoginStartResponse
 
     @POST("auth/device/start")
     suspend fun startDeviceFlow(): DeviceFlowStartResponse
