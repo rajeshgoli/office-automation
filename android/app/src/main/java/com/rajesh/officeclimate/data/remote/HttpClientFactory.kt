@@ -24,6 +24,7 @@ class HttpClientFactory(
 ) {
     suspend fun create(
         includeLogging: Boolean = false,
+        includeBearerAuth: Boolean = true,
         connectTimeoutSeconds: Long = 10,
         readTimeoutSeconds: Long = 30,
     ): OkHttpClient {
@@ -39,6 +40,16 @@ class HttpClientFactory(
                     level = HttpLoggingInterceptor.Level.BASIC
                 }
             )
+        }
+
+        val jwtToken = settingsRepository.jwtToken.first().trim()
+        if (includeBearerAuth && jwtToken.isNotBlank()) {
+            builder.addInterceptor { chain ->
+                val request = chain.request().newBuilder()
+                    .header("Authorization", "Bearer $jwtToken")
+                    .build()
+                chain.proceed(request)
+            }
         }
 
         val alias = settingsRepository.deviceCertificateAlias.first().trim()

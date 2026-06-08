@@ -72,8 +72,8 @@ fun SettingsScreen(
 
         Text(
             text = when {
-                state.deviceCertificateAlias.isNotBlank() -> "Device enrolled as ${state.deviceCertificateAlias}"
-                state.isLoggedIn -> "Device enrolled"
+                state.isLoggedIn && state.userEmail.isNotBlank() -> "Signed in as ${state.userEmail}"
+                state.hasDeviceCredential -> "Device enrolled. Google sign-in required."
                 else -> "Enroll this device"
             },
             style = MaterialTheme.typography.bodyMedium,
@@ -132,7 +132,7 @@ fun SettingsScreen(
 
         Button(
             onClick = viewModel::enrollDevice,
-            enabled = !state.enrolling && state.pairingUrl.isNotBlank() && state.pairingCode.isNotBlank(),
+            enabled = !state.enrolling && !state.signingIn && state.pairingUrl.isNotBlank() && state.pairingCode.isNotBlank(),
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.buttonColors(containerColor = Emerald),
         ) {
@@ -149,7 +149,37 @@ fun SettingsScreen(
 
         Spacer(Modifier.height(12.dp))
 
+        if (state.hasDeviceCredential && !state.isLoggedIn) {
+            Button(
+                onClick = viewModel::signInWithGoogle,
+                enabled = !state.enrolling && !state.signingIn,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = Emerald),
+            ) {
+                if (state.signingIn) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.height(20.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.background,
+                    )
+                } else {
+                    Text("Sign in with Google", color = MaterialTheme.colorScheme.background)
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+        }
+
         state.enrollmentStatus?.let { message ->
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodySmall,
+                color = Emerald,
+            )
+        }
+
+        state.signInStatus?.let { message ->
+            Spacer(Modifier.height(12.dp))
             Text(
                 text = message,
                 style = MaterialTheme.typography.bodySmall,

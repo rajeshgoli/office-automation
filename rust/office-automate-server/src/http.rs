@@ -641,10 +641,7 @@ async fn auth_middleware(
     }
 
     match cloudflare_access_service_auth(&state, &headers, remote_addr).await {
-        CloudflareAccessServiceAuth::Authenticated(user) => {
-            request.extensions_mut().insert(user);
-            return next.run(request).await;
-        }
+        CloudflareAccessServiceAuth::DeviceAllowed => {}
         CloudflareAccessServiceAuth::Rejected => {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -778,14 +775,14 @@ fn route_authorization_class(method: &Method, path: &str) -> RouteAuthorizationC
 }
 
 fn should_skip_auth(route_class: RouteAuthorizationClass, auth_mode: HttpAuthMode) -> bool {
-    matches!(
-        route_class,
-        RouteAuthorizationClass::Preflight | RouteAuthorizationClass::PublicArtifact
-    ) || (matches!(auth_mode, HttpAuthMode::OAuth)
-        && matches!(
-            route_class,
-            RouteAuthorizationClass::MobileBootstrap | RouteAuthorizationClass::PublicStatic
-        ))
+    matches!(route_class, RouteAuthorizationClass::Preflight)
+        || (matches!(auth_mode, HttpAuthMode::Open)
+            && matches!(route_class, RouteAuthorizationClass::PublicArtifact))
+        || (matches!(auth_mode, HttpAuthMode::OAuth)
+            && matches!(
+                route_class,
+                RouteAuthorizationClass::MobileBootstrap | RouteAuthorizationClass::PublicStatic
+            ))
 }
 
 fn requires_csrf(method: &Method) -> bool {
@@ -845,7 +842,7 @@ fn forwarded_for_ip(headers: &HeaderMap) -> Option<IpAddr> {
 }
 
 enum CloudflareAccessServiceAuth {
-    Authenticated(AuthenticatedUser),
+    DeviceAllowed,
     Rejected,
     AbsentOrUserAccess,
 }
@@ -878,7 +875,7 @@ async fn cloudflare_access_service_auth(
     else {
         return CloudflareAccessServiceAuth::AbsentOrUserAccess;
     };
-    let device = match db::find_active_device_registration_by_common_name(
+    let _device = match db::find_active_device_registration_by_common_name(
         &state.config.runtime.database_path,
         &identity,
     ) {
@@ -889,9 +886,7 @@ async fn cloudflare_access_service_auth(
             return CloudflareAccessServiceAuth::Rejected;
         }
     };
-    CloudflareAccessServiceAuth::Authenticated(AuthenticatedUser {
-        email: format!("cloudflare_mtls:{}", device.device_id),
-    })
+    CloudflareAccessServiceAuth::DeviceAllowed
 }
 
 async fn status(State(state): State<AppState>) -> Json<Status> {
@@ -3538,6 +3533,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn oauth_mode_requires_auth_for_artifact_routes() {
+        assert!(should_skip_auth(
+            RouteAuthorizationClass::PublicArtifact,
+            HttpAuthMode::Open
+        ));
+        assert!(!should_skip_auth(
+            RouteAuthorizationClass::PublicArtifact,
+            HttpAuthMode::OAuth
+        ));
+        assert!(!should_skip_auth(
+            RouteAuthorizationClass::PublicArtifact,
+            HttpAuthMode::Basic
+        ));
+    }
+
     #[tokio::test]
     async fn controller_ipc_token_allows_local_edge_calls() {
         let mut config = oauth_config();
@@ -6092,6 +6103,7 @@ mod tests {
             .oneshot(
                 HttpRequest::builder()
                     .uri("/apps/office-climate/meta.json")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -6114,6 +6126,7 @@ mod tests {
             .oneshot(
                 HttpRequest::builder()
                     .uri(format!("/apps/office-climate/{artifact_hash}.apk"))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .expect("request"),
             )

@@ -87,6 +87,7 @@ class ClimateRepository(
 
     private suspend fun rebuild(url: String) {
         currentUrl = url
+        val authToken = settingsRepository.jwtToken.first().trim()
 
         val client = httpClientFactory.create(
             includeLogging = true,
@@ -102,7 +103,7 @@ class ClimateRepository(
             .build()
 
         apiService = retrofit.create(ApiService::class.java)
-        wsManager = WebSocketManager(client, json)
+        wsManager = WebSocketManager(client, json, authToken)
     }
 
     private fun startPolling() {
