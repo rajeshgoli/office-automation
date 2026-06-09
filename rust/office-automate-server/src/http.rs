@@ -2670,9 +2670,24 @@ async fn serve_static_or_index(state: &AppState, path: &str) -> Response {
     match tokio::fs::read(&target).await {
         Ok(bytes) => Response::builder()
             .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, static_content_type(&target))
             .body(Body::from(bytes))
             .expect("static response"),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn static_content_type(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("webmanifest") => "application/manifest+json; charset=utf-8",
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
     }
 }
 
@@ -6668,6 +6683,50 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn frontend_static_routes_set_content_type() {
+        let config = test_config();
+        tokio::fs::create_dir_all(&config.runtime.frontend_dist)
+            .await
+            .expect("create frontend dist");
+        tokio::fs::write(
+            config.runtime.frontend_dist.join("index.html"),
+            b"spa-index",
+        )
+        .await
+        .expect("write index");
+        tokio::fs::write(config.runtime.frontend_dist.join("manifest.json"), b"{}")
+            .await
+            .expect("write manifest");
+        tokio::fs::write(config.runtime.frontend_dist.join("icon-192.png"), b"png")
+            .await
+            .expect("write icon");
+
+        for (path, expected_content_type) in [
+            ("/", "text/html; charset=utf-8"),
+            ("/dashboard", "text/html; charset=utf-8"),
+            ("/manifest.json", "application/json; charset=utf-8"),
+            ("/icon-192.png", "image/png"),
+        ] {
+            let response = app(config.clone())
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                expected_content_type,
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]
