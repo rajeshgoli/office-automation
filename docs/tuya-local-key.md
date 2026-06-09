@@ -260,7 +260,7 @@ This was the old behavior of the script — fixed in-tree. Newer Smart Life vers
 Both the device and Smart Life are stuck on a stale key. See step 4.3 → Path B.
 
 ### Tuya Cloud fallback returns 0 devices
-Tuya cloud projects need devices linked via the IoT Platform asset model. Don't rely on cloud — local-only is the goal. The orchestrator's cloud fallback in `erv_client.py` is best-effort and will likely fail silently here.
+Tuya cloud projects need devices linked via the IoT Platform asset model. Don't rely on cloud for this ERV recovery path — local control is the goal, and the Rust ERV client should use the refreshed local key in `config.yaml`.
 
 ## Prevention
 

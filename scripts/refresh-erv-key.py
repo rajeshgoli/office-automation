@@ -28,6 +28,7 @@ CLIENT_ID = "HA_3y9q4ak7g4ephrvke"
 SCHEMA = "haauthorize"
 DEFAULT_AUTH_FILE = Path.home() / ".office-automate" / "tuya-sharing-auth.json"
 DEFAULT_CONFIG_FILE = Path("config.yaml")
+REQUIREMENTS_FILE = "scripts/refresh-erv-key-requirements.txt"
 SERVICE_LABEL = "com.office-automate.server"
 
 
@@ -53,7 +54,7 @@ def load_roundtrip_yaml():
         from ruamel.yaml import YAML
     except ImportError as exc:  # pragma: no cover - depends on local env
         raise RefreshError(
-            "ruamel.yaml is required. Run: python3 -m pip install -r requirements.txt"
+            f"ruamel.yaml is required. Run: python3 -m pip install -r {REQUIREMENTS_FILE}"
         ) from exc
 
     yaml = YAML()
@@ -347,7 +348,10 @@ def print_qr(payload: str, stderr: TextIO) -> None:
     try:
         import qrcode
     except ImportError:
-        print("qrcode is not installed; install requirements.txt to render the QR.", file=stderr)
+        print(
+            f"qrcode is not installed; install {REQUIREMENTS_FILE} to render the QR.",
+            file=stderr,
+        )
         return
 
     qr = qrcode.QRCode(border=1)
@@ -456,7 +460,7 @@ def restart_orchestrator() -> None:
 def ensure_tuya_sdk() -> None:
     if LoginControl is None or Manager is None:
         raise RefreshError(
-            "tuya-device-sharing-sdk is required. Run: python3 -m pip install -r requirements.txt"
+            f"tuya-device-sharing-sdk is required. Run: python3 -m pip install -r {REQUIREMENTS_FILE}"
         )
 
 
@@ -499,7 +503,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--restart",
         action="store_true",
-        help="kickstart the launchctl orchestrator service after --update-config changes the key",
+        help=f"kickstart the launchctl {SERVICE_LABEL} service after --update-config changes the key",
     )
     return parser
 
