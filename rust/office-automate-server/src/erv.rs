@@ -11,7 +11,11 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
 use serde_json::{Map, Value, json};
-use tokio::{sync::broadcast, task::JoinHandle, time};
+use tokio::{
+    sync::{Mutex as AsyncMutex, broadcast},
+    task::JoinHandle,
+    time,
+};
 
 use crate::{
     config::{AppConfig, ErvConfig},
@@ -179,6 +183,7 @@ struct ErvWriteAttempt {
 #[derive(Debug, Clone)]
 pub struct ErvState {
     inner: Arc<RwLock<ErvInner>>,
+    local_io_lock: Arc<AsyncMutex<()>>,
     database_path: PathBuf,
     status_broadcast: Arc<RwLock<Option<broadcast::Sender<()>>>>,
 }
@@ -199,6 +204,7 @@ impl ErvState {
     pub fn new(database_path: PathBuf) -> Self {
         Self {
             inner: Arc::default(),
+            local_io_lock: Arc::default(),
             database_path,
             status_broadcast: Arc::default(),
         }
@@ -212,6 +218,18 @@ impl ErvState {
     }
 
     pub async fn refresh_with<R>(&self, config: &ErvConfig, reader: &R) -> Result<ErvDeviceStatus>
+    where
+        R: ErvStatusReader + ?Sized,
+    {
+        let _local_io_guard = self.local_io_lock.lock().await;
+        self.refresh_with_locked(config, reader).await
+    }
+
+    async fn refresh_with_locked<R>(
+        &self,
+        config: &ErvConfig,
+        reader: &R,
+    ) -> Result<ErvDeviceStatus>
     where
         R: ErvStatusReader + ?Sized,
     {
@@ -253,8 +271,21 @@ impl ErvState {
             bail!("ERV local Tuya key is invalid");
         }
 
+        let _local_io_guard = self.local_io_lock.lock().await;
+        if self.would_suppress_write_attempt(reason) {
+            let attempt = self.record_write_attempt(speed, reason, co2_ppm);
+            if attempt.suppressed {
+                self.record_write_burst_suppression(speed, reason, co2_ppm, &attempt);
+                bail!(
+                    "ERV automated local write suppressed by burst guard after {} attempts in {} seconds",
+                    attempt.recent_write_attempts_5m,
+                    LOCAL_WRITE_BURST_WINDOW_SECONDS as u64
+                );
+            }
+        }
+
         let smoked_status = self
-            .smoke_status_with(config, writer)
+            .smoke_status_with_locked(config, writer)
             .await
             .context("ERV smoke check failed before active write")?;
 
@@ -262,7 +293,7 @@ impl ErvState {
             return Ok(smoked_status);
         }
 
-        self.write_speed_after_gate(config, writer, speed, reason, co2_ppm)
+        self.write_speed_after_gate_locked(config, writer, speed, reason, co2_ppm)
             .await
     }
 
@@ -287,11 +318,12 @@ impl ErvState {
             bail!("ERV local Tuya key is invalid");
         }
 
-        self.write_speed_after_gate(config, writer, speed, reason, co2_ppm)
+        let _local_io_guard = self.local_io_lock.lock().await;
+        self.write_speed_after_gate_locked(config, writer, speed, reason, co2_ppm)
             .await
     }
 
-    async fn write_speed_after_gate<W>(
+    async fn write_speed_after_gate_locked<W>(
         &self,
         config: &ErvConfig,
         writer: &W,
@@ -357,6 +389,28 @@ impl ErvState {
             .map_or(true, |retry_at| now >= retry_at)
     }
 
+    pub fn status_poll_delay(&self, config: &ErvConfig, now: f64) -> Duration {
+        let inner = self.inner.read().expect("ERV state lock poisoned");
+        if let Some(retry_at) = inner.next_local_retry_at
+            && retry_at > now
+        {
+            return Duration::from_secs(((retry_at - now).ceil() as u64).max(1));
+        }
+
+        let active_interval = config.poll_interval_seconds.max(5);
+        let idle_interval = config.idle_poll_interval_seconds.max(active_interval);
+        let status_known_idle = inner
+            .latest_status
+            .as_ref()
+            .is_some_and(|status| !status.power);
+
+        Duration::from_secs(if status_known_idle {
+            idle_interval
+        } else {
+            active_interval
+        })
+    }
+
     pub async fn smoke_status_with<W>(
         &self,
         config: &ErvConfig,
@@ -372,6 +426,18 @@ impl ErvState {
             bail!("ERV local Tuya key is invalid");
         }
 
+        let _local_io_guard = self.local_io_lock.lock().await;
+        self.smoke_status_with_locked(config, writer).await
+    }
+
+    async fn smoke_status_with_locked<W>(
+        &self,
+        config: &ErvConfig,
+        writer: &W,
+    ) -> Result<ErvDeviceStatus>
+    where
+        W: ErvSpeedWriter + ?Sized,
+    {
         match writer.smoke_status(config).await {
             Ok(status) => {
                 if self.record_local_success(status.clone()) {
@@ -387,6 +453,16 @@ impl ErvState {
                 Err(error)
             }
         }
+    }
+
+    fn would_suppress_write_attempt(&self, reason: &str) -> bool {
+        if write_burst_guard_exempt(reason) {
+            return false;
+        }
+        let at = unix_timestamp_now();
+        let inner = self.inner.read().expect("ERV state lock poisoned");
+        recent_write_attempts_locked(&inner, at, LOCAL_WRITE_BURST_WINDOW_SECONDS) + 1
+            > LOCAL_WRITE_BURST_ATTEMPT_LIMIT
     }
 
     pub fn set_manual_override(&self, speed: ErvFanSpeed, now: f64) {
@@ -858,7 +934,7 @@ fn local_failure_retry_delay_seconds(consecutive_failures: u64) -> f64 {
 }
 
 fn write_burst_guard_exempt(reason: &str) -> bool {
-    matches!(reason, "manual_override" | "safety_interlock")
+    matches!(reason, "manual_override")
 }
 
 fn push_local_activity_locked(inner: &mut ErvInner, activity: ErvLocalActivity) {
@@ -947,15 +1023,15 @@ pub fn start_erv_status_poll(config: &AppConfig, erv: ErvState) -> Option<JoinHa
     let config = config.erv.clone();
     Some(tokio::spawn(async move {
         let reader = RustuyaErvStatusReader;
-        let mut interval = time::interval(Duration::from_secs(config.poll_interval_seconds.max(5)));
         loop {
-            interval.tick().await;
             if !erv.local_retry_allowed(unix_timestamp_now()) {
+                time::sleep(erv.status_poll_delay(&config, unix_timestamp_now())).await;
                 continue;
             }
             if let Err(error) = erv.refresh_with(&config, &reader).await {
                 tracing::warn!("ERV read-only status poll failed: {error:#}");
             }
+            time::sleep(erv.status_poll_delay(&config, unix_timestamp_now())).await;
         }
     }))
 }
@@ -1493,6 +1569,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_poll_delay_uses_idle_interval_and_failure_backoff() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let reader = FakeErvReader::new(vec![
+            Ok(parse_erv_status_payload(r#"{"dps":{"1":false}}"#).expect("status")),
+            Err(anyhow!("Connection reset by peer")),
+        ]);
+        let config = ErvConfig {
+            poll_interval_seconds: 11,
+            idle_poll_interval_seconds: 97,
+            ..test_config()
+        };
+
+        assert_eq!(
+            state.status_poll_delay(&config, unix_timestamp_now()),
+            Duration::from_secs(11)
+        );
+
+        state
+            .refresh_with(&config, &reader)
+            .await
+            .expect("idle status poll succeeds");
+        assert_eq!(
+            state.status_poll_delay(&config, unix_timestamp_now()),
+            Duration::from_secs(97)
+        );
+
+        assert!(state.refresh_with(&config, &reader).await.is_err());
+        let delay = state.status_poll_delay(&config, unix_timestamp_now());
+        assert!(delay >= Duration::from_secs(LOCAL_FAILURE_BASE_RETRY_SECONDS as u64 - 1));
+        assert!(delay <= Duration::from_secs(LOCAL_FAILURE_BASE_RETRY_SECONDS as u64));
+    }
+
+    #[tokio::test]
     async fn local_success_updates_status_and_recovers_invalid_key_notification() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let database_path = temp_dir.path().join("office_climate.db");
@@ -1706,7 +1818,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn safety_interlock_bypasses_write_burst_guard() {
+    async fn safety_interlock_respects_write_burst_guard() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let database_path = temp_dir.path().join("office_climate.db");
         db::migrate_database(&database_path).expect("migration");
@@ -1734,7 +1846,7 @@ mod tests {
                 .expect("write succeeds before burst guard");
         }
 
-        state
+        let error = state
             .set_speed_after_smoke_with(
                 &active_config(),
                 &writer,
@@ -1743,12 +1855,56 @@ mod tests {
                 Some(900),
             )
             .await
-            .expect("safety write bypasses burst guard");
+            .expect_err("safety write respects burst guard");
 
-        assert_eq!(
-            writer.write_speeds().len(),
-            LOCAL_WRITE_BURST_ATTEMPT_LIMIT + 1
+        assert!(error.to_string().contains("burst guard"));
+        assert_eq!(writer.write_speeds().len(), LOCAL_WRITE_BURST_ATTEMPT_LIMIT);
+        assert!(!state.local_retry_allowed(unix_timestamp_now()));
+    }
+
+    #[tokio::test]
+    async fn burst_guard_blocks_pre_write_smoke_check() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let writer = FakeErvWriter::new(
+            vec![Ok(medium_status())],
+            vec![
+                Ok(turbo_status()),
+                Ok(turbo_status()),
+                Ok(turbo_status()),
+                Ok(turbo_status()),
+            ],
         );
+
+        for index in 0..LOCAL_WRITE_BURST_ATTEMPT_LIMIT {
+            state
+                .set_speed_after_smoke_with(
+                    &active_config(),
+                    &writer,
+                    ErvFanSpeed::Turbo,
+                    &format!("away_refresh_{index}"),
+                    Some(900),
+                )
+                .await
+                .expect("write succeeds before burst guard");
+        }
+
+        let error = state
+            .set_speed_with(
+                &active_config(),
+                &writer,
+                ErvFanSpeed::Quiet,
+                "away_refresh_suppressed",
+                Some(900),
+            )
+            .await
+            .expect_err("burst guard should fail before smoke");
+
+        assert!(error.to_string().contains("burst guard"));
+        assert_eq!(writer.smoke_calls(), 0);
+        assert_eq!(writer.write_speeds().len(), LOCAL_WRITE_BURST_ATTEMPT_LIMIT);
     }
 
     #[tokio::test]

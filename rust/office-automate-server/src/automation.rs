@@ -133,7 +133,7 @@ impl ErvPolicyCoordinator {
                 reason,
                 ..
             } => {
-                if !self.erv.local_retry_allowed(now) && reason != "safety_interlock" {
+                if !self.erv.local_retry_allowed(now) {
                     return Ok(());
                 }
                 self.apply_policy_erv_speed(
@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn safety_interlock_bypasses_local_retry_backoff() {
+    async fn safety_interlock_respects_local_retry_backoff() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let database_path = temp_dir.path().join("office_climate.db");
         db::migrate_database(&database_path).expect("migration");
@@ -813,16 +813,11 @@ mod tests {
         coordinator
             .evaluate_erv_policy(false)
             .await
-            .expect("safety interlock applies despite local retry backoff");
+            .expect("safety interlock waits for local retry backoff");
 
         assert_eq!(
             writer.writes(),
-            vec![
-                ErvFanSpeed::Turbo,
-                ErvFanSpeed::Turbo,
-                ErvFanSpeed::Turbo,
-                ErvFanSpeed::Off
-            ]
+            vec![ErvFanSpeed::Turbo, ErvFanSpeed::Turbo, ErvFanSpeed::Turbo]
         );
     }
 
