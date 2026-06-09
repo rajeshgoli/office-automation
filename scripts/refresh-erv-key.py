@@ -42,11 +42,20 @@ class AuthCacheTokenListener(SharingTokenListener):
     def __init__(self, auth_file: Path, auth_cache: dict[str, Any]):
         self.auth_file = auth_file
         self.auth_cache = auth_cache
+        self.persist_error: Exception | None = None
 
     def update_token(self, token_info: dict[str, Any]):
         self.auth_cache["token_info"] = token_info
         self.auth_cache["updated_at"] = int(time.time())
-        save_auth_cache(self.auth_file, self.auth_cache)
+        try:
+            save_auth_cache(self.auth_file, self.auth_cache)
+        except Exception as exc:  # pragma: no cover - exact SDK behavior varies
+            self.persist_error = exc
+            raise
+
+    def raise_if_persist_failed(self) -> None:
+        if self.persist_error is not None:
+            raise RefreshError(f"failed to persist refreshed Smart Life token: {self.persist_error}")
 
 
 def load_roundtrip_yaml():
@@ -388,6 +397,7 @@ def fetch_current_local_key(
     device = fetch_device_detail(manager, device_id)
     if device is None:
         device = fetch_device_from_cache(manager, device_id)
+    listener.raise_if_persist_failed()
     if device is None:
         raise RefreshError(f"device {device_id} was not returned by Smart Life")
 

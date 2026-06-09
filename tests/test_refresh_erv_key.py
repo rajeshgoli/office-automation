@@ -80,6 +80,22 @@ class FakeManager:
         )
 
 
+class SwallowingRefreshErrorManager(FakeManager):
+    def update_device_cache(self):
+        try:
+            FakeManager.latest_listener.update_token(
+                {
+                    "t": 1770000001000,
+                    "expire_time": 7200,
+                    "uid": "uid",
+                    "access_token": "new-access-token",
+                    "refresh_token": "new-refresh-token",
+                }
+            )
+        except OSError:
+            pass
+
+
 def test_update_config_preserves_comments_and_auth_refresh(tmp_path, monkeypatch):
     module = load_script_module()
     monkeypatch.setattr(module, "Manager", FakeManager)
@@ -112,6 +128,38 @@ def test_update_config_preserves_comments_and_auth_refresh(tmp_path, monkeypatch
     auth_data = json.loads(auth.read_text())
     assert auth_data["token_info"]["access_token"] == "new-access-token"
     assert auth_data["token_info"]["refresh_token"] == "new-refresh-token"
+
+
+def test_token_refresh_persistence_error_fails_fetch(tmp_path, monkeypatch):
+    module = load_script_module()
+    monkeypatch.setattr(module, "Manager", SwallowingRefreshErrorManager)
+    monkeypatch.setattr(module, "LoginControl", object)
+
+    def failing_save_auth_cache(auth_file, auth_cache):
+        raise OSError("read-only auth file")
+
+    monkeypatch.setattr(module, "save_auth_cache", failing_save_auth_cache)
+
+    config = tmp_path / "config.yaml"
+    auth = tmp_path / "auth.json"
+    write_config(config)
+    write_auth(auth)
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    rc = module.main(
+        [
+            "--config",
+            str(config),
+            "--auth-file",
+            str(auth),
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert rc == 1
+    assert "failed to persist refreshed Smart Life token" in stderr.getvalue()
 
 
 def test_custom_auth_file_parent_is_not_chmodded(tmp_path, monkeypatch):
