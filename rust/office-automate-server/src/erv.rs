@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     future::Future,
     path::PathBuf,
     pin::Pin,
@@ -24,6 +25,10 @@ const DP_EXHAUST_SPEED: &str = "102";
 const LOCAL_KEY_ERROR_THRESHOLD: u64 = 5;
 const LOCAL_FAILURE_BASE_RETRY_SECONDS: f64 = 5.0 * 60.0;
 const LOCAL_FAILURE_MAX_RETRY_SECONDS: f64 = 60.0 * 60.0;
+const LOCAL_ACTIVITY_HISTORY_LIMIT: usize = 32;
+const LOCAL_FAILURE_RCA_THRESHOLD: u64 = 3;
+const LOCAL_WRITE_BURST_WINDOW_SECONDS: f64 = 5.0 * 60.0;
+const LOCAL_WRITE_BURST_ATTEMPT_LIMIT: usize = 3;
 pub const ERV_MANUAL_OVERRIDE_SECONDS: i64 = 30 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +156,26 @@ struct ErvManualOverride {
     expires_at: f64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ErvLocalActivity {
+    at: f64,
+    timestamp: String,
+    event: &'static str,
+    target_speed: Option<ErvFanSpeed>,
+    reason: Option<String>,
+    co2_ppm: Option<i64>,
+    message: Option<String>,
+    recent_write_attempts_5m: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ErvWriteAttempt {
+    timestamp: String,
+    recent_write_attempts_5m: usize,
+    suppressed: bool,
+    recent_activity: Vec<Value>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ErvState {
     inner: Arc<RwLock<ErvInner>>,
@@ -167,6 +192,7 @@ struct ErvInner {
     manual_override: Option<ErvManualOverride>,
     consecutive_local_failures: u64,
     next_local_retry_at: Option<f64>,
+    recent_local_activity: VecDeque<ErvLocalActivity>,
 }
 
 impl ErvState {
@@ -276,13 +302,25 @@ impl ErvState {
     where
         W: ErvSpeedWriter + ?Sized,
     {
+        let attempt = self.record_write_attempt(speed, reason, co2_ppm);
+        if attempt.suppressed {
+            self.record_write_burst_suppression(speed, reason, co2_ppm, &attempt);
+            bail!(
+                "ERV automated local write suppressed by burst guard after {} attempts in {} seconds",
+                attempt.recent_write_attempts_5m,
+                LOCAL_WRITE_BURST_WINDOW_SECONDS as u64
+            );
+        }
+
         match writer.set_speed(config, speed).await {
             Ok(status) => {
                 self.record_speed_success(status.clone(), speed, reason, co2_ppm);
+                self.record_write_success(status.clone(), speed, reason, co2_ppm, &attempt);
                 Ok(status)
             }
             Err(error) => {
                 let message = format!("{error:#}");
+                self.record_write_failure(speed, reason, co2_ppm, &message);
                 self.record_local_failure(&message);
                 Err(error)
             }
@@ -447,6 +485,207 @@ impl ErvState {
         }
     }
 
+    fn record_write_attempt(
+        &self,
+        speed: ErvFanSpeed,
+        reason: &str,
+        co2_ppm: Option<i64>,
+    ) -> ErvWriteAttempt {
+        let at = unix_timestamp_now();
+        let timestamp = local_iso_now();
+        let snapshot = self.snapshot();
+        let (recent_write_attempts_5m, recent_activity) = {
+            let mut inner = self.inner.write().expect("ERV state lock poisoned");
+            let recent_write_attempts_5m =
+                recent_write_attempts_locked(&inner, at, LOCAL_WRITE_BURST_WINDOW_SECONDS) + 1;
+            push_local_activity_locked(
+                &mut inner,
+                ErvLocalActivity {
+                    at,
+                    timestamp: timestamp.clone(),
+                    event: "local_write_attempt",
+                    target_speed: Some(speed),
+                    reason: Some(reason.to_string()),
+                    co2_ppm,
+                    message: None,
+                    recent_write_attempts_5m: Some(recent_write_attempts_5m),
+                },
+            );
+            (
+                recent_write_attempts_5m,
+                recent_local_activity_json_locked(&inner),
+            )
+        };
+        let suppressed = recent_write_attempts_5m > LOCAL_WRITE_BURST_ATTEMPT_LIMIT
+            && !write_burst_guard_exempt(reason);
+
+        self.log_health_event(
+            "local_write_attempt",
+            json!({
+                "type": "erv_local_write_attempt",
+                "at": timestamp,
+                "target_speed": speed.as_str(),
+                "reason": reason,
+                "co2_ppm": co2_ppm,
+                "previous_status": runtime_snapshot_json(snapshot),
+                "recent_write_attempts_5m": recent_write_attempts_5m,
+                "burst_window_seconds": LOCAL_WRITE_BURST_WINDOW_SECONDS,
+                "burst_attempt_limit": LOCAL_WRITE_BURST_ATTEMPT_LIMIT,
+                "burst_guard_would_suppress": suppressed,
+                "recent_local_activity": recent_activity,
+            }),
+        );
+
+        ErvWriteAttempt {
+            timestamp,
+            recent_write_attempts_5m,
+            suppressed,
+            recent_activity,
+        }
+    }
+
+    fn record_write_burst_suppression(
+        &self,
+        speed: ErvFanSpeed,
+        reason: &str,
+        co2_ppm: Option<i64>,
+        attempt: &ErvWriteAttempt,
+    ) {
+        let at = unix_timestamp_now();
+        let timestamp = local_iso_now();
+        {
+            let mut inner = self.inner.write().expect("ERV state lock poisoned");
+            inner.next_local_retry_at = Some(at + LOCAL_WRITE_BURST_WINDOW_SECONDS);
+            push_local_activity_locked(
+                &mut inner,
+                ErvLocalActivity {
+                    at,
+                    timestamp: timestamp.clone(),
+                    event: "local_write_burst_suppressed",
+                    target_speed: Some(speed),
+                    reason: Some(reason.to_string()),
+                    co2_ppm,
+                    message: Some("automated write burst guard".to_string()),
+                    recent_write_attempts_5m: Some(attempt.recent_write_attempts_5m),
+                },
+            );
+        }
+
+        self.log_health_event(
+            "local_write_burst_suppressed",
+            json!({
+                "type": "erv_local_write_burst_suppressed",
+                "at": timestamp,
+                "target_speed": speed.as_str(),
+                "reason": reason,
+                "co2_ppm": co2_ppm,
+                "recent_write_attempts_5m": attempt.recent_write_attempts_5m,
+                "attempted_at": attempt.timestamp.clone(),
+                "burst_window_seconds": LOCAL_WRITE_BURST_WINDOW_SECONDS,
+                "burst_attempt_limit": LOCAL_WRITE_BURST_ATTEMPT_LIMIT,
+                "retry_after_seconds": LOCAL_WRITE_BURST_WINDOW_SECONDS,
+                "recent_local_activity": self.recent_local_activity_json(),
+            }),
+        );
+    }
+
+    fn record_write_success(
+        &self,
+        device_status: ErvDeviceStatus,
+        speed: ErvFanSpeed,
+        reason: &str,
+        co2_ppm: Option<i64>,
+        attempt: &ErvWriteAttempt,
+    ) {
+        let at = unix_timestamp_now();
+        let timestamp = local_iso_now();
+        {
+            let mut inner = self.inner.write().expect("ERV state lock poisoned");
+            push_local_activity_locked(
+                &mut inner,
+                ErvLocalActivity {
+                    at,
+                    timestamp: timestamp.clone(),
+                    event: "local_write_success",
+                    target_speed: Some(speed),
+                    reason: Some(reason.to_string()),
+                    co2_ppm,
+                    message: None,
+                    recent_write_attempts_5m: Some(attempt.recent_write_attempts_5m),
+                },
+            );
+        }
+
+        self.log_health_event(
+            "local_write_success",
+            json!({
+                "type": "erv_local_write_success",
+                "at": timestamp,
+                "target_speed": speed.as_str(),
+                "reason": reason,
+                "co2_ppm": co2_ppm,
+                "device_status": device_status_json(&device_status),
+                "recent_write_attempts_5m": attempt.recent_write_attempts_5m,
+                "attempted_at": attempt.timestamp.clone(),
+                "activity_at_attempt": attempt.recent_activity.clone(),
+                "recent_local_activity": self.recent_local_activity_json(),
+            }),
+        );
+    }
+
+    fn record_write_failure(
+        &self,
+        speed: ErvFanSpeed,
+        reason: &str,
+        co2_ppm: Option<i64>,
+        message: &str,
+    ) {
+        let at = unix_timestamp_now();
+        let timestamp = local_iso_now();
+        let sanitized_message = sanitize_erv_error(message);
+        let (recent_write_attempts_5m, recent_activity) = {
+            let mut inner = self.inner.write().expect("ERV state lock poisoned");
+            let recent_write_attempts_5m =
+                recent_write_attempts_locked(&inner, at, LOCAL_WRITE_BURST_WINDOW_SECONDS);
+            push_local_activity_locked(
+                &mut inner,
+                ErvLocalActivity {
+                    at,
+                    timestamp: timestamp.clone(),
+                    event: "local_write_failed",
+                    target_speed: Some(speed),
+                    reason: Some(reason.to_string()),
+                    co2_ppm,
+                    message: Some(sanitized_message.clone()),
+                    recent_write_attempts_5m: Some(recent_write_attempts_5m),
+                },
+            );
+            (
+                recent_write_attempts_5m,
+                recent_local_activity_json_locked(&inner),
+            )
+        };
+
+        self.log_health_event(
+            "local_write_failed",
+            json!({
+                "type": "erv_local_write_failed",
+                "at": timestamp,
+                "target_speed": speed.as_str(),
+                "reason": reason,
+                "co2_ppm": co2_ppm,
+                "error": sanitized_message,
+                "recent_write_attempts_5m": recent_write_attempts_5m,
+                "recent_local_activity": recent_activity,
+            }),
+        );
+    }
+
+    fn recent_local_activity_json(&self) -> Vec<Value> {
+        let inner = self.inner.read().expect("ERV state lock poisoned");
+        recent_local_activity_json_locked(&inner)
+    }
+
     fn record_speed_success(
         &self,
         device_status: ErvDeviceStatus,
@@ -505,6 +744,7 @@ impl ErvState {
                     "type": "erv_local_key_recovered",
                     "recovered_at": now,
                     "invalid_since": invalid_since,
+                    "recent_local_activity": self.recent_local_activity_json(),
                 }),
             );
         }
@@ -513,10 +753,13 @@ impl ErvState {
 
     fn record_local_failure(&self, message: &str) -> bool {
         let now = local_iso_now();
+        let at = unix_timestamp_now();
         let mut invalid_event = None;
+        let mut failure_streak_event = None;
         {
             let mut inner = self.inner.write().expect("ERV state lock poisoned");
-            inner.control.last_error = Some(format!("Local status failed: {message}"));
+            let sanitized_message = sanitize_erv_error(message);
+            inner.control.last_error = Some(format!("Local status failed: {sanitized_message}"));
             inner.control.last_error_at = Some(now.clone());
             inner.control.using_cloud = false;
             inner.consecutive_local_failures = inner.consecutive_local_failures.saturating_add(1);
@@ -524,29 +767,59 @@ impl ErvState {
                 unix_timestamp_now()
                     + local_failure_retry_delay_seconds(inner.consecutive_local_failures),
             );
+            let recent_write_attempts_5m =
+                recent_write_attempts_locked(&inner, at, LOCAL_WRITE_BURST_WINDOW_SECONDS);
+
+            push_local_activity_locked(
+                &mut inner,
+                ErvLocalActivity {
+                    at,
+                    timestamp: now.clone(),
+                    event: "local_failure",
+                    target_speed: None,
+                    reason: None,
+                    co2_ppm: None,
+                    message: Some(sanitized_message.clone()),
+                    recent_write_attempts_5m: Some(recent_write_attempts_5m),
+                },
+            );
 
             if !is_local_key_error(message) {
                 inner.control.consecutive_local_key_errors = 0;
-                return false;
-            }
-
-            inner.control.consecutive_local_key_errors += 1;
-            if inner.control.consecutive_local_key_errors >= LOCAL_KEY_ERROR_THRESHOLD
-                && !inner.control.local_key_invalid
-            {
-                inner.control.local_key_invalid = true;
-                inner.control.local_key_invalid_since = Some(now.clone());
-                inner.notification = Some(invalid_key_notification(&now));
-                invalid_event = Some(json!({
-                    "type": "erv_local_key_invalid",
-                    "started_at": now,
-                    "consecutive_errors": inner.control.consecutive_local_key_errors,
-                    "last_local_ok_at": inner.control.last_local_ok_at,
-                    "last_error": inner.control.last_error,
-                }));
+                if inner.consecutive_local_failures == LOCAL_FAILURE_RCA_THRESHOLD {
+                    failure_streak_event = Some(json!({
+                        "type": "erv_local_failure_streak",
+                        "at": now,
+                        "consecutive_local_failures": inner.consecutive_local_failures,
+                        "last_local_ok_at": inner.control.last_local_ok_at,
+                        "last_error": inner.control.last_error,
+                        "recent_local_activity": recent_local_activity_json_locked(&inner),
+                    }));
+                }
+            } else {
+                inner.control.consecutive_local_key_errors += 1;
+                if inner.control.consecutive_local_key_errors >= LOCAL_KEY_ERROR_THRESHOLD
+                    && !inner.control.local_key_invalid
+                {
+                    inner.control.local_key_invalid = true;
+                    inner.control.local_key_invalid_since = Some(now.clone());
+                    inner.notification = Some(invalid_key_notification(&now));
+                    invalid_event = Some(json!({
+                        "type": "erv_local_key_invalid",
+                        "started_at": now,
+                        "consecutive_errors": inner.control.consecutive_local_key_errors,
+                        "consecutive_local_failures": inner.consecutive_local_failures,
+                        "last_local_ok_at": inner.control.last_local_ok_at,
+                        "last_error": inner.control.last_error,
+                        "recent_local_activity": recent_local_activity_json_locked(&inner),
+                    }));
+                }
             }
         }
 
+        if let Some(event) = failure_streak_event {
+            self.log_health_event("local_failure_streak", event);
+        }
         if let Some(event) = invalid_event {
             self.log_health_event("local_key_invalid", event);
             return true;
@@ -582,6 +855,87 @@ impl ErvState {
 fn local_failure_retry_delay_seconds(consecutive_failures: u64) -> f64 {
     let exponent = consecutive_failures.saturating_sub(1).min(8) as i32;
     (LOCAL_FAILURE_BASE_RETRY_SECONDS * 2f64.powi(exponent)).min(LOCAL_FAILURE_MAX_RETRY_SECONDS)
+}
+
+fn write_burst_guard_exempt(reason: &str) -> bool {
+    matches!(reason, "manual_override" | "safety_interlock")
+}
+
+fn push_local_activity_locked(inner: &mut ErvInner, activity: ErvLocalActivity) {
+    while inner.recent_local_activity.len() >= LOCAL_ACTIVITY_HISTORY_LIMIT {
+        inner.recent_local_activity.pop_front();
+    }
+    inner.recent_local_activity.push_back(activity);
+}
+
+fn recent_write_attempts_locked(inner: &ErvInner, now: f64, window_seconds: f64) -> usize {
+    inner
+        .recent_local_activity
+        .iter()
+        .filter(|activity| activity.event == "local_write_attempt")
+        .filter(|activity| now - activity.at <= window_seconds)
+        .count()
+}
+
+fn recent_local_activity_json_locked(inner: &ErvInner) -> Vec<Value> {
+    inner
+        .recent_local_activity
+        .iter()
+        .map(local_activity_json)
+        .collect()
+}
+
+fn local_activity_json(activity: &ErvLocalActivity) -> Value {
+    json!({
+        "at": activity.timestamp.clone(),
+        "event": activity.event,
+        "target_speed": activity.target_speed.map(ErvFanSpeed::as_str),
+        "reason": activity.reason.as_deref(),
+        "co2_ppm": activity.co2_ppm,
+        "message": activity.message.as_deref(),
+        "recent_write_attempts_5m": activity.recent_write_attempts_5m,
+    })
+}
+
+fn runtime_snapshot_json(snapshot: ErvRuntimeSnapshot) -> Value {
+    json!({
+        "status_known": snapshot.status_known,
+        "running": snapshot.running,
+        "speed": snapshot.speed.as_str(),
+        "last_speed_changed_at": snapshot.last_speed_changed_at,
+        "local_key_invalid": snapshot.local_key_invalid,
+    })
+}
+
+fn device_status_json(status: &ErvDeviceStatus) -> Value {
+    json!({
+        "power": status.power,
+        "fan_speed": status.fan_speed.map(ErvFanSpeed::as_str),
+        "supply_speed": status.supply_speed,
+        "exhaust_speed": status.exhaust_speed,
+    })
+}
+
+fn sanitize_erv_error(message: &str) -> String {
+    const MAX_ERROR_CHARS: usize = 512;
+    let sanitized = message
+        .chars()
+        .map(|character| {
+            if character.is_control() && character != '\n' && character != '\t' {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+
+    if sanitized.chars().count() <= MAX_ERROR_CHARS {
+        return sanitized;
+    }
+
+    let mut truncated = sanitized.chars().take(MAX_ERROR_CHARS).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 pub fn start_erv_status_poll(config: &AppConfig, erv: ErvState) -> Option<JoinHandle<()>> {
@@ -1048,6 +1402,26 @@ mod tests {
             .expect("query")
             .expect("event");
         assert_eq!(latest, "local_key_invalid");
+
+        let history = db::read_history(&database_path, 1, 10).expect("history");
+        let event = history
+            .device_events
+            .iter()
+            .find(|event| event["event"] == "local_key_invalid")
+            .expect("local key invalid event");
+        let details = event["details"]
+            .as_str()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .expect("event details");
+        assert_eq!(details["consecutive_errors"], LOCAL_KEY_ERROR_THRESHOLD);
+        assert_eq!(
+            details["recent_local_activity"]
+                .as_array()
+                .expect("recent local activity")
+                .last()
+                .expect("last activity")["event"],
+            "local_failure"
+        );
     }
 
     #[tokio::test]
@@ -1213,6 +1587,24 @@ mod tests {
             "away_refresh_CO2=2100ppm"
         );
         assert_eq!(history.climate_actions[0]["co2_ppm"], 2100);
+        assert!(
+            history
+                .device_events
+                .iter()
+                .any(|event| event["event"] == "local_write_attempt")
+        );
+        let success_event = history
+            .device_events
+            .iter()
+            .find(|event| event["event"] == "local_write_success")
+            .expect("local write success event");
+        let details = success_event["details"]
+            .as_str()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .expect("event details");
+        assert_eq!(details["target_speed"], "turbo");
+        assert_eq!(details["reason"], "away_refresh_CO2=2100ppm");
+        assert_eq!(details["device_status"]["fan_speed"], "turbo");
     }
 
     #[tokio::test]
@@ -1241,6 +1633,122 @@ mod tests {
 
         let history = db::read_history(&database_path, 1, 10).expect("history");
         assert!(history.climate_actions.is_empty());
+        assert!(
+            history
+                .device_events
+                .iter()
+                .all(|event| event["event"] != "local_write_attempt")
+        );
+    }
+
+    #[tokio::test]
+    async fn automated_write_burst_guard_suppresses_fourth_policy_write() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path.clone());
+        let writer = FakeErvWriter::new(
+            Vec::new(),
+            vec![
+                Ok(turbo_status()),
+                Ok(turbo_status()),
+                Ok(turbo_status()),
+                Ok(turbo_status()),
+            ],
+        );
+
+        for index in 0..LOCAL_WRITE_BURST_ATTEMPT_LIMIT {
+            state
+                .set_speed_after_smoke_with(
+                    &active_config(),
+                    &writer,
+                    ErvFanSpeed::Turbo,
+                    &format!("away_refresh_{index}"),
+                    Some(900),
+                )
+                .await
+                .expect("write succeeds before burst guard");
+        }
+
+        let error = state
+            .set_speed_after_smoke_with(
+                &active_config(),
+                &writer,
+                ErvFanSpeed::Turbo,
+                "away_refresh_suppressed",
+                Some(900),
+            )
+            .await
+            .expect_err("fourth automated write suppressed");
+
+        assert!(error.to_string().contains("burst guard"));
+        assert_eq!(
+            writer.write_speeds(),
+            vec![ErvFanSpeed::Turbo, ErvFanSpeed::Turbo, ErvFanSpeed::Turbo]
+        );
+        assert!(!state.local_retry_allowed(unix_timestamp_now()));
+
+        let history = db::read_history(&database_path, 1, 20).expect("history");
+        let suppressed = history
+            .device_events
+            .iter()
+            .find(|event| event["event"] == "local_write_burst_suppressed")
+            .expect("burst suppression event");
+        let details = suppressed["details"]
+            .as_str()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .expect("event details");
+        assert_eq!(
+            details["recent_write_attempts_5m"],
+            (LOCAL_WRITE_BURST_ATTEMPT_LIMIT + 1) as i64
+        );
+        assert_eq!(details["target_speed"], "turbo");
+    }
+
+    #[tokio::test]
+    async fn safety_interlock_bypasses_write_burst_guard() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let writer = FakeErvWriter::new(
+            Vec::new(),
+            vec![
+                Ok(turbo_status()),
+                Ok(turbo_status()),
+                Ok(turbo_status()),
+                Ok(turbo_status()),
+            ],
+        );
+
+        for _ in 0..LOCAL_WRITE_BURST_ATTEMPT_LIMIT {
+            state
+                .set_speed_after_smoke_with(
+                    &active_config(),
+                    &writer,
+                    ErvFanSpeed::Turbo,
+                    "away_refresh",
+                    Some(900),
+                )
+                .await
+                .expect("write succeeds before burst guard");
+        }
+
+        state
+            .set_speed_after_smoke_with(
+                &active_config(),
+                &writer,
+                ErvFanSpeed::Turbo,
+                "safety_interlock",
+                Some(900),
+            )
+            .await
+            .expect("safety write bypasses burst guard");
+
+        assert_eq!(
+            writer.write_speeds().len(),
+            LOCAL_WRITE_BURST_ATTEMPT_LIMIT + 1
+        );
     }
 
     #[tokio::test]

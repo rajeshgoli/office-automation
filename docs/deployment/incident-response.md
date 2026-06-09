@@ -91,6 +91,15 @@ Run non-mutating smoke checks:
 ./oa smoke presence
 ```
 
+If ERV local control is failing or the local key appears to have rotated, capture the recent ERV RCA timeline before refreshing the key:
+
+```bash
+sqlite3 data/office_climate.db \
+  "SELECT timestamp,event,details FROM device_events WHERE device_type='erv' AND event IN ('local_write_attempt','local_write_success','local_write_failed','local_write_burst_suppressed','local_failure_streak','local_key_invalid','local_key_recovered') ORDER BY timestamp DESC LIMIT 50;"
+```
+
+The ERV local-key-invalid event includes the recent local command/failure activity window. Keep the raw output local because it may contain operational timing and error details.
+
 If the controller itself is suspected compromised, leave the tunnel down and stop the controller only after deciding whether additional local evidence is needed:
 
 ```bash
