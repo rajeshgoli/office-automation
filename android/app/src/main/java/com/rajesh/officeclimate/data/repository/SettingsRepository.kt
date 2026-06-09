@@ -10,8 +10,11 @@ import androidx.datastore.preferences.preferencesDataStore
 import com.rajesh.officeclimate.util.Defaults
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import java.io.ByteArrayInputStream
 import java.net.URI
 import java.security.KeyStore
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
 
@@ -155,8 +158,19 @@ class SettingsRepository(private val context: Context) {
     private fun hasValidDeviceCredential(prefs: Preferences): Boolean {
         val alias = prefs[Keys.DEVICE_CERTIFICATE_ALIAS]?.trim().orEmpty()
         val certificateChain = prefs[Keys.DEVICE_CERTIFICATE_CHAIN_PEM]?.trim().orEmpty()
-        return alias.isNotBlank() && certificateChain.isNotBlank() && hasDevicePrivateKey(alias)
+        return alias.isNotBlank() &&
+            certificateChain.isNotBlank() &&
+            hasDevicePrivateKey(alias) &&
+            hasRsaDeviceCertificate(certificateChain)
     }
+
+    private fun hasRsaDeviceCertificate(certificateChainPem: String): Boolean =
+        runCatching {
+            val certificates = CertificateFactory.getInstance("X.509")
+                .generateCertificates(ByteArrayInputStream(certificateChainPem.toByteArray()))
+                .filterIsInstance<X509Certificate>()
+            certificates.firstOrNull()?.publicKey?.algorithm.equals("RSA", ignoreCase = true)
+        }.getOrDefault(false)
 
     private fun hasDevicePrivateKey(alias: String): Boolean =
         runCatching {

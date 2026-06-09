@@ -23,7 +23,6 @@ import java.net.URI
 import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.KeyStore
-import java.security.spec.ECGenParameterSpec
 import java.util.UUID
 
 @Serializable
@@ -116,13 +115,25 @@ class DeviceEnrollmentRepository(
 
     private fun generateKeyPair(alias: String): KeyPair {
         val keyPairGenerator = KeyPairGenerator.getInstance(
-            KeyProperties.KEY_ALGORITHM_EC,
+            KeyProperties.KEY_ALGORITHM_RSA,
             ANDROID_KEYSTORE,
         )
         keyPairGenerator.initialize(
-            KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
-                .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
-                .setDigests(KeyProperties.DIGEST_SHA256)
+            KeyGenParameterSpec.Builder(
+                alias,
+                KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_DECRYPT,
+            )
+                .setKeySize(2048)
+                .setDigests(
+                    KeyProperties.DIGEST_SHA256,
+                    KeyProperties.DIGEST_SHA384,
+                    KeyProperties.DIGEST_SHA512,
+                )
+                .setSignaturePaddings(
+                    KeyProperties.SIGNATURE_PADDING_RSA_PKCS1,
+                    KeyProperties.SIGNATURE_PADDING_RSA_PSS,
+                )
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_PKCS1)
                 .setUserAuthenticationRequired(false)
                 .build(),
         )
@@ -132,7 +143,7 @@ class DeviceEnrollmentRepository(
     private fun buildCsrPem(keyPair: KeyPair, deviceName: String): String {
         val subject = X500Name("CN=${deviceName.ifBlank { "Office Automate Device" }}")
         val builder = JcaPKCS10CertificationRequestBuilder(subject, keyPair.public)
-        val signer = JcaContentSignerBuilder("SHA256withECDSA").build(keyPair.private)
+        val signer = JcaContentSignerBuilder("SHA256withRSA").build(keyPair.private)
         val csr: PKCS10CertificationRequest = builder.build(signer)
         val writer = StringWriter()
         JcaPEMWriter(writer).use { pemWriter ->
