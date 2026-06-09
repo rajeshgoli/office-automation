@@ -544,11 +544,11 @@ def main(
             device_id,
         )
 
-        if current_key == configured_key:
-            print("no rotation needed", file=stdout)
-            return 0
-
         if args.update_config:
+            if current_key == configured_key:
+                print("no rotation needed", file=stdout)
+                return 0
+
             update_config_local_key(args.config, current_key)
             suffix = f" for {device_name}" if device_name else ""
             print(f"updated {args.config}: erv.local_key refreshed{suffix}", file=stdout)

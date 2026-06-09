@@ -150,6 +150,35 @@ def test_same_key_reports_no_rotation_and_does_not_restart(tmp_path, monkeypatch
     assert config.read_text() == before
 
 
+def test_same_key_print_mode_still_outputs_key(tmp_path, monkeypatch):
+    module = load_script_module()
+    monkeypatch.setattr(module, "Manager", FakeManager)
+    monkeypatch.setattr(module, "LoginControl", object)
+
+    config = tmp_path / "config.yaml"
+    auth = tmp_path / "auth.json"
+    write_config(config, local_key="new-local-key")
+    write_auth(auth)
+    before = config.read_text()
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    rc = module.main(
+        [
+            "--config",
+            str(config),
+            "--auth-file",
+            str(auth),
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert rc == 0
+    assert stdout.getvalue().strip() == "new-local-key"
+    assert config.read_text() == before
+
+
 def test_print_mode_outputs_key_without_updating_config(tmp_path, monkeypatch):
     module = load_script_module()
     monkeypatch.setattr(module, "Manager", FakeManager)
