@@ -2271,7 +2271,8 @@ async fn latest_app_artifact(State(state): State<AppState>, Path(app): Path<Stri
         .expect("valid redirect response");
     response
         .headers_mut()
-        .insert(header::CACHE_CONTROL, "no-cache".parse().expect("header"));
+        .insert(header::CACHE_CONTROL, no_store_header_value());
+    apply_no_store_headers(&mut response);
     response
 }
 
@@ -2298,7 +2299,11 @@ async fn hashed_app_artifact(
 
 async fn app_artifact_meta(State(state): State<AppState>, Path(app): Path<String>) -> Response {
     match state.artifacts.read_metadata(&app).await {
-        Ok(Some(metadata)) => Json(metadata).into_response(),
+        Ok(Some(metadata)) => {
+            let mut response = Json(metadata).into_response();
+            apply_no_store_headers(&mut response);
+            response
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
             tracing::error!("artifact metadata read failed: {error:#}");
@@ -2316,6 +2321,25 @@ async fn legacy_apk(State(state): State<AppState>) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+fn no_store_header_value() -> HeaderValue {
+    HeaderValue::from_static("no-store, max-age=0")
+}
+
+fn apply_no_store_headers(response: &mut Response) {
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, no_store_header_value());
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
+    headers.insert(
+        HeaderName::from_static("cdn-cache-control"),
+        HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        HeaderName::from_static("cloudflare-cdn-cache-control"),
+        HeaderValue::from_static("no-store"),
+    );
 }
 
 async fn auth_login(
@@ -3193,6 +3217,20 @@ mod tests {
         body.extend_from_slice(bytes);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         body
+    }
+
+    fn assert_no_store_headers(headers: &HeaderMap) {
+        assert_eq!(
+            headers.get(header::CACHE_CONTROL).unwrap(),
+            "no-store, max-age=0"
+        );
+        assert_eq!(headers.get(header::PRAGMA).unwrap(), "no-cache");
+        assert_eq!(headers.get(header::EXPIRES).unwrap(), "0");
+        assert_eq!(headers.get("cdn-cache-control").unwrap(), "no-store");
+        assert_eq!(
+            headers.get("cloudflare-cdn-cache-control").unwrap(),
+            "no-store"
+        );
     }
 
     #[tokio::test]
@@ -6280,6 +6318,7 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+        assert_no_store_headers(response.headers());
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read body");
@@ -6291,6 +6330,23 @@ mod tests {
         assert_eq!(metadata["uploaded_by"], "engineer@rajeshgo.li");
         assert_eq!(metadata["version_code"], 7);
         assert_eq!(metadata["version_name"], "1.2.0");
+
+        let response = app(config.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/apps/office-climate/latest.apk")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_no_store_headers(response.headers());
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            &format!("/apps/office-climate/{artifact_hash}.apk")
+        );
 
         let response = app(config)
             .oneshot(
