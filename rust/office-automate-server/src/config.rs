@@ -276,6 +276,7 @@ pub struct ErvConfig {
     pub status_timeout_seconds: u64,
     pub verify_delay_seconds: u64,
     pub poll_interval_seconds: u64,
+    pub idle_poll_interval_seconds: u64,
 }
 
 impl ErvConfig {
@@ -300,6 +301,7 @@ impl Default for ErvConfig {
             status_timeout_seconds: 5,
             verify_delay_seconds: 1,
             poll_interval_seconds: 60,
+            idle_poll_interval_seconds: 300,
         }
     }
 }
@@ -527,6 +529,18 @@ impl AppConfig {
         if let Some(enabled) = env_lookup("OFFICE_AUTOMATE_ERV_ACTIVE_CONTROL_ENABLED") {
             file_config.erv.active_control_enabled =
                 parse_bool_env("OFFICE_AUTOMATE_ERV_ACTIVE_CONTROL_ENABLED", &enabled)?;
+        }
+
+        if let Some(seconds) = env_lookup("OFFICE_AUTOMATE_ERV_POLL_INTERVAL_SECONDS") {
+            file_config.erv.poll_interval_seconds = seconds.parse().with_context(|| {
+                format!("invalid OFFICE_AUTOMATE_ERV_POLL_INTERVAL_SECONDS value {seconds:?}")
+            })?;
+        }
+
+        if let Some(seconds) = env_lookup("OFFICE_AUTOMATE_ERV_IDLE_POLL_INTERVAL_SECONDS") {
+            file_config.erv.idle_poll_interval_seconds = seconds.parse().with_context(|| {
+                format!("invalid OFFICE_AUTOMATE_ERV_IDLE_POLL_INTERVAL_SECONDS value {seconds:?}")
+            })?;
         }
 
         if let Some(enabled) = env_lookup("OFFICE_AUTOMATE_PRESENCE_ENABLED") {
@@ -911,6 +925,8 @@ thresholds:
         assert!(config.erv.active_control_enabled);
         assert_eq!(config.erv.version, "3.4");
         assert_eq!(config.erv.port, 6668);
+        assert_eq!(config.erv.poll_interval_seconds, 60);
+        assert_eq!(config.erv.idle_poll_interval_seconds, 300);
         assert!(config.erv.is_configured());
         assert_eq!(config.runtime.mqtt_host, "rust-broker");
         assert_eq!(config.runtime.mqtt_port, 2883);

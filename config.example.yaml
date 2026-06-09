@@ -39,6 +39,8 @@ erv:
   device_id: "your_tuya_device_id"
   local_key: "your_tuya_local_key"
   ip: "192.168.1.xxx"
+  poll_interval_seconds: 60       # Poll while ERV state is unknown/running
+  idle_poll_interval_seconds: 300  # Back off status polling when ERV is known off
 
 # Option 2: Shelly relay (if using relay instead of Tuya)
 # erv:
