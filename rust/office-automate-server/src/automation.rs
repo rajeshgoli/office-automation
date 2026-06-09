@@ -133,7 +133,7 @@ impl ErvPolicyCoordinator {
                 reason,
                 ..
             } => {
-                if !self.erv.local_retry_allowed(now) {
+                if !self.erv.local_retry_allowed(now) && reason != "safety_interlock" {
                     return Ok(());
                 }
                 self.apply_policy_erv_speed(
@@ -570,14 +570,15 @@ mod tests {
         let database_path = temp_dir.path().join("office_climate.db");
         db::migrate_database(&database_path).expect("migration");
         let config = test_config(database_path.clone());
+        let now = unix_timestamp_now();
         let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
             &config.thresholds,
-            1_000.0,
+            now - 2.0,
         )));
         {
             let mut machine = state_machine.write().expect("state machine lock poisoned");
-            machine.set_manual_presence(true, 1_001.0);
-            machine.update_door(true, 1_002.0);
+            machine.set_manual_presence(true, now - 1.0);
+            machine.update_door(true, now - 0.5);
         }
         let qingping = QingpingState::default();
         qingping.apply_reading(qingping_reading(700));
@@ -753,6 +754,76 @@ mod tests {
             .expect("second policy evaluation respects backoff");
         assert_eq!(writer.smoke_calls(), 1);
         assert!(writer.writes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn safety_interlock_bypasses_local_retry_backoff() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let config = test_config(database_path.clone());
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            1_000.0,
+        )));
+        {
+            let mut machine = state_machine.write().expect("state machine lock poisoned");
+            machine.set_manual_presence(true, 1_001.0);
+            machine.update_door(true, 1_002.0);
+        }
+        let qingping = QingpingState::default();
+        qingping.apply_reading(qingping_reading(700));
+        let erv = ErvState::new(database_path);
+        let writer = Arc::new(FakeErvWriter::new(vec![Ok(erv_status(ErvFanSpeed::Turbo))]));
+
+        for index in 0..3 {
+            erv.set_speed_after_smoke_with(
+                &config.erv,
+                writer.as_ref(),
+                ErvFanSpeed::Turbo,
+                &format!("away_refresh_{index}"),
+                Some(900),
+            )
+            .await
+            .expect("write succeeds before burst guard");
+        }
+        erv.set_speed_after_smoke_with(
+            &config.erv,
+            writer.as_ref(),
+            ErvFanSpeed::Turbo,
+            "away_refresh_suppressed",
+            Some(900),
+        )
+        .await
+        .expect_err("fourth automated write is suppressed");
+        assert!(!erv.local_retry_allowed(unix_timestamp_now()));
+
+        let policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
+        let (status_broadcast, _) = broadcast::channel(4);
+        let coordinator = ErvPolicyCoordinator::new(
+            config,
+            state_machine,
+            qingping,
+            erv,
+            policy,
+            writer.clone(),
+            status_broadcast,
+        );
+
+        coordinator
+            .evaluate_erv_policy(false)
+            .await
+            .expect("safety interlock applies despite local retry backoff");
+
+        assert_eq!(
+            writer.writes(),
+            vec![
+                ErvFanSpeed::Turbo,
+                ErvFanSpeed::Turbo,
+                ErvFanSpeed::Turbo,
+                ErvFanSpeed::Off
+            ]
+        );
     }
 
     #[tokio::test]
