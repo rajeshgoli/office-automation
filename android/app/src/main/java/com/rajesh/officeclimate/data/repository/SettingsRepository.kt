@@ -53,7 +53,7 @@ class SettingsRepository(private val context: Context) {
     }
 
     val isAuthenticated: Flow<Boolean> = context.dataStore.data.map { prefs ->
-        hasValidDeviceCredential(prefs) && !prefs[Keys.JWT_TOKEN].isNullOrBlank()
+        hasValidDeviceCredential(prefs)
     }
 
     val dismissedUpdateArtifactHash: Flow<String?> = context.dataStore.data.map { prefs ->

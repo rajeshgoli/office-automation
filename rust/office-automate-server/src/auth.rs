@@ -570,7 +570,10 @@ impl AuthManager {
         let Some(id_token) = token_response.id_token.as_deref() else {
             return Ok(None);
         };
-        let Some(email) = self.verify_google_id_token(oauth, id_token).await? else {
+        let Some(email) = self
+            .verify_google_id_token(oauth, id_token, &oauth.client_id)
+            .await?
+        else {
             return Ok(None);
         };
         let jwt = self.generate_jwt(&email)?;
@@ -667,7 +670,10 @@ impl AuthManager {
             let Some(id_token) = body.get("id_token").and_then(Value::as_str) else {
                 return Ok(json!({"status": "error", "message": "Missing id_token"}));
             };
-            let Some(email) = self.verify_google_id_token(oauth, id_token).await? else {
+            let Some(email) = self
+                .verify_google_id_token(oauth, id_token, &oauth.client_id)
+                .await?
+            else {
                 return Ok(json!({"status": "forbidden", "message": "Email not allowed"}));
             };
             let jwt = self.generate_jwt(&email)?;
@@ -689,13 +695,14 @@ impl AuthManager {
             return Ok(json!({"status": "pending", "message": "User has not authorized yet"}));
         }
 
-        if status == StatusCode::BAD_REQUEST {
+        if status == StatusCode::BAD_REQUEST || status == StatusCode::FORBIDDEN {
             let error = body.get("error").and_then(Value::as_str).unwrap_or("error");
             return Ok(match error {
                 "authorization_pending" => {
                     json!({"status": "pending", "message": "Waiting for user authorization"})
                 }
                 "slow_down" => json!({"status": "slow_down", "message": "Polling too fast"}),
+                "access_denied" => json!({"status": "forbidden", "message": "Access denied"}),
                 _ => json!({"status": "error", "message": error}),
             });
         }
@@ -707,6 +714,7 @@ impl AuthManager {
         &self,
         oauth: &OAuthRuntime,
         id_token: &str,
+        expected_audience: &str,
     ) -> Result<Option<String>> {
         let info: GoogleTokenInfo = self
             .inner
@@ -722,7 +730,7 @@ impl AuthManager {
             .await
             .context("Google tokeninfo response was not JSON")?;
 
-        if info.aud.as_deref() != Some(oauth.client_id.as_str()) {
+        if info.aud.as_deref() != Some(expected_audience) {
             return Ok(None);
         }
 

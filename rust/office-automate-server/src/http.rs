@@ -640,8 +640,20 @@ async fn auth_middleware(
         return next.run(request).await;
     }
 
-    match cloudflare_access_service_auth(&state, &headers, remote_addr).await {
-        CloudflareAccessServiceAuth::DeviceAllowed => {}
+    let cloudflare_service_auth =
+        cloudflare_access_service_auth(&state, &headers, remote_addr).await;
+    let route_class = route_authorization_class(request.method(), request.uri().path());
+
+    match cloudflare_service_auth {
+        CloudflareAccessServiceAuth::DeviceAllowed(identity)
+            if route_class != RouteAuthorizationClass::AdminUpload =>
+        {
+            request.extensions_mut().insert(AuthenticatedUser {
+                email: format!("cloudflare_mtls:{identity}"),
+            });
+            return next.run(request).await;
+        }
+        CloudflareAccessServiceAuth::DeviceAllowed(_) => {}
         CloudflareAccessServiceAuth::Rejected => {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -651,8 +663,6 @@ async fn auth_middleware(
         }
         CloudflareAccessServiceAuth::AbsentOrUserAccess => {}
     }
-
-    let route_class = route_authorization_class(request.method(), request.uri().path());
 
     if should_skip_auth(route_class, auth_mode) {
         return next.run(request).await;
@@ -842,7 +852,7 @@ fn forwarded_for_ip(headers: &HeaderMap) -> Option<IpAddr> {
 }
 
 enum CloudflareAccessServiceAuth {
-    DeviceAllowed,
+    DeviceAllowed(String),
     Rejected,
     AbsentOrUserAccess,
 }
@@ -886,7 +896,7 @@ async fn cloudflare_access_service_auth(
             return CloudflareAccessServiceAuth::Rejected;
         }
     };
-    CloudflareAccessServiceAuth::DeviceAllowed
+    CloudflareAccessServiceAuth::DeviceAllowed(identity)
 }
 
 async fn status(State(state): State<AppState>) -> Json<Status> {

@@ -116,14 +116,7 @@ class ClimateRepository(
                     _apiConnected.value = true
                     _error.value = null
                 } catch (e: HttpException) {
-                    if (e.code() == 401) {
-                        Log.w(TAG, "Auth expired (401), clearing token")
-                        settingsRepository.clearAuth()
-                        _authExpired.value = true
-                        stop()
-                        return@launch
-                    }
-                    if (e.code() == 302 || e.code() == 403) {
+                    if (e.code() == 302 || e.code() == 401 || e.code() == 403) {
                         Log.w(TAG, "Cloudflare Access blocked request (${e.code()})")
                         _apiConnected.value = false
                         _error.value = "Cloudflare Access blocked this device. Enroll it with oa register-device."
