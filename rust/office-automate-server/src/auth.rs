@@ -72,6 +72,7 @@ pub struct PendingOAuthState {
     pub code_verifier: String,
     pub redirect_uri: String,
     pub platform: Option<String>,
+    pub return_to: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -478,6 +479,7 @@ impl AuthManager {
         host: &str,
         forwarded_proto: Option<&str>,
         platform: Option<String>,
+        return_to: Option<String>,
     ) -> Result<Value> {
         let oauth = self
             .inner
@@ -501,6 +503,7 @@ impl AuthManager {
                     code_verifier,
                     redirect_uri: redirect_uri.clone(),
                     platform,
+                    return_to,
                 },
             );
 
@@ -582,6 +585,7 @@ impl AuthManager {
             email,
             jwt,
             platform: pending.platform,
+            return_to: pending.return_to,
             secure_cookie: pending.redirect_uri.starts_with("https://"),
             refresh_token: token_response.refresh_token,
             access_token: token_response.access_token,
@@ -747,6 +751,7 @@ pub struct FinishedOAuthLogin {
     pub email: String,
     pub jwt: String,
     pub platform: Option<String>,
+    pub return_to: Option<String>,
     pub secure_cookie: bool,
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
@@ -927,6 +932,7 @@ mod tests {
                 "office.example.com",
                 Some("https"),
                 Some("android".to_string()),
+                Some("/apps/office-climate/latest.apk".to_string()),
             )
             .expect("login");
         let url = payload["authorization_url"].as_str().expect("url");
@@ -936,6 +942,10 @@ mod tests {
         assert_eq!(
             manager.pending_state(state).expect("stored").platform,
             Some("android".to_string())
+        );
+        assert_eq!(
+            manager.pending_state(state).expect("stored").return_to,
+            Some("/apps/office-climate/latest.apk".to_string())
         );
     }
 

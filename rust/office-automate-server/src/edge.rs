@@ -370,6 +370,9 @@ async fn edge_auth_middleware(
         } else {
             "Invalid or expired token"
         };
+        if should_redirect_browser_to_oauth_login(request.method(), &headers) {
+            return browser_oauth_login_redirect(request.uri()).into_response();
+        }
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": message, "login_url": "/auth/login"})),
@@ -402,6 +405,42 @@ async fn edge_auth_middleware(
 
     request.extensions_mut().insert(user);
     next.run(request).await
+}
+
+fn should_redirect_browser_to_oauth_login(method: &Method, headers: &HeaderMap) -> bool {
+    if *method != Method::GET && *method != Method::HEAD {
+        return false;
+    }
+    if headers.contains_key(header::AUTHORIZATION) {
+        return false;
+    }
+    let sec_fetch_mode = headers
+        .get("sec-fetch-mode")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if sec_fetch_mode.eq_ignore_ascii_case("navigate") {
+        return true;
+    }
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| accept.contains("text/html"))
+}
+
+fn browser_oauth_login_redirect(uri: &Uri) -> Response {
+    let return_to = uri
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or("/");
+    let location = format!(
+        "/auth/login?redirect=1&return_to={}",
+        urlencoding::encode(return_to)
+    );
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, location)
+        .body(Body::empty())
+        .expect("valid OAuth login redirect")
 }
 
 async fn forward_get(State(state): State<EdgeState>, OriginalUri(uri): OriginalUri) -> Response {
@@ -865,11 +904,35 @@ async fn auth_login(
         .get("platform")
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty());
+    let return_to = query
+        .get("return_to")
+        .and_then(|value| sanitize_oauth_return_to(value));
+    let redirect_to_provider = query
+        .get("redirect")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
     let forwarded_proto = headers
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok());
 
-    match state.auth.begin_login(host, forwarded_proto, platform) {
+    match state
+        .auth
+        .begin_login(host, forwarded_proto, platform, return_to)
+    {
+        Ok(payload) if redirect_to_provider => {
+            let Some(authorization_url) = payload.get("authorization_url").and_then(Value::as_str)
+            else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "Failed to start OAuth"})),
+                )
+                    .into_response();
+            };
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header(header::LOCATION, authorization_url)
+                .body(Body::empty())
+                .expect("valid OAuth provider redirect")
+        }
         Ok(payload) => Json(payload).into_response(),
         Err(error) => {
             tracing::error!("failed to start OAuth login: {error:#}");
@@ -914,7 +977,12 @@ async fn auth_callback(
             )
             .body(Body::empty())
             .expect("valid android redirect response"),
-        Ok(Some(login)) => browser_login_response(&state.auth, &login.jwt, login.secure_cookie),
+        Ok(Some(login)) => browser_login_response(
+            &state.auth,
+            &login.jwt,
+            login.secure_cookie,
+            login.return_to.as_deref().unwrap_or("/"),
+        ),
         Ok(None) => (
             StatusCode::FORBIDDEN,
             Html("<html><body><h1>Login Failed</h1><p>Email not authorized</p></body></html>"),
@@ -1044,10 +1112,27 @@ fn escape_html_text(value: &str) -> String {
         .collect()
 }
 
-fn browser_login_response(auth: &AuthManager, token: &str, secure_cookie: bool) -> Response {
+fn sanitize_oauth_return_to(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || !value.starts_with('/')
+        || value.starts_with("//")
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn browser_login_response(
+    auth: &AuthManager,
+    token: &str,
+    secure_cookie: bool,
+    return_to: &str,
+) -> Response {
     let mut response = Response::builder()
         .status(StatusCode::FOUND)
-        .header(header::LOCATION, "/")
+        .header(header::LOCATION, return_to)
         .body(Body::empty())
         .expect("valid browser login response");
     if let Some(cookies) = auth.issue_oauth_session_cookies(token, secure_cookie) {
