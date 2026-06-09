@@ -224,7 +224,7 @@ Local keys can contain shell-special characters (`$`, `}`, `>`, `^`, etc.). YAML
 Deploy + restart:
 ```sh
 scp config.yaml USER@SERVER_IP:/path/to/office-automate/config.yaml
-ssh USER@SERVER_IP 'U=$(id -u); launchctl kickstart -k gui/$U/com.office-automate.orchestrator'
+ssh USER@SERVER_IP 'U=$(id -u); launchctl kickstart -k gui/$U/com.office-automate.server'
 ssh USER@SERVER_IP 'tail -n 50 /tmp/office-automate.error.log'
 ```
 

@@ -28,7 +28,7 @@ CLIENT_ID = "HA_3y9q4ak7g4ephrvke"
 SCHEMA = "haauthorize"
 DEFAULT_AUTH_FILE = Path.home() / ".office-automate" / "tuya-sharing-auth.json"
 DEFAULT_CONFIG_FILE = Path("config.yaml")
-SERVICE_LABEL = "com.office-automate.orchestrator"
+SERVICE_LABEL = "com.office-automate.server"
 
 
 class RefreshError(Exception):

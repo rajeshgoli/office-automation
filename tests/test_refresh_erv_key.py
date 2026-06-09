@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -183,3 +184,30 @@ def test_qr_payload_wraps_home_assistant_qrcode_token():
         module.extract_qr_payload(result, "qr-token-value")
         == "tuyaSmart--qrLogin?token=qr-token-value"
     )
+
+
+def test_restart_uses_current_launchd_server_label(monkeypatch):
+    module = load_script_module()
+    calls = []
+
+    monkeypatch.setattr(module.os, "getuid", lambda: 501)
+
+    def fake_run(command, check):
+        calls.append((command, check))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    module.restart_orchestrator()
+
+    assert calls == [
+        (
+            [
+                "launchctl",
+                "kickstart",
+                "-k",
+                "gui/501/com.office-automate.server",
+            ],
+            True,
+        )
+    ]
