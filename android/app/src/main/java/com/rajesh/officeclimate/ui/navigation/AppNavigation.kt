@@ -21,6 +21,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -66,7 +69,15 @@ fun AppNavigation(authCallbackCount: Int = 0) {
     val navController = rememberNavController()
     val context = LocalContext.current
     val settingsRepo = SettingsRepository(context)
+    var cleanupComplete by remember { mutableStateOf(false) }
     val isAuthenticated by settingsRepo.isAuthenticated.collectAsState(initial = null)
+
+    LaunchedEffect(Unit) {
+        settingsRepo.clearLegacyAuthAndInvalidDeviceCredentialIfNeeded()
+        cleanupComplete = true
+    }
+
+    if (!cleanupComplete) return
 
     val startDestination = when (isAuthenticated) {
         true -> Routes.DASHBOARD

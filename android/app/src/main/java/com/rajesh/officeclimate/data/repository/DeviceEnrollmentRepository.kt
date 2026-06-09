@@ -1,7 +1,6 @@
 package com.rajesh.officeclimate.data.repository
 
-import android.security.keystore.KeyGenParameterSpec
-import android.security.keystore.KeyProperties
+import android.util.Base64
 import com.rajesh.officeclimate.data.remote.HttpClientFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -98,7 +97,7 @@ class DeviceEnrollmentRepository(
                 val payload = json.decodeFromString(DeviceEnrollmentResponse.serializer(), body)
                 settingsRepository.saveDeviceCertificateChainPem(payload.certificateChainPem)
                 settingsRepository.saveDeviceCertificateAlias(alias)
-                settingsRepository.clearDevicePrivateKeyPkcs8()
+                settingsRepository.saveDevicePrivateKeyPkcs8(privateKeyPkcs8(keyPair.private))
                 return@withContext DeviceEnrollmentResult(
                     alias = alias,
                     deviceId = payload.deviceId,
@@ -113,30 +112,9 @@ class DeviceEnrollmentRepository(
         }
     }
 
-    private fun generateKeyPair(alias: String): KeyPair {
-        val keyPairGenerator = KeyPairGenerator.getInstance(
-            KeyProperties.KEY_ALGORITHM_RSA,
-            ANDROID_KEYSTORE,
-        )
-        keyPairGenerator.initialize(
-            KeyGenParameterSpec.Builder(
-                alias,
-                KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_DECRYPT,
-            )
-                .setKeySize(2048)
-                .setDigests(
-                    KeyProperties.DIGEST_SHA256,
-                    KeyProperties.DIGEST_SHA384,
-                    KeyProperties.DIGEST_SHA512,
-                )
-                .setSignaturePaddings(
-                    KeyProperties.SIGNATURE_PADDING_RSA_PKCS1,
-                    KeyProperties.SIGNATURE_PADDING_RSA_PSS,
-                )
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_PKCS1)
-                .setUserAuthenticationRequired(false)
-                .build(),
-        )
+    private fun generateKeyPair(@Suppress("UNUSED_PARAMETER") alias: String): KeyPair {
+        val keyPairGenerator = KeyPairGenerator.getInstance("RSA")
+        keyPairGenerator.initialize(2048)
         return keyPairGenerator.generateKeyPair()
     }
 
@@ -172,6 +150,9 @@ class DeviceEnrollmentRepository(
             KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }.deleteEntry(alias)
         }
     }
+
+    private fun privateKeyPkcs8(privateKey: java.security.PrivateKey): String =
+        Base64.encodeToString(privateKey.encoded, Base64.NO_WRAP)
 
     private fun validatePairingUrl(pairingUrl: String) {
         val uri = runCatching { URI(pairingUrl.trim()) }.getOrNull()
