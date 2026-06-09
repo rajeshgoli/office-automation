@@ -57,12 +57,21 @@ class HttpClientFactory(
 
         val alias = settingsRepository.deviceCertificateAlias.first().trim()
         val certificateChainPem = settingsRepository.deviceCertificateChainPem.first().trim()
-        val privateKeyPkcs8 = settingsRepository.devicePrivateKeyPkcs8()
-        if (alias.isNotBlank() && certificateChainPem.isNotBlank() && privateKeyPkcs8.isNotBlank()) {
-            runCatching { loadClientCertificate(alias, certificateChainPem, privateKeyPkcs8) }
+        if (alias.isNotBlank() && certificateChainPem.isNotBlank()) {
+            val legacyPrivateKeyPkcs8 = settingsRepository.devicePrivateKeyPkcs8()
+            runCatching {
+                loadClientCertificate(
+                    alias = alias,
+                    certificateChainPem = certificateChainPem,
+                    legacyPrivateKeyPkcs8 = legacyPrivateKeyPkcs8,
+                )
+            }
                 .onSuccess { sslConfig ->
                     sslConfig?.let { (sslSocketFactory, trustManager) ->
                         builder.sslSocketFactory(sslSocketFactory, trustManager)
+                        if (legacyPrivateKeyPkcs8.isNotBlank()) {
+                            settingsRepository.clearDevicePrivateKeyPkcs8()
+                        }
                     }
                 }
                 .onFailure { error ->
@@ -76,13 +85,16 @@ class HttpClientFactory(
     private fun loadClientCertificate(
         alias: String,
         certificateChainPem: String,
-        privateKeyPkcs8: String,
+        legacyPrivateKeyPkcs8: String,
     ): Pair<SSLSocketFactory, X509TrustManager>? {
         val certificateChain = decodeCertificates(certificateChainPem)
         if (certificateChain.isEmpty()) {
             return null
         }
-        val privateKey = decodePrivateKey(privateKeyPkcs8) ?: return null
+        val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        val privateKey = loadPrivateKeyFromStore(keyStore, alias)
+            ?: importLegacyPrivateKey(keyStore, alias, certificateChain, legacyPrivateKeyPkcs8)
+            ?: return null
 
         val keyManager = SingleAliasKeyManager(
             alias = alias,
@@ -121,8 +133,32 @@ class HttpClientFactory(
             KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(keyBytes))
         }.getOrNull()
 
+    private fun loadPrivateKeyFromStore(keyStore: KeyStore, alias: String): PrivateKey? =
+        runCatching { keyStore.getKey(alias, null) as? PrivateKey }.getOrNull()
+
+    private fun importLegacyPrivateKey(
+        keyStore: KeyStore,
+        alias: String,
+        certificateChain: List<X509Certificate>,
+        privateKeyPkcs8: String,
+    ): PrivateKey? {
+        if (privateKeyPkcs8.isBlank()) {
+            return null
+        }
+        val privateKey = decodePrivateKey(privateKeyPkcs8) ?: return null
+        return runCatching {
+            keyStore.setEntry(
+                alias,
+                KeyStore.PrivateKeyEntry(privateKey, certificateChain.toTypedArray()),
+                null,
+            )
+            loadPrivateKeyFromStore(keyStore, alias)
+        }.getOrNull()
+    }
+
     private companion object {
         const val TAG = "HttpClientFactory"
+        const val ANDROID_KEYSTORE = "AndroidKeyStore"
     }
 
     private class SingleAliasKeyManager(

@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.first
 import java.io.ByteArrayInputStream
 import java.net.URI
+import java.security.KeyStore
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 
@@ -170,8 +171,8 @@ class SettingsRepository(private val context: Context) {
         val privateKeyPkcs8 = prefs[Keys.DEVICE_PRIVATE_KEY_PKCS8]?.trim().orEmpty()
         return alias.isNotBlank() &&
             certificateChain.isNotBlank() &&
-            privateKeyPkcs8.isNotBlank() &&
-            hasRsaDeviceCertificate(certificateChain)
+            hasRsaDeviceCertificate(certificateChain) &&
+            (deviceKeyExists(alias) || privateKeyPkcs8.isNotBlank())
     }
 
     private fun hasRsaDeviceCertificate(certificateChainPem: String): Boolean =
@@ -182,4 +183,13 @@ class SettingsRepository(private val context: Context) {
             certificates.firstOrNull()?.publicKey?.algorithm.equals("RSA", ignoreCase = true)
         }.getOrDefault(false)
 
+    private fun deviceKeyExists(alias: String): Boolean =
+        runCatching {
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            keyStore.getKey(alias, null) != null
+        }.getOrDefault(false)
+
+    private companion object {
+        const val ANDROID_KEYSTORE = "AndroidKeyStore"
+    }
 }
