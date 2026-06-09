@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::status::Status;
 
-pub(crate) const MAX_QINGPING_PAYLOAD_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_QINGPING_PAYLOAD_BYTES: usize = 20 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QingpingReading {
@@ -338,6 +338,29 @@ mod tests {
             .expect_err("oversized payload rejected");
 
         assert!(error.to_string().contains("payload exceeds"));
+    }
+
+    #[test]
+    fn accepts_current_qingping_sized_payloads() {
+        let filler = "x".repeat(16 * 1024);
+        let payload = serde_json::json!({
+            "mac": "aa:bb:cc:dd:ee:ff",
+            "sensorData": [{
+                "temperature": {"value": 22.5},
+                "humidity": {"value": 47.0},
+                "co2": {"value": 413},
+                "tvoc": {"value": 18}
+            }],
+            "padding": filler
+        })
+        .to_string();
+
+        assert!(payload.len() > 16 * 1024);
+        assert!(payload.len() <= MAX_QINGPING_PAYLOAD_BYTES);
+        let reading =
+            parse_qingping_payload(payload.as_bytes(), "aa:bb:cc:dd:ee:ff").expect("parse");
+
+        assert_eq!(reading.expect("reading").co2_ppm, Some(413));
     }
 
     #[test]
