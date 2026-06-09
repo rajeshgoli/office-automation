@@ -258,11 +258,12 @@ For remote Android access, configure the Cloudflare Access Service Auth policy a
 ```bash
 export OFFICE_AUTOMATE_CLOUDFLARE_ACCOUNT_ID="..."
 export OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_APP_ID="..."        # optional for reusable policies
+export OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_JWT_AUDIENCE="..."  # Access application AUD tag
 export OFFICE_AUTOMATE_CLOUDFLARE_DEVICE_POLICY_ID="..."
 export OFFICE_AUTOMATE_CLOUDFLARE_API_TOKEN="..."
 ```
 
-When those values are configured, pairing adds the new device certificate CN to the Cloudflare policy before completing local enrollment. Revocation removes the CN from Cloudflare before marking the local registration revoked. If the Cloudflare update fails, the command fails instead of silently leaving stale edge access.
+When those values are configured, pairing adds the new device certificate CN to the Cloudflare policy before completing local enrollment. Revocation removes the CN from Cloudflare before marking the local registration revoked. If the Cloudflare update fails, the command fails instead of silently leaving stale edge access. The origin requires `OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_JWT_AUDIENCE` to match the Access application AUD tag before accepting a Cloudflare mTLS assertion as device auth.
 
 The default device mTLS CA files are repo-local and gitignored:
 

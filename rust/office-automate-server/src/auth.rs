@@ -274,7 +274,12 @@ impl AuthManager {
     pub async fn verify_cloudflare_access_assertion(
         &self,
         token: &str,
+        expected_audience: &str,
     ) -> Option<CloudflareAccessClaims> {
+        let expected_audience = expected_audience.trim();
+        if expected_audience.is_empty() {
+            return None;
+        }
         let header = decode_header(token).ok()?;
         let kid = header.kid.as_deref()?;
         let untrusted_claims = Self::decode_cloudflare_access_assertion_unverified(token)?;
@@ -294,7 +299,7 @@ impl AuthManager {
             .ok()?;
         let key = DecodingKey::from_jwk(jwks.find(kid)?).ok()?;
         let mut validation = Validation::new(Algorithm::RS256);
-        validation.validate_aud = false;
+        validation.set_audience(&[expected_audience]);
         validation.set_issuer(&[issuer.as_str().trim_end_matches('/')]);
         decode::<CloudflareAccessClaims>(token, &key, &validation)
             .ok()

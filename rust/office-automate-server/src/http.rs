@@ -911,9 +911,15 @@ async fn cloudflare_access_service_auth(
     else {
         return CloudflareAccessServiceAuth::AbsentOrUserAccess;
     };
+    let Some(expected_audience) = state.config.cloudflare_access.access_jwt_audience() else {
+        tracing::warn!(
+            "Cloudflare mTLS assertion rejected: cloudflare_access.jwt_audience is not configured"
+        );
+        return CloudflareAccessServiceAuth::Rejected;
+    };
     let Some(claims) = state
         .auth
-        .verify_cloudflare_access_assertion(assertion)
+        .verify_cloudflare_access_assertion(assertion, expected_audience)
         .await
     else {
         return CloudflareAccessServiceAuth::Rejected;
