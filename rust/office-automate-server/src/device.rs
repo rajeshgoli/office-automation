@@ -216,6 +216,17 @@ async fn complete_device_pairing(
                 .into_response();
         }
     };
+    let certificate_chain_pem =
+        match build_certificate_chain_pem(&certificate_pem, &state.ca_cert_path) {
+            Ok(chain) => chain,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                )
+                    .into_response();
+            }
+        };
     if let Err(error) = cloudflare::sync_device_common_name(
         &state.cloudflare_access,
         &certificate_common_name,
@@ -243,7 +254,7 @@ async fn complete_device_pairing(
             pairing_code: registration.pairing_code,
             common_name: registration.common_name,
             certificate_pem: certificate_pem.clone(),
-            certificate_chain_pem: certificate_pem.clone(),
+            certificate_chain_pem,
             expires_at: registration.expires_at,
         })
         .into_response(),
@@ -421,6 +432,16 @@ authorityKeyIdentifier = keyid,issuer
     fs::read_to_string(&cert_path).context("failed to read signed certificate")
 }
 
+fn build_certificate_chain_pem(certificate_pem: &str, ca_cert_path: &Path) -> Result<String> {
+    let ca_cert_pem =
+        fs::read_to_string(ca_cert_path).context("failed to read device CA certificate")?;
+    Ok(format!(
+        "{}\n{}",
+        certificate_pem.trim(),
+        ca_cert_pem.trim()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +454,27 @@ mod tests {
         assert_eq!(payload.pairing_code, "ABC123");
         assert_eq!(payload.csr_pem, "");
         assert_eq!(payload.public_key_pem, "");
+    }
+
+    #[test]
+    fn build_certificate_chain_appends_ca_certificate() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = temp_dir.path().join("device-ca.pem");
+        fs::write(
+            &ca_path,
+            "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write ca");
+
+        let chain = build_certificate_chain_pem(
+            "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n\n",
+            &ca_path,
+        )
+        .expect("chain");
+
+        assert_eq!(
+            chain,
+            "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----"
+        );
     }
 }

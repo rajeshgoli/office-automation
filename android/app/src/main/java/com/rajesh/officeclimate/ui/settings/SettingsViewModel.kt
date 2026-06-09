@@ -1,12 +1,9 @@
 package com.rajesh.officeclimate.ui.settings
 
 import android.app.Application
-import android.content.Intent
-import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.rajesh.officeclimate.data.repository.DeviceEnrollmentRepository
-import com.rajesh.officeclimate.data.repository.OfficeAuthRepository
 import com.rajesh.officeclimate.data.repository.SettingsRepository
 import com.rajesh.officeclimate.util.Defaults
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -18,21 +15,17 @@ data class SettingsUiState(
     val serverUrl: String = Defaults.SERVER_URL,
     val isLoggedIn: Boolean = false,
     val hasDeviceCredential: Boolean = false,
-    val userEmail: String = "",
     val deviceCertificateAlias: String = "",
     val pairingUrl: String = Defaults.DEVICE_PAIRING_URL,
     val pairingCode: String = "",
     val enrolling: Boolean = false,
-    val signingIn: Boolean = false,
     val error: String? = null,
     val enrollmentStatus: String? = null,
-    val signInStatus: String? = null,
 )
 
 class SettingsViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepo = SettingsRepository(application)
     private val deviceEnrollmentRepository = DeviceEnrollmentRepository(settingsRepo)
-    private val officeAuthRepository = OfficeAuthRepository(settingsRepo)
 
     private val _uiState = MutableStateFlow(SettingsUiState())
     val uiState: StateFlow<SettingsUiState> = _uiState
@@ -41,12 +34,10 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             settingsRepo.clearLegacyAuthAndInvalidDeviceCredentialIfNeeded()
             val hasDeviceCredential = settingsRepo.hasDeviceCredential.first()
-            val jwtToken = settingsRepo.jwtToken.first()
             _uiState.value = _uiState.value.copy(
                 serverUrl = settingsRepo.serverUrl.first(),
                 hasDeviceCredential = hasDeviceCredential,
-                isLoggedIn = hasDeviceCredential && jwtToken.isNotBlank(),
-                userEmail = settingsRepo.userEmail.first(),
+                isLoggedIn = hasDeviceCredential,
                 deviceCertificateAlias = settingsRepo.deviceCertificateAlias.first(),
                 pairingUrl = Defaults.DEVICE_PAIRING_URL,
             )
@@ -96,7 +87,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                     enrolling = false,
                     deviceCertificateAlias = result.alias,
                     hasDeviceCredential = true,
-                    isLoggedIn = false,
+                    isLoggedIn = true,
                     enrollmentStatus = "Device enrolled as ${result.deviceName}.",
                     error = null,
                 )
@@ -107,38 +98,5 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 )
             }
         }
-    }
-
-    fun signInWithGoogle() {
-        val state = _uiState.value
-        if (!state.hasDeviceCredential) {
-            _uiState.value = state.copy(error = "Enroll this device before signing in.")
-            return
-        }
-
-        _uiState.value = state.copy(signingIn = true, error = null, signInStatus = null)
-        viewModelScope.launch {
-            try {
-                settingsRepo.saveServerUrl(_uiState.value.serverUrl)
-                val login = officeAuthRepository.startBrowserLogin()
-                _uiState.value = _uiState.value.copy(
-                    signingIn = false,
-                    signInStatus = "Complete Google sign-in in the browser.",
-                )
-                openVerificationUrl(login.authorizationUrl)
-            } catch (e: Exception) {
-                _uiState.value = _uiState.value.copy(
-                    signingIn = false,
-                    error = "Sign-in failed: ${e.message}",
-                )
-            }
-        }
-    }
-
-    private fun openVerificationUrl(url: String) {
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        getApplication<Application>().startActivity(intent)
     }
 }

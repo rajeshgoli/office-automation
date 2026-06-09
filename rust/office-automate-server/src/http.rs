@@ -640,8 +640,20 @@ async fn auth_middleware(
         return next.run(request).await;
     }
 
-    match cloudflare_access_service_auth(&state, &headers, remote_addr).await {
-        CloudflareAccessServiceAuth::DeviceAllowed => {}
+    let cloudflare_service_auth =
+        cloudflare_access_service_auth(&state, &headers, remote_addr).await;
+    let route_class = route_authorization_class(request.method(), request.uri().path());
+
+    match cloudflare_service_auth {
+        CloudflareAccessServiceAuth::DeviceAllowed(identity)
+            if route_class != RouteAuthorizationClass::AdminUpload =>
+        {
+            request.extensions_mut().insert(AuthenticatedUser {
+                email: format!("cloudflare_mtls:{identity}"),
+            });
+            return next.run(request).await;
+        }
+        CloudflareAccessServiceAuth::DeviceAllowed(_) => {}
         CloudflareAccessServiceAuth::Rejected => {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -651,8 +663,6 @@ async fn auth_middleware(
         }
         CloudflareAccessServiceAuth::AbsentOrUserAccess => {}
     }
-
-    let route_class = route_authorization_class(request.method(), request.uri().path());
 
     if should_skip_auth(route_class, auth_mode) {
         return next.run(request).await;
@@ -682,6 +692,9 @@ async fn auth_middleware(
                 } else {
                     "Invalid or expired token"
                 };
+                if should_redirect_browser_to_oauth_login(request.method(), &headers) {
+                    return browser_oauth_login_redirect(request.uri()).into_response();
+                }
                 return (
                     StatusCode::UNAUTHORIZED,
                     Json(json!({"error": message, "login_url": "/auth/login"})),
@@ -724,6 +737,42 @@ async fn auth_middleware(
             response
         }
     }
+}
+
+fn should_redirect_browser_to_oauth_login(method: &Method, headers: &HeaderMap) -> bool {
+    if *method != Method::GET && *method != Method::HEAD {
+        return false;
+    }
+    if headers.contains_key(header::AUTHORIZATION) {
+        return false;
+    }
+    let sec_fetch_mode = headers
+        .get("sec-fetch-mode")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if sec_fetch_mode.eq_ignore_ascii_case("navigate") {
+        return true;
+    }
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| accept.contains("text/html"))
+}
+
+fn browser_oauth_login_redirect(uri: &axum::http::Uri) -> Response {
+    let return_to = uri
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or("/");
+    let location = format!(
+        "/auth/login?redirect=1&return_to={}",
+        urlencoding::encode(return_to)
+    );
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, location)
+        .body(Body::empty())
+        .expect("valid OAuth login redirect")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -842,7 +891,7 @@ fn forwarded_for_ip(headers: &HeaderMap) -> Option<IpAddr> {
 }
 
 enum CloudflareAccessServiceAuth {
-    DeviceAllowed,
+    DeviceAllowed(String),
     Rejected,
     AbsentOrUserAccess,
 }
@@ -862,9 +911,15 @@ async fn cloudflare_access_service_auth(
     else {
         return CloudflareAccessServiceAuth::AbsentOrUserAccess;
     };
+    let Some(expected_audience) = state.config.cloudflare_access.access_jwt_audience() else {
+        tracing::warn!(
+            "Cloudflare mTLS assertion rejected: cloudflare_access.jwt_audience is not configured"
+        );
+        return CloudflareAccessServiceAuth::Rejected;
+    };
     let Some(claims) = state
         .auth
-        .verify_cloudflare_access_assertion(assertion)
+        .verify_cloudflare_access_assertion(assertion, expected_audience)
         .await
     else {
         return CloudflareAccessServiceAuth::Rejected;
@@ -886,7 +941,7 @@ async fn cloudflare_access_service_auth(
             return CloudflareAccessServiceAuth::Rejected;
         }
     };
-    CloudflareAccessServiceAuth::DeviceAllowed
+    CloudflareAccessServiceAuth::DeviceAllowed(identity)
 }
 
 async fn status(State(state): State<AppState>) -> Json<Status> {
@@ -2188,6 +2243,10 @@ async fn deploy_app(
 }
 
 async fn latest_app_artifact(State(state): State<AppState>, Path(app): Path<String>) -> Response {
+    latest_app_artifact_redirect(&state, &app).await
+}
+
+async fn latest_app_artifact_redirect(state: &AppState, app: &str) -> Response {
     let metadata = match state.artifacts.read_metadata(&app).await {
         Ok(Some(metadata)) => metadata,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -2222,7 +2281,8 @@ async fn latest_app_artifact(State(state): State<AppState>, Path(app): Path<Stri
         .expect("valid redirect response");
     response
         .headers_mut()
-        .insert(header::CACHE_CONTROL, "no-cache".parse().expect("header"));
+        .insert(header::CACHE_CONTROL, no_store_header_value());
+    apply_no_store_headers(&mut response);
     response
 }
 
@@ -2233,6 +2293,9 @@ async fn hashed_app_artifact(
     let Some(artifact_hash) = artifact_file.strip_suffix(".apk") else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if is_download_alias(artifact_hash) {
+        return latest_app_artifact_redirect(&state, &app).await;
+    }
     match state
         .artifacts
         .serve_hashed_artifact(&app, artifact_hash)
@@ -2247,9 +2310,20 @@ async fn hashed_app_artifact(
     }
 }
 
+fn is_download_alias(value: &str) -> bool {
+    let Some(attempt) = value.strip_prefix("attempt") else {
+        return false;
+    };
+    !attempt.is_empty() && attempt.len() <= 4 && attempt.chars().all(|ch| ch.is_ascii_digit())
+}
+
 async fn app_artifact_meta(State(state): State<AppState>, Path(app): Path<String>) -> Response {
     match state.artifacts.read_metadata(&app).await {
-        Ok(Some(metadata)) => Json(metadata).into_response(),
+        Ok(Some(metadata)) => {
+            let mut response = Json(metadata).into_response();
+            apply_no_store_headers(&mut response);
+            response
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
             tracing::error!("artifact metadata read failed: {error:#}");
@@ -2267,6 +2341,25 @@ async fn legacy_apk(State(state): State<AppState>) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+fn no_store_header_value() -> HeaderValue {
+    HeaderValue::from_static("no-store, max-age=0")
+}
+
+fn apply_no_store_headers(response: &mut Response) {
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, no_store_header_value());
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
+    headers.insert(
+        HeaderName::from_static("cdn-cache-control"),
+        HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        HeaderName::from_static("cloudflare-cdn-cache-control"),
+        HeaderValue::from_static("no-store"),
+    );
 }
 
 async fn auth_login(
@@ -2296,11 +2389,35 @@ async fn auth_login(
         .get("platform")
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty());
+    let return_to = query
+        .get("return_to")
+        .and_then(|value| sanitize_oauth_return_to(value));
+    let redirect_to_provider = query
+        .get("redirect")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
     let forwarded_proto = headers
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok());
 
-    match state.auth.begin_login(host, forwarded_proto, platform) {
+    match state
+        .auth
+        .begin_login(host, forwarded_proto, platform, return_to)
+    {
+        Ok(payload) if redirect_to_provider => {
+            let Some(authorization_url) = payload.get("authorization_url").and_then(Value::as_str)
+            else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "Failed to start OAuth"})),
+                )
+                    .into_response();
+            };
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header(header::LOCATION, authorization_url)
+                .body(Body::empty())
+                .expect("valid OAuth provider redirect")
+        }
         Ok(payload) => Json(payload).into_response(),
         Err(error) => {
             tracing::error!("failed to start OAuth login: {error:#}");
@@ -2349,7 +2466,12 @@ async fn auth_callback(
             )
             .body(Body::empty())
             .expect("valid android redirect response"),
-        Ok(Some(login)) => browser_login_response(&state.auth, &login.jwt, login.secure_cookie),
+        Ok(Some(login)) => browser_login_response(
+            &state.auth,
+            &login.jwt,
+            login.secure_cookie,
+            login.return_to.as_deref().unwrap_or("/"),
+        ),
         Ok(None) => (
             StatusCode::FORBIDDEN,
             Html("<html><body><h1>Login Failed</h1><p>Email not authorized</p></body></html>"),
@@ -2388,10 +2510,27 @@ fn script_json_string(value: &str) -> String {
         .replace('&', "\\u0026")
 }
 
-fn browser_login_response(auth: &AuthManager, token: &str, secure_cookie: bool) -> Response {
+fn sanitize_oauth_return_to(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || !value.starts_with('/')
+        || value.starts_with("//")
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn browser_login_response(
+    auth: &AuthManager,
+    token: &str,
+    secure_cookie: bool,
+    return_to: &str,
+) -> Response {
     let mut response = Response::builder()
         .status(StatusCode::FOUND)
-        .header(header::LOCATION, "/")
+        .header(header::LOCATION, return_to)
         .body(Body::empty())
         .expect("valid browser login response");
     if let Some(cookies) = auth.issue_oauth_session_cookies(token, secure_cookie) {
@@ -2537,9 +2676,24 @@ async fn serve_static_or_index(state: &AppState, path: &str) -> Response {
     match tokio::fs::read(&target).await {
         Ok(bytes) => Response::builder()
             .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, static_content_type(&target))
             .body(Body::from(bytes))
             .expect("static response"),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn static_content_type(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("webmanifest") => "application/manifest+json; charset=utf-8",
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
     }
 }
 
@@ -3100,6 +3254,20 @@ mod tests {
         body
     }
 
+    fn assert_no_store_headers(headers: &HeaderMap) {
+        assert_eq!(
+            headers.get(header::CACHE_CONTROL).unwrap(),
+            "no-store, max-age=0"
+        );
+        assert_eq!(headers.get(header::PRAGMA).unwrap(), "no-cache");
+        assert_eq!(headers.get(header::EXPIRES).unwrap(), "0");
+        assert_eq!(headers.get("cdn-cache-control").unwrap(), "no-store");
+        assert_eq!(
+            headers.get("cloudflare-cdn-cache-control").unwrap(),
+            "no-store"
+        );
+    }
+
     #[tokio::test]
     async fn status_route_returns_compatibility_skeleton() {
         let response = app(test_config())
@@ -3340,12 +3508,33 @@ mod tests {
         assert_eq!(value["login_url"], "/auth/login");
     }
 
+    #[tokio::test]
+    async fn oauth_middleware_redirects_browser_artifact_navigation_to_login() {
+        let response = app(oauth_config())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/apps/office-climate/latest.apk")
+                    .header(header::ACCEPT, "text/html,application/xhtml+xml")
+                    .header("sec-fetch-mode", "navigate")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers().get(header::LOCATION).expect("location"),
+            "/auth/login?redirect=1&return_to=%2Fapps%2Foffice-climate%2Flatest.apk"
+        );
+    }
+
     #[test]
     fn browser_login_response_sets_httponly_session_and_csrf_cookies() {
         let config = oauth_config();
         let auth = AuthManager::new(&config.orchestrator).expect("auth");
         let token = auth.generate_jwt("engineer@rajeshgo.li").expect("token");
-        let response = browser_login_response(&auth, &token, true);
+        let response = browser_login_response(&auth, &token, true, "/");
 
         assert_eq!(response.status(), StatusCode::FOUND);
         assert_eq!(
@@ -3381,8 +3570,13 @@ mod tests {
         let config = oauth_config();
         let auth = AuthManager::new(&config.orchestrator).expect("auth");
         let token = auth.generate_jwt("engineer@rajeshgo.li").expect("token");
-        let response = browser_login_response(&auth, &token, false);
+        let response =
+            browser_login_response(&auth, &token, false, "/apps/office-climate/latest.apk");
 
+        assert_eq!(
+            response.headers().get(header::LOCATION).expect("location"),
+            "/apps/office-climate/latest.apk"
+        );
         let cookies = response
             .headers()
             .get_all(header::SET_COOKIE)
@@ -6159,6 +6353,7 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+        assert_no_store_headers(response.headers());
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read body");
@@ -6170,6 +6365,40 @@ mod tests {
         assert_eq!(metadata["uploaded_by"], "engineer@rajeshgo.li");
         assert_eq!(metadata["version_code"], 7);
         assert_eq!(metadata["version_name"], "1.2.0");
+
+        let response = app(config.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/apps/office-climate/latest.apk")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_no_store_headers(response.headers());
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            &format!("/apps/office-climate/{artifact_hash}.apk")
+        );
+
+        let response = app(config.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/apps/office-climate/attempt2.apk")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_no_store_headers(response.headers());
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            &format!("/apps/office-climate/{artifact_hash}.apk")
+        );
 
         let response = app(config)
             .oneshot(
@@ -6460,6 +6689,50 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn frontend_static_routes_set_content_type() {
+        let config = test_config();
+        tokio::fs::create_dir_all(&config.runtime.frontend_dist)
+            .await
+            .expect("create frontend dist");
+        tokio::fs::write(
+            config.runtime.frontend_dist.join("index.html"),
+            b"spa-index",
+        )
+        .await
+        .expect("write index");
+        tokio::fs::write(config.runtime.frontend_dist.join("manifest.json"), b"{}")
+            .await
+            .expect("write manifest");
+        tokio::fs::write(config.runtime.frontend_dist.join("icon-192.png"), b"png")
+            .await
+            .expect("write icon");
+
+        for (path, expected_content_type) in [
+            ("/", "text/html; charset=utf-8"),
+            ("/dashboard", "text/html; charset=utf-8"),
+            ("/manifest.json", "application/json; charset=utf-8"),
+            ("/icon-192.png", "image/png"),
+        ] {
+            let response = app(config.clone())
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                expected_content_type,
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]

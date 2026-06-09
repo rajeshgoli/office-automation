@@ -72,6 +72,7 @@ pub struct PendingOAuthState {
     pub code_verifier: String,
     pub redirect_uri: String,
     pub platform: Option<String>,
+    pub return_to: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -273,7 +274,12 @@ impl AuthManager {
     pub async fn verify_cloudflare_access_assertion(
         &self,
         token: &str,
+        expected_audience: &str,
     ) -> Option<CloudflareAccessClaims> {
+        let expected_audience = expected_audience.trim();
+        if expected_audience.is_empty() {
+            return None;
+        }
         let header = decode_header(token).ok()?;
         let kid = header.kid.as_deref()?;
         let untrusted_claims = Self::decode_cloudflare_access_assertion_unverified(token)?;
@@ -293,7 +299,7 @@ impl AuthManager {
             .ok()?;
         let key = DecodingKey::from_jwk(jwks.find(kid)?).ok()?;
         let mut validation = Validation::new(Algorithm::RS256);
-        validation.validate_aud = false;
+        validation.set_audience(&[expected_audience]);
         validation.set_issuer(&[issuer.as_str().trim_end_matches('/')]);
         decode::<CloudflareAccessClaims>(token, &key, &validation)
             .ok()
@@ -478,6 +484,7 @@ impl AuthManager {
         host: &str,
         forwarded_proto: Option<&str>,
         platform: Option<String>,
+        return_to: Option<String>,
     ) -> Result<Value> {
         let oauth = self
             .inner
@@ -501,6 +508,7 @@ impl AuthManager {
                     code_verifier,
                     redirect_uri: redirect_uri.clone(),
                     platform,
+                    return_to,
                 },
             );
 
@@ -570,7 +578,10 @@ impl AuthManager {
         let Some(id_token) = token_response.id_token.as_deref() else {
             return Ok(None);
         };
-        let Some(email) = self.verify_google_id_token(oauth, id_token).await? else {
+        let Some(email) = self
+            .verify_google_id_token(oauth, id_token, &oauth.client_id)
+            .await?
+        else {
             return Ok(None);
         };
         let jwt = self.generate_jwt(&email)?;
@@ -579,6 +590,7 @@ impl AuthManager {
             email,
             jwt,
             platform: pending.platform,
+            return_to: pending.return_to,
             secure_cookie: pending.redirect_uri.starts_with("https://"),
             refresh_token: token_response.refresh_token,
             access_token: token_response.access_token,
@@ -667,7 +679,10 @@ impl AuthManager {
             let Some(id_token) = body.get("id_token").and_then(Value::as_str) else {
                 return Ok(json!({"status": "error", "message": "Missing id_token"}));
             };
-            let Some(email) = self.verify_google_id_token(oauth, id_token).await? else {
+            let Some(email) = self
+                .verify_google_id_token(oauth, id_token, &oauth.client_id)
+                .await?
+            else {
                 return Ok(json!({"status": "forbidden", "message": "Email not allowed"}));
             };
             let jwt = self.generate_jwt(&email)?;
@@ -689,13 +704,14 @@ impl AuthManager {
             return Ok(json!({"status": "pending", "message": "User has not authorized yet"}));
         }
 
-        if status == StatusCode::BAD_REQUEST {
+        if status == StatusCode::BAD_REQUEST || status == StatusCode::FORBIDDEN {
             let error = body.get("error").and_then(Value::as_str).unwrap_or("error");
             return Ok(match error {
                 "authorization_pending" => {
                     json!({"status": "pending", "message": "Waiting for user authorization"})
                 }
                 "slow_down" => json!({"status": "slow_down", "message": "Polling too fast"}),
+                "access_denied" => json!({"status": "forbidden", "message": "Access denied"}),
                 _ => json!({"status": "error", "message": error}),
             });
         }
@@ -707,6 +723,7 @@ impl AuthManager {
         &self,
         oauth: &OAuthRuntime,
         id_token: &str,
+        expected_audience: &str,
     ) -> Result<Option<String>> {
         let info: GoogleTokenInfo = self
             .inner
@@ -722,7 +739,7 @@ impl AuthManager {
             .await
             .context("Google tokeninfo response was not JSON")?;
 
-        if info.aud.as_deref() != Some(oauth.client_id.as_str()) {
+        if info.aud.as_deref() != Some(expected_audience) {
             return Ok(None);
         }
 
@@ -739,6 +756,7 @@ pub struct FinishedOAuthLogin {
     pub email: String,
     pub jwt: String,
     pub platform: Option<String>,
+    pub return_to: Option<String>,
     pub secure_cookie: bool,
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
@@ -919,6 +937,7 @@ mod tests {
                 "office.example.com",
                 Some("https"),
                 Some("android".to_string()),
+                Some("/apps/office-climate/latest.apk".to_string()),
             )
             .expect("login");
         let url = payload["authorization_url"].as_str().expect("url");
@@ -928,6 +947,10 @@ mod tests {
         assert_eq!(
             manager.pending_state(state).expect("stored").platform,
             Some("android".to_string())
+        );
+        assert_eq!(
+            manager.pending_state(state).expect("stored").return_to,
+            Some("/apps/office-climate/latest.apk".to_string())
         );
     }
 

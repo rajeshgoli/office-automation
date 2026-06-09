@@ -85,11 +85,12 @@ export async function checkTrustedNetwork(): Promise<boolean> {
 
 export async function startLogin(): Promise<{ authorization_url: string }> {
   clearAuthToken();
-  const response = await authFetch(`${API_BASE}/auth/login`);
-  if (!response.ok) {
-    throw new Error('Failed to initiate login');
-  }
-  return response.json();
+  const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}` || '/';
+  const params = new URLSearchParams({
+    redirect: '1',
+    return_to: returnTo,
+  });
+  return { authorization_url: `${API_BASE}/auth/login?${params.toString()}` };
 }
 
 export async function logout(): Promise<void> {

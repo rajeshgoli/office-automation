@@ -10,8 +10,12 @@ import androidx.datastore.preferences.preferencesDataStore
 import com.rajesh.officeclimate.util.Defaults
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.first
+import java.io.ByteArrayInputStream
 import java.net.URI
 import java.security.KeyStore
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
 
@@ -23,7 +27,7 @@ class SettingsRepository(private val context: Context) {
         val USER_EMAIL = stringPreferencesKey("user_email")
         val DEVICE_CERTIFICATE_ALIAS = stringPreferencesKey("device_certificate_alias")
         val DEVICE_CERTIFICATE_CHAIN_PEM = stringPreferencesKey("device_certificate_chain_pem")
-        val LEGACY_DEVICE_PRIVATE_KEY_PKCS8 = stringPreferencesKey("device_private_key_pkcs8")
+        val DEVICE_PRIVATE_KEY_PKCS8 = stringPreferencesKey("device_private_key_pkcs8")
         val DISMISSED_UPDATE_ARTIFACT_HASH = stringPreferencesKey("dismissed_update_artifact_hash")
         val DISMISSED_APP_NOTIFICATION_IDS = stringSetPreferencesKey("dismissed_app_notification_ids")
     }
@@ -53,7 +57,7 @@ class SettingsRepository(private val context: Context) {
     }
 
     val isAuthenticated: Flow<Boolean> = context.dataStore.data.map { prefs ->
-        hasValidDeviceCredential(prefs) && !prefs[Keys.JWT_TOKEN].isNullOrBlank()
+        hasValidDeviceCredential(prefs)
     }
 
     val dismissedUpdateArtifactHash: Flow<String?> = context.dataStore.data.map { prefs ->
@@ -98,21 +102,30 @@ class SettingsRepository(private val context: Context) {
         }
     }
 
-    suspend fun clearDevicePrivateKeyPkcs8() {
+    suspend fun saveDevicePrivateKeyPkcs8(privateKeyPkcs8: String) {
         context.dataStore.edit { prefs ->
-            prefs.remove(Keys.LEGACY_DEVICE_PRIVATE_KEY_PKCS8)
+            prefs[Keys.DEVICE_PRIVATE_KEY_PKCS8] = privateKeyPkcs8.trim()
         }
     }
 
+    suspend fun clearDevicePrivateKeyPkcs8() {
+        context.dataStore.edit { prefs ->
+            prefs.remove(Keys.DEVICE_PRIVATE_KEY_PKCS8)
+        }
+    }
+
+    suspend fun devicePrivateKeyPkcs8(): String =
+        context.dataStore.data.first()[Keys.DEVICE_PRIVATE_KEY_PKCS8]?.trim().orEmpty()
+
     suspend fun clearLegacyAuthAndInvalidDeviceCredentialIfNeeded() {
         context.dataStore.edit { prefs ->
-            prefs.remove(Keys.LEGACY_DEVICE_PRIVATE_KEY_PKCS8)
             if (
                 !prefs[Keys.DEVICE_CERTIFICATE_ALIAS].isNullOrBlank() &&
                     !hasValidDeviceCredential(prefs)
             ) {
                 prefs.remove(Keys.DEVICE_CERTIFICATE_ALIAS)
                 prefs.remove(Keys.DEVICE_CERTIFICATE_CHAIN_PEM)
+                prefs.remove(Keys.DEVICE_PRIVATE_KEY_PKCS8)
                 prefs.remove(Keys.JWT_TOKEN)
                 prefs.remove(Keys.USER_EMAIL)
             }
@@ -155,14 +168,25 @@ class SettingsRepository(private val context: Context) {
     private fun hasValidDeviceCredential(prefs: Preferences): Boolean {
         val alias = prefs[Keys.DEVICE_CERTIFICATE_ALIAS]?.trim().orEmpty()
         val certificateChain = prefs[Keys.DEVICE_CERTIFICATE_CHAIN_PEM]?.trim().orEmpty()
-        return alias.isNotBlank() && certificateChain.isNotBlank() && hasDevicePrivateKey(alias)
+        val privateKeyPkcs8 = prefs[Keys.DEVICE_PRIVATE_KEY_PKCS8]?.trim().orEmpty()
+        return alias.isNotBlank() &&
+            certificateChain.isNotBlank() &&
+            hasRsaDeviceCertificate(certificateChain) &&
+            (deviceKeyExists(alias) || privateKeyPkcs8.isNotBlank())
     }
 
-    private fun hasDevicePrivateKey(alias: String): Boolean =
+    private fun hasRsaDeviceCertificate(certificateChainPem: String): Boolean =
         runCatching {
-            KeyStore.getInstance(ANDROID_KEYSTORE)
-                .apply { load(null) }
-                .getKey(alias, null) != null
+            val certificates = CertificateFactory.getInstance("X.509")
+                .generateCertificates(ByteArrayInputStream(certificateChainPem.toByteArray()))
+                .filterIsInstance<X509Certificate>()
+            certificates.firstOrNull()?.publicKey?.algorithm.equals("RSA", ignoreCase = true)
+        }.getOrDefault(false)
+
+    private fun deviceKeyExists(alias: String): Boolean =
+        runCatching {
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            keyStore.getKey(alias, null) != null
         }.getOrDefault(false)
 
     private companion object {

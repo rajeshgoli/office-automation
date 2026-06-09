@@ -141,6 +141,7 @@ pub struct ArtifactConfig {
 pub struct CloudflareAccessConfig {
     pub account_id: Option<String>,
     pub app_id: Option<String>,
+    pub jwt_audience: Option<String>,
     pub device_policy_id: Option<String>,
     pub api_token: Option<String>,
     pub api_base_url: String,
@@ -151,6 +152,7 @@ impl Default for CloudflareAccessConfig {
         Self {
             account_id: None,
             app_id: None,
+            jwt_audience: None,
             device_policy_id: None,
             api_token: None,
             api_base_url: "https://api.cloudflare.com/client/v4".to_string(),
@@ -171,6 +173,13 @@ impl CloudflareAccessConfig {
                 .api_token
                 .as_deref()
                 .is_some_and(|value| !value.trim().is_empty())
+    }
+
+    pub fn access_jwt_audience(&self) -> Option<&str> {
+        self.jwt_audience
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
     }
 }
 
@@ -559,6 +568,10 @@ impl AppConfig {
             file_config.cloudflare_access.app_id = Some(app_id);
         }
 
+        if let Some(audience) = env_lookup("OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_JWT_AUDIENCE") {
+            file_config.cloudflare_access.jwt_audience = Some(audience);
+        }
+
         if let Some(policy_id) = env_lookup("OFFICE_AUTOMATE_CLOUDFLARE_DEVICE_POLICY_ID") {
             file_config.cloudflare_access.device_policy_id = Some(policy_id);
         }
@@ -853,6 +866,7 @@ thresholds:
             "OFFICE_AUTOMATE_TELEMETRY_DAYS" => Some("14".to_string()),
             "OFFICE_AUTOMATE_PUBLIC_URL" => Some("https://office.example.com".to_string()),
             "OFFICE_AUTOMATE_CONTROLLER_IPC_TOKEN" => Some("edge-ipc-token".to_string()),
+            "OFFICE_AUTOMATE_CLOUDFLARE_ACCESS_JWT_AUDIENCE" => Some("access-aud".to_string()),
             "OFFICE_AUTOMATE_ADMIN_EMAILS" => {
                 Some("rajesh@example.com,ops@example.com".to_string())
             }
@@ -954,6 +968,10 @@ thresholds:
             Some("edge-ipc-token")
         );
         assert_eq!(
+            config.cloudflare_access.access_jwt_audience(),
+            Some("access-aud")
+        );
+        assert_eq!(
             config.orchestrator.admin_emails,
             vec!["rajesh@example.com", "ops@example.com"]
         );
@@ -962,6 +980,23 @@ thresholds:
         assert_eq!(config.thresholds.hvac_cool_on_temp_f, 82);
         assert_eq!(config.thresholds.expected_occupancy_start, "08:30");
         assert_eq!(config.thresholds.expected_occupancy_end, "18:45");
+    }
+
+    #[test]
+    fn cloudflare_access_jwt_audience_ignores_blank_values() {
+        let config = CloudflareAccessConfig {
+            jwt_audience: Some("  ".to_string()),
+            ..CloudflareAccessConfig::default()
+        };
+
+        assert_eq!(config.access_jwt_audience(), None);
+
+        let config = CloudflareAccessConfig {
+            jwt_audience: Some(" aud-tag ".to_string()),
+            ..CloudflareAccessConfig::default()
+        };
+
+        assert_eq!(config.access_jwt_audience(), Some("aud-tag"));
     }
 
     #[test]

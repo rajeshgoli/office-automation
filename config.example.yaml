@@ -28,6 +28,7 @@ artifacts:
 cloudflare_access:
   account_id: "cloudflare-account-id"
   app_id: "optional-access-application-id"
+  jwt_audience: "cloudflare-access-application-aud-tag"
   device_policy_id: "cloudflare-device-mtls-policy-id"
   api_token: "cloudflare-api-token-with-access-apps-policies-write"
 
