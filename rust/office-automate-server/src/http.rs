@@ -2237,6 +2237,10 @@ async fn deploy_app(
 }
 
 async fn latest_app_artifact(State(state): State<AppState>, Path(app): Path<String>) -> Response {
+    latest_app_artifact_redirect(&state, &app).await
+}
+
+async fn latest_app_artifact_redirect(state: &AppState, app: &str) -> Response {
     let metadata = match state.artifacts.read_metadata(&app).await {
         Ok(Some(metadata)) => metadata,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -2283,6 +2287,9 @@ async fn hashed_app_artifact(
     let Some(artifact_hash) = artifact_file.strip_suffix(".apk") else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if is_download_alias(artifact_hash) {
+        return latest_app_artifact_redirect(&state, &app).await;
+    }
     match state
         .artifacts
         .serve_hashed_artifact(&app, artifact_hash)
@@ -2295,6 +2302,13 @@ async fn hashed_app_artifact(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+fn is_download_alias(value: &str) -> bool {
+    let Some(attempt) = value.strip_prefix("attempt") else {
+        return false;
+    };
+    !attempt.is_empty() && attempt.len() <= 4 && attempt.chars().all(|ch| ch.is_ascii_digit())
 }
 
 async fn app_artifact_meta(State(state): State<AppState>, Path(app): Path<String>) -> Response {
@@ -6335,6 +6349,23 @@ mod tests {
             .oneshot(
                 HttpRequest::builder()
                     .uri("/apps/office-climate/latest.apk")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_no_store_headers(response.headers());
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            &format!("/apps/office-climate/{artifact_hash}.apk")
+        );
+
+        let response = app(config.clone())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/apps/office-climate/attempt2.apk")
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .expect("request"),
