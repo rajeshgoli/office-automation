@@ -158,16 +158,19 @@ def load_auth_cache(auth_file: Path) -> dict[str, Any]:
 
 
 def save_auth_cache(auth_file: Path, auth_cache: dict[str, Any]) -> None:
-    auth_file.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        auth_file.parent.chmod(0o700)
-    except OSError:
-        pass
+    parent = auth_file.parent
+    parent_preexisted = parent.exists()
+    parent.mkdir(parents=True, exist_ok=True)
+    if should_chmod_auth_parent(auth_file, parent_preexisted):
+        try:
+            parent.chmod(0o700)
+        except OSError:
+            pass
 
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{auth_file.name}.",
         suffix=".tmp",
-        dir=str(auth_file.parent),
+        dir=str(parent),
         text=True,
     )
     tmp_path = Path(tmp_name)
@@ -180,6 +183,12 @@ def save_auth_cache(auth_file: Path, auth_cache: dict[str, Any]) -> None:
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
+
+
+def should_chmod_auth_parent(auth_file: Path, parent_preexisted: bool) -> bool:
+    if not parent_preexisted:
+        return True
+    return auth_file.expanduser().resolve().parent == DEFAULT_AUTH_FILE.parent.resolve()
 
 
 def require_keys(data: Any, keys: list[str]) -> None:
