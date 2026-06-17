@@ -1939,22 +1939,33 @@ pub fn get_latest_contact_device_state(
     database_path: &Path,
     device_type: &str,
 ) -> Result<Option<String>> {
+    Ok(
+        get_latest_contact_device_state_with_timestamp(database_path, device_type)?
+            .map(|(event, _timestamp)| event),
+    )
+}
+
+pub fn get_latest_contact_device_state_with_timestamp(
+    database_path: &Path,
+    device_type: &str,
+) -> Result<Option<(String, Option<f64>)>> {
     let connection = Connection::open(database_path)
         .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
-    connection
+    let row = connection
         .query_row(
             r#"
-            SELECT event FROM device_events
+            SELECT event, timestamp FROM device_events
             WHERE device_type = ?
               AND event IN ('open', 'closed')
             ORDER BY timestamp DESC, id DESC
             LIMIT 1
             "#,
             params![device_type],
-            |row| row.get(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
-        .with_context(|| format!("failed to read latest {device_type} contact state"))
+        .with_context(|| format!("failed to read latest {device_type} contact state"))?;
+    Ok(row.map(|(event, timestamp)| (event, timestamp_to_unix_seconds(&timestamp))))
 }
 
 fn parse_timestamp(value: &str) -> Option<NaiveDateTime> {
@@ -1966,6 +1977,15 @@ fn parse_timestamp(value: &str) -> Option<NaiveDateTime> {
                 .ok()
                 .map(|timestamp| timestamp.with_timezone(&Local).naive_local())
         })
+}
+
+fn timestamp_to_unix_seconds(value: &str) -> Option<f64> {
+    parse_timestamp(value).and_then(|timestamp| {
+        timestamp
+            .and_local_timezone(Local)
+            .single()
+            .map(|timestamp| timestamp.timestamp_millis() as f64 / 1_000.0)
+    })
 }
 
 fn sqlite_local_datetime_expr(column: &str) -> String {
@@ -2989,6 +3009,21 @@ mod tests {
         log_device_event(&db_path, "door", "closed", Some("Office Door"), None)
             .expect("log closed");
         log_device_event(&db_path, "door", "error", Some("Office Door"), None).expect("log error");
+        let connection = Connection::open(&db_path).expect("open database");
+        connection
+            .execute(
+                r#"
+                UPDATE device_events
+                SET timestamp = CASE event
+                    WHEN 'open' THEN '2026-06-01 11:00:00'
+                    WHEN 'closed' THEN '2026-06-01 12:00:00'
+                    WHEN 'error' THEN '2026-06-01 13:00:00'
+                END
+                WHERE device_type = 'door'
+                "#,
+                [],
+            )
+            .expect("update timestamps");
 
         assert_eq!(
             get_latest_device_state(&db_path, "door").expect("latest"),
@@ -2998,12 +3033,16 @@ mod tests {
             get_latest_contact_device_state(&db_path, "door").expect("latest contact"),
             Some("closed".to_string())
         );
+        let (event, timestamp) = get_latest_contact_device_state_with_timestamp(&db_path, "door")
+            .expect("latest contact with timestamp")
+            .expect("latest contact");
+        assert_eq!(event, "closed");
+        assert!(timestamp.expect("parsed timestamp") > 0.0);
         assert_eq!(
             get_latest_device_state(&db_path, "window").expect("missing"),
             None
         );
 
-        let connection = Connection::open(&db_path).expect("open database");
         let details: Option<String> = connection
             .query_row(
                 "SELECT details FROM device_events WHERE event = 'open'",

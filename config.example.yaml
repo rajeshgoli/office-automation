@@ -61,11 +61,14 @@ thresholds:
   co2_refresh_target_ppm: 500  # Target for away-mode ventilation
   co2_plateau_release_delta_ppm: 100 # Resume ventilation if CO2 climbs this far above learned outdoor baseline
   erv_min_dwell_seconds: 180   # Minimum time between automated ERV speed changes within stable presence state
+  erv_door_open_grace_seconds: 180  # Let brief door openings settle before stopping ERV
+  erv_door_close_grace_seconds: 180 # Wait for motion/Mac signals before restarting away ventilation after entry
   hvac_heat_off_temp_f: 75     # Turn heat off at/above this Qingping temp
   hvac_heat_on_temp_f: 71      # Turn heat back on at/below this temp (hysteresis)
   hvac_cool_on_temp_f: 81      # Start cooling above this Qingping temp
   hvac_cool_off_temp_f: 78     # Stop cooling at/below this temp (hysteresis)
   hvac_cool_setpoint_f: 78     # Cooling target when automation starts cooling
+  hvac_door_open_grace_seconds: 180 # Let brief door openings settle before HVAC safety-off
   motion_timeout_seconds: 60   # Time before motion absence triggers away
   mac_poll_interval_seconds: 5 # How often to check Mac occupancy
   away_stale_flush_enabled: true        # Periodic stale-air flush while away

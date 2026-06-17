@@ -50,6 +50,8 @@ pub enum HvacMode {
 pub struct ErvPolicyInput {
     pub occupancy: OccupancyState,
     pub door_open: bool,
+    pub door_open_seconds: Option<f64>,
+    pub door_closed_seconds: Option<f64>,
     pub window_open: bool,
     pub co2_ppm: Option<i64>,
     pub tvoc: Option<i64>,
@@ -229,9 +231,24 @@ impl ErvPolicyState {
         input: ErvPolicyInput,
         now: f64,
     ) -> ErvDecision {
-        if input.window_open || input.door_open {
+        if input.window_open {
             self.tvoc_away_ventilation_active = false;
             if input.current_running {
+                return target_decision(
+                    thresholds,
+                    &input,
+                    now,
+                    VentilationSpeed::Off,
+                    "safety_interlock".to_string(),
+                    true,
+                );
+            }
+            return ErvDecision::NoChange;
+        }
+
+        if input.door_open {
+            self.tvoc_away_ventilation_active = false;
+            if input.current_running && door_open_safety_delay_elapsed(thresholds, &input) {
                 return target_decision(
                     thresholds,
                     &input,
@@ -318,6 +335,10 @@ impl ErvPolicyState {
                 ErvDecision::NoChange
             }
             OccupancyState::Away => {
+                if door_close_entry_grace_active(thresholds, &input) {
+                    return ErvDecision::NoChange;
+                }
+
                 if self.initial_away_settle_active(thresholds, now) {
                     return ErvDecision::NoChange;
                 }
@@ -793,6 +814,20 @@ fn stale_flush_speed(thresholds: &ThresholdsConfig) -> VentilationSpeed {
     }
 }
 
+fn door_open_safety_delay_elapsed(thresholds: &ThresholdsConfig, input: &ErvPolicyInput) -> bool {
+    thresholds.erv_door_open_grace_seconds == 0
+        || input
+            .door_open_seconds
+            .is_some_and(|seconds| seconds >= thresholds.erv_door_open_grace_seconds as f64)
+}
+
+fn door_close_entry_grace_active(thresholds: &ThresholdsConfig, input: &ErvPolicyInput) -> bool {
+    thresholds.erv_door_close_grace_seconds > 0
+        && input
+            .door_closed_seconds
+            .is_some_and(|seconds| seconds < thresholds.erv_door_close_grace_seconds as f64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,6 +836,8 @@ mod tests {
         ErvPolicyInput {
             occupancy: OccupancyState::Away,
             door_open: false,
+            door_open_seconds: None,
+            door_closed_seconds: None,
             window_open: false,
             co2_ppm,
             tvoc,
@@ -813,13 +850,13 @@ mod tests {
     }
 
     #[test]
-    fn safety_interlock_turns_running_erv_off_with_dwell_bypass() {
+    fn window_safety_interlock_turns_running_erv_off_with_dwell_bypass() {
         let thresholds = ThresholdsConfig::default();
         let mut policy = ErvPolicyState::new(&thresholds);
         let decision = policy.decide_erv(
             &thresholds,
             ErvPolicyInput {
-                door_open: true,
+                window_open: true,
                 current_running: true,
                 current_speed: VentilationSpeed::Quiet,
                 last_speed_changed_at: Some(1_000.0),
@@ -836,6 +873,81 @@ mod tests {
                 bypass_dwell: true,
             }
         );
+    }
+
+    #[test]
+    fn brief_door_open_does_not_stop_running_erv() {
+        let thresholds = ThresholdsConfig {
+            erv_door_open_grace_seconds: 180,
+            ..ThresholdsConfig::default()
+        };
+        let mut policy = ErvPolicyState::new(&thresholds);
+        let decision = policy.decide_erv(
+            &thresholds,
+            ErvPolicyInput {
+                door_open: true,
+                door_open_seconds: Some(10.0),
+                current_running: true,
+                current_speed: VentilationSpeed::Turbo,
+                last_speed_changed_at: Some(1_000.0),
+                ..away_input(Some(700), None)
+            },
+            1_010.0,
+        );
+
+        assert_eq!(decision, ErvDecision::NoChange);
+    }
+
+    #[test]
+    fn sustained_door_open_stops_running_erv() {
+        let thresholds = ThresholdsConfig {
+            erv_door_open_grace_seconds: 180,
+            ..ThresholdsConfig::default()
+        };
+        let mut policy = ErvPolicyState::new(&thresholds);
+        let decision = policy.decide_erv(
+            &thresholds,
+            ErvPolicyInput {
+                door_open: true,
+                door_open_seconds: Some(181.0),
+                current_running: true,
+                current_speed: VentilationSpeed::Turbo,
+                last_speed_changed_at: Some(1_000.0),
+                ..away_input(Some(700), None)
+            },
+            1_181.0,
+        );
+
+        assert_eq!(
+            decision,
+            ErvDecision::SetSpeed {
+                target_speed: VentilationSpeed::Off,
+                reason: "safety_interlock".to_string(),
+                bypass_dwell: true,
+            }
+        );
+    }
+
+    #[test]
+    fn recent_door_close_suppresses_away_restart_while_entry_signals_settle() {
+        let thresholds = ThresholdsConfig {
+            min_away_seconds_before_erv: 0,
+            erv_door_close_grace_seconds: 180,
+            away_stale_flush_enabled: false,
+            ..ThresholdsConfig::default()
+        };
+        let mut policy = ErvPolicyState::new(&thresholds);
+        policy.away_start_at = Some(0.0);
+        let decision = policy.decide_erv(
+            &thresholds,
+            ErvPolicyInput {
+                door_closed_seconds: Some(2.0),
+                ..away_input(Some(700), None)
+            },
+            1_002.0,
+        );
+
+        assert_eq!(decision, ErvDecision::NoChange);
     }
 
     #[test]
@@ -876,6 +988,8 @@ mod tests {
                 current_speed: VentilationSpeed::Off,
                 manual_override: None,
                 door_open: false,
+                door_open_seconds: None,
+                door_closed_seconds: None,
                 window_open: false,
                 last_speed_changed_at: Some(1_000.0),
                 bypass_dwell: false,
@@ -902,6 +1016,8 @@ mod tests {
                 current_speed: VentilationSpeed::Quiet,
                 manual_override: None,
                 door_open: false,
+                door_open_seconds: None,
+                door_closed_seconds: None,
                 window_open: false,
                 last_speed_changed_at: Some(1_000.0),
                 bypass_dwell: true,

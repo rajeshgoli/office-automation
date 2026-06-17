@@ -65,6 +65,7 @@ pub struct SensorsStatus {
     pub external_monitor: bool,
     pub motion_detected: bool,
     pub door_open: bool,
+    pub door_last_changed: f64,
     pub window_open: bool,
     pub co2_ppm: i64,
 }
@@ -77,6 +78,7 @@ impl Default for SensorsStatus {
             external_monitor: false,
             motion_detected: false,
             door_open: false,
+            door_last_changed: 0.0,
             window_open: false,
             co2_ppm: 400,
         }

@@ -237,6 +237,8 @@ fn is_loopback_bind_host(host: &str) -> bool {
 }
 
 const HVAC_TEMPERATURE_BANDS_SETTING: &str = "hvac_temperature_bands";
+const DOOR_GRACE_IDLE_POLL_SECONDS: u64 = 60;
+const DOOR_GRACE_RETRY_SECONDS: u64 = 30;
 pub(crate) const CONTROLLER_IPC_TOKEN_HEADER: &str = "x-office-automate-controller-token";
 
 #[derive(Clone)]
@@ -582,6 +584,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         Some(erv_automation.clone()),
         Some(yolink_hvac_trigger),
     );
+    let _door_grace_task = start_door_grace_policy_poll(app_state.clone(), erv_automation);
     let _erv_task = crate::erv::start_erv_status_poll(&config, erv_state);
     let _hvac_task = crate::hvac::start_hvac_status_poll(&config, hvac_state);
     let _presence_task = start_presence_poll(app_state);
@@ -593,6 +596,93 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     )
     .await
     .context("HTTP server failed")
+}
+
+fn start_door_grace_policy_poll(
+    state: AppState,
+    erv_automation: ErvPolicyCoordinator,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut status_rx = state.status_broadcast.subscribe();
+        loop {
+            match door_grace_policy_delay(&state) {
+                Some(delay) if delay.is_zero() => {
+                    evaluate_sensor_policies(
+                        erv_automation.clone(),
+                        state.clone(),
+                        true,
+                        "door grace",
+                    )
+                    .await;
+                    time::sleep(Duration::from_secs(DOOR_GRACE_RETRY_SECONDS)).await;
+                }
+                Some(delay) => {
+                    tokio::select! {
+                        _ = time::sleep(delay) => {
+                            evaluate_sensor_policies(
+                                erv_automation.clone(),
+                                state.clone(),
+                                true,
+                                "door grace",
+                            )
+                            .await;
+                        }
+                        _ = status_rx.recv() => {}
+                    }
+                }
+                None => {
+                    tokio::select! {
+                        _ = time::sleep(Duration::from_secs(DOOR_GRACE_IDLE_POLL_SECONDS)) => {}
+                        _ = status_rx.recv() => {}
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn door_grace_policy_delay(state: &AppState) -> Option<Duration> {
+    let now = unix_timestamp_now();
+    let state_status = {
+        let machine = state
+            .state_machine
+            .read()
+            .expect("state machine lock poisoned");
+        machine.status_at(now)
+    };
+    if !state_status.sensors.door_open {
+        if state_status.is_present
+            || !state.config.erv.active_control_enabled
+            || state_status.sensors.door_closed_at <= 0.0
+        {
+            return None;
+        }
+        let deadline = state_status.sensors.door_closed_at
+            + state.config.thresholds.erv_door_close_grace_seconds as f64;
+        return (deadline > now).then_some(Duration::from_secs_f64(deadline - now));
+    }
+
+    if state_status.sensors.door_opened_at <= 0.0 {
+        return None;
+    }
+
+    let mut next_deadline = None::<f64>;
+    if state.config.erv.active_control_enabled && state.erv.snapshot().running {
+        next_deadline = Some(
+            state_status.sensors.door_opened_at
+                + state.config.thresholds.erv_door_open_grace_seconds as f64,
+        );
+    }
+    let hvac_deadline = state_status.sensors.door_opened_at
+        + state.config.thresholds.hvac_door_open_grace_seconds as f64;
+    let cached_hvac_active = active_hvac_control_mode(&state.hvac.snapshot().mode).is_some();
+    if state.config.mitsubishi.active_control_enabled && (hvac_deadline > now || cached_hvac_active)
+    {
+        next_deadline =
+            Some(next_deadline.map_or(hvac_deadline, |deadline| deadline.min(hvac_deadline)));
+    }
+
+    next_deadline.map(|deadline| Duration::from_secs_f64((deadline - now).max(0.0)))
 }
 
 fn start_presence_poll(state: AppState) -> Option<JoinHandle<()>> {
@@ -1417,15 +1507,14 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
         && temp_f
             .is_some_and(|temp_f| temp_f < state.config.thresholds.hvac_critical_temp_f as f64)
         && hvac_mode != HvacMode::Heat;
+    let hvac_safety_interlock =
+        hvac_safety_interlock_active(&state_status, &state.config.thresholds, now);
 
-    if !state_status.safety_interlock
-        && !critical_heat_needed
-        && state.hvac.manual_override_active()
-    {
+    if !hvac_safety_interlock && !critical_heat_needed && state.hvac.manual_override_active() {
         return Ok(());
     }
 
-    if state_status.safety_interlock {
+    if hvac_safety_interlock {
         let verified_status = state
             .hvac
             .smoke_status_with(&state.config.mitsubishi, state.hvac_writer.as_ref())
@@ -1467,6 +1556,10 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
         state.hvac.set_temp_band_mode(None);
         state.hvac.clear_manual_override();
         broadcast_status(state);
+        return Ok(());
+    }
+
+    if state_status.sensors.door_open {
         return Ok(());
     }
 
@@ -1638,6 +1731,24 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
 
     broadcast_status(state);
     Ok(())
+}
+
+fn hvac_safety_interlock_active(
+    state_status: &crate::state::StateStatus,
+    thresholds: &crate::config::ThresholdsConfig,
+    now: f64,
+) -> bool {
+    state_status.sensors.window_open
+        || (state_status.sensors.door_open
+            && door_open_grace_elapsed(
+                state_status.sensors.door_opened_at,
+                now,
+                thresholds.hvac_door_open_grace_seconds,
+            ))
+}
+
+fn door_open_grace_elapsed(door_opened_at: f64, now: f64, grace_seconds: u64) -> bool {
+    grace_seconds == 0 || (door_opened_at > 0.0 && now - door_opened_at >= grace_seconds as f64)
 }
 
 fn clear_hvac_manual_override_on_transition(
@@ -1952,6 +2063,7 @@ fn status_for_state(state: &AppState) -> Status {
     status.sensors.external_monitor = state_status.sensors.external_monitor;
     status.sensors.motion_detected = state_status.sensors.motion_detected;
     status.sensors.door_open = state_status.sensors.door_open;
+    status.sensors.door_last_changed = state_status.sensors.door_last_changed;
     status.sensors.window_open = state_status.sensors.window_open;
     status.sensors.co2_ppm = state_status.sensors.co2_ppm;
     state.qingping.overlay_status(&mut status);
@@ -3136,11 +3248,11 @@ mod tests {
         .expect("HVAC auto status")
     }
 
-    fn office_door_device() -> yolink::YoLinkDevice {
+    fn office_window_device() -> yolink::YoLinkDevice {
         yolink::YoLinkDevice {
-            device_id: "door-1".to_string(),
-            name: "Office Door".to_string(),
-            token: "door-token".to_string(),
+            device_id: "window-1".to_string(),
+            name: "Office Window".to_string(),
+            token: "window-token".to_string(),
             device_type: yolink::DeviceType::DoorSensor,
             state: json!({"state": "closed", "online": true})
                 .as_object()
@@ -3229,6 +3341,13 @@ mod tests {
         .expect("app")
     }
 
+    fn configure_fake_erv(config: &mut AppConfig) {
+        config.erv.active_control_enabled = true;
+        config.erv.ip = "127.0.0.1".to_string();
+        config.erv.device_id = "erv-device".to_string();
+        config.erv.local_key = "local-key".to_string();
+    }
+
     fn erv_status(speed: ErvFanSpeed) -> ErvDeviceStatus {
         let payload = match speed {
             ErvFanSpeed::Off => r#"{"dps":{"1":false,"101":1,"102":1}}"#,
@@ -3266,6 +3385,176 @@ mod tests {
             headers.get("cloudflare-cdn-cache-control").unwrap(),
             "no-store"
         );
+    }
+
+    #[tokio::test]
+    async fn door_grace_policy_delay_schedules_earliest_active_deadline() {
+        let mut config = test_config();
+        configure_fake_erv(&mut config);
+        config.mitsubishi.active_control_enabled = true;
+        config.thresholds.erv_door_open_grace_seconds = 180;
+        config.thresholds.hvac_door_open_grace_seconds = 90;
+        let opened_at = unix_timestamp_now() - 30.0;
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            opened_at - 1.0,
+        )));
+        state_machine
+            .write()
+            .expect("state lock")
+            .update_door(true, opened_at);
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        let erv_writer = Arc::new(FakeErvWriter::new(
+            vec![Ok(erv_status(ErvFanSpeed::Off))],
+            vec![Ok(erv_status(ErvFanSpeed::Turbo))],
+        ));
+        let (_router, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            QingpingState::default(),
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            erv_writer.clone(),
+            Arc::new(FakeHvacWriter::default()),
+        )
+        .expect("app");
+
+        state
+            .erv
+            .set_speed_with(
+                &state.config.erv,
+                erv_writer.as_ref(),
+                ErvFanSpeed::Turbo,
+                "test",
+                None,
+            )
+            .await
+            .expect("set ERV active");
+        state
+            .hvac
+            .record_status(hvac_status(HvacControlMode::Heat, 22.0));
+
+        let delay = door_grace_policy_delay(&state).expect("door grace delay");
+        assert!(delay >= Duration::from_secs(55), "{delay:?}");
+        assert!(delay <= Duration::from_secs(61), "{delay:?}");
+    }
+
+    #[tokio::test]
+    async fn door_grace_policy_delay_schedules_hvac_deadline_with_stale_off_cache() {
+        let mut config = test_config();
+        config.mitsubishi.active_control_enabled = true;
+        config.thresholds.hvac_door_open_grace_seconds = 90;
+        let opened_at = unix_timestamp_now() - 30.0;
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            opened_at - 1.0,
+        )));
+        state_machine
+            .write()
+            .expect("state lock")
+            .update_door(true, opened_at);
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Off, 22.0));
+        let (_router, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            QingpingState::default(),
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            Arc::new(FakeHvacWriter::default()),
+        )
+        .expect("app");
+
+        let delay = door_grace_policy_delay(&state).expect("HVAC grace delay");
+        assert!(delay >= Duration::from_secs(55), "{delay:?}");
+        assert!(delay <= Duration::from_secs(61), "{delay:?}");
+    }
+
+    #[tokio::test]
+    async fn door_grace_policy_delay_stays_idle_without_open_active_device() {
+        let config = test_config();
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            now - 1.0,
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        let (_router, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            QingpingState::default(),
+            state_machine.clone(),
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            Arc::new(FakeHvacWriter::default()),
+        )
+        .expect("app");
+
+        state_machine
+            .write()
+            .expect("state lock")
+            .update_door(true, now - 10.0);
+        assert!(door_grace_policy_delay(&state).is_none());
+
+        state
+            .hvac
+            .record_status(hvac_status(HvacControlMode::Heat, 22.0));
+        state_machine
+            .write()
+            .expect("state lock")
+            .update_door(false, now);
+        assert!(door_grace_policy_delay(&state).is_none());
+    }
+
+    #[tokio::test]
+    async fn door_grace_policy_delay_schedules_closed_away_restart_deadline() {
+        let mut config = test_config();
+        configure_fake_erv(&mut config);
+        config.thresholds.erv_door_close_grace_seconds = 180;
+        let closed_at = unix_timestamp_now() - 30.0;
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            closed_at - 10.0,
+        )));
+        {
+            let mut machine = state_machine.write().expect("state lock");
+            machine.update_door(true, closed_at - 5.0);
+            machine.update_door(false, closed_at);
+        }
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        let (_router, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            QingpingState::default(),
+            state_machine.clone(),
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            Arc::new(FakeHvacWriter::default()),
+        )
+        .expect("app");
+
+        let delay = door_grace_policy_delay(&state).expect("door close grace delay");
+        assert!(delay >= Duration::from_secs(145), "{delay:?}");
+        assert!(delay <= Duration::from_secs(151), "{delay:?}");
+
+        state_machine
+            .write()
+            .expect("state lock")
+            .set_manual_presence(true, unix_timestamp_now());
+        assert!(door_grace_policy_delay(&state).is_none());
     }
 
     #[tokio::test]
@@ -4939,7 +5228,7 @@ mod tests {
         state_machine
             .write()
             .expect("state machine lock poisoned")
-            .update_door(true, unix_timestamp_now());
+            .update_window(true, unix_timestamp_now());
         let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
         let erv_state = ErvState::new(config.runtime.database_path.clone());
         let hvac_state = HvacState::new(config.runtime.database_path.clone());
@@ -4997,6 +5286,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automated_hvac_policy_ignores_brief_door_open() {
+        let config = configured_hvac_config(true);
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            now,
+        )));
+        {
+            let mut machine = state_machine.write().expect("state machine lock poisoned");
+            machine.set_manual_presence(true, now - 10.0);
+            machine.update_door(true, now - 5.0);
+        }
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Off, 22.0));
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Cool, 25.5))],
+        ));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            qingping_with_temp(28.0),
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy applies");
+
+        assert_eq!(writer.smoke_calls(), 0);
+        assert!(writer.write_modes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn automated_hvac_policy_turns_off_for_sustained_door_open() {
+        let config = configured_hvac_config(true);
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            now,
+        )));
+        {
+            let mut machine = state_machine.write().expect("state machine lock poisoned");
+            machine.set_manual_presence(true, now - 240.0);
+            machine.update_door(true, now - 181.0);
+        }
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Heat, 22.0));
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Heat, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+        ));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            QingpingState::default(),
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy applies");
+
+        assert_eq!(writer.smoke_calls(), 1);
+        assert_eq!(writer.write_modes(), vec![(HvacControlMode::Off, None)]);
+    }
+
+    #[tokio::test]
     async fn automated_hvac_policy_safety_interlock_bypasses_manual_override() {
         let config = configured_hvac_config(true);
         let now = unix_timestamp_now();
@@ -5007,7 +5378,7 @@ mod tests {
         {
             let mut machine = state_machine.write().expect("state machine lock poisoned");
             machine.set_manual_presence(true, now);
-            machine.update_door(true, now + 1.0);
+            machine.update_window(true, now + 1.0);
         }
         let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
         let erv_state = ErvState::new(config.runtime.database_path.clone());
@@ -5053,7 +5424,7 @@ mod tests {
         state_machine
             .write()
             .expect("state machine lock poisoned")
-            .update_door(true, now + 1.0);
+            .update_window(true, now + 1.0);
         let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
         let erv_state = ErvState::new(config.runtime.database_path.clone());
         let hvac_state = HvacState::new(config.runtime.database_path.clone());
@@ -5098,7 +5469,7 @@ mod tests {
             .expect("state machine lock poisoned")
             .set_manual_presence(true, now);
         let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
-        yolink.apply_devices(vec![office_door_device()]);
+        yolink.apply_devices(vec![office_window_device()]);
         let erv_state = ErvState::new(config.runtime.database_path.clone());
         let hvac_state = HvacState::new(config.runtime.database_path.clone());
         hvac_state.record_status(hvac_status(HvacControlMode::Heat, 22.0));
@@ -5119,7 +5490,7 @@ mod tests {
         .expect("app");
 
         yolink
-            .apply_event("door-1", json!({"state": "open"}), now + 1.0)
+            .apply_event("window-1", json!({"state": "open"}), now + 1.0)
             .expect("event applies");
         evaluate_and_apply_hvac_policy(&state)
             .await
@@ -5230,7 +5601,7 @@ mod tests {
         {
             let mut machine = state_machine.write().expect("state machine lock poisoned");
             machine.set_manual_presence(true, now);
-            machine.update_door(true, now + 1.0);
+            machine.update_window(true, now + 1.0);
         }
         let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
         let erv_state = ErvState::new(config.runtime.database_path.clone());
@@ -5265,7 +5636,7 @@ mod tests {
         state_machine
             .write()
             .expect("state machine lock poisoned")
-            .update_door(false, now + 2.0);
+            .update_window(false, now + 2.0);
         evaluate_and_apply_hvac_policy(&state)
             .await
             .expect("HVAC policy restores heat");
@@ -5291,7 +5662,7 @@ mod tests {
         {
             let mut machine = state_machine.write().expect("state machine lock poisoned");
             machine.set_manual_presence(true, now);
-            machine.update_door(true, now + 1.0);
+            machine.update_window(true, now + 1.0);
         }
         let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
         let erv_state = ErvState::new(config.runtime.database_path.clone());
@@ -5326,7 +5697,7 @@ mod tests {
         state_machine
             .write()
             .expect("state machine lock poisoned")
-            .update_door(false, now + 2.0);
+            .update_window(false, now + 2.0);
         evaluate_and_apply_hvac_policy(&state)
             .await
             .expect("HVAC policy restores auto");

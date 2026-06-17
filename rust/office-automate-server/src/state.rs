@@ -62,6 +62,10 @@ pub struct SensorState {
     pub motion_last_seen: f64,
     pub door_open: bool,
     pub door_last_changed: f64,
+    #[serde(default)]
+    pub door_opened_at: f64,
+    #[serde(default)]
+    pub door_closed_at: f64,
     pub window_open: bool,
     pub co2_ppm: i64,
     pub last_updated: f64,
@@ -76,6 +80,8 @@ impl Default for SensorState {
             motion_last_seen: 0.0,
             door_open: false,
             door_last_changed: 0.0,
+            door_opened_at: 0.0,
+            door_closed_at: 0.0,
             window_open: false,
             co2_ppm: 400,
             last_updated: 0.0,
@@ -107,6 +113,9 @@ pub struct StateStatusSensors {
     pub external_monitor: bool,
     pub motion_detected: bool,
     pub door_open: bool,
+    pub door_last_changed: f64,
+    pub door_opened_at: f64,
+    pub door_closed_at: f64,
     pub window_open: bool,
     pub co2_ppm: i64,
 }
@@ -283,9 +292,17 @@ impl StateMachine {
     pub fn update_door(&mut self, is_open: bool, now: f64) -> Option<StateTransition> {
         let timer_transition = self.advance_timers(now);
         let was_open = self.last_door_state;
+        let previous_open = was_open.unwrap_or(self.sensors.door_open);
 
         self.sensors.door_open = is_open;
         self.sensors.door_last_changed = now;
+        if previous_open != is_open {
+            if is_open {
+                self.sensors.door_opened_at = now;
+            } else {
+                self.sensors.door_closed_at = now;
+            }
+        }
         self.sensors.last_updated = now;
 
         if !is_open && self.suppress_next_door_close_departure {
@@ -297,6 +314,19 @@ impl StateMachine {
         }
 
         timer_transition.or_else(|| self.evaluate_at(now))
+    }
+
+    pub fn restore_door_state(&mut self, is_open: bool, changed_at: f64, now: f64) {
+        let changed_at = changed_at.min(now).max(0.0);
+        self.sensors.door_open = is_open;
+        self.sensors.door_last_changed = changed_at;
+        if is_open {
+            self.sensors.door_opened_at = changed_at;
+        } else {
+            self.sensors.door_closed_at = changed_at;
+        }
+        self.sensors.last_updated = now;
+        self.last_door_state = Some(is_open);
     }
 
     pub fn update_window(&mut self, is_open: bool, now: f64) -> Option<StateTransition> {
@@ -368,6 +398,9 @@ impl StateMachine {
                 external_monitor: self.sensors.external_monitor,
                 motion_detected: self.sensors.motion_detected,
                 door_open: self.sensors.door_open,
+                door_last_changed: self.sensors.door_last_changed,
+                door_opened_at: self.sensors.door_opened_at,
+                door_closed_at: self.sensors.door_closed_at,
                 window_open: self.sensors.window_open,
                 co2_ppm: self.sensors.co2_ppm,
             },
@@ -544,6 +577,7 @@ mod tests {
         machine.sensors.external_monitor = true;
         machine.sensors.mac_last_active = 1_100.0;
         machine.sensors.door_last_changed = 1_040.0;
+        machine.sensors.door_closed_at = 1_030.0;
         machine.sensors.motion_detected = true;
         machine.sensors.motion_last_seen = 1_100.0;
 
@@ -553,7 +587,26 @@ mod tests {
         assert!(!machine.sensors.motion_detected);
         assert_eq!(machine.sensors.motion_last_seen, 0.0);
         assert_eq!(machine.sensors.door_last_changed, 1_101.0);
+        assert_eq!(machine.sensors.door_closed_at, 1_030.0);
         assert!(!machine.presence_signal_active_at(1_102.0));
+    }
+
+    #[test]
+    fn duplicate_door_reports_do_not_reset_transition_timestamps() {
+        let mut machine = StateMachine::new(StateConfig::default(), 1_000.0);
+        machine.update_door(true, 1_010.0);
+        machine.update_door(true, 1_020.0);
+
+        assert!(machine.sensors.door_open);
+        assert_eq!(machine.sensors.door_last_changed, 1_020.0);
+        assert_eq!(machine.sensors.door_opened_at, 1_010.0);
+
+        machine.update_door(false, 1_030.0);
+        machine.update_door(false, 1_040.0);
+
+        assert!(!machine.sensors.door_open);
+        assert_eq!(machine.sensors.door_last_changed, 1_040.0);
+        assert_eq!(machine.sensors.door_closed_at, 1_030.0);
     }
 
     #[test]
