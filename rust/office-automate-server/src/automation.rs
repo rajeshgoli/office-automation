@@ -110,6 +110,15 @@ impl ErvPolicyCoordinator {
                         OccupancyState::Away
                     },
                     door_open: state_status.sensors.door_open,
+                    door_open_seconds: state_status
+                        .sensors
+                        .door_open
+                        .then_some(state_status.sensors.door_opened_at)
+                        .filter(|opened_at| *opened_at > 0.0)
+                        .map(|opened_at| (now - opened_at).max(0.0)),
+                    door_closed_seconds: (!state_status.sensors.door_open
+                        && state_status.sensors.door_closed_at > 0.0)
+                        .then_some((now - state_status.sensors.door_closed_at).max(0.0)),
                     window_open: state_status.sensors.window_open,
                     co2_ppm: qingping_reading
                         .as_ref()
@@ -578,7 +587,7 @@ mod tests {
         {
             let mut machine = state_machine.write().expect("state machine lock poisoned");
             machine.set_manual_presence(true, now - 1.0);
-            machine.update_door(true, now - 0.5);
+            machine.update_window(true, now - 0.5);
         }
         let qingping = QingpingState::default();
         qingping.apply_reading(qingping_reading(700));

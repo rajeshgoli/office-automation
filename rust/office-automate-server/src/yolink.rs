@@ -338,11 +338,13 @@ impl YoLinkState {
     }
 
     pub fn restore_from_database(&self, now: f64) -> Result<()> {
-        if let Some(state) = db::get_latest_contact_device_state(&self.database_path, "door")? {
+        if let Some((state, changed_at)) =
+            db::get_latest_contact_device_state_with_timestamp(&self.database_path, "door")?
+        {
             self.state_machine
                 .write()
                 .expect("state machine lock poisoned")
-                .update_door(state == "open", now);
+                .restore_door_state(state == "open", changed_at.unwrap_or(now), now);
         }
         if let Some(state) = db::get_latest_contact_device_state(&self.database_path, "window")? {
             self.state_machine
@@ -844,6 +846,7 @@ mod tests {
         state::{OccupancyState, StateConfig},
     };
     use anyhow::Result;
+    use chrono::TimeZone;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct FakeErvWriter {
@@ -1538,18 +1541,34 @@ mod tests {
             .expect("log window error");
         db::log_device_event(&db_path, "motion", "detected", Some("Office Motion"), None)
             .expect("log motion");
+        let now = 1_050.0;
+        let opened_at = 450.0;
+        let opened_at_timestamp = chrono::Local
+            .timestamp_opt(opened_at as i64, 0)
+            .single()
+            .expect("local timestamp")
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        rusqlite::Connection::open(&db_path)
+            .expect("open database")
+            .execute(
+                "UPDATE device_events SET timestamp = ? WHERE device_type = 'door' AND event = 'open'",
+                [&opened_at_timestamp],
+            )
+            .expect("update door timestamp");
 
         let yolink = test_state(db_path);
-        yolink.restore_from_database(1_050.0).expect("restore");
+        yolink.restore_from_database(now).expect("restore");
 
         let machine = yolink
             .state_machine
             .read()
             .expect("state machine lock poisoned");
         assert!(machine.sensors.door_open);
+        assert!((machine.sensors.door_opened_at - opened_at).abs() < 1.0);
         assert!(!machine.sensors.window_open);
         assert!(machine.sensors.motion_detected);
-        assert_eq!(machine.state, OccupancyState::Away);
+        assert_eq!(machine.state, OccupancyState::Present);
     }
 
     #[test]
