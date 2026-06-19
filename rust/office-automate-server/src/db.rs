@@ -1035,20 +1035,41 @@ pub fn read_office_sessions(database_path: &Path, days: i64) -> Result<Value> {
     let connection = Connection::open(database_path)
         .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
     let now = Local::now().naive_local();
-    let cutoff = format_timestamp(now - Duration::days(days));
+    let cutoff_at = now - Duration::days(days);
+    let cutoff = format_timestamp(cutoff_at);
+    let previous = connection
+        .query_row(
+            "SELECT timestamp, state FROM occupancy_log WHERE timestamp <= ? ORDER BY timestamp DESC LIMIT 1",
+            params![&cutoff],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
     let rows = query_text_pairs(
         &connection,
         "SELECT timestamp, state FROM occupancy_log WHERE timestamp > ? ORDER BY timestamp ASC",
         &cutoff,
     )?;
 
-    let mut by_date: BTreeMap<String, Vec<(NaiveDateTime, String)>> = BTreeMap::new();
+    let mut transitions = Vec::new();
+    if let Some((_, state)) = previous {
+        transitions.push((cutoff_at, state));
+    }
     for (timestamp, state) in rows {
         if let Some(parsed) = parse_timestamp(&timestamp) {
-            by_date
-                .entry(parsed.date().to_string())
-                .or_default()
-                .push((parsed, state));
+            transitions.push((parsed, state));
+        }
+    }
+    transitions.sort_by_key(|(timestamp, _)| *timestamp);
+
+    let mut by_date: BTreeMap<NaiveDate, Vec<(NaiveDateTime, NaiveDateTime)>> = BTreeMap::new();
+    for index in 0..transitions.len() {
+        let (start, state) = &transitions[index];
+        let end = transitions
+            .get(index + 1)
+            .map(|(timestamp, _)| *timestamp)
+            .unwrap_or(now);
+        if state == "present" {
+            add_office_session_interval(&mut by_date, (*start).max(cutoff_at), end);
         }
     }
 
@@ -1056,51 +1077,45 @@ pub fn read_office_sessions(database_path: &Path, days: i64) -> Result<Value> {
     let mut arrival_minutes = Vec::new();
     let mut departure_minutes = Vec::new();
 
-    for (date, transitions) in by_date {
-        let Some(arrival) = transitions.iter().find_map(|(timestamp, state)| {
-            (state == "present" && timestamp.hour() >= 5).then_some(*timestamp)
-        }) else {
+    for (date, intervals) in by_date {
+        let Some((arrival, _)) = intervals.first().copied() else {
+            continue;
+        };
+        let Some((_, departure)) = intervals.last().copied() else {
             continue;
         };
 
-        let (mut departure, departure_state) = transitions
-            .last()
-            .map(|(timestamp, state)| (*timestamp, state.as_str()))
-            .expect("non-empty transitions");
-        if departure_state == "present" && arrival.date() == now.date() {
-            departure = now;
-        }
-
-        let mut duration_hours = (departure - arrival).num_seconds() as f64 / 3600.0;
+        let duration_hours = intervals
+            .iter()
+            .map(|(start, end)| (*end - *start).num_seconds().max(0) as f64 / 3600.0)
+            .sum::<f64>();
         let mut gaps = Vec::new();
-        let mut gap_start = None;
-        for (timestamp, state) in &transitions {
-            if *timestamp <= arrival || *timestamp > departure {
-                continue;
-            }
-            if state == "away" && gap_start.is_none() {
-                gap_start = Some(*timestamp);
-            } else if state == "present" {
-                if let Some(start) = gap_start.take() {
-                    let duration_min = (timestamp.signed_duration_since(start).num_seconds() as f64
-                        / 60.0)
-                        .round() as i64;
-                    if duration_min >= 2 {
-                        gaps.push(json!({
-                            "left": start.format("%H:%M:%S").to_string(),
-                            "returned": timestamp.format("%H:%M:%S").to_string(),
-                            "duration_min": duration_min,
-                        }));
-                        duration_hours -= duration_min as f64 / 60.0;
-                    }
-                }
+        for window in intervals.windows(2) {
+            let left = window[0].1;
+            let returned = window[1].0;
+            let duration_min =
+                (returned.signed_duration_since(left).num_seconds() as f64 / 60.0).round() as i64;
+            if duration_min >= 2 {
+                gaps.push(json!({
+                    "left": left.format("%H:%M:%S").to_string(),
+                    "returned": returned.format("%H:%M:%S").to_string(),
+                    "duration_min": duration_min,
+                }));
             }
         }
 
-        arrival_minutes.push((arrival.hour() * 60 + arrival.minute()) as f64);
-        departure_minutes.push((departure.hour() * 60 + departure.minute()) as f64);
+        let mut arrival_minute = (arrival.hour() * 60 + arrival.minute()) as f64;
+        if arrival.date() > date {
+            arrival_minute += 24.0 * 60.0;
+        }
+        arrival_minutes.push(arrival_minute);
+        let mut departure_minute = (departure.hour() * 60 + departure.minute()) as f64;
+        if departure.date() > date {
+            departure_minute += 24.0 * 60.0;
+        }
+        departure_minutes.push(departure_minute);
         sessions.push(json!({
-            "date": date,
+            "date": date.to_string(),
             "arrival": arrival.format("%H:%M:%S").to_string(),
             "departure": departure.format("%H:%M:%S").to_string(),
             "duration_hours": round1(duration_hours),
@@ -1136,6 +1151,41 @@ pub fn read_office_sessions(database_path: &Path, days: i64) -> Result<Value> {
     };
 
     Ok(json!({"sessions": sessions, "summary": summary}))
+}
+
+fn add_office_session_interval(
+    by_date: &mut BTreeMap<NaiveDate, Vec<(NaiveDateTime, NaiveDateTime)>>,
+    mut start: NaiveDateTime,
+    end: NaiveDateTime,
+) {
+    while start < end {
+        let boundary = next_office_day_boundary(start);
+        let segment_end = end.min(boundary);
+        by_date
+            .entry(office_session_date(start))
+            .or_default()
+            .push((start, segment_end));
+        start = segment_end;
+    }
+}
+
+fn office_session_date(timestamp: NaiveDateTime) -> NaiveDate {
+    if timestamp.hour() < 5 {
+        timestamp.date() - Duration::days(1)
+    } else {
+        timestamp.date()
+    }
+}
+
+fn next_office_day_boundary(timestamp: NaiveDateTime) -> NaiveDateTime {
+    let boundary_date = if timestamp.hour() < 5 {
+        timestamp.date()
+    } else {
+        timestamp.date() + Duration::days(1)
+    };
+    boundary_date
+        .and_hms_opt(5, 0, 0)
+        .expect("valid office day boundary")
 }
 
 pub fn read_co2_ohlc(database_path: &Path, hours: i64, bucket_minutes: i64) -> Result<Value> {
@@ -2050,7 +2100,7 @@ fn stddev(values: &[f64], average: f64) -> f64 {
 }
 
 fn minutes_to_time(minutes: f64) -> String {
-    let minutes = minutes as i64;
+    let minutes = (minutes as i64).rem_euclid(24 * 60);
     format!("{:02}:{:02}:00", minutes / 60, minutes % 60)
 }
 
@@ -2928,6 +2978,95 @@ mod tests {
         assert_eq!(history.occupancy_history[0]["state"], "present");
         assert_eq!(history.occupancy_history[0]["trigger"], "manual");
         assert_eq!(history.occupancy_history[0]["co2_ppm"], 500);
+    }
+
+    #[test]
+    fn office_sessions_sum_present_intervals_across_midnight() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+
+        let session_date = Local::now().naive_local().date() - Duration::days(2);
+        let next_date = session_date + Duration::days(1);
+        let rows = [
+            (
+                format!("{} 18:00:00", session_date.format("%Y-%m-%d")),
+                "present",
+            ),
+            (
+                format!("{} 19:00:00", session_date.format("%Y-%m-%d")),
+                "away",
+            ),
+            (
+                format!("{} 20:00:00", session_date.format("%Y-%m-%d")),
+                "present",
+            ),
+            (format!("{} 00:30:00", next_date.format("%Y-%m-%d")), "away"),
+        ];
+        let connection = Connection::open(&db_path).expect("open database");
+        for (timestamp, state) in rows {
+            connection
+                .execute(
+                    "INSERT INTO occupancy_log (timestamp, state) VALUES (?, ?)",
+                    params![timestamp, state],
+                )
+                .expect("insert occupancy row");
+        }
+
+        let payload = read_office_sessions(&db_path, 7).expect("sessions");
+        let sessions = payload["sessions"].as_array().expect("sessions array");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["date"], session_date.to_string());
+        assert_eq!(sessions[0]["arrival"], "18:00:00");
+        assert_eq!(sessions[0]["departure"], "00:30:00");
+        assert_eq!(sessions[0]["duration_hours"], 5.5);
+        assert_eq!(sessions[0]["gaps"][0]["duration_min"], 60);
+        assert_eq!(payload["summary"]["avg_departure"], "00:30:00");
+        assert_eq!(payload["summary"]["avg_duration_hours"], 5.5);
+        assert_eq!(payload["summary"]["total_hours_week"], 5.5);
+    }
+
+    #[test]
+    fn office_sessions_normalize_pre_dawn_arrivals_for_summary() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+
+        let first_date = Local::now().naive_local().date() - Duration::days(4);
+        let second_date = first_date + Duration::days(1);
+        let third_date = second_date + Duration::days(1);
+        let rows = [
+            (
+                format!("{} 23:00:00", first_date.format("%Y-%m-%d")),
+                "present",
+            ),
+            (
+                format!("{} 23:30:00", first_date.format("%Y-%m-%d")),
+                "away",
+            ),
+            (
+                format!("{} 02:00:00", third_date.format("%Y-%m-%d")),
+                "present",
+            ),
+            (
+                format!("{} 02:30:00", third_date.format("%Y-%m-%d")),
+                "away",
+            ),
+        ];
+        let connection = Connection::open(&db_path).expect("open database");
+        for (timestamp, state) in rows {
+            connection
+                .execute(
+                    "INSERT INTO occupancy_log (timestamp, state) VALUES (?, ?)",
+                    params![timestamp, state],
+                )
+                .expect("insert occupancy row");
+        }
+
+        let payload = read_office_sessions(&db_path, 7).expect("sessions");
+
+        assert_eq!(payload["summary"]["avg_arrival"], "00:30:00");
     }
 
     #[test]
