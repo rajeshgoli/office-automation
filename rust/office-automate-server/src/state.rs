@@ -45,7 +45,7 @@ impl Default for StateConfig {
     fn default() -> Self {
         Self {
             motion_timeout_seconds: 60.0,
-            departure_verification_seconds: 10.0,
+            departure_verification_seconds: 120.0,
             door_open_threshold_minutes: 5.0,
             door_open_away_timeout_minutes: 5.0,
             co2_critical_ppm: 2000,
@@ -260,22 +260,22 @@ impl StateMachine {
         external_monitor: bool,
         now: f64,
     ) -> Option<StateTransition> {
-        let timer_transition = self.advance_timers(now);
-
         self.sensors.external_monitor = external_monitor;
         self.sensors.mac_last_active = last_active_timestamp;
         self.sensors.last_updated = now;
 
-        if last_active_timestamp > self.sensors.door_last_changed && self.verifying_departure() {
+        if external_monitor
+            && last_active_timestamp > self.sensors.door_last_changed
+            && self.verifying_departure()
+        {
             self.cancel_departure_verification();
         }
 
+        let timer_transition = self.advance_timers(now);
         self.evaluate_at(now).or(timer_transition)
     }
 
     pub fn update_motion(&mut self, detected: bool, now: f64) -> Option<StateTransition> {
-        let timer_transition = self.advance_timers(now);
-
         self.sensors.motion_detected = detected;
         if detected {
             self.sensors.motion_last_seen = now;
@@ -286,6 +286,7 @@ impl StateMachine {
         }
         self.sensors.last_updated = now;
 
+        let timer_transition = self.advance_timers(now);
         self.evaluate_at(now).or(timer_transition)
     }
 
@@ -310,7 +311,11 @@ impl StateMachine {
             self.suppress_next_door_close_departure = false;
         } else if was_open == Some(true) && !is_open {
             self.cancel_door_open_away_timer();
-            self.start_departure_verification(now);
+            if self.presence_signal_active_at(now) {
+                self.cancel_departure_verification();
+            } else {
+                self.start_departure_verification(now);
+            }
         }
 
         timer_transition.or_else(|| self.evaluate_at(now))
@@ -446,6 +451,13 @@ impl StateMachine {
 mod tests {
     use super::*;
 
+    fn fast_departure_config() -> StateConfig {
+        StateConfig {
+            departure_verification_seconds: 10.0,
+            ..StateConfig::default()
+        }
+    }
+
     #[test]
     fn mac_activity_after_door_event_transitions_to_present() {
         let mut machine = StateMachine::new(StateConfig::default(), 1_000.0);
@@ -483,10 +495,45 @@ mod tests {
     }
 
     #[test]
-    fn departure_verification_expires_to_away_and_resets_motion() {
+    fn active_motion_before_door_close_does_not_count_as_inside_presence() {
         let mut machine = StateMachine::new(StateConfig::default(), 1_000.0);
+
+        machine.update_door(true, 1_010.0);
+        assert_eq!(machine.update_motion(true, 1_012.0), None);
+
+        let transition = machine.update_door(false, 1_020.0);
+
+        assert_eq!(transition, None);
+        assert_eq!(machine.state, OccupancyState::Away);
+        assert!(!machine.verifying_departure());
+    }
+
+    #[test]
+    fn motion_after_door_close_counts_as_inside_presence() {
+        let mut machine = StateMachine::new(StateConfig::default(), 1_000.0);
+
+        machine.update_door(true, 1_010.0);
+        machine.update_motion(true, 1_012.0);
+        machine.update_door(false, 1_020.0);
+
+        let transition = machine.update_motion(true, 1_021.0);
+
+        assert_eq!(
+            transition,
+            Some(StateTransition {
+                old_state: OccupancyState::Away,
+                new_state: OccupancyState::Present,
+            })
+        );
+        assert_eq!(machine.state, OccupancyState::Present);
+    }
+
+    #[test]
+    fn departure_verification_expires_to_away_and_resets_motion() {
+        let mut machine = StateMachine::new(fast_departure_config(), 1_000.0);
         machine.set_manual_presence(true, 1_001.0);
         machine.update_door(true, 1_010.0);
+        machine.update_motion(false, 1_019.0);
         machine.update_door(false, 1_020.0);
 
         assert!(machine.verifying_departure());
@@ -511,8 +558,10 @@ mod tests {
         let mut machine = StateMachine::new(StateConfig::default(), 1_000.0);
         machine.set_manual_presence(true, 1_001.0);
         machine.update_door(true, 1_010.0);
+        machine.update_motion(false, 1_019.0);
         machine.update_door(false, 1_020.0);
 
+        assert!(machine.verifying_departure());
         machine.update_mac_occupancy(1_021.0, true, 1_022.0);
 
         assert!(!machine.verifying_departure());
@@ -521,14 +570,84 @@ mod tests {
     }
 
     #[test]
-    fn fresh_mac_update_after_departure_timer_restores_present() {
+    fn fresh_mac_update_after_departure_deadline_cancels_before_away() {
+        let mut machine = StateMachine::new(fast_departure_config(), 1_000.0);
+        machine.set_manual_presence(true, 1_001.0);
+        machine.update_door(true, 1_010.0);
+        machine.update_motion(false, 1_019.0);
+        machine.update_door(false, 1_020.0);
+
+        assert!(machine.verifying_departure());
+        let transition = machine.update_mac_occupancy(1_031.0, true, 1_031.0);
+
+        assert_eq!(transition, None);
+        assert_eq!(machine.state, OccupancyState::Present);
+        assert!(!machine.verifying_departure());
+    }
+
+    #[test]
+    fn mac_update_without_external_monitor_does_not_cancel_departure_verification() {
+        let mut machine = StateMachine::new(fast_departure_config(), 1_000.0);
+        machine.set_manual_presence(true, 1_001.0);
+        machine.update_door(true, 1_010.0);
+        machine.update_motion(false, 1_019.0);
+        machine.update_door(false, 1_020.0);
+
+        assert!(machine.verifying_departure());
+        let transition = machine.update_mac_occupancy(1_031.0, false, 1_031.0);
+
+        assert_eq!(
+            transition,
+            Some(StateTransition {
+                old_state: OccupancyState::Present,
+                new_state: OccupancyState::Away,
+            })
+        );
+        assert_eq!(machine.state, OccupancyState::Away);
+        assert!(!machine.verifying_departure());
+    }
+
+    #[test]
+    fn door_close_with_only_stale_active_motion_starts_departure_verification() {
         let mut machine = StateMachine::new(StateConfig::default(), 1_000.0);
         machine.set_manual_presence(true, 1_001.0);
         machine.update_door(true, 1_010.0);
+        machine.update_motion(true, 1_012.0);
+
+        let transition = machine.update_door(false, 1_020.0);
+
+        assert_eq!(transition, None);
+        assert_eq!(machine.state, OccupancyState::Present);
+        assert!(machine.verifying_departure());
+    }
+
+    #[test]
+    fn motion_after_door_close_cancels_departure_verification() {
+        let mut machine = StateMachine::new(StateConfig::default(), 1_000.0);
+        machine.set_manual_presence(true, 1_001.0);
+        machine.update_door(true, 1_010.0);
+        machine.update_motion(true, 1_012.0);
         machine.update_door(false, 1_020.0);
 
-        machine.update_mac_occupancy(1_031.0, true, 1_031.0);
+        assert!(machine.verifying_departure());
+        assert_eq!(machine.update_motion(true, 1_021.0), None);
+        assert!(!machine.verifying_departure());
+        assert_eq!(machine.advance_timers(1_040.0), None);
+        assert_eq!(machine.state, OccupancyState::Present);
+    }
 
+    #[test]
+    fn fresh_motion_after_departure_deadline_cancels_before_away() {
+        let mut machine = StateMachine::new(fast_departure_config(), 1_000.0);
+        machine.set_manual_presence(true, 1_001.0);
+        machine.update_door(true, 1_010.0);
+        machine.update_motion(false, 1_019.0);
+        machine.update_door(false, 1_020.0);
+
+        assert!(machine.verifying_departure());
+        let transition = machine.update_motion(true, 1_031.0);
+
+        assert_eq!(transition, None);
         assert_eq!(machine.state, OccupancyState::Present);
         assert!(!machine.verifying_departure());
     }

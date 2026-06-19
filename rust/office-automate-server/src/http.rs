@@ -659,7 +659,7 @@ fn door_grace_policy_delay(state: &AppState) -> Option<Duration> {
         }
         let deadline = state_status.sensors.door_closed_at
             + state.config.thresholds.erv_door_close_grace_seconds as f64;
-        return (deadline > now).then_some(Duration::from_secs_f64(deadline - now));
+        return (deadline > now).then(|| Duration::from_secs_f64(deadline - now));
     }
 
     if state_status.sensors.door_opened_at <= 0.0 {
@@ -2041,14 +2041,17 @@ fn status_for_state(state: &AppState) -> Status {
     let mut status =
         Status::read_only_with_temperature_bands(&state.config, active_temperature_bands(state));
     let now = unix_timestamp_now();
-    let state_status = {
+    let (state_status, timer_transition) = {
         let mut machine = state
             .state_machine
             .write()
             .expect("state machine lock poisoned");
-        machine.advance_timers(now);
-        machine.status_at(now)
+        let transition = machine.advance_timers(now);
+        (machine.status_at(now), transition)
     };
+    if let Err(error) = log_state_transition(state, timer_transition, "internal_presence") {
+        tracing::warn!("failed to persist timer-driven status transition: {error:#}");
+    }
 
     status.state = state_status.state;
     status.is_present = state_status.is_present;
@@ -3558,6 +3561,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn door_grace_policy_delay_handles_expired_closed_away_deadline() {
+        let mut config = test_config();
+        configure_fake_erv(&mut config);
+        config.thresholds.erv_door_close_grace_seconds = 30;
+        let closed_at = unix_timestamp_now() - 60.0;
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            closed_at - 10.0,
+        )));
+        {
+            let mut machine = state_machine.write().expect("state lock");
+            machine.update_door(true, closed_at - 5.0);
+            machine.update_door(false, closed_at);
+        }
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        let (_router, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            QingpingState::default(),
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            Arc::new(FakeHvacWriter::default()),
+        )
+        .expect("app");
+
+        assert!(door_grace_policy_delay(&state).is_none());
+    }
+
+    #[tokio::test]
     async fn status_route_returns_compatibility_skeleton() {
         let response = app(test_config())
             .oneshot(
@@ -3582,6 +3618,55 @@ mod tests {
         assert!(value.get("erv").is_some());
         assert!(value.get("hvac").is_some());
         assert!(value["erv"]["control"].get("last_local_ok_at").is_some());
+    }
+
+    #[tokio::test]
+    async fn status_route_persists_timer_driven_departure_transition() {
+        let mut config = test_config();
+        config.thresholds.departure_verification_seconds = 10;
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            now - 100.0,
+        )));
+        {
+            let mut machine = state_machine.write().expect("state lock");
+            machine.set_manual_presence(true, now - 40.0);
+            machine.update_door(true, now - 30.0);
+            machine.update_motion(false, now - 21.0);
+            machine.update_door(false, now - 20.0);
+            assert!(machine.verifying_departure());
+        }
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        let (router, _state) = try_app_with_erv_writer_and_coordinator(
+            config.clone(),
+            QingpingState::default(),
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            Arc::new(FakeHvacWriter::default()),
+        )
+        .expect("app");
+
+        let response = router
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let history = db::read_history(&config.runtime.database_path, 1, 10).expect("history");
+        assert_eq!(history.occupancy_history.len(), 1);
+        assert_eq!(history.occupancy_history[0]["state"], "away");
+        assert_eq!(history.occupancy_history[0]["trigger"], "internal_presence");
     }
 
     #[tokio::test]

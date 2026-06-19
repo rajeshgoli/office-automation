@@ -359,7 +359,7 @@ impl Default for ThresholdsConfig {
     fn default() -> Self {
         Self {
             motion_timeout_seconds: 60,
-            departure_verification_seconds: 10,
+            departure_verification_seconds: 120,
             door_open_threshold_minutes: 5,
             door_open_away_timeout_minutes: 5,
             co2_critical_ppm: 2000,

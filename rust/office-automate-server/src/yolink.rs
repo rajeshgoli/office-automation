@@ -281,6 +281,12 @@ impl YoLinkState {
             }
         };
 
+        if let Err(error) = self.log_occupancy_transition(transition) {
+            tracing::warn!(
+                "failed to persist YoLink occupancy transition after state update: {error:#}"
+            );
+        }
+
         if let Err(error) = db::log_device_event(
             &self.database_path,
             device_type,
@@ -300,6 +306,25 @@ impl YoLinkState {
             device_name: validated.device_name,
             transition,
         }))
+    }
+
+    fn log_occupancy_transition(&self, transition: Option<StateTransition>) -> Result<()> {
+        let Some(transition) = transition else {
+            return Ok(());
+        };
+        let co2_ppm = self
+            .state_machine
+            .read()
+            .expect("state machine lock poisoned")
+            .sensors
+            .co2_ppm;
+        db::log_occupancy_change(
+            &self.database_path,
+            transition.new_state.as_str(),
+            Some("yolink"),
+            Some(co2_ppm),
+            Some(&json!({"old_state": transition.old_state.as_str()})),
+        )
     }
 
     fn validate_event(
@@ -1338,6 +1363,37 @@ mod tests {
             db::get_latest_device_state(&db_path, "motion").expect("motion state"),
             Some("detected".to_string())
         );
+    }
+
+    #[test]
+    fn persists_yolink_occupancy_transitions() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+        let yolink = test_state(db_path.clone());
+        yolink.apply_devices(sample_devices());
+
+        yolink
+            .apply_event("door-1", json!({"state": "open"}), 1_010.0)
+            .expect("door open")
+            .expect("applied");
+        yolink
+            .apply_event("motion-1", json!({"state": "alert"}), 1_012.0)
+            .expect("motion detected")
+            .expect("applied");
+        yolink
+            .apply_event("door-1", json!({"state": "closed"}), 1_020.0)
+            .expect("door closed")
+            .expect("applied");
+        yolink
+            .apply_event("motion-1", json!({"state": "alert"}), 1_021.0)
+            .expect("motion detected after close")
+            .expect("applied");
+
+        let history = db::read_history(&db_path, 24, 10).expect("history");
+        assert_eq!(history.occupancy_history.len(), 1);
+        assert_eq!(history.occupancy_history[0]["state"], "present");
+        assert_eq!(history.occupancy_history[0]["trigger"], "yolink");
     }
 
     #[test]
