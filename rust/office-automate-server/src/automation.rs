@@ -651,6 +651,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_air_quality_sensors_do_not_turn_running_erv_off_as_clean_air() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let mut config = test_config(database_path.clone());
+        config.room_mode.air_quality_sensors_enabled = false;
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
+            &config.thresholds,
+            &config.room_mode,
+            now - 2.0,
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .set_manual_presence(true, now - 1.0);
+        let qingping = QingpingState::default();
+        qingping.apply_reading(qingping_reading(450));
+        let erv = ErvState::new(database_path.clone());
+        let writer = Arc::new(FakeErvWriter::new(vec![Ok(erv_status(ErvFanSpeed::Turbo))]));
+        erv.smoke_status_with(&config.erv, writer.as_ref())
+            .await
+            .expect("initial ERV status");
+        let policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
+        let (status_broadcast, _) = broadcast::channel(4);
+        let coordinator = ErvPolicyCoordinator::new(
+            config,
+            state_machine,
+            qingping,
+            erv,
+            policy,
+            writer.clone(),
+            status_broadcast,
+        );
+
+        coordinator
+            .evaluate_erv_policy(false)
+            .await
+            .expect("policy preserves current speed without trusted air-quality");
+
+        assert!(writer.writes().is_empty());
+        assert!(
+            db::read_history(&database_path, 1, 10)
+                .expect("history")
+                .climate_actions
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn disabled_climate_automation_skips_erv_policy_writes() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let database_path = temp_dir.path().join("office_climate.db");

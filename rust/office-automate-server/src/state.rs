@@ -187,13 +187,11 @@ impl StateMachine {
 
     pub fn presence_signal_active_at(&self, now: f64) -> bool {
         if !self.config.contact_sensors_enabled {
-            let motion_age = now - self.sensors.motion_last_seen;
-            let motion_recent = self.sensors.motion_detected
-                || (self.sensors.motion_last_seen > 0.0
-                    && motion_age < self.config.motion_timeout_seconds);
+            let motion_recent = self.signal_recent_at(self.sensors.motion_last_seen, now);
             let freshness_anchor = self.last_manual_away_at.unwrap_or(0.0);
-            let mac_recent =
-                self.sensors.external_monitor && self.sensors.mac_last_active > freshness_anchor;
+            let mac_recent = self.sensors.external_monitor
+                && self.sensors.mac_last_active > freshness_anchor
+                && self.signal_recent_at(self.sensors.mac_last_active, now);
             return mac_recent || motion_recent;
         }
 
@@ -215,6 +213,10 @@ impl StateMachine {
             && self.sensors.motion_last_seen > self.sensors.door_last_changed;
 
         mac_presence || motion_inside
+    }
+
+    fn signal_recent_at(&self, timestamp: f64, now: f64) -> bool {
+        timestamp > 0.0 && now - timestamp < self.config.motion_timeout_seconds
     }
 
     pub fn safety_interlock_active(&self) -> bool {
@@ -291,10 +293,19 @@ impl StateMachine {
                 }
                 None
             }
-        } else if self.state == OccupancyState::Away && self.presence_signal_active_at(now) {
-            self.transition_to(OccupancyState::Present)
         } else {
-            None
+            let presence_signal_active = self.presence_signal_active_at(now);
+            if self.state == OccupancyState::Away && presence_signal_active {
+                self.transition_to(OccupancyState::Present)
+            } else if !self.config.contact_sensors_enabled
+                && self.state == OccupancyState::Present
+                && !presence_signal_active
+            {
+                self.sensors.motion_detected = false;
+                self.transition_to(OccupancyState::Away)
+            } else {
+                None
+            }
         };
 
         self.last_door_state = Some(self.sensors.door_open);
@@ -854,6 +865,73 @@ mod tests {
                 new_state: OccupancyState::Present,
             })
         );
+    }
+
+    #[test]
+    fn disabled_contact_sensors_transition_away_after_motion_timeout() {
+        let mut machine = StateMachine::new(contact_disabled_config(), 1_000.0);
+        assert!(
+            machine
+                .update_motion(true, 1_010.0)
+                .is_some_and(|transition| transition.new_state == OccupancyState::Present)
+        );
+
+        let transition = machine.evaluate_at(1_071.0);
+
+        assert_eq!(
+            transition,
+            Some(StateTransition {
+                old_state: OccupancyState::Present,
+                new_state: OccupancyState::Away,
+            })
+        );
+        assert_eq!(machine.state, OccupancyState::Away);
+        assert!(!machine.sensors.motion_detected);
+        assert!(!machine.presence_signal_active_at(1_071.0));
+    }
+
+    #[test]
+    fn disabled_contact_sensors_transition_away_when_mac_activity_is_stale() {
+        let mut machine = StateMachine::new(contact_disabled_config(), 1_000.0);
+        assert!(
+            machine
+                .update_mac_occupancy(1_010.0, true, 1_010.0)
+                .is_some_and(|transition| transition.new_state == OccupancyState::Present)
+        );
+
+        let transition = machine.evaluate_at(1_071.0);
+
+        assert_eq!(
+            transition,
+            Some(StateTransition {
+                old_state: OccupancyState::Present,
+                new_state: OccupancyState::Away,
+            })
+        );
+        assert_eq!(machine.state, OccupancyState::Away);
+        assert!(!machine.presence_signal_active_at(1_071.0));
+    }
+
+    #[test]
+    fn disabled_contact_sensors_transition_away_when_external_monitor_disconnects() {
+        let mut machine = StateMachine::new(contact_disabled_config(), 1_000.0);
+        assert!(
+            machine
+                .update_mac_occupancy(1_010.0, true, 1_010.0)
+                .is_some_and(|transition| transition.new_state == OccupancyState::Present)
+        );
+
+        let transition = machine.update_mac_occupancy(1_010.0, false, 1_020.0);
+
+        assert_eq!(
+            transition,
+            Some(StateTransition {
+                old_state: OccupancyState::Present,
+                new_state: OccupancyState::Away,
+            })
+        );
+        assert_eq!(machine.state, OccupancyState::Away);
+        assert!(!machine.presence_signal_active_at(1_020.0));
     }
 
     #[test]
