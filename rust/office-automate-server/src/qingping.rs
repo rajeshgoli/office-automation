@@ -70,7 +70,9 @@ impl QingpingState {
         status.air_quality.noise_db = reading.noise_db.map(|value| value as f64);
         status.air_quality.last_update = Some(reading.timestamp);
 
-        if let Some(co2_ppm) = status.air_quality.co2_ppm {
+        if status.air_quality.trusted_office_reading
+            && let Some(co2_ppm) = status.air_quality.co2_ppm
+        {
             status.sensors.co2_ppm = co2_ppm;
         }
     }
@@ -390,6 +392,7 @@ mod tests {
             erv_should_run: false,
             verifying_departure: false,
             in_door_open_mode: false,
+            room_mode: crate::status::RoomModeStatus::default(),
             sensors: crate::status::SensorsStatus::default(),
             air_quality: crate::status::AirQualityStatus::default(),
             erv: crate::status::ErvStatus::default(),
@@ -404,6 +407,61 @@ mod tests {
         state.mark_interval_configured();
         state.overlay_status(&mut status);
         assert!(status.air_quality.interval_configured);
+    }
+
+    #[test]
+    fn ignored_air_quality_does_not_overwrite_trusted_sensor_co2() {
+        let state = QingpingState::default();
+        state.apply_reading(QingpingReading {
+            device_name: "Qingping Air Monitor".to_string(),
+            mac_hint: "AABBCCDDEEFF".to_string(),
+            temp_c: Some(22.5),
+            humidity: Some(45.0),
+            co2_ppm: Some(900),
+            pm25: Some(3),
+            pm10: Some(4),
+            tvoc: Some(25),
+            noise_db: Some(37),
+            timestamp: "2026-06-22T07:30:00".to_string(),
+            raw_data: "{}".to_string(),
+        });
+        let mut status = Status {
+            state: "away".to_string(),
+            is_present: false,
+            presence_signal_active: false,
+            safety_interlock: false,
+            erv_should_run: false,
+            verifying_departure: false,
+            in_door_open_mode: false,
+            room_mode: crate::status::RoomModeStatus {
+                renovation: true,
+                climate_automation_enabled: false,
+                contact_sensors_enabled: false,
+                air_quality_sensors_enabled: false,
+            },
+            sensors: crate::status::SensorsStatus {
+                co2_ppm: 400,
+                air_quality_sensors_enabled: false,
+                air_quality_sensors_ignored: true,
+                ..crate::status::SensorsStatus::default()
+            },
+            air_quality: crate::status::AirQualityStatus {
+                trusted_office_reading: false,
+                ignored_reason: Some("renovation_air_quality_sensor_moved".to_string()),
+                ..crate::status::AirQualityStatus::default()
+            },
+            erv: crate::status::ErvStatus::default(),
+            hvac: crate::status::HvacStatus::default(),
+            manual_override: crate::status::ManualOverrideStatus::default(),
+            notifications: Vec::new(),
+        };
+
+        state.overlay_status(&mut status);
+
+        assert_eq!(status.air_quality.co2_ppm, Some(900));
+        assert_eq!(status.air_quality.temp_c, Some(22.5));
+        assert!(!status.air_quality.trusted_office_reading);
+        assert_eq!(status.sensors.co2_ppm, 400);
     }
 
     #[test]

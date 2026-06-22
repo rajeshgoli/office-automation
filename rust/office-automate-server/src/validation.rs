@@ -1504,8 +1504,9 @@ async fn validate_live_devices(
     if !config.yolink.is_configured() {
         bail!("shadow validation requires configured YoLink API credentials");
     }
-    let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+    let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
         &config.thresholds,
+        &config.room_mode,
         current_timestamp_seconds(),
     )));
     let yolink_state = YoLinkState::new(state_machine, config.runtime.database_path.clone());
@@ -3404,6 +3405,7 @@ mod tests {
             .to_path_buf();
         AppConfig {
             orchestrator: OrchestratorConfig::default(),
+            room_mode: crate::config::RoomModeConfig::default(),
             presence: crate::config::PresenceConfig::default(),
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),

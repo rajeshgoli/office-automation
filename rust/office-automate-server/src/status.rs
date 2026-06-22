@@ -11,6 +11,7 @@ pub struct Status {
     pub erv_should_run: bool,
     pub verifying_departure: bool,
     pub in_door_open_mode: bool,
+    pub room_mode: RoomModeStatus,
     pub sensors: SensorsStatus,
     pub air_quality: AirQualityStatus,
     pub erv: ErvStatus,
@@ -28,7 +29,20 @@ impl Status {
         config: &AppConfig,
         temperature_bands: TemperatureBands,
     ) -> Self {
-        let sensors = SensorsStatus::default();
+        let sensors = SensorsStatus {
+            contact_sensors_enabled: config.room_mode.contact_sensors_enabled,
+            contact_sensors_ignored: !config.room_mode.contact_sensors_enabled,
+            air_quality_sensors_enabled: config.room_mode.air_quality_sensors_enabled,
+            air_quality_sensors_ignored: !config.room_mode.air_quality_sensors_enabled,
+            ..SensorsStatus::default()
+        };
+        let air_quality = AirQualityStatus {
+            report_interval: config.qingping.report_interval,
+            trusted_office_reading: config.room_mode.air_quality_sensors_enabled,
+            ignored_reason: (!config.room_mode.air_quality_sensors_enabled)
+                .then(|| "renovation_air_quality_sensor_moved".to_string()),
+            ..AirQualityStatus::default()
+        };
 
         Self {
             state: "away".to_string(),
@@ -38,11 +52,9 @@ impl Status {
             erv_should_run: sensors.co2_ppm > config.thresholds.co2_refresh_target_ppm,
             verifying_departure: false,
             in_door_open_mode: false,
+            room_mode: RoomModeStatus::from_config(config),
             sensors,
-            air_quality: AirQualityStatus {
-                report_interval: config.qingping.report_interval,
-                ..AirQualityStatus::default()
-            },
+            air_quality,
             erv: ErvStatus {
                 away_stale_flush_enabled: config.thresholds.away_stale_flush_enabled,
                 ..ErvStatus::default()
@@ -58,6 +70,36 @@ impl Status {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoomModeStatus {
+    pub renovation: bool,
+    pub climate_automation_enabled: bool,
+    pub contact_sensors_enabled: bool,
+    pub air_quality_sensors_enabled: bool,
+}
+
+impl RoomModeStatus {
+    fn from_config(config: &AppConfig) -> Self {
+        Self {
+            renovation: config.room_mode.renovation,
+            climate_automation_enabled: config.room_mode.climate_automation_enabled,
+            contact_sensors_enabled: config.room_mode.contact_sensors_enabled,
+            air_quality_sensors_enabled: config.room_mode.air_quality_sensors_enabled,
+        }
+    }
+}
+
+impl Default for RoomModeStatus {
+    fn default() -> Self {
+        Self {
+            renovation: false,
+            climate_automation_enabled: true,
+            contact_sensors_enabled: true,
+            air_quality_sensors_enabled: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SensorsStatus {
     pub mac_last_active: f64,
@@ -68,6 +110,10 @@ pub struct SensorsStatus {
     pub door_last_changed: f64,
     pub window_open: bool,
     pub co2_ppm: i64,
+    pub contact_sensors_enabled: bool,
+    pub contact_sensors_ignored: bool,
+    pub air_quality_sensors_enabled: bool,
+    pub air_quality_sensors_ignored: bool,
 }
 
 impl Default for SensorsStatus {
@@ -81,6 +127,10 @@ impl Default for SensorsStatus {
             door_last_changed: 0.0,
             window_open: false,
             co2_ppm: 400,
+            contact_sensors_enabled: true,
+            contact_sensors_ignored: false,
+            air_quality_sensors_enabled: true,
+            air_quality_sensors_ignored: false,
         }
     }
 }
@@ -97,6 +147,8 @@ pub struct AirQualityStatus {
     pub last_update: Option<String>,
     pub report_interval: u64,
     pub interval_configured: bool,
+    pub trusted_office_reading: bool,
+    pub ignored_reason: Option<String>,
 }
 
 impl Default for AirQualityStatus {
@@ -112,6 +164,8 @@ impl Default for AirQualityStatus {
             last_update: None,
             report_interval: 60,
             interval_configured: false,
+            trusted_office_reading: true,
+            ignored_reason: None,
         }
     }
 }
@@ -243,12 +297,13 @@ mod tests {
     use super::*;
     use crate::config::{
         ErvConfig, MitsubishiConfig, OrchestratorConfig, PresenceConfig, QingpingConfig,
-        RuntimeConfig, TelemetryConfig, ThresholdsConfig, YoLinkConfig,
+        RoomModeConfig, RuntimeConfig, TelemetryConfig, ThresholdsConfig, YoLinkConfig,
     };
 
     fn test_config() -> AppConfig {
         AppConfig {
             orchestrator: OrchestratorConfig::default(),
+            room_mode: RoomModeConfig::default(),
             presence: PresenceConfig::default(),
             qingping: QingpingConfig {
                 report_interval: 45,
@@ -302,6 +357,7 @@ mod tests {
             "erv_should_run",
             "verifying_departure",
             "in_door_open_mode",
+            "room_mode",
             "sensors",
             "air_quality",
             "erv",
@@ -316,8 +372,16 @@ mod tests {
         assert_eq!(value["sensors"]["mac_last_active"], 0.0);
         assert_eq!(value["sensors"]["mac_active"], false);
         assert_eq!(value["sensors"]["co2_ppm"], 400);
+        assert_eq!(value["room_mode"]["renovation"], false);
+        assert_eq!(value["room_mode"]["climate_automation_enabled"], true);
+        assert_eq!(value["sensors"]["contact_sensors_enabled"], true);
+        assert_eq!(value["sensors"]["contact_sensors_ignored"], false);
+        assert_eq!(value["sensors"]["air_quality_sensors_enabled"], true);
+        assert_eq!(value["sensors"]["air_quality_sensors_ignored"], false);
         assert_eq!(value["air_quality"]["report_interval"], 45);
         assert_eq!(value["air_quality"]["interval_configured"], false);
+        assert_eq!(value["air_quality"]["trusted_office_reading"], true);
+        assert!(value["air_quality"]["ignored_reason"].is_null());
         assert_eq!(value["erv"]["speed"], "off");
         assert_eq!(value["erv"]["away_stale_flush_enabled"], false);
         assert!(value["erv"]["control"]["last_ok_at"].is_null());

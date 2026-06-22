@@ -66,6 +66,10 @@ impl ErvPolicyCoordinator {
     }
 
     async fn evaluate_erv_policy_locked(&self, bypass_dwell: bool) -> Result<()> {
+        if !self.config.room_mode.climate_automation_enabled {
+            return Ok(());
+        }
+
         let now = unix_timestamp_now();
         let state_status = {
             let machine = self
@@ -74,7 +78,7 @@ impl ErvPolicyCoordinator {
                 .expect("state machine lock poisoned");
             machine.status_at(now)
         };
-        let qingping_reading = self.qingping.latest();
+        let qingping_reading = self.trusted_qingping_reading();
         let manual_override = self
             .erv
             .active_manual_override_speed(now)
@@ -120,10 +124,14 @@ impl ErvPolicyCoordinator {
                         && state_status.sensors.door_closed_at > 0.0)
                         .then_some((now - state_status.sensors.door_closed_at).max(0.0)),
                     window_open: state_status.sensors.window_open,
-                    co2_ppm: qingping_reading
-                        .as_ref()
-                        .and_then(|reading| reading.co2_ppm)
-                        .or(Some(state_status.sensors.co2_ppm)),
+                    co2_ppm: if self.config.room_mode.air_quality_sensors_enabled {
+                        qingping_reading
+                            .as_ref()
+                            .and_then(|reading| reading.co2_ppm)
+                            .or(Some(state_status.sensors.co2_ppm))
+                    } else {
+                        None
+                    },
                     tvoc: qingping_reading.as_ref().and_then(|reading| reading.tvoc),
                     current_running: erv_snapshot.running,
                     current_speed: ventilation_speed_from_erv(erv_snapshot.speed),
@@ -245,7 +253,16 @@ impl ErvPolicyCoordinator {
     }
 
     pub fn latest_co2_ppm(&self) -> Option<i64> {
-        self.qingping.latest().and_then(|reading| reading.co2_ppm)
+        self.trusted_qingping_reading()
+            .and_then(|reading| reading.co2_ppm)
+    }
+
+    fn trusted_qingping_reading(&self) -> Option<crate::qingping::QingpingReading> {
+        self.config
+            .room_mode
+            .air_quality_sensors_enabled
+            .then(|| self.qingping.latest())
+            .flatten()
     }
 
     pub fn broadcast_status(&self) {
@@ -276,9 +293,13 @@ impl ErvPolicyCoordinator {
             return false;
         }
 
-        let co2_ppm = qingping_reading
-            .and_then(|reading| reading.co2_ppm)
-            .or(Some(state_status.sensors.co2_ppm));
+        let co2_ppm = if self.config.room_mode.air_quality_sensors_enabled {
+            qingping_reading
+                .and_then(|reading| reading.co2_ppm)
+                .or(Some(state_status.sensors.co2_ppm))
+        } else {
+            None
+        };
         let tvoc = qingping_reading.and_then(|reading| reading.tvoc);
 
         if state_status.is_present {
@@ -457,6 +478,7 @@ mod tests {
             .to_path_buf();
         AppConfig {
             orchestrator: OrchestratorConfig::default(),
+            room_mode: crate::config::RoomModeConfig::default(),
             presence: PresenceConfig::default(),
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),
@@ -570,6 +592,158 @@ mod tests {
         assert_eq!(
             history.climate_actions[0]["reason"],
             "present_co2_critical_2100ppm"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_air_quality_sensors_do_not_drive_erv_policy_or_history() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let mut config = test_config(database_path.clone());
+        config.room_mode.air_quality_sensors_enabled = false;
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
+            &config.thresholds,
+            &config.room_mode,
+            now - 2.0,
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .set_manual_presence(true, now - 1.0);
+        let qingping = QingpingState::default();
+        qingping.apply_reading(qingping_reading(2100));
+        let erv = ErvState::new(database_path.clone());
+        let writer = Arc::new(FakeErvWriter::new(vec![Ok(erv_status(ErvFanSpeed::Off))]));
+        let policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
+        let (status_broadcast, _) = broadcast::channel(4);
+        let coordinator = ErvPolicyCoordinator::new(
+            config,
+            state_machine,
+            qingping,
+            erv,
+            policy.clone(),
+            writer.clone(),
+            status_broadcast,
+        );
+
+        coordinator
+            .evaluate_erv_policy(false)
+            .await
+            .expect("policy applies without trusted air-quality");
+
+        assert!(writer.writes().is_empty());
+        assert_eq!(
+            policy
+                .read()
+                .expect("policy lock poisoned")
+                .air_quality_sample_counts(),
+            (0, 0)
+        );
+        assert!(
+            db::read_history(&database_path, 1, 10)
+                .expect("history")
+                .climate_actions
+                .is_empty()
+        );
+        assert_eq!(coordinator.latest_co2_ppm(), None);
+    }
+
+    #[tokio::test]
+    async fn disabled_air_quality_sensors_do_not_turn_running_erv_off_as_clean_air() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let mut config = test_config(database_path.clone());
+        config.room_mode.air_quality_sensors_enabled = false;
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
+            &config.thresholds,
+            &config.room_mode,
+            now - 2.0,
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .set_manual_presence(true, now - 1.0);
+        let qingping = QingpingState::default();
+        qingping.apply_reading(qingping_reading(450));
+        let erv = ErvState::new(database_path.clone());
+        let writer = Arc::new(FakeErvWriter::new(vec![Ok(erv_status(ErvFanSpeed::Turbo))]));
+        erv.smoke_status_with(&config.erv, writer.as_ref())
+            .await
+            .expect("initial ERV status");
+        let policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
+        let (status_broadcast, _) = broadcast::channel(4);
+        let coordinator = ErvPolicyCoordinator::new(
+            config,
+            state_machine,
+            qingping,
+            erv,
+            policy,
+            writer.clone(),
+            status_broadcast,
+        );
+
+        coordinator
+            .evaluate_erv_policy(false)
+            .await
+            .expect("policy preserves current speed without trusted air-quality");
+
+        assert!(writer.writes().is_empty());
+        assert!(
+            db::read_history(&database_path, 1, 10)
+                .expect("history")
+                .climate_actions
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_climate_automation_skips_erv_policy_writes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let mut config = test_config(database_path.clone());
+        config.room_mode.climate_automation_enabled = false;
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
+            &config.thresholds,
+            &config.room_mode,
+            now - 2.0,
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .set_manual_presence(true, now - 1.0);
+        let qingping = QingpingState::default();
+        qingping.apply_reading(qingping_reading(2100));
+        let erv = ErvState::new(database_path.clone());
+        let writer = Arc::new(FakeErvWriter::new(vec![Ok(erv_status(ErvFanSpeed::Off))]));
+        let policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
+        let (status_broadcast, _) = broadcast::channel(4);
+        let coordinator = ErvPolicyCoordinator::new(
+            config,
+            state_machine,
+            qingping,
+            erv,
+            policy,
+            writer.clone(),
+            status_broadcast,
+        );
+
+        coordinator
+            .evaluate_erv_policy(false)
+            .await
+            .expect("policy gate returns ok");
+
+        assert!(writer.writes().is_empty());
+        assert!(
+            db::read_history(&database_path, 1, 10)
+                .expect("history")
+                .climate_actions
+                .is_empty()
         );
     }
 

@@ -534,6 +534,27 @@ fn write_restore_env(
 
     write_literal_env(
         &mut contents,
+        "OFFICE_AUTOMATE_RENOVATION_MODE",
+        bool_env(config.room_mode.renovation),
+    )?;
+    write_literal_env(
+        &mut contents,
+        "OFFICE_AUTOMATE_CLIMATE_AUTOMATION_ENABLED",
+        bool_env(config.room_mode.climate_automation_enabled),
+    )?;
+    write_literal_env(
+        &mut contents,
+        "OFFICE_AUTOMATE_CONTACT_SENSORS_ENABLED",
+        bool_env(config.room_mode.contact_sensors_enabled),
+    )?;
+    write_literal_env(
+        &mut contents,
+        "OFFICE_AUTOMATE_AIR_QUALITY_SENSORS_ENABLED",
+        bool_env(config.room_mode.air_quality_sensors_enabled),
+    )?;
+
+    write_literal_env(
+        &mut contents,
         "OFFICE_AUTOMATE_PRESENCE_ENABLED",
         bool_env(config.presence.enabled),
     )?;
@@ -880,6 +901,7 @@ mod tests {
     fn test_config(root: &Path, config_path: PathBuf, database_path: PathBuf) -> AppConfig {
         AppConfig {
             orchestrator: OrchestratorConfig::default(),
+            room_mode: crate::config::RoomModeConfig::default(),
             presence: PresenceConfig::default(),
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),
@@ -1102,6 +1124,10 @@ mod tests {
         config.mitsubishi.device_serial = Some("serial-1".to_string());
         config.yolink.uaid = "uaid".to_string();
         config.yolink.secret_key = "secret-key".to_string();
+        config.room_mode.renovation = true;
+        config.room_mode.climate_automation_enabled = false;
+        config.room_mode.contact_sensors_enabled = false;
+        config.room_mode.air_quality_sensors_enabled = false;
         config.presence.enabled = true;
 
         let report =
@@ -1122,6 +1148,10 @@ mod tests {
         assert!(contents.contains("export OFFICE_AUTOMATE_ERV_LOCAL_KEY='local'\"'\"'key'"));
         assert!(contents.contains("export OFFICE_AUTOMATE_KUMO_PASSWORD='kumo-password'"));
         assert!(contents.contains("export OFFICE_AUTOMATE_YOLINK_SECRET_KEY='secret-key'"));
+        assert!(contents.contains("export OFFICE_AUTOMATE_RENOVATION_MODE='true'"));
+        assert!(contents.contains("export OFFICE_AUTOMATE_CLIMATE_AUTOMATION_ENABLED='false'"));
+        assert!(contents.contains("export OFFICE_AUTOMATE_CONTACT_SENSORS_ENABLED='false'"));
+        assert!(contents.contains("export OFFICE_AUTOMATE_AIR_QUALITY_SENSORS_ENABLED='false'"));
         assert!(report.validations.iter().any(
             |validation| validation == "effective restore environment written: restore-env.sh"
         ));

@@ -120,6 +120,8 @@ export interface ApiStatus {
     tvoc: number | null;
     noise_db: number | null;
     last_update: string | null;
+    trusted_office_reading?: boolean;
+    ignored_reason?: string | null;
   };
   erv: {
     running: boolean;

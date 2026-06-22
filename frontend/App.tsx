@@ -68,19 +68,31 @@ function statusToOccupancy(api: ApiStatus): OccupancyState {
   return api.is_present ? OccupancyState.PRESENT : OccupancyState.AWAY;
 }
 
+function hasTrustedAirQuality(api: ApiStatus): boolean {
+  return api.air_quality.trusted_office_reading !== false;
+}
+
+function trustedCo2(api: ApiStatus): number {
+  if (hasTrustedAirQuality(api)) {
+    return api.air_quality.co2_ppm ?? api.sensors.co2_ppm ?? 0;
+  }
+  return api.sensors.co2_ppm ?? 0;
+}
+
 // Convert API response to OfficeState
 function apiToState(api: ApiStatus): OfficeState {
   const occupancy = statusToOccupancy(api);
+  const trustedAirQuality = hasTrustedAirQuality(api);
 
   return {
-    co2: api.air_quality.co2_ppm ?? api.sensors.co2_ppm ?? 0,
-    temperature: api.air_quality.temp_c ? toFahrenheit(api.air_quality.temp_c) : 0,
+    co2: trustedCo2(api),
+    temperature: trustedAirQuality && api.air_quality.temp_c ? toFahrenheit(api.air_quality.temp_c) : 0,
     tempTrend: 'stable',
-    humidity: api.air_quality.humidity ? Math.round(api.air_quality.humidity * 10) / 10 : 0,
-    tvoc: api.air_quality.tvoc ?? 0,
-    noise: api.air_quality.noise_db ?? 0,
-    pm25: api.air_quality.pm25 ?? 0,
-    pm10: api.air_quality.pm10 ?? 0,
+    humidity: trustedAirQuality && api.air_quality.humidity ? Math.round(api.air_quality.humidity * 10) / 10 : 0,
+    tvoc: trustedAirQuality ? api.air_quality.tvoc ?? 0 : 0,
+    noise: trustedAirQuality ? api.air_quality.noise_db ?? 0 : 0,
+    pm25: trustedAirQuality ? api.air_quality.pm25 ?? 0 : 0,
+    pm10: trustedAirQuality ? api.air_quality.pm10 ?? 0 : 0,
     door: api.sensors.door_open ? DeviceStatus.OPEN : DeviceStatus.CLOSED,
     window: api.sensors.window_open ? DeviceStatus.OPEN : DeviceStatus.CLOSED,
     hvacMode: api.hvac?.mode === 'heat' ? DeviceStatus.HEAT :
@@ -219,7 +231,7 @@ const App: React.FC = () => {
 
           // Add to history every update
           addHistoryPoint(
-            status.air_quality.co2_ppm ?? status.sensors.co2_ppm ?? 0,
+            trustedCo2(status),
             statusToOccupancy(status),
             status.erv.running
           );
@@ -285,7 +297,7 @@ const App: React.FC = () => {
       setApiConnected(true);
 
       addHistoryPoint(
-        status.air_quality.co2_ppm ?? status.sensors.co2_ppm ?? 0,
+        trustedCo2(status),
         statusToOccupancy(status),
         status.erv.running
       );

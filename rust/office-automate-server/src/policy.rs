@@ -287,6 +287,7 @@ impl ErvPolicyState {
         let tvoc_at_target = input
             .tvoc
             .is_some_and(|tvoc| tvoc <= thresholds.tvoc_away_target);
+        let air_quality_available = input.co2_ppm.is_some() || input.tvoc.is_some();
 
         match input.occupancy {
             OccupancyState::Present => {
@@ -321,7 +322,7 @@ impl ErvPolicyState {
                     return ErvDecision::NoChange;
                 }
 
-                if input.current_running {
+                if input.current_running && air_quality_available {
                     return target_decision(
                         thresholds,
                         &input,
@@ -433,6 +434,7 @@ impl ErvPolicyState {
                     && !self.tvoc_away_ventilation_active
                     && stale_speed.is_none()
                     && input.current_running
+                    && air_quality_available
                 {
                     return target_decision(
                         thresholds,

@@ -266,8 +266,9 @@ pub fn try_app(config: AppConfig) -> Result<Router> {
 }
 
 fn try_app_with_qingping(config: AppConfig, qingping: QingpingState) -> Result<Router> {
-    let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+    let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
         &config.thresholds,
+        &config.room_mode,
         unix_timestamp_now(),
     )));
     let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
@@ -533,8 +534,9 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind HTTP listener at {bind_address}"))?;
     let qingping = QingpingState::default();
-    let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+    let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
         &config.thresholds,
+        &config.room_mode,
         unix_timestamp_now(),
     )));
     let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
@@ -642,6 +644,10 @@ fn start_door_grace_policy_poll(
 }
 
 fn door_grace_policy_delay(state: &AppState) -> Option<Duration> {
+    if !state.config.room_mode.contact_sensors_enabled {
+        return None;
+    }
+
     let now = unix_timestamp_now();
     let state_status = {
         let machine = state
@@ -1483,6 +1489,10 @@ async fn erv(State(state): State<AppState>, Json(payload): Json<ErvRequest>) -> 
 }
 
 async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
+    if !state.config.room_mode.climate_automation_enabled {
+        return Ok(());
+    }
+
     if !state.config.mitsubishi.active_control_enabled {
         return Ok(());
     }
@@ -1497,10 +1507,17 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
     };
     let hvac_snapshot = state.hvac.snapshot();
     let temp_f = state
-        .qingping
-        .latest()
-        .and_then(|reading| reading.temp_c)
-        .map(celsius_to_fahrenheit);
+        .config
+        .room_mode
+        .air_quality_sensors_enabled
+        .then(|| {
+            state
+                .qingping
+                .latest()
+                .and_then(|reading| reading.temp_c)
+                .map(celsius_to_fahrenheit)
+        })
+        .flatten();
     let bands = active_temperature_bands(state);
     let hvac_mode = hvac_mode_from_str(&hvac_snapshot.mode).unwrap_or(HvacMode::Off);
     let critical_heat_needed = !state_status.is_present
@@ -2052,6 +2069,7 @@ fn status_for_state(state: &AppState) -> Status {
     if let Err(error) = log_state_transition(state, timer_transition, "internal_presence") {
         tracing::warn!("failed to persist timer-driven status transition: {error:#}");
     }
+    schedule_timer_transition_policy_evaluation(state, timer_transition);
 
     status.state = state_status.state;
     status.is_present = state_status.is_present;
@@ -2073,6 +2091,36 @@ fn status_for_state(state: &AppState) -> Status {
     state.erv.overlay_status(&mut status);
     state.hvac.overlay_status(&mut status);
     status
+}
+
+fn schedule_timer_transition_policy_evaluation(
+    state: &AppState,
+    transition: Option<StateTransition>,
+) {
+    if transition.is_none() {
+        return;
+    }
+
+    clear_hvac_manual_override_on_transition(state, transition);
+    let state = state.clone();
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("skipping timer-driven policy evaluation: no Tokio runtime is active");
+        return;
+    };
+
+    handle.spawn(async move {
+        if let Err(error) = state.erv_automation.evaluate_erv_policy(true).await {
+            tracing::warn!(
+                "ERV automated policy apply failed after timer-driven transition: {error:#}"
+            );
+        }
+        if let Err(error) = evaluate_and_apply_hvac_policy(&state).await {
+            tracing::warn!(
+                "HVAC automated policy apply failed after timer-driven transition: {error:#}"
+            );
+        }
+        broadcast_status(&state);
+    });
 }
 
 fn validate_temperature_bands(bands: TemperatureBands) -> Result<(), &'static str> {
@@ -3007,6 +3055,7 @@ mod tests {
         let root = temp_dir.keep();
         AppConfig {
             orchestrator: OrchestratorConfig::default(),
+            room_mode: crate::config::RoomModeConfig::default(),
             presence: crate::config::PresenceConfig::default(),
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),
@@ -3520,6 +3569,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn door_grace_policy_delay_stays_idle_when_contact_sensors_are_disabled() {
+        let mut config = test_config();
+        configure_fake_erv(&mut config);
+        config.room_mode.contact_sensors_enabled = false;
+        config.mitsubishi.active_control_enabled = true;
+        let opened_at = unix_timestamp_now() - 30.0;
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
+            &config.thresholds,
+            &config.room_mode,
+            opened_at - 1.0,
+        )));
+        {
+            let mut machine = state_machine.write().expect("state lock");
+            machine.sensors.door_open = true;
+            machine.sensors.door_opened_at = opened_at;
+        }
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        let erv_writer = Arc::new(FakeErvWriter::new(
+            vec![Ok(erv_status(ErvFanSpeed::Off))],
+            vec![Ok(erv_status(ErvFanSpeed::Turbo))],
+        ));
+        let (_router, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            QingpingState::default(),
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            erv_writer.clone(),
+            Arc::new(FakeHvacWriter::default()),
+        )
+        .expect("app");
+        state
+            .erv
+            .set_speed_with(
+                &state.config.erv,
+                erv_writer.as_ref(),
+                ErvFanSpeed::Turbo,
+                "test",
+                None,
+            )
+            .await
+            .expect("set ERV active");
+        state
+            .hvac
+            .record_status(hvac_status(HvacControlMode::Heat, 22.0));
+
+        assert!(door_grace_policy_delay(&state).is_none());
+    }
+
+    #[tokio::test]
     async fn door_grace_policy_delay_schedules_closed_away_restart_deadline() {
         let mut config = test_config();
         configure_fake_erv(&mut config);
@@ -3621,6 +3723,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_restore_skips_contacts_when_contact_sensors_are_disabled() {
+        let mut config = test_config();
+        config.room_mode.contact_sensors_enabled = false;
+        db::migrate_database(&config.runtime.database_path).expect("migration");
+        db::log_device_event(
+            &config.runtime.database_path,
+            "door",
+            "open",
+            Some("Office Door"),
+            Some(&json!({"state": "open", "contact_sensor_trusted": true})),
+        )
+        .expect("log door");
+        db::log_device_event(
+            &config.runtime.database_path,
+            "window",
+            "open",
+            Some("Office Window"),
+            Some(&json!({"state": "open", "contact_sensor_trusted": true})),
+        )
+        .expect("log window");
+        db::log_device_event(
+            &config.runtime.database_path,
+            "motion",
+            "detected",
+            Some("Office Motion"),
+            None,
+        )
+        .expect("log motion");
+
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["is_present"], true);
+        assert_eq!(value["sensors"]["motion_detected"], true);
+        assert_eq!(value["sensors"]["door_open"], false);
+        assert_eq!(value["sensors"]["window_open"], false);
+        assert_eq!(value["sensors"]["contact_sensors_enabled"], false);
+        assert_eq!(value["sensors"]["contact_sensors_ignored"], true);
+    }
+
+    #[tokio::test]
     async fn status_route_persists_timer_driven_departure_transition() {
         let mut config = test_config();
         config.thresholds.departure_verification_seconds = 10;
@@ -3670,6 +3825,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_route_timer_transition_runs_policy_evaluation() {
+        let mut config = configured_erv_config(true);
+        config.room_mode.contact_sensors_enabled = false;
+        config.thresholds.motion_timeout_seconds = 1;
+        config.thresholds.min_away_seconds_before_erv = 0;
+        config.thresholds.erv_min_dwell_seconds = 0;
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
+            &config.thresholds,
+            &config.room_mode,
+            now - 10.0,
+        )));
+        {
+            let mut machine = state_machine.write().expect("state lock");
+            machine.set_manual_presence(true, now - 5.0);
+            assert_eq!(machine.state, OccupancyState::Present);
+        }
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let writer = Arc::new(FakeErvWriter::new(
+            vec![Ok(erv_status(ErvFanSpeed::Off))],
+            vec![Ok(erv_status(ErvFanSpeed::Turbo))],
+        ));
+        let (router, _state) = try_app_with_erv_writer_and_coordinator(
+            config.clone(),
+            qingping_with_co2(2100),
+            state_machine,
+            yolink,
+            ErvState::new(config.runtime.database_path.clone()),
+            HvacState::new(config.runtime.database_path.clone()),
+            writer.clone(),
+            Arc::new(FakeHvacWriter::default()),
+        )
+        .expect("app");
+
+        let response = router
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["is_present"], false);
+
+        for _ in 0..50 {
+            if !writer.write_speeds().is_empty() {
+                break;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(writer.write_speeds(), vec![ErvFanSpeed::Turbo]);
+        let history = db::read_history(&config.runtime.database_path, 1, 10).expect("history");
+        assert_eq!(history.occupancy_history[0]["state"], "away");
+        assert_eq!(history.climate_actions[0]["action"], "turbo");
+    }
+
+    #[tokio::test]
     async fn status_route_reflects_latest_qingping_reading() {
         let qingping = QingpingState::default();
         qingping.apply_reading(crate::qingping::QingpingReading {
@@ -3711,6 +3931,42 @@ mod tests {
         assert_eq!(value["air_quality"]["tvoc"], 25);
         assert_eq!(value["air_quality"]["noise_db"], 37.0);
         assert_eq!(value["air_quality"]["last_update"], "2026-06-05T12:30:00");
+    }
+
+    #[tokio::test]
+    async fn status_route_marks_moved_qingping_reading_as_untrusted() {
+        let qingping = QingpingState::default();
+        qingping.apply_reading(qingping_reading(900));
+        let mut config = test_config();
+        config.room_mode.renovation = true;
+        config.room_mode.air_quality_sensors_enabled = false;
+
+        let response = try_app_with_qingping(config, qingping)
+            .expect("app")
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(value["sensors"]["co2_ppm"], 400);
+        assert_eq!(value["sensors"]["air_quality_sensors_enabled"], false);
+        assert_eq!(value["sensors"]["air_quality_sensors_ignored"], true);
+        assert_eq!(value["air_quality"]["co2_ppm"], 900);
+        assert_eq!(value["air_quality"]["trusted_office_reading"], false);
+        assert_eq!(
+            value["air_quality"]["ignored_reason"],
+            "renovation_air_quality_sensor_moved"
+        );
     }
 
     #[tokio::test]
@@ -4835,6 +5091,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_climate_automation_skips_internal_and_manual_presence_policy_writes() {
+        let mut config = configured_erv_config(true);
+        config.mitsubishi = configured_hvac_config(true).mitsubishi;
+        config.room_mode.climate_automation_enabled = false;
+        let qingping = qingping_with_temp(28.0);
+        qingping.apply_reading(qingping_reading(2100));
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
+            &config.thresholds,
+            &config.room_mode,
+            now - 10.0,
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let erv_writer = Arc::new(FakeErvWriter::new(
+            vec![Ok(erv_status(ErvFanSpeed::Off))],
+            vec![Ok(erv_status(ErvFanSpeed::Quiet))],
+        ));
+        let hvac_writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Cool, 25.5))],
+        ));
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Off, 22.0));
+        let (service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            qingping,
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            erv_writer.clone(),
+            hvac_writer.clone(),
+        )
+        .expect("app state");
+
+        apply_presence_snapshot(
+            &state,
+            PresenceSnapshot {
+                last_active_timestamp: now,
+                external_monitor: true,
+                idle_seconds: 0.1,
+                display_count: 2,
+                external_displays: vec!["Studio Display".to_string()],
+            },
+        )
+        .await
+        .expect("presence update");
+        let response = service
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/presence")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"state":"away"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("manual presence response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(erv_writer.smoke_calls(), 0);
+        assert!(erv_writer.write_speeds().is_empty());
+        assert_eq!(hvac_writer.smoke_calls(), 0);
+        assert!(hvac_writer.write_modes().is_empty());
+    }
+
+    #[tokio::test]
     async fn websocket_broadcasts_manual_presence_updates() {
         let service = app(test_config());
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -5632,6 +5956,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_climate_automation_skips_yolink_hvac_policy_write() {
+        let mut config = configured_hvac_config(true);
+        config.room_mode.climate_automation_enabled = false;
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
+            &config.thresholds,
+            &config.room_mode,
+            now,
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        yolink.apply_devices(vec![office_motion_device()]);
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Off, 22.0));
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Cool, 25.5))],
+        ));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            qingping_with_temp(28.0),
+            state_machine,
+            yolink.clone(),
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        let applied = yolink
+            .apply_event("motion-1", json!({"state": "alert"}), now + 1.0)
+            .expect("event applies")
+            .expect("motion report applies");
+        assert!(applied.transition.is_some());
+
+        evaluate_yolink_hvac_update(state, applied.transition).await;
+
+        assert_eq!(writer.smoke_calls(), 0);
+        assert!(writer.write_modes().is_empty());
+    }
+
+    #[tokio::test]
     async fn yolink_transition_broadcasts_when_only_hvac_override_clears() {
         let config = configured_hvac_config(true);
         let now = unix_timestamp_now();
@@ -6277,6 +6644,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_air_quality_sensors_do_not_drive_hvac_temperature_policy() {
+        let mut config = configured_hvac_config(true);
+        config.room_mode.air_quality_sensors_enabled = false;
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Cool, 25.5))],
+        ));
+        let qingping = qingping_with_temp(28.0);
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
+            &config.thresholds,
+            &config.room_mode,
+            unix_timestamp_now(),
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .set_manual_presence(true, unix_timestamp_now());
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Off, 22.0));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            qingping,
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy applies without trusted air-quality");
+
+        assert_eq!(writer.smoke_calls(), 0);
+        assert!(writer.write_modes().is_empty());
+    }
+
+    #[tokio::test]
     async fn qingping_sensor_update_drives_hvac_policy_without_route_update() {
         let config = configured_hvac_config(true);
         let writer = Arc::new(FakeHvacWriter::new(
@@ -6324,6 +6733,61 @@ mod tests {
             writer.write_modes(),
             vec![(HvacControlMode::Cool, Some(25.5))]
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_climate_automation_skips_sensor_and_door_grace_policy_writes() {
+        let mut config = configured_erv_config(true);
+        config.mitsubishi = configured_hvac_config(true).mitsubishi;
+        config.room_mode.climate_automation_enabled = false;
+        let erv_writer = Arc::new(FakeErvWriter::new(
+            vec![Ok(erv_status(ErvFanSpeed::Off))],
+            vec![Ok(erv_status(ErvFanSpeed::Quiet))],
+        ));
+        let hvac_writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Cool, 25.5))],
+        ));
+        let qingping = qingping_with_temp(28.0);
+        qingping.apply_reading(qingping_reading(2100));
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
+            &config.thresholds,
+            &config.room_mode,
+            unix_timestamp_now(),
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .set_manual_presence(true, unix_timestamp_now());
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Off, 22.0));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            qingping,
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            erv_writer.clone(),
+            hvac_writer.clone(),
+        )
+        .expect("app");
+
+        evaluate_sensor_policies(
+            state.erv_automation.clone(),
+            state.clone(),
+            false,
+            "Qingping",
+        )
+        .await;
+        evaluate_sensor_policies(state.erv_automation.clone(), state, true, "door grace").await;
+
+        assert_eq!(erv_writer.smoke_calls(), 0);
+        assert!(erv_writer.write_speeds().is_empty());
+        assert_eq!(hvac_writer.smoke_calls(), 0);
+        assert!(hvac_writer.write_modes().is_empty());
     }
 
     #[tokio::test]
