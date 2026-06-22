@@ -266,8 +266,9 @@ pub fn try_app(config: AppConfig) -> Result<Router> {
 }
 
 fn try_app_with_qingping(config: AppConfig, qingping: QingpingState) -> Result<Router> {
-    let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+    let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
         &config.thresholds,
+        &config.room_mode,
         unix_timestamp_now(),
     )));
     let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
@@ -533,8 +534,9 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind HTTP listener at {bind_address}"))?;
     let qingping = QingpingState::default();
-    let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+    let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
         &config.thresholds,
+        &config.room_mode,
         unix_timestamp_now(),
     )));
     let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
@@ -642,6 +644,10 @@ fn start_door_grace_policy_poll(
 }
 
 fn door_grace_policy_delay(state: &AppState) -> Option<Duration> {
+    if !state.config.room_mode.contact_sensors_enabled {
+        return None;
+    }
+
     let now = unix_timestamp_now();
     let state_status = {
         let machine = state
@@ -3521,6 +3527,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn door_grace_policy_delay_stays_idle_when_contact_sensors_are_disabled() {
+        let mut config = test_config();
+        configure_fake_erv(&mut config);
+        config.room_mode.contact_sensors_enabled = false;
+        config.mitsubishi.active_control_enabled = true;
+        let opened_at = unix_timestamp_now() - 30.0;
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
+            &config.thresholds,
+            &config.room_mode,
+            opened_at - 1.0,
+        )));
+        {
+            let mut machine = state_machine.write().expect("state lock");
+            machine.sensors.door_open = true;
+            machine.sensors.door_opened_at = opened_at;
+        }
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        let erv_writer = Arc::new(FakeErvWriter::new(
+            vec![Ok(erv_status(ErvFanSpeed::Off))],
+            vec![Ok(erv_status(ErvFanSpeed::Turbo))],
+        ));
+        let (_router, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            QingpingState::default(),
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            erv_writer.clone(),
+            Arc::new(FakeHvacWriter::default()),
+        )
+        .expect("app");
+        state
+            .erv
+            .set_speed_with(
+                &state.config.erv,
+                erv_writer.as_ref(),
+                ErvFanSpeed::Turbo,
+                "test",
+                None,
+            )
+            .await
+            .expect("set ERV active");
+        state
+            .hvac
+            .record_status(hvac_status(HvacControlMode::Heat, 22.0));
+
+        assert!(door_grace_policy_delay(&state).is_none());
+    }
+
+    #[tokio::test]
     async fn door_grace_policy_delay_schedules_closed_away_restart_deadline() {
         let mut config = test_config();
         configure_fake_erv(&mut config);
@@ -3619,6 +3678,59 @@ mod tests {
         assert!(value.get("erv").is_some());
         assert!(value.get("hvac").is_some());
         assert!(value["erv"]["control"].get("last_local_ok_at").is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_restore_skips_contacts_when_contact_sensors_are_disabled() {
+        let mut config = test_config();
+        config.room_mode.contact_sensors_enabled = false;
+        db::migrate_database(&config.runtime.database_path).expect("migration");
+        db::log_device_event(
+            &config.runtime.database_path,
+            "door",
+            "open",
+            Some("Office Door"),
+            Some(&json!({"state": "open", "contact_sensor_trusted": true})),
+        )
+        .expect("log door");
+        db::log_device_event(
+            &config.runtime.database_path,
+            "window",
+            "open",
+            Some("Office Window"),
+            Some(&json!({"state": "open", "contact_sensor_trusted": true})),
+        )
+        .expect("log window");
+        db::log_device_event(
+            &config.runtime.database_path,
+            "motion",
+            "detected",
+            Some("Office Motion"),
+            None,
+        )
+        .expect("log motion");
+
+        let response = app(config)
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["is_present"], true);
+        assert_eq!(value["sensors"]["motion_detected"], true);
+        assert_eq!(value["sensors"]["door_open"], false);
+        assert_eq!(value["sensors"]["window_open"], false);
+        assert_eq!(value["sensors"]["contact_sensors_enabled"], false);
+        assert_eq!(value["sensors"]["contact_sensors_ignored"], true);
     }
 
     #[tokio::test]

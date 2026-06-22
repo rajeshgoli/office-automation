@@ -230,16 +230,26 @@ impl YoLinkState {
             return Ok(None);
         };
         self.record_device_event(device_id, &validated.details);
+        let contact_sensors_enabled = self.contact_sensors_enabled();
+        let is_contact_event = matches!(validated.role, DeviceRole::Door | DeviceRole::Window);
+        let details = if is_contact_event {
+            contact_event_details(validated.details.clone(), contact_sensors_enabled)
+        } else {
+            validated.details.clone()
+        };
 
         let (device_type, event, transition) = match validated.role {
             DeviceRole::Door => match validated.state {
                 ValidatedYoLinkState::Open | ValidatedYoLinkState::Closed => {
                     let is_open = validated.state == ValidatedYoLinkState::Open;
-                    let transition = self
-                        .state_machine
-                        .write()
-                        .expect("state machine lock poisoned")
-                        .update_door(is_open, now);
+                    let transition = contact_sensors_enabled
+                        .then(|| {
+                            self.state_machine
+                                .write()
+                                .expect("state machine lock poisoned")
+                                .update_door(is_open, now)
+                        })
+                        .flatten();
                     ("door", if is_open { "open" } else { "closed" }, transition)
                 }
                 ValidatedYoLinkState::Error => ("door", "error", None),
@@ -250,11 +260,14 @@ impl YoLinkState {
             DeviceRole::Window => match validated.state {
                 ValidatedYoLinkState::Open | ValidatedYoLinkState::Closed => {
                     let is_open = validated.state == ValidatedYoLinkState::Open;
-                    let transition = self
-                        .state_machine
-                        .write()
-                        .expect("state machine lock poisoned")
-                        .update_window(is_open, now);
+                    let transition = contact_sensors_enabled
+                        .then(|| {
+                            self.state_machine
+                                .write()
+                                .expect("state machine lock poisoned")
+                                .update_window(is_open, now)
+                        })
+                        .flatten();
                     (
                         "window",
                         if is_open { "open" } else { "closed" },
@@ -292,13 +305,17 @@ impl YoLinkState {
             device_type,
             event,
             Some(&validated.device_name),
-            Some(&validated.details),
+            Some(&details),
         ) {
             tracing::warn!(
                 "failed to persist YoLink {device_type} event after state update: {error:#}"
             );
         }
         self.notify_status();
+
+        if is_contact_event && !contact_sensors_enabled {
+            return Ok(None);
+        }
 
         Ok(Some(YoLinkAppliedEvent {
             device_type: device_type.to_string(),
@@ -362,20 +379,31 @@ impl YoLinkState {
         }
     }
 
+    fn contact_sensors_enabled(&self) -> bool {
+        self.state_machine
+            .read()
+            .expect("state machine lock poisoned")
+            .config
+            .contact_sensors_enabled
+    }
+
     pub fn restore_from_database(&self, now: f64) -> Result<()> {
-        if let Some((state, changed_at)) =
-            db::get_latest_contact_device_state_with_timestamp(&self.database_path, "door")?
-        {
-            self.state_machine
-                .write()
-                .expect("state machine lock poisoned")
-                .restore_door_state(state == "open", changed_at.unwrap_or(now), now);
-        }
-        if let Some(state) = db::get_latest_contact_device_state(&self.database_path, "window")? {
-            self.state_machine
-                .write()
-                .expect("state machine lock poisoned")
-                .update_window(state == "open", now);
+        if self.contact_sensors_enabled() {
+            if let Some((state, changed_at)) =
+                db::get_latest_contact_device_state_with_timestamp(&self.database_path, "door")?
+            {
+                self.state_machine
+                    .write()
+                    .expect("state machine lock poisoned")
+                    .restore_door_state(state == "open", changed_at.unwrap_or(now), now);
+            }
+            if let Some(state) = db::get_latest_contact_device_state(&self.database_path, "window")?
+            {
+                self.state_machine
+                    .write()
+                    .expect("state machine lock poisoned")
+                    .update_window(state == "open", now);
+            }
         }
         if let Some(state) = db::get_latest_device_state(&self.database_path, "motion")? {
             self.state_machine
@@ -673,6 +701,19 @@ fn sanitize_yolink_event_details(event_data: &Value) -> Result<Value> {
     Ok(Value::Object(sanitized))
 }
 
+fn contact_event_details(mut details: Value, trusted: bool) -> Value {
+    if let Value::Object(object) = &mut details {
+        object.insert("contact_sensor_trusted".to_string(), json!(trusted));
+        if !trusted {
+            object.insert(
+                "ignored_reason".to_string(),
+                json!("renovation_contact_sensors_disabled"),
+            );
+        }
+    }
+    details
+}
+
 fn sanitize_yolink_detail_value(value: &Value) -> Option<Value> {
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) => Some(value.clone()),
@@ -935,11 +976,15 @@ mod tests {
     }
 
     fn test_state(database_path: PathBuf) -> YoLinkState {
+        test_state_with_config(
+            database_path,
+            StateConfig::from_thresholds(&ThresholdsConfig::default()),
+        )
+    }
+
+    fn test_state_with_config(database_path: PathBuf, state_config: StateConfig) -> YoLinkState {
         YoLinkState::new(
-            Arc::new(RwLock::new(StateMachine::new(
-                StateConfig::from_thresholds(&ThresholdsConfig::default()),
-                1_000.0,
-            ))),
+            Arc::new(RwLock::new(StateMachine::new(state_config, 1_000.0))),
             database_path,
         )
     }
@@ -1367,6 +1412,74 @@ mod tests {
     }
 
     #[test]
+    fn disabled_contact_sensors_log_raw_events_without_updating_contact_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+        let yolink = test_state_with_config(
+            db_path.clone(),
+            StateConfig {
+                contact_sensors_enabled: false,
+                ..StateConfig::from_thresholds(&ThresholdsConfig::default())
+            },
+        );
+        yolink.apply_devices(sample_devices());
+
+        let door = yolink
+            .apply_event("door-1", json!({"state": "open"}), 1_010.0)
+            .expect("door event");
+        let window = yolink
+            .apply_event("window-1", json!({"state": "open"}), 1_011.0)
+            .expect("window event");
+        let motion = yolink
+            .apply_event("motion-1", json!({"state": "alert"}), 1_012.0)
+            .expect("motion event")
+            .expect("applied");
+
+        assert!(door.is_none());
+        assert!(window.is_none());
+        assert_eq!(
+            motion.transition,
+            Some(StateTransition {
+                old_state: OccupancyState::Away,
+                new_state: OccupancyState::Present,
+            })
+        );
+
+        let machine = yolink
+            .state_machine
+            .read()
+            .expect("state machine lock poisoned");
+        assert!(!machine.sensors.door_open);
+        assert!(!machine.sensors.window_open);
+        assert!(machine.sensors.motion_detected);
+        assert_eq!(machine.state, OccupancyState::Present);
+        drop(machine);
+
+        assert_eq!(
+            db::get_latest_device_state(&db_path, "door").expect("raw door state"),
+            Some("open".to_string())
+        );
+        assert_eq!(
+            db::get_latest_contact_device_state(&db_path, "door").expect("trusted door state"),
+            None
+        );
+        let history = db::read_history(&db_path, 24, 10).expect("history");
+        let door_event = history
+            .device_events
+            .iter()
+            .find(|event| event["device_type"] == "door")
+            .expect("door event");
+        let door_details = door_event["details"].as_str().expect("details string");
+        let door_details: Value = serde_json::from_str(door_details).expect("details json");
+        assert_eq!(door_details["contact_sensor_trusted"], false);
+        assert_eq!(
+            door_details["ignored_reason"],
+            "renovation_contact_sensors_disabled"
+        );
+    }
+
+    #[test]
     fn persists_yolink_occupancy_transitions() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("office_climate.db");
@@ -1514,6 +1627,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ignored_contact_events_do_not_trigger_policy_or_hook_but_motion_does() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+        let mut config = test_config(db_path.clone());
+        config.room_mode.contact_sensors_enabled = false;
+        let state_machine = Arc::new(RwLock::new(StateMachine::new(
+            StateConfig::from_thresholds_and_room_mode(&config.thresholds, &config.room_mode),
+            1_000.0,
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), db_path.clone());
+        yolink.apply_devices(sample_devices());
+        let qingping = QingpingState::default();
+        let erv = ErvState::new(db_path);
+        let writer = Arc::new(FakeErvWriter::new(vec![Ok(erv_status(
+            ErvFanSpeed::Medium,
+        ))]));
+        let policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
+        let (status_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let coordinator = ErvPolicyCoordinator::new(
+            config,
+            state_machine,
+            qingping,
+            erv,
+            policy,
+            writer.clone(),
+            status_broadcast,
+        );
+        let hook_observations = Arc::new(Mutex::new(Vec::new()));
+        let hook: DeviceIngressHook = Arc::new({
+            let hook_observations = hook_observations.clone();
+            move |transition| {
+                hook_observations
+                    .lock()
+                    .expect("hook observations lock")
+                    .push(transition);
+            }
+        });
+
+        apply_yolink_report_with_policy(
+            &yolink,
+            YoLinkReport {
+                device_id: "door-1".to_string(),
+                data: json!({"state": "open"}),
+            },
+            1_002.0,
+            Some(&coordinator),
+            Some(&hook),
+        )
+        .await
+        .expect("ignored contact report applies");
+
+        assert!(writer.write_speeds().is_empty());
+        assert!(
+            hook_observations
+                .lock()
+                .expect("hook observations lock")
+                .is_empty()
+        );
+
+        apply_yolink_report_with_policy(
+            &yolink,
+            YoLinkReport {
+                device_id: "motion-1".to_string(),
+                data: json!({"state": "alert"}),
+            },
+            1_003.0,
+            Some(&coordinator),
+            Some(&hook),
+        )
+        .await
+        .expect("motion report applies");
+
+        assert_eq!(writer.write_speeds(), vec![ErvFanSpeed::Off]);
+        assert_eq!(
+            *hook_observations.lock().expect("hook observations lock"),
+            vec![Some(StateTransition {
+                old_state: OccupancyState::Away,
+                new_state: OccupancyState::Present,
+            })]
+        );
+    }
+
+    #[tokio::test]
     async fn device_hook_runs_when_erv_policy_write_fails_after_report_applies() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("office_climate.db");
@@ -1623,6 +1820,49 @@ mod tests {
             .expect("state machine lock poisoned");
         assert!(machine.sensors.door_open);
         assert!((machine.sensors.door_opened_at - opened_at).abs() < 1.0);
+        assert!(!machine.sensors.window_open);
+        assert!(machine.sensors.motion_detected);
+        assert_eq!(machine.state, OccupancyState::Present);
+    }
+
+    #[test]
+    fn restore_skips_contacts_when_contact_sensors_are_disabled_but_restores_motion() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+        db::log_device_event(
+            &db_path,
+            "door",
+            "open",
+            Some("Office Door"),
+            Some(&json!({"state": "open", "contact_sensor_trusted": true})),
+        )
+        .expect("log door");
+        db::log_device_event(
+            &db_path,
+            "window",
+            "open",
+            Some("Office Window"),
+            Some(&json!({"state": "open", "contact_sensor_trusted": true})),
+        )
+        .expect("log window");
+        db::log_device_event(&db_path, "motion", "detected", Some("Office Motion"), None)
+            .expect("log motion");
+
+        let yolink = test_state_with_config(
+            db_path,
+            StateConfig {
+                contact_sensors_enabled: false,
+                ..StateConfig::from_thresholds(&ThresholdsConfig::default())
+            },
+        );
+        yolink.restore_from_database(1_050.0).expect("restore");
+
+        let machine = yolink
+            .state_machine
+            .read()
+            .expect("state machine lock poisoned");
+        assert!(!machine.sensors.door_open);
         assert!(!machine.sensors.window_open);
         assert!(machine.sensors.motion_detected);
         assert_eq!(machine.state, OccupancyState::Present);
