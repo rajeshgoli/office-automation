@@ -68,7 +68,9 @@ pub fn migrate_database(database_path: &Path) -> Result<()> {
                 pm10 INTEGER,
                 tvoc INTEGER,
                 noise_db INTEGER,
-                source TEXT DEFAULT 'qingping'
+                source TEXT DEFAULT 'qingping',
+                office_trusted INTEGER NOT NULL DEFAULT 1,
+                ignored_reason TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_sensor_timestamp ON sensor_readings(timestamp);
 
@@ -197,6 +199,18 @@ pub fn migrate_database(database_path: &Path) -> Result<()> {
         "sensor_readings",
         "noise_db",
         "ALTER TABLE sensor_readings ADD COLUMN noise_db INTEGER",
+    )?;
+    ensure_column(
+        &connection,
+        "sensor_readings",
+        "office_trusted",
+        "ALTER TABLE sensor_readings ADD COLUMN office_trusted INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        &connection,
+        "sensor_readings",
+        "ignored_reason",
+        "ALTER TABLE sensor_readings ADD COLUMN ignored_reason TEXT",
     )?;
     ensure_column(
         &connection,
@@ -883,6 +897,15 @@ fn random_url_token(byte_len: usize) -> String {
 }
 
 pub fn insert_sensor_reading(database_path: &Path, reading: &QingpingReading) -> Result<()> {
+    insert_sensor_reading_with_trust(database_path, reading, true, None)
+}
+
+pub fn insert_sensor_reading_with_trust(
+    database_path: &Path,
+    reading: &QingpingReading,
+    office_trusted: bool,
+    ignored_reason: Option<&str>,
+) -> Result<()> {
     if let Some(parent) = database_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create data directory {}", parent.display()))?;
@@ -894,8 +917,8 @@ pub fn insert_sensor_reading(database_path: &Path, reading: &QingpingReading) ->
         .execute(
             r#"
             INSERT INTO sensor_readings
-                (timestamp, co2_ppm, temp_c, humidity, pm25, pm10, tvoc, noise_db, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (timestamp, co2_ppm, temp_c, humidity, pm25, pm10, tvoc, noise_db, source, office_trusted, ignored_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
             params![
                 reading.database_timestamp(),
@@ -907,6 +930,8 @@ pub fn insert_sensor_reading(database_path: &Path, reading: &QingpingReading) ->
                 reading.tvoc,
                 reading.noise_db,
                 "qingping",
+                office_trusted,
+                ignored_reason,
             ],
         )
         .context("failed to insert Qingping sensor reading")?;
@@ -2145,7 +2170,7 @@ fn query_sensor_points(
         .with_context(|| format!("failed to open SQLite database {}", database_path.display()))?;
     let cutoff = format_timestamp(Local::now().naive_local() - Duration::hours(hours));
     let mut statement = connection.prepare(&format!(
-        "SELECT timestamp, {column} FROM sensor_readings WHERE timestamp > ? AND {column} IS NOT NULL ORDER BY timestamp ASC"
+        "SELECT timestamp, {column} FROM sensor_readings WHERE timestamp > ? AND {column} IS NOT NULL AND (office_trusted IS NULL OR office_trusted != 0) ORDER BY timestamp ASC"
     ))?;
     let rows = statement.query_map(params![cutoff], |row| {
         Ok((
@@ -3147,6 +3172,55 @@ mod tests {
                 37,
                 "qingping".to_string()
             )
+        );
+    }
+
+    #[test]
+    fn untrusted_sensor_readings_keep_raw_history_metadata_and_leave_trusted_charts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+
+        let reading = QingpingReading {
+            device_name: "Qingping Air Monitor".to_string(),
+            mac_hint: "AABBCCDDEEFF".to_string(),
+            temp_c: Some(23.5),
+            humidity: Some(45.0),
+            co2_ppm: Some(900),
+            pm25: Some(3),
+            pm10: Some(4),
+            tvoc: Some(25),
+            noise_db: Some(37),
+            timestamp: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+            raw_data: "{}".to_string(),
+        };
+
+        insert_sensor_reading_with_trust(
+            &db_path,
+            &reading,
+            false,
+            Some("renovation_air_quality_sensor_moved"),
+        )
+        .expect("insert untrusted reading");
+
+        let history = read_history(&db_path, 1, 10).expect("history");
+        assert_eq!(history.sensor_readings.len(), 1);
+        assert_eq!(history.sensor_readings[0]["co2_ppm"], 900);
+        assert_eq!(history.sensor_readings[0]["office_trusted"], 0);
+        assert_eq!(
+            history.sensor_readings[0]["ignored_reason"],
+            "renovation_air_quality_sensor_moved"
+        );
+
+        let co2 = read_co2_ohlc(&db_path, 1, 5).expect("co2 history");
+        assert_eq!(co2["candles"].as_array().expect("candles").len(), 0);
+        let temperature = read_temperature_history(&db_path, 1, 5).expect("temperature history");
+        assert_eq!(
+            temperature["points"]
+                .as_array()
+                .expect("temperature points")
+                .len(),
+            0
         );
     }
 
