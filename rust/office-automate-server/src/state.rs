@@ -187,8 +187,7 @@ impl StateMachine {
 
     pub fn presence_signal_active_at(&self, now: f64) -> bool {
         if !self.config.contact_sensors_enabled {
-            let motion_recent = self.sensors.motion_detected
-                || self.signal_recent_at(self.sensors.motion_last_seen, now);
+            let motion_recent = self.signal_recent_at(self.sensors.motion_last_seen, now);
             let freshness_anchor = self.last_manual_away_at.unwrap_or(0.0);
             let mac_recent = self.sensors.external_monitor
                 && self.sensors.mac_last_active > freshness_anchor
@@ -912,6 +911,15 @@ mod tests {
         assert_eq!(machine.state, OccupancyState::Present);
         assert!(machine.sensors.motion_detected);
         assert!(machine.presence_signal_active_at(1_040.0));
+    }
+
+    #[test]
+    fn disabled_contact_sensors_report_stale_motion_inactive_without_evaluation() {
+        let mut machine = StateMachine::new(contact_disabled_config(), 1_000.0);
+        machine.sensors.motion_detected = true;
+        machine.sensors.motion_last_seen = 1_010.0;
+
+        assert!(!machine.presence_signal_active_at(1_071.0));
     }
 
     #[test]
