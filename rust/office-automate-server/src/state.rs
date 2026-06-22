@@ -187,7 +187,8 @@ impl StateMachine {
 
     pub fn presence_signal_active_at(&self, now: f64) -> bool {
         if !self.config.contact_sensors_enabled {
-            let motion_recent = self.signal_recent_at(self.sensors.motion_last_seen, now);
+            let motion_recent = self.sensors.motion_detected
+                || self.signal_recent_at(self.sensors.motion_last_seen, now);
             let freshness_anchor = self.last_manual_away_at.unwrap_or(0.0);
             let mac_recent = self.sensors.external_monitor
                 && self.sensors.mac_last_active > freshness_anchor
@@ -280,6 +281,13 @@ impl StateMachine {
     pub fn evaluate_at(&mut self, now: f64) -> Option<StateTransition> {
         if let Some(transition) = self.advance_timers(now) {
             return Some(transition);
+        }
+
+        if !self.config.contact_sensors_enabled
+            && self.sensors.motion_detected
+            && !self.signal_recent_at(self.sensors.motion_last_seen, now)
+        {
+            self.sensors.motion_detected = false;
         }
 
         let transition = if self.in_door_open_mode_at(now) {
@@ -888,6 +896,22 @@ mod tests {
         assert_eq!(machine.state, OccupancyState::Away);
         assert!(!machine.sensors.motion_detected);
         assert!(!machine.presence_signal_active_at(1_071.0));
+    }
+
+    #[test]
+    fn disabled_contact_sensors_keep_present_while_motion_flag_is_recent() {
+        let mut machine = StateMachine::new(contact_disabled_config(), 1_000.0);
+        assert!(
+            machine
+                .update_motion(true, 1_010.0)
+                .is_some_and(|transition| transition.new_state == OccupancyState::Present)
+        );
+
+        assert_eq!(machine.evaluate_at(1_040.0), None);
+
+        assert_eq!(machine.state, OccupancyState::Present);
+        assert!(machine.sensors.motion_detected);
+        assert!(machine.presence_signal_active_at(1_040.0));
     }
 
     #[test]
