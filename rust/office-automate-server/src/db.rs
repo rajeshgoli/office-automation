@@ -1512,30 +1512,45 @@ pub fn read_openings(database_path: &Path, days: i64) -> Result<Vec<Value>> {
         .collect::<BTreeMap<_, _>>();
 
     for device_type in ["door", "window"] {
-        let last_before: Option<String> = connection
+        let last_before: Option<(String, bool)> = connection
             .query_row(
-                &format!(
-                    "SELECT event FROM device_events WHERE timestamp < ? AND device_type = ? AND event IN ('open', 'closed') AND {TRUSTED_CONTACT_EVENT_FILTER} ORDER BY timestamp DESC, id DESC LIMIT 1"
-                ),
+                "SELECT event, COALESCE(json_extract(details, '$.contact_sensor_trusted'), 1) != 0 AS trusted \
+                 FROM device_events \
+                 WHERE timestamp < ? AND device_type = ? AND event IN ('open', 'closed') \
+                 ORDER BY timestamp DESC, id DESC LIMIT 1",
                 params![cutoff, device_type],
-                |row| row.get(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
             )
             .optional()?;
-        let mut open_start = (last_before.as_deref() == Some("open")).then_some(start);
+        let mut open_start = last_before
+            .as_ref()
+            .is_some_and(|(event, trusted)| *trusted && event == "open")
+            .then_some(start);
 
         let mut statement = connection.prepare(
-            &format!(
-                "SELECT timestamp, event FROM device_events WHERE timestamp >= ? AND device_type = ? AND event IN ('open', 'closed') AND {TRUSTED_CONTACT_EVENT_FILTER} ORDER BY timestamp ASC, id ASC"
-            ),
+            "SELECT timestamp, event, COALESCE(json_extract(details, '$.contact_sensor_trusted'), 1) != 0 AS trusted \
+             FROM device_events \
+             WHERE timestamp >= ? AND device_type = ? AND event IN ('open', 'closed') \
+             ORDER BY timestamp ASC, id ASC",
         )?;
         let rows = statement.query_map(params![cutoff, device_type], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
         })?;
         for row in rows {
-            let (timestamp, event) = row?;
+            let (timestamp, event, trusted) = row?;
             let Some(parsed) = parse_timestamp(&timestamp) else {
                 continue;
             };
+            if !trusted {
+                if let Some(started) = open_start.take() {
+                    push_open_intervals(&mut grouped, device_type, started, parsed);
+                }
+                continue;
+            }
             if event == "open" && open_start.is_none() {
                 open_start = Some(parsed);
             } else if event == "closed" {
@@ -3427,5 +3442,42 @@ mod tests {
         assert_eq!(door.len(), 1);
         assert_eq!(door[0]["open"], "11:00:00");
         assert_eq!(door[0]["close"], "12:00:00");
+    }
+
+    #[test]
+    fn openings_stop_carried_trusted_interval_at_ignored_contact_event() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+        let today = Local::now().naive_local().date();
+        let connection = Connection::open(&db_path).expect("open database");
+        connection
+            .execute(
+                r#"
+                INSERT INTO device_events (timestamp, device_type, device_name, event, details)
+                VALUES (?, 'door', 'Office Door', 'open', ?),
+                       (?, 'door', 'Office Door', 'open', ?)
+                "#,
+                params![
+                    format_timestamp(day_start(today) - Duration::hours(1)),
+                    serde_json::json!({"state": "open", "contact_sensor_trusted": true})
+                        .to_string(),
+                    format_timestamp(day_start(today) + Duration::hours(10)),
+                    serde_json::json!({
+                        "state": "open",
+                        "contact_sensor_trusted": false,
+                        "ignored_reason": "renovation_contact_sensors_disabled"
+                    })
+                    .to_string(),
+                ],
+            )
+            .expect("insert openings");
+
+        let openings = read_openings(&db_path, 1).expect("openings");
+        let door = openings[0]["door"].as_array().expect("door openings");
+
+        assert_eq!(door.len(), 1);
+        assert_eq!(door[0]["open"], "00:00:00");
+        assert_eq!(door[0]["close"], "10:00:00");
     }
 }
