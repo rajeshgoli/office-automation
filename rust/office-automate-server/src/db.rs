@@ -2047,19 +2047,30 @@ pub fn get_latest_contact_device_state_with_timestamp(
     let row = connection
         .query_row(
             r#"
-            SELECT event, timestamp FROM device_events
+            SELECT
+                event,
+                timestamp,
+                COALESCE(json_extract(details, '$.contact_sensor_trusted'), 1) != 0 AS trusted
+            FROM device_events
             WHERE device_type = ?
               AND event IN ('open', 'closed')
-              AND (details IS NULL OR COALESCE(json_extract(details, '$.contact_sensor_trusted'), 1) != 0)
             ORDER BY timestamp DESC, id DESC
             LIMIT 1
             "#,
             params![device_type],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
         )
         .optional()
         .with_context(|| format!("failed to read latest {device_type} contact state"))?;
-    Ok(row.map(|(event, timestamp)| (event, timestamp_to_unix_seconds(&timestamp))))
+    Ok(row.and_then(|(event, timestamp, trusted)| {
+        trusted.then(|| (event, timestamp_to_unix_seconds(&timestamp)))
+    }))
 }
 
 fn parse_timestamp(value: &str) -> Option<NaiveDateTime> {
@@ -3286,7 +3297,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_contact_state_ignores_untrusted_contact_events() {
+    fn latest_contact_state_stops_at_newer_untrusted_contact_events() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("office_climate.db");
         migrate_database(&db_path).expect("migration");
@@ -3335,7 +3346,7 @@ mod tests {
         );
         assert_eq!(
             get_latest_contact_device_state(&db_path, "door").expect("latest trusted contact"),
-            Some("closed".to_string())
+            None
         );
     }
 

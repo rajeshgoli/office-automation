@@ -2069,6 +2069,7 @@ fn status_for_state(state: &AppState) -> Status {
     if let Err(error) = log_state_transition(state, timer_transition, "internal_presence") {
         tracing::warn!("failed to persist timer-driven status transition: {error:#}");
     }
+    schedule_timer_transition_policy_evaluation(state, timer_transition);
 
     status.state = state_status.state;
     status.is_present = state_status.is_present;
@@ -2090,6 +2091,36 @@ fn status_for_state(state: &AppState) -> Status {
     state.erv.overlay_status(&mut status);
     state.hvac.overlay_status(&mut status);
     status
+}
+
+fn schedule_timer_transition_policy_evaluation(
+    state: &AppState,
+    transition: Option<StateTransition>,
+) {
+    if transition.is_none() {
+        return;
+    }
+
+    clear_hvac_manual_override_on_transition(state, transition);
+    let state = state.clone();
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("skipping timer-driven policy evaluation: no Tokio runtime is active");
+        return;
+    };
+
+    handle.spawn(async move {
+        if let Err(error) = state.erv_automation.evaluate_erv_policy(true).await {
+            tracing::warn!(
+                "ERV automated policy apply failed after timer-driven transition: {error:#}"
+            );
+        }
+        if let Err(error) = evaluate_and_apply_hvac_policy(&state).await {
+            tracing::warn!(
+                "HVAC automated policy apply failed after timer-driven transition: {error:#}"
+            );
+        }
+        broadcast_status(&state);
+    });
 }
 
 fn validate_temperature_bands(bands: TemperatureBands) -> Result<(), &'static str> {
@@ -3791,6 +3822,71 @@ mod tests {
         assert_eq!(history.occupancy_history.len(), 1);
         assert_eq!(history.occupancy_history[0]["state"], "away");
         assert_eq!(history.occupancy_history[0]["trigger"], "internal_presence");
+    }
+
+    #[tokio::test]
+    async fn status_route_timer_transition_runs_policy_evaluation() {
+        let mut config = configured_erv_config(true);
+        config.room_mode.contact_sensors_enabled = false;
+        config.thresholds.motion_timeout_seconds = 1;
+        config.thresholds.min_away_seconds_before_erv = 0;
+        config.thresholds.erv_min_dwell_seconds = 0;
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
+            &config.thresholds,
+            &config.room_mode,
+            now - 10.0,
+        )));
+        {
+            let mut machine = state_machine.write().expect("state lock");
+            machine.set_manual_presence(true, now - 5.0);
+            assert_eq!(machine.state, OccupancyState::Present);
+        }
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let writer = Arc::new(FakeErvWriter::new(
+            vec![Ok(erv_status(ErvFanSpeed::Off))],
+            vec![Ok(erv_status(ErvFanSpeed::Turbo))],
+        ));
+        let (router, _state) = try_app_with_erv_writer_and_coordinator(
+            config.clone(),
+            qingping_with_co2(2100),
+            state_machine,
+            yolink,
+            ErvState::new(config.runtime.database_path.clone()),
+            HvacState::new(config.runtime.database_path.clone()),
+            writer.clone(),
+            Arc::new(FakeHvacWriter::default()),
+        )
+        .expect("app");
+
+        let response = router
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["is_present"], false);
+
+        for _ in 0..50 {
+            if !writer.write_speeds().is_empty() {
+                break;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(writer.write_speeds(), vec![ErvFanSpeed::Turbo]);
+        let history = db::read_history(&config.runtime.database_path, 1, 10).expect("history");
+        assert_eq!(history.occupancy_history[0]["state"], "away");
+        assert_eq!(history.climate_actions[0]["action"], "turbo");
     }
 
     #[tokio::test]
