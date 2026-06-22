@@ -16,6 +16,8 @@ use sha2::{Digest, Sha256};
 use crate::{config::AppConfig, qingping::QingpingReading};
 
 pub const DEVICE_PAIRING_MAX_FAILED_ATTEMPTS: i64 = 5;
+const TRUSTED_CONTACT_EVENT_FILTER: &str =
+    "(details IS NULL OR COALESCE(json_extract(details, '$.contact_sensor_trusted'), 1) != 0)";
 
 const SESSION_OUTPUT_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS session_output (
@@ -1263,15 +1265,26 @@ pub fn read_daily_stats(database_path: &Path, days: i64) -> Result<Vec<Value>> {
     let labels = day_labels(now.date(), days);
 
     let mut door_counts = HashMap::new();
-    let mut statement = connection.prepare(
-        "SELECT date(timestamp) AS date, COUNT(*) AS count FROM device_events WHERE timestamp >= ? AND device_type = 'door' GROUP BY date(timestamp)",
-    )?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT date(timestamp) AS date, COUNT(*) AS count FROM device_events WHERE timestamp >= ? AND device_type = 'door' AND {TRUSTED_CONTACT_EVENT_FILTER} GROUP BY date(timestamp)",
+    ))?;
     let rows = statement.query_map(params![cutoff], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
     for row in rows {
         let (date, count) = row?;
         door_counts.insert(date, count);
+    }
+    let mut ignored_contact_counts = HashMap::new();
+    let mut statement = connection.prepare(
+        "SELECT date(timestamp) AS date, COUNT(*) AS count FROM device_events WHERE timestamp >= ? AND device_type IN ('door', 'window') AND json_extract(details, '$.contact_sensor_trusted') = 0 GROUP BY date(timestamp)",
+    )?;
+    let rows = statement.query_map(params![cutoff], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (date, count) = row?;
+        ignored_contact_counts.insert(date, count);
     }
 
     let presence = durations_from_state_table(
@@ -1314,6 +1327,7 @@ pub fn read_daily_stats(database_path: &Path, days: i64) -> Result<Vec<Value>> {
             json!({
                 "date": date,
                 "door_events": door_counts.get(&date).copied().unwrap_or_default(),
+                "ignored_contact_events": ignored_contact_counts.get(&date).copied().unwrap_or_default(),
                 "erv_runtime_min": erv.get(&date).copied().unwrap_or_default().round() as i64,
                 "hvac_runtime_min": hvac.get(&date).copied().unwrap_or_default().round() as i64,
                 "presence_hours": round1(presence.get(&date).copied().unwrap_or_default()),
@@ -1475,7 +1489,9 @@ pub fn read_openings(database_path: &Path, days: i64) -> Result<Vec<Value>> {
     for device_type in ["door", "window"] {
         let last_before: Option<String> = connection
             .query_row(
-                "SELECT event FROM device_events WHERE timestamp < ? AND device_type = ? ORDER BY timestamp DESC LIMIT 1",
+                &format!(
+                    "SELECT event FROM device_events WHERE timestamp < ? AND device_type = ? AND event IN ('open', 'closed') AND {TRUSTED_CONTACT_EVENT_FILTER} ORDER BY timestamp DESC, id DESC LIMIT 1"
+                ),
                 params![cutoff, device_type],
                 |row| row.get(0),
             )
@@ -1483,7 +1499,9 @@ pub fn read_openings(database_path: &Path, days: i64) -> Result<Vec<Value>> {
         let mut open_start = (last_before.as_deref() == Some("open")).then_some(start);
 
         let mut statement = connection.prepare(
-            "SELECT timestamp, event FROM device_events WHERE timestamp >= ? AND device_type = ? ORDER BY timestamp ASC",
+            &format!(
+                "SELECT timestamp, event FROM device_events WHERE timestamp >= ? AND device_type = ? AND event IN ('open', 'closed') AND {TRUSTED_CONTACT_EVENT_FILTER} ORDER BY timestamp ASC, id ASC"
+            ),
         )?;
         let rows = statement.query_map(params![cutoff, device_type], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -2007,6 +2025,7 @@ pub fn get_latest_contact_device_state_with_timestamp(
             SELECT event, timestamp FROM device_events
             WHERE device_type = ?
               AND event IN ('open', 'closed')
+              AND (details IS NULL OR COALESCE(json_extract(details, '$.contact_sensor_trusted'), 1) != 0)
             ORDER BY timestamp DESC, id DESC
             LIMIT 1
             "#,
@@ -3190,5 +3209,138 @@ mod tests {
             )
             .expect("read details");
         assert_eq!(details, Some(r#"{"state":"open"}"#.to_string()));
+    }
+
+    #[test]
+    fn latest_contact_state_ignores_untrusted_contact_events() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+
+        log_device_event(
+            &db_path,
+            "door",
+            "closed",
+            Some("Office Door"),
+            Some(&serde_json::json!({
+                "state": "closed",
+                "contact_sensor_trusted": true,
+            })),
+        )
+        .expect("log trusted closed");
+        log_device_event(
+            &db_path,
+            "door",
+            "open",
+            Some("Office Door"),
+            Some(&serde_json::json!({
+                "state": "open",
+                "contact_sensor_trusted": false,
+                "ignored_reason": "renovation_contact_sensors_disabled",
+            })),
+        )
+        .expect("log ignored open");
+        let connection = Connection::open(&db_path).expect("open database");
+        connection
+            .execute(
+                r#"
+                UPDATE device_events
+                SET timestamp = CASE event
+                    WHEN 'closed' THEN '2026-06-01 12:00:00'
+                    WHEN 'open' THEN '2026-06-01 13:00:00'
+                END
+                WHERE device_type = 'door'
+                "#,
+                [],
+            )
+            .expect("update timestamps");
+
+        assert_eq!(
+            get_latest_device_state(&db_path, "door").expect("latest raw"),
+            Some("open".to_string())
+        );
+        assert_eq!(
+            get_latest_contact_device_state(&db_path, "door").expect("latest trusted contact"),
+            Some("closed".to_string())
+        );
+    }
+
+    #[test]
+    fn daily_stats_separates_ignored_contact_events() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+        let today = Local::now().naive_local().date();
+        let trusted_timestamp = format_timestamp(day_start(today) + Duration::hours(9));
+        let ignored_timestamp = format_timestamp(day_start(today) + Duration::hours(10));
+        let connection = Connection::open(&db_path).expect("open database");
+        connection
+            .execute(
+                r#"
+                INSERT INTO device_events (timestamp, device_type, device_name, event, details)
+                VALUES (?, 'door', 'Office Door', 'closed', ?),
+                       (?, 'door', 'Office Door', 'open', ?),
+                       (?, 'window', 'Office Window', 'open', ?)
+                "#,
+                params![
+                    trusted_timestamp,
+                    serde_json::json!({"state": "closed", "contact_sensor_trusted": true})
+                        .to_string(),
+                    ignored_timestamp,
+                    serde_json::json!({"state": "open", "contact_sensor_trusted": false})
+                        .to_string(),
+                    ignored_timestamp,
+                    serde_json::json!({"state": "open", "contact_sensor_trusted": false})
+                        .to_string(),
+                ],
+            )
+            .expect("insert contact events");
+
+        let stats = read_daily_stats(&db_path, 1).expect("daily stats");
+
+        assert_eq!(stats[0]["date"], today.to_string());
+        assert_eq!(stats[0]["door_events"], 1);
+        assert_eq!(stats[0]["ignored_contact_events"], 2);
+    }
+
+    #[test]
+    fn openings_exclude_ignored_contact_intervals() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+        let today = Local::now().naive_local().date();
+        let connection = Connection::open(&db_path).expect("open database");
+        connection
+            .execute(
+                r#"
+                INSERT INTO device_events (timestamp, device_type, device_name, event, details)
+                VALUES (?, 'door', 'Office Door', 'open', ?),
+                       (?, 'door', 'Office Door', 'closed', ?),
+                       (?, 'door', 'Office Door', 'open', ?),
+                       (?, 'door', 'Office Door', 'closed', ?)
+                "#,
+                params![
+                    format_timestamp(day_start(today) + Duration::hours(9)),
+                    serde_json::json!({"state": "open", "contact_sensor_trusted": false})
+                        .to_string(),
+                    format_timestamp(day_start(today) + Duration::hours(10)),
+                    serde_json::json!({"state": "closed", "contact_sensor_trusted": false})
+                        .to_string(),
+                    format_timestamp(day_start(today) + Duration::hours(11)),
+                    serde_json::json!({"state": "open", "contact_sensor_trusted": true})
+                        .to_string(),
+                    format_timestamp(day_start(today) + Duration::hours(12)),
+                    serde_json::json!({"state": "closed", "contact_sensor_trusted": true})
+                        .to_string(),
+                ],
+            )
+            .expect("insert openings");
+
+        let openings = read_openings(&db_path, 1).expect("openings");
+        let door = openings[0]["door"].as_array().expect("door openings");
+
+        assert_eq!(door.len(), 1);
+        assert_eq!(door[0]["open"], "11:00:00");
+        assert_eq!(door[0]["close"], "12:00:00");
     }
 }
