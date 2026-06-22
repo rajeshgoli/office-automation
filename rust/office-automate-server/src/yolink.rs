@@ -1627,6 +1627,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_climate_automation_skips_yolink_erv_policy_write() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&db_path).expect("migration");
+        let mut config = test_config(db_path.clone());
+        config.room_mode.climate_automation_enabled = false;
+        let state_machine = Arc::new(RwLock::new(StateMachine::new(
+            StateConfig::from_thresholds_and_room_mode(&config.thresholds, &config.room_mode),
+            1_000.0,
+        )));
+        let yolink = YoLinkState::new(state_machine.clone(), db_path.clone());
+        yolink.apply_devices(sample_devices());
+        let qingping = QingpingState::default();
+        let erv = ErvState::new(db_path);
+        let writer = Arc::new(FakeErvWriter::new(vec![Ok(erv_status(
+            ErvFanSpeed::Medium,
+        ))]));
+        let policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
+        let (status_broadcast, _) = tokio::sync::broadcast::channel(4);
+        let coordinator = ErvPolicyCoordinator::new(
+            config,
+            state_machine,
+            qingping,
+            erv,
+            policy,
+            writer.clone(),
+            status_broadcast,
+        );
+        let hook_observations = Arc::new(Mutex::new(Vec::new()));
+        let hook: DeviceIngressHook = Arc::new({
+            let hook_observations = hook_observations.clone();
+            move |transition| {
+                hook_observations
+                    .lock()
+                    .expect("hook observations lock")
+                    .push(transition);
+            }
+        });
+
+        apply_yolink_report_with_policy(
+            &yolink,
+            YoLinkReport {
+                device_id: "motion-1".to_string(),
+                data: json!({"state": "alert"}),
+            },
+            1_002.0,
+            Some(&coordinator),
+            Some(&hook),
+        )
+        .await
+        .expect("report applies through climate gate");
+
+        assert!(writer.write_speeds().is_empty());
+        assert_eq!(
+            *hook_observations.lock().expect("hook observations lock"),
+            vec![Some(StateTransition {
+                old_state: OccupancyState::Away,
+                new_state: OccupancyState::Present,
+            })]
+        );
+    }
+
+    #[tokio::test]
     async fn ignored_contact_events_do_not_trigger_policy_or_hook_but_motion_does() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("office_climate.db");

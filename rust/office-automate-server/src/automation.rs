@@ -66,6 +66,10 @@ impl ErvPolicyCoordinator {
     }
 
     async fn evaluate_erv_policy_locked(&self, bypass_dwell: bool) -> Result<()> {
+        if !self.config.room_mode.climate_automation_enabled {
+            return Ok(());
+        }
+
         let now = unix_timestamp_now();
         let state_status = {
             let machine = self
@@ -644,6 +648,53 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(coordinator.latest_co2_ppm(), None);
+    }
+
+    #[tokio::test]
+    async fn disabled_climate_automation_skips_erv_policy_writes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let mut config = test_config(database_path.clone());
+        config.room_mode.climate_automation_enabled = false;
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
+            &config.thresholds,
+            &config.room_mode,
+            now - 2.0,
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .set_manual_presence(true, now - 1.0);
+        let qingping = QingpingState::default();
+        qingping.apply_reading(qingping_reading(2100));
+        let erv = ErvState::new(database_path.clone());
+        let writer = Arc::new(FakeErvWriter::new(vec![Ok(erv_status(ErvFanSpeed::Off))]));
+        let policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
+        let (status_broadcast, _) = broadcast::channel(4);
+        let coordinator = ErvPolicyCoordinator::new(
+            config,
+            state_machine,
+            qingping,
+            erv,
+            policy,
+            writer.clone(),
+            status_broadcast,
+        );
+
+        coordinator
+            .evaluate_erv_policy(false)
+            .await
+            .expect("policy gate returns ok");
+
+        assert!(writer.writes().is_empty());
+        assert!(
+            db::read_history(&database_path, 1, 10)
+                .expect("history")
+                .climate_actions
+                .is_empty()
+        );
     }
 
     #[tokio::test]
