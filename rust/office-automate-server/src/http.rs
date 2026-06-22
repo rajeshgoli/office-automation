@@ -1503,10 +1503,17 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
     };
     let hvac_snapshot = state.hvac.snapshot();
     let temp_f = state
-        .qingping
-        .latest()
-        .and_then(|reading| reading.temp_c)
-        .map(celsius_to_fahrenheit);
+        .config
+        .room_mode
+        .air_quality_sensors_enabled
+        .then(|| {
+            state
+                .qingping
+                .latest()
+                .and_then(|reading| reading.temp_c)
+                .map(celsius_to_fahrenheit)
+        })
+        .flatten();
     let bands = active_temperature_bands(state);
     let hvac_mode = hvac_mode_from_str(&hvac_snapshot.mode).unwrap_or(HvacMode::Off);
     let critical_heat_needed = !state_status.is_present
@@ -3824,6 +3831,42 @@ mod tests {
         assert_eq!(value["air_quality"]["tvoc"], 25);
         assert_eq!(value["air_quality"]["noise_db"], 37.0);
         assert_eq!(value["air_quality"]["last_update"], "2026-06-05T12:30:00");
+    }
+
+    #[tokio::test]
+    async fn status_route_marks_moved_qingping_reading_as_untrusted() {
+        let qingping = QingpingState::default();
+        qingping.apply_reading(qingping_reading(900));
+        let mut config = test_config();
+        config.room_mode.renovation = true;
+        config.room_mode.air_quality_sensors_enabled = false;
+
+        let response = try_app_with_qingping(config, qingping)
+            .expect("app")
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(value["sensors"]["co2_ppm"], 400);
+        assert_eq!(value["sensors"]["air_quality_sensors_enabled"], false);
+        assert_eq!(value["sensors"]["air_quality_sensors_ignored"], true);
+        assert_eq!(value["air_quality"]["co2_ppm"], 900);
+        assert_eq!(value["air_quality"]["trusted_office_reading"], false);
+        assert_eq!(
+            value["air_quality"]["ignored_reason"],
+            "renovation_air_quality_sensor_moved"
+        );
     }
 
     #[tokio::test]
@@ -6387,6 +6430,48 @@ mod tests {
         assert_eq!(value["climate_actions"][0]["system"], "hvac");
         assert_eq!(value["climate_actions"][0]["action"], "cool");
         assert_eq!(value["climate_actions"][0]["reason"], "cool_band_start_82F");
+    }
+
+    #[tokio::test]
+    async fn disabled_air_quality_sensors_do_not_drive_hvac_temperature_policy() {
+        let mut config = configured_hvac_config(true);
+        config.room_mode.air_quality_sensors_enabled = false;
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Cool, 25.5))],
+        ));
+        let qingping = qingping_with_temp(28.0);
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds_and_room_mode(
+            &config.thresholds,
+            &config.room_mode,
+            unix_timestamp_now(),
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .set_manual_presence(true, unix_timestamp_now());
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Off, 22.0));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            qingping,
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy applies without trusted air-quality");
+
+        assert_eq!(writer.smoke_calls(), 0);
+        assert!(writer.write_modes().is_empty());
     }
 
     #[tokio::test]

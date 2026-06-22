@@ -118,6 +118,7 @@ pub fn start_qingping_ingress(
     )?;
     let database_path = config.runtime.database_path.clone();
     let configured_mac = device_mac.to_string();
+    let office_trusted = config.room_mode.air_quality_sensors_enabled;
     let guard = Arc::new(Mutex::new(QingpingIngressGuard::default()));
 
     let mut broker = Broker::new(broker_config);
@@ -140,6 +141,7 @@ pub fn start_qingping_ingress(
                 qingping,
                 guard,
                 reading_hook,
+                office_trusted,
             );
         })
         .context("failed to spawn Qingping MQTT ingest thread")?;
@@ -167,6 +169,7 @@ fn ingest_loop(
     qingping: QingpingState,
     guard: Arc<Mutex<QingpingIngressGuard>>,
     reading_hook: Option<SensorIngressHook>,
+    office_trusted: bool,
 ) {
     loop {
         match link_rx.recv() {
@@ -181,6 +184,7 @@ fn ingest_loop(
                     &qingping,
                     &guard,
                     reading_hook.as_ref(),
+                    office_trusted,
                 );
             }
             Ok(Some(_)) | Ok(None) => {}
@@ -199,6 +203,7 @@ fn handle_qingping_publish(
     qingping: &QingpingState,
     guard: &Arc<Mutex<QingpingIngressGuard>>,
     reading_hook: Option<&SensorIngressHook>,
+    office_trusted: bool,
 ) {
     match parse_qingping_payload(payload, configured_mac) {
         Ok(Some(reading)) => {
@@ -210,7 +215,13 @@ fn handle_qingping_publish(
                 tracing::warn!("rejected Qingping MQTT reading: {error}");
                 return;
             }
-            if let Err(error) = db::insert_sensor_reading(database_path, &reading) {
+            let ignored_reason = (!office_trusted).then_some("renovation_air_quality_sensor_moved");
+            if let Err(error) = db::insert_sensor_reading_with_trust(
+                database_path,
+                &reading,
+                office_trusted,
+                ignored_reason,
+            ) {
                 tracing::warn!("failed to store Qingping reading: {error:#}");
             }
             qingping.apply_reading(reading);
@@ -460,10 +471,38 @@ mod tests {
             &qingping,
             &Arc::new(Mutex::new(QingpingIngressGuard::default())),
             Some(&hook),
+            true,
         );
 
         assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
         assert_eq!(qingping.latest().expect("reading").co2_ppm, Some(2100));
+    }
+
+    #[test]
+    fn qingping_publish_marks_untrusted_air_quality_rows() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        migrate_database(&database_path).expect("migration");
+        let qingping = QingpingState::default();
+
+        handle_qingping_publish(
+            br#"{"sensorData":[{"co2":{"value":900},"temperature":{"value":23.5},"tvoc":{"value":30}}]}"#,
+            "aa:bb:cc:dd:ee:ff",
+            &database_path,
+            &qingping,
+            &Arc::new(Mutex::new(QingpingIngressGuard::default())),
+            None,
+            false,
+        );
+
+        let history = db::read_history(&database_path, 1, 10).expect("history");
+        assert_eq!(history.sensor_readings.len(), 1);
+        assert_eq!(history.sensor_readings[0]["co2_ppm"], 900);
+        assert_eq!(history.sensor_readings[0]["office_trusted"], 0);
+        assert_eq!(
+            history.sensor_readings[0]["ignored_reason"],
+            "renovation_air_quality_sensor_moved"
+        );
     }
 
     #[test]
