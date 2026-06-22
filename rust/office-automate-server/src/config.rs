@@ -9,6 +9,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppConfig {
     pub orchestrator: OrchestratorConfig,
+    pub room_mode: RoomModeConfig,
     pub presence: PresenceConfig,
     pub qingping: QingpingConfig,
     pub yolink: YoLinkConfig,
@@ -19,6 +20,26 @@ pub struct AppConfig {
     pub thresholds: ThresholdsConfig,
     pub telemetry: TelemetryConfig,
     pub runtime: RuntimeConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RoomModeConfig {
+    pub renovation: bool,
+    pub climate_automation_enabled: bool,
+    pub contact_sensors_enabled: bool,
+    pub air_quality_sensors_enabled: bool,
+}
+
+impl Default for RoomModeConfig {
+    fn default() -> Self {
+        Self {
+            renovation: false,
+            climate_automation_enabled: true,
+            contact_sensors_enabled: true,
+            air_quality_sensors_enabled: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -430,6 +451,7 @@ pub struct RuntimeConfig {
 #[serde(default)]
 struct FileConfig {
     orchestrator: OrchestratorConfig,
+    room_mode: RoomModeConfig,
     presence: PresenceConfig,
     qingping: QingpingConfig,
     yolink: YoLinkConfig,
@@ -604,6 +626,26 @@ impl AppConfig {
             file_config.cloudflare_access.api_base_url = api_base_url;
         }
 
+        if let Some(enabled) = env_lookup("OFFICE_AUTOMATE_RENOVATION_MODE") {
+            file_config.room_mode.renovation =
+                parse_bool_env("OFFICE_AUTOMATE_RENOVATION_MODE", &enabled)?;
+        }
+
+        if let Some(enabled) = env_lookup("OFFICE_AUTOMATE_CLIMATE_AUTOMATION_ENABLED") {
+            file_config.room_mode.climate_automation_enabled =
+                parse_bool_env("OFFICE_AUTOMATE_CLIMATE_AUTOMATION_ENABLED", &enabled)?;
+        }
+
+        if let Some(enabled) = env_lookup("OFFICE_AUTOMATE_CONTACT_SENSORS_ENABLED") {
+            file_config.room_mode.contact_sensors_enabled =
+                parse_bool_env("OFFICE_AUTOMATE_CONTACT_SENSORS_ENABLED", &enabled)?;
+        }
+
+        if let Some(enabled) = env_lookup("OFFICE_AUTOMATE_AIR_QUALITY_SENSORS_ENABLED") {
+            file_config.room_mode.air_quality_sensors_enabled =
+                parse_bool_env("OFFICE_AUTOMATE_AIR_QUALITY_SENSORS_ENABLED", &enabled)?;
+        }
+
         if let Some(admin_emails) = env_lookup("OFFICE_AUTOMATE_ADMIN_EMAILS") {
             file_config.orchestrator.admin_emails = admin_emails
                 .split(',')
@@ -732,6 +774,7 @@ impl AppConfig {
 
         Ok(Self {
             orchestrator: file_config.orchestrator,
+            room_mode: file_config.room_mode,
             presence: file_config.presence,
             qingping: file_config.qingping,
             yolink: file_config.yolink,
@@ -795,6 +838,11 @@ orchestrator:
   port: 9001
 presence:
   poll_interval_seconds: 7
+room_mode:
+  renovation: false
+  climate_automation_enabled: true
+  contact_sensors_enabled: true
+  air_quality_sensors_enabled: true
 telemetry:
   repos:
     - "/yaml/repo"
@@ -843,6 +891,10 @@ thresholds:
             "OFFICE_AUTOMATE_ERV_DEVICE_ID" => Some("env-erv-device".to_string()),
             "OFFICE_AUTOMATE_ERV_LOCAL_KEY" => Some("env-erv-key".to_string()),
             "OFFICE_AUTOMATE_ERV_ACTIVE_CONTROL_ENABLED" => Some("true".to_string()),
+            "OFFICE_AUTOMATE_RENOVATION_MODE" => Some("true".to_string()),
+            "OFFICE_AUTOMATE_CLIMATE_AUTOMATION_ENABLED" => Some("false".to_string()),
+            "OFFICE_AUTOMATE_CONTACT_SENSORS_ENABLED" => Some("false".to_string()),
+            "OFFICE_AUTOMATE_AIR_QUALITY_SENSORS_ENABLED" => Some("false".to_string()),
             "OFFICE_AUTOMATE_PRESENCE_ENABLED" => Some("true".to_string()),
             "OFFICE_AUTOMATE_PRESENCE_COMMAND_TIMEOUT_SECONDS" => Some("3".to_string()),
             "OFFICE_AUTOMATE_TELEMETRY_REPOS" => Some("/env/repo-a,/env/repo-b".to_string()),
@@ -896,6 +948,10 @@ thresholds:
 
         assert_eq!(config.orchestrator.host, "127.0.0.1");
         assert_eq!(config.orchestrator.port, 9001);
+        assert!(config.room_mode.renovation);
+        assert!(!config.room_mode.climate_automation_enabled);
+        assert!(!config.room_mode.contact_sensors_enabled);
+        assert!(!config.room_mode.air_quality_sensors_enabled);
         assert!(config.presence.enabled);
         assert_eq!(config.presence.poll_interval_seconds, 7);
         assert_eq!(config.presence.command_timeout_seconds, 3);

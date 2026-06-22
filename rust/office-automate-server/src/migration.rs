@@ -880,6 +880,7 @@ mod tests {
     fn test_config(root: &Path, config_path: PathBuf, database_path: PathBuf) -> AppConfig {
         AppConfig {
             orchestrator: OrchestratorConfig::default(),
+            room_mode: crate::config::RoomModeConfig::default(),
             presence: PresenceConfig::default(),
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),
