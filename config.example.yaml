@@ -14,6 +14,15 @@ qingping:
   mqtt_password: "replace-with-random-device-password"
   device_mac: "AA:BB:CC:DD:EE:FF"
 
+# Room operating mode. Defaults preserve normal office behavior. During
+# renovation, keep raw telemetry flowing but mark moved sensors as untrusted and
+# disable automated climate writes.
+room_mode:
+  renovation: false
+  climate_automation_enabled: true
+  contact_sensors_enabled: true
+  air_quality_sensors_enabled: true
+
 # Android artifact upload hardening. Set this to the SHA-256 digest of the
 # office-climate release signing certificate. The deploy endpoint rejects APKs
 # signed by any other cert when this is configured.

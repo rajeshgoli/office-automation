@@ -951,6 +951,7 @@ mod tests {
             .to_path_buf();
         AppConfig {
             orchestrator: OrchestratorConfig::default(),
+            room_mode: crate::config::RoomModeConfig::default(),
             presence: PresenceConfig::default(),
             qingping: QingpingConfig::default(),
             yolink: YoLinkConfig::default(),
