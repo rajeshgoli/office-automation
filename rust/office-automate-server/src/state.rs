@@ -22,6 +22,10 @@ impl OccupancyState {
 pub struct StateConfig {
     pub motion_timeout_seconds: f64,
     pub departure_verification_seconds: f64,
+    pub post_renovation_departure_verification_seconds: f64,
+    pub post_renovation_enabled: bool,
+    pub post_renovation_expires_at: Option<f64>,
+    pub post_renovation_expiry_valid: bool,
     pub door_open_threshold_minutes: f64,
     pub door_open_away_timeout_minutes: f64,
     pub co2_critical_ppm: i64,
@@ -41,6 +45,12 @@ impl StateConfig {
         Self {
             motion_timeout_seconds: thresholds.motion_timeout_seconds as f64,
             departure_verification_seconds: thresholds.departure_verification_seconds as f64,
+            post_renovation_departure_verification_seconds: thresholds
+                .post_renovation_departure_verification_seconds
+                as f64,
+            post_renovation_enabled: thresholds.post_renovation_enabled,
+            post_renovation_expires_at: post_renovation_expires_at_unix(thresholds),
+            post_renovation_expiry_valid: post_renovation_expiry_valid(thresholds),
             door_open_threshold_minutes: thresholds.door_open_threshold_minutes as f64,
             door_open_away_timeout_minutes: thresholds.door_open_away_timeout_minutes as f64,
             co2_critical_ppm: thresholds.co2_critical_ppm,
@@ -55,12 +65,54 @@ impl Default for StateConfig {
         Self {
             motion_timeout_seconds: 60.0,
             departure_verification_seconds: 120.0,
+            post_renovation_departure_verification_seconds: 30.0,
+            post_renovation_enabled: false,
+            post_renovation_expires_at: None,
+            post_renovation_expiry_valid: true,
             door_open_threshold_minutes: 5.0,
             door_open_away_timeout_minutes: 5.0,
             co2_critical_ppm: 2000,
             co2_refresh_target_ppm: 500,
             contact_sensors_enabled: true,
         }
+    }
+}
+
+impl StateConfig {
+    fn departure_verification_seconds_at(&self, now: f64) -> f64 {
+        if self.post_renovation_active_at(now) {
+            self.post_renovation_departure_verification_seconds
+        } else {
+            self.departure_verification_seconds
+        }
+    }
+
+    fn post_renovation_active_at(&self, now: f64) -> bool {
+        if !self.post_renovation_enabled {
+            return false;
+        }
+        if !self.post_renovation_expiry_valid {
+            return false;
+        }
+        match self.post_renovation_expires_at {
+            Some(expires_at) => now < expires_at,
+            None => true,
+        }
+    }
+}
+
+fn post_renovation_expires_at_unix(thresholds: &ThresholdsConfig) -> Option<f64> {
+    thresholds
+        .post_renovation_expires_at
+        .as_deref()
+        .and_then(|expires_at| chrono::DateTime::parse_from_rfc3339(expires_at).ok())
+        .map(|expires_at| expires_at.timestamp_millis() as f64 / 1_000.0)
+}
+
+fn post_renovation_expiry_valid(thresholds: &ThresholdsConfig) -> bool {
+    match thresholds.post_renovation_expires_at.as_deref() {
+        Some(expires_at) => chrono::DateTime::parse_from_rfc3339(expires_at).is_ok(),
+        None => true,
     }
 }
 
@@ -514,7 +566,7 @@ impl StateMachine {
     fn start_departure_verification(&mut self, now: f64) {
         if self.config.contact_sensors_enabled && self.state == OccupancyState::Present {
             self.departure_verification_deadline =
-                Some(now + self.config.departure_verification_seconds);
+                Some(now + self.config.departure_verification_seconds_at(now));
         }
     }
 
@@ -645,6 +697,69 @@ mod tests {
         assert!(!machine.sensors.motion_detected);
         assert_eq!(machine.sensors.motion_last_seen, 0.0);
         assert!(!machine.verifying_departure());
+    }
+
+    #[test]
+    fn post_renovation_uses_aggressive_departure_verification() {
+        let mut machine = StateMachine::new(
+            StateConfig {
+                departure_verification_seconds: 120.0,
+                post_renovation_departure_verification_seconds: 30.0,
+                post_renovation_enabled: true,
+                post_renovation_expires_at: Some(2_000.0),
+                ..StateConfig::default()
+            },
+            1_000.0,
+        );
+        machine.set_manual_presence(true, 1_001.0);
+        machine.update_door(true, 1_010.0);
+        machine.update_motion(false, 1_019.0);
+        machine.update_door(false, 1_020.0);
+
+        assert!(machine.verifying_departure());
+        assert_eq!(machine.advance_timers(1_049.0), None);
+        assert_eq!(machine.state, OccupancyState::Present);
+
+        let transition = machine.advance_timers(1_050.0);
+        assert_eq!(
+            transition,
+            Some(StateTransition {
+                old_state: OccupancyState::Present,
+                new_state: OccupancyState::Away,
+            })
+        );
+        assert!(!machine.verifying_departure());
+    }
+
+    #[test]
+    fn expired_post_renovation_uses_normal_departure_verification() {
+        let mut machine = StateMachine::new(
+            StateConfig {
+                departure_verification_seconds: 120.0,
+                post_renovation_departure_verification_seconds: 30.0,
+                post_renovation_enabled: true,
+                post_renovation_expires_at: Some(1_000.0),
+                ..StateConfig::default()
+            },
+            1_000.0,
+        );
+        machine.set_manual_presence(true, 1_001.0);
+        machine.update_door(true, 1_010.0);
+        machine.update_motion(false, 1_019.0);
+        machine.update_door(false, 1_020.0);
+
+        assert!(machine.verifying_departure());
+        assert_eq!(machine.advance_timers(1_050.0), None);
+        assert_eq!(machine.state, OccupancyState::Present);
+
+        let transition = machine.advance_timers(1_140.0);
+        assert_eq!(
+            transition,
+            Some(StateTransition {
+                old_state: OccupancyState::Present,
+                new_state: OccupancyState::Away,
+            })
+        );
     }
 
     #[test]

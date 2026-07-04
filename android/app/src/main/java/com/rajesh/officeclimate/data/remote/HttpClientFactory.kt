@@ -14,6 +14,7 @@ import java.security.PrivateKey
 import java.security.SecureRandom
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
+import java.security.spec.InvalidKeySpecException
 import java.security.spec.PKCS8EncodedKeySpec
 import javax.net.ssl.SSLEngine
 import javax.net.ssl.X509ExtendedKeyManager
@@ -69,9 +70,6 @@ class HttpClientFactory(
                 .onSuccess { sslConfig ->
                     sslConfig?.let { (sslSocketFactory, trustManager) ->
                         builder.sslSocketFactory(sslSocketFactory, trustManager)
-                        if (legacyPrivateKeyPkcs8.isNotBlank()) {
-                            settingsRepository.clearDevicePrivateKeyPkcs8()
-                        }
                     }
                 }
                 .onFailure { error ->
@@ -93,7 +91,7 @@ class HttpClientFactory(
         }
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
         val privateKey = loadPrivateKeyFromStore(keyStore, alias)
-            ?: importLegacyPrivateKey(keyStore, alias, certificateChain, legacyPrivateKeyPkcs8)
+            ?: decodePrivateKey(legacyPrivateKeyPkcs8)
             ?: return null
 
         val keyManager = SingleAliasKeyManager(
@@ -127,34 +125,22 @@ class HttpClientFactory(
             .filterIsInstance<X509Certificate>()
     }
 
-    private fun decodePrivateKey(privateKeyPkcs8: String): PrivateKey? =
-        runCatching {
-            val keyBytes = Base64.decode(privateKeyPkcs8, Base64.DEFAULT)
-            KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(keyBytes))
-        }.getOrNull()
+    private fun decodePrivateKey(privateKeyPkcs8: String): PrivateKey? {
+        if (privateKeyPkcs8.isBlank()) return null
+        val keyBytes = runCatching { Base64.decode(privateKeyPkcs8, Base64.DEFAULT) }.getOrNull()
+            ?: return null
+        val spec = PKCS8EncodedKeySpec(keyBytes)
+        for (algorithm in listOf("EC", "RSA")) {
+            try {
+                return KeyFactory.getInstance(algorithm).generatePrivate(spec)
+            } catch (_: InvalidKeySpecException) {
+            }
+        }
+        return null
+    }
 
     private fun loadPrivateKeyFromStore(keyStore: KeyStore, alias: String): PrivateKey? =
         runCatching { keyStore.getKey(alias, null) as? PrivateKey }.getOrNull()
-
-    private fun importLegacyPrivateKey(
-        keyStore: KeyStore,
-        alias: String,
-        certificateChain: List<X509Certificate>,
-        privateKeyPkcs8: String,
-    ): PrivateKey? {
-        if (privateKeyPkcs8.isBlank()) {
-            return null
-        }
-        val privateKey = decodePrivateKey(privateKeyPkcs8) ?: return null
-        return runCatching {
-            keyStore.setEntry(
-                alias,
-                KeyStore.PrivateKeyEntry(privateKey, certificateChain.toTypedArray()),
-                null,
-            )
-            loadPrivateKeyFromStore(keyStore, alias)
-        }.getOrNull()
-    }
 
     private companion object {
         const val TAG = "HttpClientFactory"

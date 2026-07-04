@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use chrono::DateTime;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -16,6 +17,7 @@ pub struct AppConfig {
     pub artifacts: ArtifactConfig,
     pub cloudflare_access: CloudflareAccessConfig,
     pub erv: ErvConfig,
+    pub blinds: BlindsConfig,
     pub mitsubishi: MitsubishiConfig,
     pub thresholds: ThresholdsConfig,
     pub telemetry: TelemetryConfig,
@@ -327,6 +329,79 @@ impl Default for ErvConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct BlindsConfig {
+    #[serde(rename = "type")]
+    pub device_type: String,
+    pub ip: String,
+    pub device_id: String,
+    pub local_key: String,
+    pub active_control_enabled: bool,
+    pub version: String,
+    pub port: u16,
+    pub status_timeout_seconds: u64,
+    pub control_dp: String,
+    pub open_value: String,
+    pub close_value: String,
+    pub smart_life_auth_file: Option<PathBuf>,
+    pub smart_life_home_id: Option<String>,
+    pub open_scene_id: Option<String>,
+    pub close_scene_id: Option<String>,
+}
+
+impl BlindsConfig {
+    pub fn is_configured(&self) -> bool {
+        self.local_tuya_configured() || self.smart_life_scene_configured()
+    }
+
+    pub fn local_tuya_configured(&self) -> bool {
+        self.device_type == "tuya"
+            && !self.ip.trim().is_empty()
+            && !self.device_id.trim().is_empty()
+            && !self.local_key.trim().is_empty()
+            && !self.control_dp.trim().is_empty()
+    }
+
+    pub fn smart_life_scene_configured(&self) -> bool {
+        self.device_type == "tuya"
+            && self
+                .smart_life_home_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .open_scene_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            && self
+                .close_scene_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+    }
+}
+
+impl Default for BlindsConfig {
+    fn default() -> Self {
+        Self {
+            device_type: "tuya".to_string(),
+            ip: String::new(),
+            device_id: String::new(),
+            local_key: String::new(),
+            active_control_enabled: false,
+            version: "3.4".to_string(),
+            port: 6668,
+            status_timeout_seconds: 5,
+            control_dp: "1".to_string(),
+            open_value: "open".to_string(),
+            close_value: "close".to_string(),
+            smart_life_auth_file: None,
+            smart_life_home_id: None,
+            open_scene_id: None,
+            close_scene_id: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ThresholdsConfig {
@@ -374,6 +449,14 @@ pub struct ThresholdsConfig {
     pub away_stale_flush_interval_hours: u64,
     pub away_stale_flush_duration_minutes: u64,
     pub away_stale_flush_speed: String,
+    pub post_renovation_enabled: bool,
+    pub post_renovation_expires_at: Option<String>,
+    pub post_renovation_tvoc_threshold: i64,
+    pub post_renovation_present_tvoc_target: i64,
+    pub post_renovation_away_tvoc_target: i64,
+    pub post_renovation_min_speed: String,
+    pub post_renovation_negative_pressure: bool,
+    pub post_renovation_departure_verification_seconds: u64,
 }
 
 impl Default for ThresholdsConfig {
@@ -423,7 +506,32 @@ impl Default for ThresholdsConfig {
             away_stale_flush_interval_hours: 8,
             away_stale_flush_duration_minutes: 30,
             away_stale_flush_speed: "medium".to_string(),
+            post_renovation_enabled: false,
+            post_renovation_expires_at: None,
+            post_renovation_tvoc_threshold: 150,
+            post_renovation_present_tvoc_target: 120,
+            post_renovation_away_tvoc_target: 40,
+            post_renovation_min_speed: "quiet".to_string(),
+            post_renovation_negative_pressure: false,
+            post_renovation_departure_verification_seconds: 30,
         }
+    }
+}
+
+impl ThresholdsConfig {
+    pub fn post_renovation_active_at(&self, now: f64) -> bool {
+        if !self.post_renovation_enabled {
+            return false;
+        }
+
+        let Some(expires_at) = self.post_renovation_expires_at.as_deref() else {
+            return true;
+        };
+
+        let Ok(expires_at) = DateTime::parse_from_rfc3339(expires_at) else {
+            return false;
+        };
+        now < expires_at.timestamp_millis() as f64 / 1_000.0
     }
 }
 
@@ -458,6 +566,7 @@ struct FileConfig {
     artifacts: ArtifactConfig,
     cloudflare_access: CloudflareAccessConfig,
     erv: ErvConfig,
+    blinds: BlindsConfig,
     mitsubishi: MitsubishiConfig,
     thresholds: ThresholdsConfig,
     telemetry: TelemetryConfig,
@@ -569,6 +678,51 @@ impl AppConfig {
             file_config.erv.idle_poll_interval_seconds = seconds.parse().with_context(|| {
                 format!("invalid OFFICE_AUTOMATE_ERV_IDLE_POLL_INTERVAL_SECONDS value {seconds:?}")
             })?;
+        }
+
+        if let Some(ip) = env_lookup("OFFICE_AUTOMATE_BLINDS_IP") {
+            file_config.blinds.ip = ip;
+        }
+
+        if let Some(device_id) = env_lookup("OFFICE_AUTOMATE_BLINDS_DEVICE_ID") {
+            file_config.blinds.device_id = device_id;
+        }
+
+        if let Some(local_key) = env_lookup("OFFICE_AUTOMATE_BLINDS_LOCAL_KEY") {
+            file_config.blinds.local_key = local_key;
+        }
+
+        if let Some(enabled) = env_lookup("OFFICE_AUTOMATE_BLINDS_ACTIVE_CONTROL_ENABLED") {
+            file_config.blinds.active_control_enabled =
+                parse_bool_env("OFFICE_AUTOMATE_BLINDS_ACTIVE_CONTROL_ENABLED", &enabled)?;
+        }
+
+        if let Some(control_dp) = env_lookup("OFFICE_AUTOMATE_BLINDS_CONTROL_DP") {
+            file_config.blinds.control_dp = control_dp;
+        }
+
+        if let Some(open_value) = env_lookup("OFFICE_AUTOMATE_BLINDS_OPEN_VALUE") {
+            file_config.blinds.open_value = open_value;
+        }
+
+        if let Some(close_value) = env_lookup("OFFICE_AUTOMATE_BLINDS_CLOSE_VALUE") {
+            file_config.blinds.close_value = close_value;
+        }
+
+        if let Some(path) = env_lookup("OFFICE_AUTOMATE_BLINDS_SMART_LIFE_AUTH_FILE") {
+            file_config.blinds.smart_life_auth_file = Some(PathBuf::from(path));
+        }
+
+        if let Some(home_id) = env_lookup("OFFICE_AUTOMATE_BLINDS_SMART_LIFE_HOME_ID") {
+            file_config.blinds.smart_life_home_id = Some(home_id);
+        }
+
+        if let Some(scene_id) = env_lookup("OFFICE_AUTOMATE_BLINDS_OPEN_SCENE_ID") {
+            file_config.blinds.open_scene_id = Some(scene_id);
+        }
+
+        if let Some(scene_id) = env_lookup("OFFICE_AUTOMATE_BLINDS_CLOSE_SCENE_ID") {
+            file_config.blinds.close_scene_id = Some(scene_id);
         }
 
         if let Some(enabled) = env_lookup("OFFICE_AUTOMATE_PRESENCE_ENABLED") {
@@ -752,6 +906,10 @@ impl AppConfig {
             .clone()
             .map(|path| expand_home_relative_path(path, home_dir.as_deref()))
             .unwrap_or_else(|| data_dir.join("engram_concept_registry.md"));
+        file_config.blinds.smart_life_auth_file = file_config
+            .blinds
+            .smart_life_auth_file
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()));
 
         let runtime = RuntimeConfig {
             frontend_dist: root.join("frontend").join("dist"),
@@ -781,6 +939,7 @@ impl AppConfig {
             artifacts: file_config.artifacts,
             cloudflare_access: file_config.cloudflare_access,
             erv: file_config.erv,
+            blinds: file_config.blinds,
             mitsubishi: file_config.mitsubishi,
             thresholds: file_config.thresholds,
             telemetry: file_config.telemetry,

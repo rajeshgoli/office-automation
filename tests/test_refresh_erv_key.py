@@ -64,7 +64,14 @@ class FakeManager:
                 id="erv-device-id",
                 name="ERVQ-H-F-BM",
                 local_key="new-local-key",
-            )
+                productName="Ventilation System",
+            ),
+            "bridge-device-id": SimpleNamespace(
+                id="bridge-device-id",
+                name="WiFi Bridge",
+                local_key="bridge-local-key",
+                productName="WiFi Bridge",
+            ),
         }
         FakeManager.latest_listener = listener
 
@@ -78,6 +85,16 @@ class FakeManager:
                 "refresh_token": "new-refresh-token",
             }
         )
+
+    def query_scenes(self):
+        return [
+            SimpleNamespace(
+                name="Open office blinds",
+                scene_id="open-scene-id",
+                home_id="home-id",
+                enabled=True,
+            )
+        ]
 
 
 class SwallowingRefreshErrorManager(FakeManager):
@@ -282,6 +299,111 @@ def test_print_mode_outputs_key_without_updating_config(tmp_path, monkeypatch):
     assert rc == 0
     assert stdout.getvalue().strip() == "new-local-key"
     assert config.read_text() == before
+
+
+def test_blinds_section_can_refresh_bridge_key(tmp_path, monkeypatch):
+    module = load_script_module()
+    monkeypatch.setattr(module, "Manager", FakeManager)
+    monkeypatch.setattr(module, "LoginControl", object)
+
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "\n".join(
+            [
+                "erv:",
+                '  device_id: "erv-device-id"',
+                '  local_key: "old-local-key"',
+                "blinds:",
+                '  device_id: "bridge-device-id"',
+                '  local_key: "old-bridge-key"  # keep this comment',
+                "",
+            ]
+        )
+    )
+    auth = tmp_path / "auth.json"
+    write_auth(auth)
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    rc = module.main(
+        [
+            "--config",
+            str(config),
+            "--auth-file",
+            str(auth),
+            "--section",
+            "blinds",
+            "--update-config",
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert rc == 0
+    assert "blinds.local_key refreshed for WiFi Bridge" in stdout.getvalue()
+    assert 'local_key: "bridge-local-key" # keep this comment' in config.read_text()
+    assert 'local_key: "old-local-key"' in config.read_text()
+
+
+def test_list_devices_prints_names_without_keys(tmp_path, monkeypatch):
+    module = load_script_module()
+    monkeypatch.setattr(module, "Manager", FakeManager)
+    monkeypatch.setattr(module, "LoginControl", object)
+
+    config = tmp_path / "config.yaml"
+    write_config(config)
+    auth = tmp_path / "auth.json"
+    write_auth(auth)
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    rc = module.main(
+        [
+            "--config",
+            str(config),
+            "--auth-file",
+            str(auth),
+            "--list-devices",
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    output = stdout.getvalue()
+    assert rc == 0
+    assert "name=WiFi Bridge device_id=bridge-device-id" in output
+    assert "name=ERVQ-H-F-BM device_id=erv-device-id" in output
+    assert "bridge-local-key" not in output
+    assert "new-local-key" not in output
+
+
+def test_list_scenes_prints_scene_ids(tmp_path, monkeypatch):
+    module = load_script_module()
+    monkeypatch.setattr(module, "Manager", FakeManager)
+    monkeypatch.setattr(module, "LoginControl", object)
+
+    config = tmp_path / "config.yaml"
+    write_config(config)
+    auth = tmp_path / "auth.json"
+    write_auth(auth)
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    rc = module.main(
+        [
+            "--config",
+            str(config),
+            "--auth-file",
+            str(auth),
+            "--list-scenes",
+        ],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    output = stdout.getvalue()
+    assert rc == 0
+    assert "name=Open office blinds scene_id=open-scene-id home_id=home-id enabled=yes" in output
 
 
 def test_qr_payload_wraps_home_assistant_qrcode_token():

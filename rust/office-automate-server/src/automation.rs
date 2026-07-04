@@ -99,6 +99,7 @@ impl ErvPolicyCoordinator {
             fresh_status_checked = true;
         }
 
+        let negative_pressure_active = self.post_renovation_negative_pressure_active();
         let decision = {
             let mut policy = self.policy.write().expect("ERV policy lock poisoned");
             if let Some(reading) = &qingping_reading {
@@ -133,8 +134,11 @@ impl ErvPolicyCoordinator {
                         None
                     },
                     tvoc: qingping_reading.as_ref().and_then(|reading| reading.tvoc),
+                    current_status_known: erv_snapshot.status_known,
                     current_running: erv_snapshot.running,
                     current_speed: ventilation_speed_from_erv(erv_snapshot.speed),
+                    current_negative_pressure: erv_snapshot.negative_pressure,
+                    target_negative_pressure: negative_pressure_active,
                     manual_override,
                     last_speed_changed_at: erv_snapshot.last_speed_changed_at,
                     bypass_dwell,
@@ -223,6 +227,7 @@ impl ErvPolicyCoordinator {
                 &self.config.erv,
                 self.writer.as_ref(),
                 speed,
+                self.post_renovation_negative_pressure_active(),
                 reason,
                 co2_ppm,
             )
@@ -243,6 +248,7 @@ impl ErvPolicyCoordinator {
                     &self.config.erv,
                     self.writer.as_ref(),
                     speed,
+                    self.post_renovation_negative_pressure_active(),
                     reason,
                     co2_ppm,
                 )
@@ -250,6 +256,12 @@ impl ErvPolicyCoordinator {
         }
 
         self.apply_erv_speed(speed, reason, co2_ppm).await
+    }
+
+    fn post_renovation_negative_pressure_active(&self) -> bool {
+        let now = unix_timestamp_now();
+        self.config.thresholds.post_renovation_negative_pressure
+            && self.config.thresholds.post_renovation_active_at(now)
     }
 
     pub fn latest_co2_ppm(&self) -> Option<i64> {
@@ -459,6 +471,7 @@ mod tests {
             &'a self,
             _config: &'a ErvConfig,
             speed: ErvFanSpeed,
+            _negative_pressure: bool,
         ) -> BoxFutureResult<'a, ErvDeviceStatus> {
             self.writes.lock().expect("writes lock").push(speed);
             let set_delay = self.set_delay;
@@ -494,6 +507,7 @@ mod tests {
                 ..ErvConfig::default()
             },
             mitsubishi: MitsubishiConfig::default(),
+            blinds: crate::config::BlindsConfig::default(),
             thresholds: ThresholdsConfig::default(),
             telemetry: TelemetryConfig::default(),
             runtime: RuntimeConfig {
@@ -964,6 +978,7 @@ mod tests {
                 &config.erv,
                 writer.as_ref(),
                 ErvFanSpeed::Turbo,
+                false,
                 &format!("away_refresh_{index}"),
                 Some(900),
             )
@@ -974,6 +989,7 @@ mod tests {
             &config.erv,
             writer.as_ref(),
             ErvFanSpeed::Turbo,
+            false,
             "away_refresh_suppressed",
             Some(900),
         )

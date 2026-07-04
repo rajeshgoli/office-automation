@@ -960,6 +960,7 @@ mod tests {
             &'a self,
             _config: &'a ErvConfig,
             speed: ErvFanSpeed,
+            _negative_pressure: bool,
         ) -> crate::erv::BoxFutureResult<'a, ErvDeviceStatus> {
             self.write_speeds
                 .lock()
@@ -1012,6 +1013,7 @@ mod tests {
                 ..ErvConfig::default()
             },
             mitsubishi: MitsubishiConfig::default(),
+            blinds: crate::config::BlindsConfig::default(),
             thresholds: ThresholdsConfig {
                 erv_min_dwell_seconds: 0,
                 ..ThresholdsConfig::default()

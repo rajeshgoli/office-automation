@@ -296,8 +296,9 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        ErvConfig, MitsubishiConfig, OrchestratorConfig, PresenceConfig, QingpingConfig,
-        RoomModeConfig, RuntimeConfig, TelemetryConfig, ThresholdsConfig, YoLinkConfig,
+        BlindsConfig, ErvConfig, MitsubishiConfig, OrchestratorConfig, PresenceConfig,
+        QingpingConfig, RoomModeConfig, RuntimeConfig, TelemetryConfig, ThresholdsConfig,
+        YoLinkConfig,
     };
 
     fn test_config() -> AppConfig {
@@ -313,6 +314,7 @@ mod tests {
             artifacts: crate::config::ArtifactConfig::default(),
             cloudflare_access: crate::config::CloudflareAccessConfig::default(),
             erv: ErvConfig::default(),
+            blinds: BlindsConfig::default(),
             mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig {
                 hvac_heat_on_temp_f: 70,

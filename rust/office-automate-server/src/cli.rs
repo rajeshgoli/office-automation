@@ -5,6 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::{
     artifacts::{ARTIFACT_MAX_SIZE_BYTES, ArtifactStore, ArtifactUploadPolicy},
+    blinds,
     config::AppConfig,
     db, device, edge, erv, http, hvac, migration, presence, telemetry,
     validation::{
@@ -154,6 +155,10 @@ pub enum SmokeTarget {
     Hvac,
     /// Verify macOS keyboard/display presence signals.
     Presence,
+    /// Trigger the configured close-blinds Smart Life scene.
+    BlindsClose,
+    /// Trigger the configured open-blinds Smart Life scene.
+    BlindsOpen,
 }
 
 #[derive(Debug, Subcommand, Clone, Copy, PartialEq, Eq)]
@@ -634,6 +639,14 @@ async fn run_smoke(config: &AppConfig, target: Option<SmokeTarget>) -> Result<()
                     status.idle_seconds, status.external_monitor, status.display_count
                 );
             }
+            SmokeTarget::BlindsClose => {
+                blinds::set_blinds(&config.blinds, blinds::BlindsCommand::Close).await?;
+                println!("Blinds close scene trigger OK");
+            }
+            SmokeTarget::BlindsOpen => {
+                blinds::set_blinds(&config.blinds, blinds::BlindsCommand::Open).await?;
+                println!("Blinds open scene trigger OK");
+            }
         }
     }
 
@@ -645,6 +658,8 @@ fn smoke_targets(target: Option<SmokeTarget>) -> &'static [SmokeTarget] {
         Some(SmokeTarget::Erv) => &[SmokeTarget::Erv],
         Some(SmokeTarget::Hvac) => &[SmokeTarget::Hvac],
         Some(SmokeTarget::Presence) => &[SmokeTarget::Presence],
+        Some(SmokeTarget::BlindsClose) => &[SmokeTarget::BlindsClose],
+        Some(SmokeTarget::BlindsOpen) => &[SmokeTarget::BlindsOpen],
         None => &[SmokeTarget::Erv, SmokeTarget::Hvac, SmokeTarget::Presence],
     }
 }

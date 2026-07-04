@@ -40,6 +40,7 @@ fun QuickControls(
     onPresenceState: (String) -> Unit,
     onErvSpeed: (String) -> Unit,
     onHvacMode: (String, Int?) -> Unit,
+    onBlindsCommand: (String) -> Unit,
     onTemperatureBandAction: (String, String, Int) -> Unit,
     onTemperatureBandReset: () -> Unit,
     modifier: Modifier = Modifier,
@@ -141,6 +142,31 @@ fun QuickControls(
                     isActive = currentMode == "cool",
                     isLoading = controlLoading == "hvac_cool",
                     onClick = { onHvacMode("cool", 76) },
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+
+        // Blinds Controls
+        Column {
+            Text("Blinds", style = MaterialTheme.typography.labelLarge, color = TextPrimary)
+
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                ControlButton(
+                    label = "OPEN",
+                    isActive = false,
+                    isLoading = controlLoading == "blinds_open",
+                    onClick = { onBlindsCommand("open") },
+                    modifier = Modifier.weight(1f),
+                )
+                ControlButton(
+                    label = "CLOSE",
+                    isActive = false,
+                    isLoading = controlLoading == "blinds_close",
+                    onClick = { onBlindsCommand("close") },
                     modifier = Modifier.weight(1f),
                 )
             }

@@ -237,6 +237,7 @@ export async function setERVSpeed(speed: ERVSpeed): Promise<{ ok: boolean; error
 
 export type HVACMode = 'off' | 'heat' | 'cool';
 export type PresenceState = 'present' | 'away';
+export type BlindsCommand = 'open' | 'close';
 
 /**
  * Set HVAC mode manually
@@ -248,6 +249,26 @@ export async function setHVACMode(mode: HVACMode, setpoint_f: number = 70): Prom
     method: 'POST',
     headers,
     body: JSON.stringify({ mode, setpoint_f }),
+  });
+
+  if (response.status === 401) {
+    clearAuthToken();
+    throw new Error('Authentication required');
+  }
+
+  return response.json();
+}
+
+/**
+ * Open or close the Tuya smart blinds.
+ */
+export async function setBlindsCommand(command: BlindsCommand): Promise<{ ok: boolean; error?: string }> {
+  const headers: HeadersInit = { 'Content-Type': 'application/json' };
+
+  const response = await authFetch(`${API_BASE}/blinds`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ command }),
   });
 
   if (response.status === 401) {

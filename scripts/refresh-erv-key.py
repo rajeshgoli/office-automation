@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refresh the configured ERV Tuya local key from Smart Life sharing APIs."""
+"""Refresh configured Tuya local keys from Smart Life sharing APIs."""
 
 from __future__ import annotations
 
@@ -88,31 +88,35 @@ def load_config_data(config_file: Path) -> tuple[Any, Any]:
     return yaml, data
 
 
-def read_erv_config(config_file: Path) -> tuple[str, str | None]:
+def read_device_config(config_file: Path, section: str) -> tuple[str, str | None]:
     _, data = load_config_data(config_file)
-    erv = data.get("erv")
-    if not isinstance(erv, dict):
-        raise RefreshError(f"{config_file} is missing an erv mapping")
+    device_config = data.get(section)
+    if not isinstance(device_config, dict):
+        raise RefreshError(f"{config_file} is missing a {section} mapping")
 
-    device_id = erv.get("device_id")
+    device_id = device_config.get("device_id")
     if not isinstance(device_id, str) or not device_id.strip():
-        raise RefreshError(f"{config_file} is missing erv.device_id")
+        raise RefreshError(f"{config_file} is missing {section}.device_id")
 
-    local_key = erv.get("local_key")
+    local_key = device_config.get("local_key")
     if local_key is not None and not isinstance(local_key, str):
-        raise RefreshError(f"{config_file} has a non-string erv.local_key")
+        raise RefreshError(f"{config_file} has a non-string {section}.local_key")
 
     return device_id.strip(), local_key
 
 
-def update_config_local_key(config_file: Path, new_local_key: str) -> None:
-    yaml, data = load_config_data(config_file)
-    erv = data.get("erv")
-    if not isinstance(erv, dict):
-        raise RefreshError(f"{config_file} is missing an erv mapping")
+def read_erv_config(config_file: Path) -> tuple[str, str | None]:
+    return read_device_config(config_file, "erv")
 
-    old_value = erv.get("local_key")
-    erv["local_key"] = preserve_scalar_style(old_value, new_local_key)
+
+def update_config_local_key(config_file: Path, section: str, new_local_key: str) -> None:
+    yaml, data = load_config_data(config_file)
+    device_config = data.get(section)
+    if not isinstance(device_config, dict):
+        raise RefreshError(f"{config_file} is missing a {section} mapping")
+
+    old_value = device_config.get("local_key")
+    device_config["local_key"] = preserve_scalar_style(old_value, new_local_key)
 
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{config_file.name}.",
@@ -410,6 +414,85 @@ def fetch_current_local_key(
     return local_key, name if isinstance(name, str) else None
 
 
+def list_smart_life_devices(auth_file: Path, auth_cache: dict[str, Any]) -> list[Any]:
+    ensure_tuya_sdk()
+    listener = AuthCacheTokenListener(auth_file, auth_cache)
+    manager = Manager(
+        CLIENT_ID,
+        auth_cache["user_code"],
+        auth_cache["terminal_id"],
+        auth_cache["endpoint"],
+        auth_cache["token_info"],
+        listener,
+    )
+    try:
+        manager.update_device_cache()
+    except Exception as exc:
+        raise RefreshError(f"failed to list Smart Life devices: {exc}") from exc
+    listener.raise_if_persist_failed()
+
+    device_map = getattr(manager, "device_map", {})
+    if isinstance(device_map, dict):
+        return list(device_map.values())
+    return []
+
+
+def print_device_list(devices: Iterable[Any], stdout: TextIO) -> None:
+    rows: list[tuple[str, str, str, str]] = []
+    for device in devices:
+        device_id = get_device_field(device, "id", "devId", "device_id")
+        name = get_device_field(device, "name")
+        product_name = get_device_field(device, "product_name", "productName", "product_id", "productId")
+        has_local_key = bool(get_device_field(device, "local_key", "localKey"))
+        rows.append(
+            (
+                str(name or "-"),
+                str(device_id or "-"),
+                str(product_name or "-"),
+                "yes" if has_local_key else "no",
+            )
+        )
+
+    for name, device_id, product_name, has_local_key in sorted(rows):
+        print(
+            f"name={name} device_id={device_id} product={product_name} local_key={has_local_key}",
+            file=stdout,
+        )
+
+
+def list_smart_life_scenes(auth_file: Path, auth_cache: dict[str, Any]) -> list[Any]:
+    ensure_tuya_sdk()
+    listener = AuthCacheTokenListener(auth_file, auth_cache)
+    manager = Manager(
+        CLIENT_ID,
+        auth_cache["user_code"],
+        auth_cache["terminal_id"],
+        auth_cache["endpoint"],
+        auth_cache["token_info"],
+        listener,
+    )
+    manager.update_device_cache()
+    scenes = manager.query_scenes()
+    listener.raise_if_persist_failed()
+    return scenes
+
+
+def print_scene_list(scenes: Iterable[Any], stdout: TextIO) -> None:
+    rows: list[tuple[str, str, str, bool]] = []
+    for scene in scenes:
+        name = get_device_field(scene, "name")
+        scene_id = get_device_field(scene, "scene_id", "sceneId")
+        home_id = get_device_field(scene, "home_id", "homeId")
+        enabled = bool(get_device_field(scene, "enabled"))
+        rows.append((str(name or "-"), str(scene_id or "-"), str(home_id or "-"), enabled))
+
+    for name, scene_id, home_id, enabled in sorted(rows):
+        print(
+            f"name={name} scene_id={scene_id} home_id={home_id} enabled={'yes' if enabled else 'no'}",
+            file=stdout,
+        )
+
+
 def fetch_device_detail(manager: Any, device_id: str) -> Any | None:
     customer_api = getattr(manager, "customer_api", None)
     if customer_api is None or not hasattr(customer_api, "get"):
@@ -493,9 +576,15 @@ def format_tuya_error(prefix: str, response: dict[str, Any]) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fetch the current ERV Tuya local key via the Smart Life HA sharing API.",
+        description="Fetch current Tuya local keys via the Smart Life HA sharing API.",
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_FILE)
+    parser.add_argument(
+        "--section",
+        default="erv",
+        choices=["erv", "blinds"],
+        help="config section whose device_id/local_key should be used",
+    )
     parser.add_argument("--auth-file", type=Path, default=DEFAULT_AUTH_FILE)
     parser.add_argument(
         "--init-auth",
@@ -515,9 +604,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the current local key (default unless --update-config is used)",
     )
     parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="list Smart Life devices visible to the sharing API without printing local keys",
+    )
+    parser.add_argument(
+        "--list-scenes",
+        action="store_true",
+        help="list Smart Life scenes visible to the sharing API",
+    )
+    parser.add_argument(
         "--update-config",
         action="store_true",
-        help="replace erv.local_key in config.yaml if it changed",
+        help="replace <section>.local_key in config.yaml if it changed",
     )
     parser.add_argument(
         "--restart",
@@ -537,14 +636,20 @@ def main(
 
     if args.print_key and args.update_config:
         parser.error("--print and --update-config are mutually exclusive")
+    if (args.list_devices or args.list_scenes) and (
+        args.print_key or args.update_config or args.restart
+    ):
+        parser.error(
+            "--list-devices/--list-scenes cannot be combined with --print, --update-config, or --restart"
+        )
+    if args.list_devices and args.list_scenes:
+        parser.error("--list-devices and --list-scenes are mutually exclusive")
     if args.restart and not args.update_config:
         parser.error("--restart requires --update-config")
     if args.init_auth and not args.user_code:
         parser.error("--init-auth requires --user-code")
 
     try:
-        device_id, configured_key = read_erv_config(args.config)
-
         if args.init_auth:
             auth_cache = init_auth(
                 args.user_code,
@@ -557,6 +662,14 @@ def main(
         else:
             auth_cache = load_auth_cache(args.auth_file)
 
+        if args.list_devices:
+            print_device_list(list_smart_life_devices(args.auth_file, auth_cache), stdout)
+            return 0
+        if args.list_scenes:
+            print_scene_list(list_smart_life_scenes(args.auth_file, auth_cache), stdout)
+            return 0
+
+        device_id, configured_key = read_device_config(args.config, args.section)
         current_key, device_name = fetch_current_local_key(
             args.auth_file,
             auth_cache,
@@ -568,9 +681,12 @@ def main(
                 print("no rotation needed", file=stdout)
                 return 0
 
-            update_config_local_key(args.config, current_key)
+            update_config_local_key(args.config, args.section, current_key)
             suffix = f" for {device_name}" if device_name else ""
-            print(f"updated {args.config}: erv.local_key refreshed{suffix}", file=stdout)
+            print(
+                f"updated {args.config}: {args.section}.local_key refreshed{suffix}",
+                file=stdout,
+            )
             if args.restart:
                 restart_orchestrator()
                 print(f"restarted {SERVICE_LABEL}", file=stdout)

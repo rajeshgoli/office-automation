@@ -1,6 +1,7 @@
 pub mod artifacts;
 pub mod auth;
 pub mod automation;
+pub mod blinds;
 pub mod cli;
 pub mod cloudflare;
 pub mod config;
