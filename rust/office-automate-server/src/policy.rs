@@ -55,6 +55,7 @@ pub struct ErvPolicyInput {
     pub window_open: bool,
     pub co2_ppm: Option<i64>,
     pub tvoc: Option<i64>,
+    pub current_status_known: bool,
     pub current_running: bool,
     pub current_speed: VentilationSpeed,
     pub manual_override: Option<VentilationSpeed>,
@@ -284,9 +285,21 @@ impl ErvPolicyState {
         let tvoc_needs_clearing = input
             .tvoc
             .is_some_and(|tvoc| tvoc > thresholds.tvoc_away_threshold);
-        let tvoc_at_target = input
-            .tvoc
-            .is_some_and(|tvoc| tvoc <= thresholds.tvoc_away_target);
+        let post_renovation_active = thresholds.post_renovation_active_at(now);
+        let post_renovation_tvoc_needs_clearing = post_renovation_active
+            && input
+                .tvoc
+                .is_some_and(|tvoc| tvoc > thresholds.post_renovation_tvoc_threshold);
+        let tvoc_at_target = input.tvoc.is_some_and(|tvoc| {
+            tvoc <= if post_renovation_active {
+                match input.occupancy {
+                    OccupancyState::Present => thresholds.post_renovation_present_tvoc_target,
+                    OccupancyState::Away => thresholds.post_renovation_away_tvoc_target,
+                }
+            } else {
+                thresholds.tvoc_away_target
+            }
+        });
         let air_quality_available = input.co2_ppm.is_some() || input.tvoc.is_some();
 
         match input.occupancy {
@@ -305,7 +318,47 @@ impl ErvPolicyState {
                     );
                 }
 
-                if input.current_running && input.current_speed == VentilationSpeed::Quiet {
+                if post_renovation_active {
+                    if post_renovation_tvoc_needs_clearing {
+                        return target_decision(
+                            thresholds,
+                            &input,
+                            now,
+                            VentilationSpeed::Quiet,
+                            format!(
+                                "post_renovation_present_tVOC={}",
+                                input.tvoc.expect("post-renovation tVOC checked")
+                            ),
+                            true,
+                        );
+                    }
+
+                    if let Some(tvoc) = input.tvoc {
+                        if tvoc <= thresholds.post_renovation_present_tvoc_target {
+                            return target_decision(
+                                thresholds,
+                                &input,
+                                now,
+                                VentilationSpeed::Off,
+                                format!("post_renovation_present_tVOC_target={tvoc}"),
+                                input.bypass_dwell,
+                            );
+                        }
+
+                        if input.current_running {
+                            return target_decision(
+                                thresholds,
+                                &input,
+                                now,
+                                VentilationSpeed::Quiet,
+                                format!("post_renovation_present_tVOC={tvoc}"),
+                                input.bypass_dwell,
+                            );
+                        }
+
+                        return ErvDecision::NoChange;
+                    }
+                } else if input.current_running && input.current_speed == VentilationSpeed::Quiet {
                     if co2_critical_off {
                         return target_decision(
                             thresholds,
@@ -364,13 +417,18 @@ impl ErvPolicyState {
                     }
                 }
 
-                if tvoc_needs_clearing || self.tvoc_away_ventilation_active {
+                if tvoc_needs_clearing
+                    || post_renovation_tvoc_needs_clearing
+                    || self.tvoc_away_ventilation_active
+                {
                     if tvoc_at_target && self.tvoc_away_ventilation_active {
                         self.tvoc_away_ventilation_active = false;
                         self.tvoc_plateau_detected = false;
                     } else if let Some(tvoc) = latest_tvoc {
                         tvoc_speed = self.adaptive_tvoc_speed(thresholds, tvoc, now);
-                        if !self.tvoc_away_ventilation_active && tvoc_needs_clearing {
+                        if !self.tvoc_away_ventilation_active
+                            && (tvoc_needs_clearing || post_renovation_tvoc_needs_clearing)
+                        {
                             self.tvoc_away_ventilation_active = true;
                         }
                     }
@@ -381,6 +439,16 @@ impl ErvPolicyState {
                     && (tvoc_speed == Some(VentilationSpeed::Off)
                         || !self.tvoc_away_ventilation_active)
                 {
+                    if post_renovation_active {
+                        return target_decision(
+                            thresholds,
+                            &input,
+                            now,
+                            post_renovation_min_speed(thresholds),
+                            "post_renovation_minimum_ventilation".to_string(),
+                            input.bypass_dwell,
+                        );
+                    }
                     if input.current_running {
                         let reason = if self.plateau_detected {
                             "co2_plateau"
@@ -402,6 +470,16 @@ impl ErvPolicyState {
                 let selected = select_away_candidate(co2_speed, tvoc_speed, stale_speed);
                 if let Some((source, target_speed)) = selected {
                     if target_speed == VentilationSpeed::Off {
+                        if post_renovation_active {
+                            return target_decision(
+                                thresholds,
+                                &input,
+                                now,
+                                post_renovation_min_speed(thresholds),
+                                "post_renovation_minimum_ventilation".to_string(),
+                                input.bypass_dwell,
+                            );
+                        }
                         return ErvDecision::NoChange;
                     }
 
@@ -436,6 +514,16 @@ impl ErvPolicyState {
                     && input.current_running
                     && air_quality_available
                 {
+                    if post_renovation_active {
+                        return target_decision(
+                            thresholds,
+                            &input,
+                            now,
+                            post_renovation_min_speed(thresholds),
+                            "post_renovation_minimum_ventilation".to_string(),
+                            input.bypass_dwell,
+                        );
+                    }
                     return target_decision(
                         thresholds,
                         &input,
@@ -446,7 +534,7 @@ impl ErvPolicyState {
                     );
                 }
 
-                if co2_needs_refresh || tvoc_needs_clearing {
+                if co2_needs_refresh || tvoc_needs_clearing || post_renovation_tvoc_needs_clearing {
                     let trigger = if co2_needs_refresh {
                         format!("CO2={}ppm", input.co2_ppm.expect("co2 trigger"))
                     } else {
@@ -459,6 +547,17 @@ impl ErvPolicyState {
                         VentilationSpeed::Turbo,
                         format!("away_refresh_{trigger}"),
                         input.bypass_dwell || self.initial_away_turbo_active(thresholds, now),
+                    );
+                }
+
+                if post_renovation_active {
+                    return target_decision(
+                        thresholds,
+                        &input,
+                        now,
+                        post_renovation_min_speed(thresholds),
+                        "post_renovation_minimum_ventilation".to_string(),
+                        input.bypass_dwell,
                     );
                 }
 
@@ -596,6 +695,9 @@ impl ErvPolicyState {
 
         if self.detect_tvoc_plateau(thresholds) {
             self.tvoc_plateau_detected = true;
+            if thresholds.post_renovation_active_at(now) {
+                return Some(VentilationSpeed::Quiet);
+            }
             return Some(VentilationSpeed::Off);
         }
 
@@ -732,7 +834,8 @@ fn target_decision(
     reason: String,
     bypass_dwell: bool,
 ) -> ErvDecision {
-    if target_speed == VentilationSpeed::Off && !input.current_running {
+    if target_speed == VentilationSpeed::Off && input.current_status_known && !input.current_running
+    {
         return ErvDecision::NoChange;
     }
     if target_speed != VentilationSpeed::Off
@@ -816,6 +919,18 @@ fn stale_flush_speed(thresholds: &ThresholdsConfig) -> VentilationSpeed {
     }
 }
 
+fn post_renovation_min_speed(thresholds: &ThresholdsConfig) -> VentilationSpeed {
+    match thresholds
+        .post_renovation_min_speed
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "medium" => VentilationSpeed::Medium,
+        "turbo" => VentilationSpeed::Turbo,
+        _ => VentilationSpeed::Quiet,
+    }
+}
+
 fn door_open_safety_delay_elapsed(thresholds: &ThresholdsConfig, input: &ErvPolicyInput) -> bool {
     thresholds.erv_door_open_grace_seconds == 0
         || input
@@ -843,11 +958,27 @@ mod tests {
             window_open: false,
             co2_ppm,
             tvoc,
+            current_status_known: true,
             current_running: false,
             current_speed: VentilationSpeed::Off,
             manual_override: None,
             last_speed_changed_at: None,
             bypass_dwell: false,
+        }
+    }
+
+    fn post_renovation_thresholds() -> ThresholdsConfig {
+        ThresholdsConfig {
+            post_renovation_enabled: true,
+            post_renovation_expires_at: Some("2099-01-01T00:00:00-07:00".to_string()),
+            post_renovation_tvoc_threshold: 150,
+            post_renovation_present_tvoc_target: 120,
+            post_renovation_away_tvoc_target: 40,
+            post_renovation_min_speed: "quiet".to_string(),
+            post_renovation_negative_pressure: true,
+            min_away_seconds_before_erv: 0,
+            away_stale_flush_enabled: false,
+            ..ThresholdsConfig::default()
         }
     }
 
@@ -986,6 +1117,7 @@ mod tests {
                 occupancy: OccupancyState::Present,
                 co2_ppm: Some(2_000),
                 tvoc: Some(500),
+                current_status_known: true,
                 current_running: false,
                 current_speed: VentilationSpeed::Off,
                 manual_override: None,
@@ -1014,6 +1146,7 @@ mod tests {
                 occupancy: OccupancyState::Present,
                 co2_ppm: Some(1_799),
                 tvoc: Some(500),
+                current_status_known: true,
                 current_running: true,
                 current_speed: VentilationSpeed::Quiet,
                 manual_override: None,
@@ -1035,6 +1168,266 @@ mod tests {
                 bypass_dwell: true,
             }
         );
+    }
+
+    #[test]
+    fn post_renovation_present_high_tvoc_uses_quiet_until_present_target() {
+        let thresholds = post_renovation_thresholds();
+        let mut policy = ErvPolicyState::new(&thresholds);
+        let decision = policy.decide_erv(
+            &thresholds,
+            ErvPolicyInput {
+                occupancy: OccupancyState::Present,
+                co2_ppm: Some(450),
+                tvoc: Some(151),
+                current_status_known: true,
+                current_running: false,
+                current_speed: VentilationSpeed::Off,
+                manual_override: None,
+                door_open: false,
+                door_open_seconds: None,
+                door_closed_seconds: None,
+                window_open: false,
+                last_speed_changed_at: None,
+                bypass_dwell: false,
+            },
+            1_001.0,
+        );
+
+        assert_eq!(
+            decision,
+            ErvDecision::SetSpeed {
+                target_speed: VentilationSpeed::Quiet,
+                reason: "post_renovation_present_tVOC=151".to_string(),
+                bypass_dwell: true,
+            }
+        );
+
+        let decision = policy.decide_erv(
+            &thresholds,
+            ErvPolicyInput {
+                occupancy: OccupancyState::Present,
+                co2_ppm: Some(450),
+                tvoc: Some(130),
+                current_status_known: true,
+                current_running: true,
+                current_speed: VentilationSpeed::Medium,
+                manual_override: None,
+                door_open: false,
+                door_open_seconds: None,
+                door_closed_seconds: None,
+                window_open: false,
+                last_speed_changed_at: Some(1_000.0),
+                bypass_dwell: true,
+            },
+            1_001.0,
+        );
+
+        assert_eq!(
+            decision,
+            ErvDecision::SetSpeed {
+                target_speed: VentilationSpeed::Quiet,
+                reason: "post_renovation_present_tVOC=130".to_string(),
+                bypass_dwell: true,
+            }
+        );
+
+        let decision = policy.decide_erv(
+            &thresholds,
+            ErvPolicyInput {
+                occupancy: OccupancyState::Present,
+                co2_ppm: Some(450),
+                tvoc: Some(90),
+                current_status_known: true,
+                current_running: true,
+                current_speed: VentilationSpeed::Medium,
+                manual_override: None,
+                door_open: false,
+                door_open_seconds: None,
+                door_closed_seconds: None,
+                window_open: false,
+                last_speed_changed_at: Some(1_000.0),
+                bypass_dwell: true,
+            },
+            1_001.0,
+        );
+
+        assert_eq!(
+            decision,
+            ErvDecision::SetSpeed {
+                target_speed: VentilationSpeed::Off,
+                reason: "post_renovation_present_tVOC_target=90".to_string(),
+                bypass_dwell: true,
+            }
+        );
+
+        let decision = policy.decide_erv(
+            &thresholds,
+            ErvPolicyInput {
+                occupancy: OccupancyState::Present,
+                co2_ppm: Some(450),
+                tvoc: Some(130),
+                current_status_known: true,
+                current_running: false,
+                current_speed: VentilationSpeed::Off,
+                manual_override: None,
+                door_open: false,
+                door_open_seconds: None,
+                door_closed_seconds: None,
+                window_open: false,
+                last_speed_changed_at: None,
+                bypass_dwell: false,
+            },
+            1_001.0,
+        );
+
+        assert_eq!(decision, ErvDecision::NoChange);
+    }
+
+    #[test]
+    fn post_renovation_present_target_sends_off_when_status_unknown() {
+        let thresholds = post_renovation_thresholds();
+        let mut policy = ErvPolicyState::new(&thresholds);
+        let decision = policy.decide_erv(
+            &thresholds,
+            ErvPolicyInput {
+                occupancy: OccupancyState::Present,
+                co2_ppm: Some(450),
+                tvoc: Some(117),
+                current_status_known: false,
+                current_running: false,
+                current_speed: VentilationSpeed::Off,
+                manual_override: None,
+                door_open: false,
+                door_open_seconds: None,
+                door_closed_seconds: None,
+                window_open: false,
+                last_speed_changed_at: None,
+                bypass_dwell: false,
+            },
+            1_001.0,
+        );
+
+        assert_eq!(
+            decision,
+            ErvDecision::SetSpeed {
+                target_speed: VentilationSpeed::Off,
+                reason: "post_renovation_present_tVOC_target=117".to_string(),
+                bypass_dwell: false,
+            }
+        );
+    }
+
+    #[test]
+    fn post_renovation_away_targets_tvoc_40_but_never_turns_off() {
+        let thresholds = post_renovation_thresholds();
+        let mut policy = ErvPolicyState::new(&thresholds);
+        policy.away_start_at = Some(1_000.0);
+        let decision = policy.decide_erv(&thresholds, away_input(Some(450), Some(151)), 1_100.0);
+
+        assert_eq!(
+            decision,
+            ErvDecision::SetSpeed {
+                target_speed: VentilationSpeed::Turbo,
+                reason: "away_adaptive_turbo_tVOC=151".to_string(),
+                bypass_dwell: false,
+            }
+        );
+
+        policy.tvoc_away_ventilation_active = true;
+        let decision = policy.decide_erv(
+            &thresholds,
+            ErvPolicyInput {
+                current_running: true,
+                current_speed: VentilationSpeed::Turbo,
+                tvoc: Some(35),
+                last_speed_changed_at: Some(2_000.0),
+                ..away_input(Some(450), Some(35))
+            },
+            2_200.0,
+        );
+
+        assert_eq!(
+            decision,
+            ErvDecision::SetSpeed {
+                target_speed: VentilationSpeed::Quiet,
+                reason: "post_renovation_minimum_ventilation".to_string(),
+                bypass_dwell: false,
+            }
+        );
+    }
+
+    #[test]
+    fn post_renovation_tvoc_plateau_steps_down_to_quiet_floor() {
+        let thresholds = post_renovation_thresholds();
+        let mut policy = ErvPolicyState::new(&thresholds);
+        policy.away_start_at = Some(0.0);
+        policy.tvoc_away_ventilation_active = true;
+        for index in 0..24 {
+            let value = [55, 56, 54, 55][index % 4];
+            policy.record_reading(
+                &thresholds,
+                index as f64 * 30.0,
+                AirQualityReading {
+                    co2_ppm: Some(450),
+                    tvoc: Some(value),
+                    temp_c: None,
+                },
+            );
+        }
+
+        let decision = policy.decide_erv(
+            &thresholds,
+            ErvPolicyInput {
+                current_running: true,
+                current_speed: VentilationSpeed::Turbo,
+                tvoc: Some(55),
+                last_speed_changed_at: Some(1_600.0),
+                ..away_input(Some(450), Some(55))
+            },
+            2_000.0,
+        );
+
+        assert_eq!(
+            decision,
+            ErvDecision::SetSpeed {
+                target_speed: VentilationSpeed::Quiet,
+                reason: "away_adaptive_quiet_tVOC=55".to_string(),
+                bypass_dwell: false,
+            }
+        );
+        assert!(policy.tvoc_plateau_detected);
+    }
+
+    #[test]
+    fn expired_post_renovation_mode_restores_present_tvoc_ignore() {
+        let thresholds = ThresholdsConfig {
+            post_renovation_enabled: true,
+            post_renovation_expires_at: Some("2020-01-01T00:00:00-07:00".to_string()),
+            ..post_renovation_thresholds()
+        };
+        let mut policy = ErvPolicyState::new(&thresholds);
+        let decision = policy.decide_erv(
+            &thresholds,
+            ErvPolicyInput {
+                occupancy: OccupancyState::Present,
+                co2_ppm: Some(450),
+                tvoc: Some(500),
+                current_status_known: true,
+                current_running: false,
+                current_speed: VentilationSpeed::Off,
+                manual_override: None,
+                door_open: false,
+                door_open_seconds: None,
+                door_closed_seconds: None,
+                window_open: false,
+                last_speed_changed_at: None,
+                bypass_dwell: false,
+            },
+            1_700_000_000.0,
+        );
+
+        assert_eq!(decision, ErvDecision::NoChange);
     }
 
     #[test]

@@ -99,6 +99,18 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun setBlinds(command: String) {
+        _controlLoading.value = "blinds_$command"
+        viewModelScope.launch {
+            climateRepo.setBlinds(command)
+                .onFailure { e ->
+                    Log.e("DashboardVM", "Blinds control failed", e)
+                    _controlError.value = "Blinds command failed: ${e.message}"
+                }
+            _controlLoading.value = null
+        }
+    }
+
     fun updateTemperatureBand(band: String, action: String, delta: Int) {
         if (_bandUpdateInFlight.value) return
 

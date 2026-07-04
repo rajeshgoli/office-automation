@@ -63,9 +63,12 @@ impl ErvFanSpeed {
         }
     }
 
-    fn speed_preset(self) -> Option<(i64, i64)> {
+    fn speed_preset(self, negative_pressure: bool) -> Option<(i64, i64)> {
         match self {
             Self::Off => None,
+            Self::Quiet if negative_pressure => Some((1, 2)),
+            Self::Medium if negative_pressure => Some((2, 3)),
+            Self::Turbo if negative_pressure => Some((7, 8)),
             Self::Quiet => Some((1, 1)),
             Self::Medium => Some((3, 2)),
             Self::Turbo => Some((8, 8)),
@@ -95,6 +98,7 @@ pub trait ErvSpeedWriter: Send + Sync {
         &'a self,
         config: &'a ErvConfig,
         speed: ErvFanSpeed,
+        negative_pressure: bool,
     ) -> BoxFutureResult<'a, ErvDeviceStatus>;
 }
 
@@ -131,6 +135,7 @@ impl ErvSpeedWriter for RustuyaErvSpeedWriter {
         &'a self,
         config: &'a ErvConfig,
         speed: ErvFanSpeed,
+        negative_pressure: bool,
     ) -> BoxFutureResult<'a, ErvDeviceStatus> {
         Box::pin(async move {
             if !config.is_configured() {
@@ -138,7 +143,7 @@ impl ErvSpeedWriter for RustuyaErvSpeedWriter {
             }
 
             let device = build_rustuya_device(config)?;
-            let result = set_rustuya_speed(&device, config, speed).await;
+            let result = set_rustuya_speed(&device, config, speed, negative_pressure).await;
             device.close().await;
             result
         })
@@ -197,6 +202,7 @@ struct ErvInner {
     manual_override: Option<ErvManualOverride>,
     consecutive_local_failures: u64,
     next_local_retry_at: Option<f64>,
+    next_status_poll_retry_at: Option<f64>,
     recent_local_activity: VecDeque<ErvLocalActivity>,
 }
 
@@ -242,7 +248,7 @@ impl ErvState {
             }
             Err(error) => {
                 let message = format!("{error:#}");
-                if self.record_local_failure(&message) {
+                if self.record_read_only_local_failure(&message) {
                     self.notify_status();
                 }
                 Err(error)
@@ -255,6 +261,7 @@ impl ErvState {
         config: &ErvConfig,
         writer: &W,
         speed: ErvFanSpeed,
+        negative_pressure: bool,
         reason: &str,
         co2_ppm: Option<i64>,
     ) -> Result<ErvDeviceStatus>
@@ -293,8 +300,15 @@ impl ErvState {
             return Ok(smoked_status);
         }
 
-        self.write_speed_after_gate_locked(config, writer, speed, reason, co2_ppm)
-            .await
+        self.write_speed_after_gate_locked(
+            config,
+            writer,
+            speed,
+            negative_pressure,
+            reason,
+            co2_ppm,
+        )
+        .await
     }
 
     pub(crate) async fn set_speed_after_smoke_with<W>(
@@ -302,6 +316,7 @@ impl ErvState {
         config: &ErvConfig,
         writer: &W,
         speed: ErvFanSpeed,
+        negative_pressure: bool,
         reason: &str,
         co2_ppm: Option<i64>,
     ) -> Result<ErvDeviceStatus>
@@ -319,8 +334,15 @@ impl ErvState {
         }
 
         let _local_io_guard = self.local_io_lock.lock().await;
-        self.write_speed_after_gate_locked(config, writer, speed, reason, co2_ppm)
-            .await
+        self.write_speed_after_gate_locked(
+            config,
+            writer,
+            speed,
+            negative_pressure,
+            reason,
+            co2_ppm,
+        )
+        .await
     }
 
     async fn write_speed_after_gate_locked<W>(
@@ -328,6 +350,7 @@ impl ErvState {
         config: &ErvConfig,
         writer: &W,
         speed: ErvFanSpeed,
+        negative_pressure: bool,
         reason: &str,
         co2_ppm: Option<i64>,
     ) -> Result<ErvDeviceStatus>
@@ -344,7 +367,7 @@ impl ErvState {
             );
         }
 
-        match writer.set_speed(config, speed).await {
+        match writer.set_speed(config, speed, negative_pressure).await {
             Ok(status) => {
                 self.record_speed_success(status.clone(), speed, reason, co2_ppm);
                 self.record_write_success(status.clone(), speed, reason, co2_ppm, &attempt);
@@ -391,7 +414,7 @@ impl ErvState {
 
     pub fn status_poll_delay(&self, config: &ErvConfig, now: f64) -> Duration {
         let inner = self.inner.read().expect("ERV state lock poisoned");
-        if let Some(retry_at) = inner.next_local_retry_at
+        if let Some(retry_at) = inner.next_status_poll_retry_at
             && retry_at > now
         {
             return Duration::from_secs(((retry_at - now).ceil() as u64).max(1));
@@ -805,6 +828,7 @@ impl ErvState {
             inner.consecutive_local_failures = 0;
             inner.control.consecutive_local_key_errors = 0;
             inner.next_local_retry_at = None;
+            inner.next_status_poll_retry_at = None;
 
             if was_invalid {
                 inner.notification = Some(recovered_notification(&now));
@@ -828,6 +852,14 @@ impl ErvState {
     }
 
     fn record_local_failure(&self, message: &str) -> bool {
+        self.record_local_failure_with_retry(message, true)
+    }
+
+    fn record_read_only_local_failure(&self, message: &str) -> bool {
+        self.record_local_failure_with_retry(message, false)
+    }
+
+    fn record_local_failure_with_retry(&self, message: &str, active_retry: bool) -> bool {
         let now = local_iso_now();
         let at = unix_timestamp_now();
         let mut invalid_event = None;
@@ -839,10 +871,13 @@ impl ErvState {
             inner.control.last_error_at = Some(now.clone());
             inner.control.using_cloud = false;
             inner.consecutive_local_failures = inner.consecutive_local_failures.saturating_add(1);
-            inner.next_local_retry_at = Some(
-                unix_timestamp_now()
-                    + local_failure_retry_delay_seconds(inner.consecutive_local_failures),
-            );
+            let retry_at = unix_timestamp_now()
+                + local_failure_retry_delay_seconds(inner.consecutive_local_failures);
+            if active_retry {
+                inner.next_local_retry_at = Some(retry_at);
+            } else {
+                inner.next_status_poll_retry_at = Some(retry_at);
+            }
             let recent_write_attempts_5m =
                 recent_write_attempts_locked(&inner, at, LOCAL_WRITE_BURST_WINDOW_SECONDS);
 
@@ -1060,6 +1095,7 @@ async fn set_rustuya_speed(
     device: &rustuya::Device,
     config: &ErvConfig,
     speed: ErvFanSpeed,
+    negative_pressure: bool,
 ) -> Result<ErvDeviceStatus> {
     if speed == ErvFanSpeed::Off {
         let result = device
@@ -1068,7 +1104,9 @@ async fn set_rustuya_speed(
             .context("failed to set ERV power off")?;
         ensure_tuya_command_ok("Local set power off failed", result.as_deref())?;
     } else {
-        let (supply, exhaust) = speed.speed_preset().expect("non-off speed has preset");
+        let (supply, exhaust) = speed
+            .speed_preset(negative_pressure)
+            .expect("non-off speed has preset");
         let result = device
             .set_value(DP_POWER, true)
             .await
@@ -1093,7 +1131,7 @@ async fn set_rustuya_speed(
         .context("failed to verify ERV local Tuya status")?
         .ok_or_else(|| anyhow!("ERV local Tuya verification returned no payload"))?;
     let status = parse_erv_status_payload(&payload)?;
-    verify_speed(speed, &status)?;
+    verify_speed(speed, &status, negative_pressure)?;
     Ok(status)
 }
 
@@ -1104,7 +1142,11 @@ fn ensure_tuya_command_ok(context: &str, payload: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn verify_speed(expected: ErvFanSpeed, actual: &ErvDeviceStatus) -> Result<()> {
+fn verify_speed(
+    expected: ErvFanSpeed,
+    actual: &ErvDeviceStatus,
+    negative_pressure: bool,
+) -> Result<()> {
     if expected == ErvFanSpeed::Off {
         if actual.power {
             bail!("ERV verification failed: expected power OFF, got ON");
@@ -1115,8 +1157,9 @@ fn verify_speed(expected: ErvFanSpeed, actual: &ErvDeviceStatus) -> Result<()> {
     if !actual.power {
         bail!("ERV verification failed: expected power ON, got OFF");
     }
-    let (expected_supply, expected_exhaust) =
-        expected.speed_preset().expect("non-off speed has preset");
+    let (expected_supply, expected_exhaust) = expected
+        .speed_preset(negative_pressure)
+        .expect("non-off speed has preset");
     if actual.supply_speed != Some(expected_supply)
         || actual.exhaust_speed != Some(expected_exhaust)
     {
@@ -1179,8 +1222,11 @@ fn fan_speed(
 
     match (supply_speed, exhaust_speed) {
         (Some(1), Some(1)) => Some(ErvFanSpeed::Quiet),
+        (Some(1), Some(2)) => Some(ErvFanSpeed::Quiet),
         (Some(3), Some(2)) => Some(ErvFanSpeed::Medium),
+        (Some(2), Some(3)) => Some(ErvFanSpeed::Medium),
         (Some(8), Some(8)) => Some(ErvFanSpeed::Turbo),
+        (Some(7), Some(8)) => Some(ErvFanSpeed::Turbo),
         _ => None,
     }
 }
@@ -1356,6 +1402,7 @@ mod tests {
             &'a self,
             _config: &'a ErvConfig,
             speed: ErvFanSpeed,
+            _negative_pressure: bool,
         ) -> BoxFutureResult<'a, ErvDeviceStatus> {
             self.write_speeds
                 .lock()
@@ -1398,6 +1445,7 @@ mod tests {
             artifacts: crate::config::ArtifactConfig::default(),
             cloudflare_access: crate::config::CloudflareAccessConfig::default(),
             erv,
+            blinds: crate::config::BlindsConfig::default(),
             mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
             telemetry: crate::config::TelemetryConfig::default(),
@@ -1444,6 +1492,24 @@ mod tests {
             parse_erv_status_payload(r#"{"dps":{"1":false,"101":"1","102":"1"}}"#).expect("status");
         assert!(!status.power);
         assert_eq!(status.fan_speed, Some(ErvFanSpeed::Off));
+    }
+
+    #[test]
+    fn maps_negative_pressure_presets_and_status_payloads() {
+        assert_eq!(ErvFanSpeed::Quiet.speed_preset(true), Some((1, 2)));
+        assert_eq!(ErvFanSpeed::Medium.speed_preset(true), Some((2, 3)));
+        assert_eq!(ErvFanSpeed::Turbo.speed_preset(true), Some((7, 8)));
+
+        let quiet =
+            parse_erv_status_payload(r#"{"dps":{"1":true,"101":1,"102":2}}"#).expect("status");
+        let medium =
+            parse_erv_status_payload(r#"{"dps":{"1":true,"101":2,"102":3}}"#).expect("status");
+        let turbo =
+            parse_erv_status_payload(r#"{"dps":{"1":true,"101":7,"102":8}}"#).expect("status");
+
+        assert_eq!(quiet.fan_speed, Some(ErvFanSpeed::Quiet));
+        assert_eq!(medium.fan_speed, Some(ErvFanSpeed::Medium));
+        assert_eq!(turbo.fan_speed, Some(ErvFanSpeed::Turbo));
     }
 
     #[tokio::test]
@@ -1547,7 +1613,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_status_failure_sets_immediate_retry_backoff() {
+    async fn local_status_failure_backs_off_polling_without_blocking_writes() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let database_path = temp_dir.path().join("office_climate.db");
         db::migrate_database(&database_path).expect("migration");
@@ -1560,13 +1626,17 @@ mod tests {
         assert!(state.refresh_with(&test_config(), &reader).await.is_err());
 
         let now = unix_timestamp_now();
-        assert!(!state.local_retry_allowed(now));
-        assert!(state.local_retry_allowed(now + LOCAL_FAILURE_BASE_RETRY_SECONDS + 1.0));
+        assert!(state.local_retry_allowed(now));
+        let delay = state.status_poll_delay(&test_config(), now);
+        assert!(delay >= Duration::from_secs(LOCAL_FAILURE_BASE_RETRY_SECONDS as u64 - 1));
+        assert!(delay <= Duration::from_secs(LOCAL_FAILURE_BASE_RETRY_SECONDS as u64));
 
         assert!(state.refresh_with(&test_config(), &reader).await.is_err());
         let now = unix_timestamp_now();
-        assert!(!state.local_retry_allowed(now + LOCAL_FAILURE_BASE_RETRY_SECONDS + 1.0));
-        assert!(state.local_retry_allowed(now + (LOCAL_FAILURE_BASE_RETRY_SECONDS * 2.0) + 1.0));
+        assert!(state.local_retry_allowed(now + LOCAL_FAILURE_BASE_RETRY_SECONDS + 1.0));
+        let delay = state.status_poll_delay(&test_config(), now);
+        assert!(delay >= Duration::from_secs((LOCAL_FAILURE_BASE_RETRY_SECONDS * 2.0) as u64 - 1));
+        assert!(delay <= Duration::from_secs((LOCAL_FAILURE_BASE_RETRY_SECONDS * 2.0) as u64));
     }
 
     #[tokio::test]
@@ -1653,6 +1723,7 @@ mod tests {
                 &test_config(),
                 &writer,
                 ErvFanSpeed::Turbo,
+                false,
                 "manual_override",
                 Some(2100),
             )
@@ -1677,6 +1748,7 @@ mod tests {
                 &active_config(),
                 &writer,
                 ErvFanSpeed::Turbo,
+                false,
                 "away_refresh_CO2=2100ppm",
                 Some(2100),
             )
@@ -1733,6 +1805,7 @@ mod tests {
                 &active_config(),
                 &writer,
                 ErvFanSpeed::Turbo,
+                false,
                 "away_refresh_CO2=2100ppm",
                 Some(2100),
             )
@@ -1776,6 +1849,7 @@ mod tests {
                     &active_config(),
                     &writer,
                     ErvFanSpeed::Turbo,
+                    false,
                     &format!("away_refresh_{index}"),
                     Some(900),
                 )
@@ -1788,6 +1862,7 @@ mod tests {
                 &active_config(),
                 &writer,
                 ErvFanSpeed::Turbo,
+                false,
                 "away_refresh_suppressed",
                 Some(900),
             )
@@ -1840,6 +1915,7 @@ mod tests {
                     &active_config(),
                     &writer,
                     ErvFanSpeed::Turbo,
+                    false,
                     "away_refresh",
                     Some(900),
                 )
@@ -1852,6 +1928,7 @@ mod tests {
                 &active_config(),
                 &writer,
                 ErvFanSpeed::Turbo,
+                false,
                 "safety_interlock",
                 Some(900),
             )
@@ -1885,6 +1962,7 @@ mod tests {
                     &active_config(),
                     &writer,
                     ErvFanSpeed::Turbo,
+                    false,
                     &format!("away_refresh_{index}"),
                     Some(900),
                 )
@@ -1897,6 +1975,7 @@ mod tests {
                 &active_config(),
                 &writer,
                 ErvFanSpeed::Quiet,
+                false,
                 "away_refresh_suppressed",
                 Some(900),
             )
@@ -1928,6 +2007,7 @@ mod tests {
                         &active_config(),
                         &writer,
                         ErvFanSpeed::Turbo,
+                        false,
                         "manual_override",
                         None,
                     )
@@ -1947,6 +2027,7 @@ mod tests {
                 &active_config(),
                 &writer,
                 ErvFanSpeed::Quiet,
+                false,
                 "manual_override",
                 None,
             )

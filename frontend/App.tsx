@@ -12,7 +12,7 @@ import {
 import { STATUS_CONFIG } from './constants';
 import VitalTile from './components/VitalTile';
 import CO2Chart from './components/CO2Chart';
-import { fetchStatus, ApiStatus, toFahrenheit, StatusWebSocket, setERVSpeed, setHVACMode, setPresence, setHVACTemperatureBands, ERVSpeed as ApiERVSpeed, HVACMode, HVACTemperatureBands, logout, checkTrustedNetwork } from './api';
+import { fetchStatus, ApiStatus, toFahrenheit, StatusWebSocket, setERVSpeed, setHVACMode, setPresence, setHVACTemperatureBands, setBlindsCommand, ERVSpeed as ApiERVSpeed, HVACMode, HVACTemperatureBands, BlindsCommand, logout, checkTrustedNetwork } from './api';
 import Login from './Login';
 import HistoricalCharts from './HistoricalCharts';
 import OfficeReplay from './OfficeReplay';
@@ -389,6 +389,22 @@ const App: React.FC = () => {
     }
   }, [addEvent, state.co2, state.occupancy]);
 
+  const handleBlindsControl = useCallback(async (command: BlindsCommand) => {
+    setControlLoading(`blinds-${command}`);
+    try {
+      const result = await setBlindsCommand(command);
+      if (!result.ok) {
+        console.error('Blinds control failed:', result.error);
+      } else {
+        addEvent('blinds', `Manual: Blinds ${command === 'open' ? 'opened' : 'closed'}`);
+      }
+    } catch (e) {
+      console.error('Blinds control error:', e);
+    } finally {
+      setControlLoading(null);
+    }
+  }, [addEvent]);
+
   const clampTemperatureBand = useCallback((key: keyof HVACTemperatureBands, value: number) => {
     const limit = TEMPERATURE_BAND_LIMITS[key];
     return Math.max(limit.min, Math.min(limit.max, value));
@@ -685,6 +701,33 @@ const App: React.FC = () => {
                 ? '...'
                 : state.occupancy === OccupancyState.PRESENT ? "I'm away" : "I'm here"}
             </button>
+          </div>
+
+          {/* Blinds Controls */}
+          <div className="rounded-2xl border border-zinc-800/70 bg-black/20 p-4 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <div className="text-sm font-bold text-zinc-400 uppercase tracking-wide">🪟 Blinds</div>
+                <div className="text-xs font-semibold text-zinc-500 mt-1">
+                  Window shade position
+                </div>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              {(['open', 'close'] as const).map((command) => (
+                <button
+                  key={command}
+                  onClick={() => handleBlindsControl(command)}
+                  disabled={controlLoading !== null}
+                  className={`px-3 py-2 text-xs font-bold uppercase rounded-lg transition-all bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200
+                    ${controlLoading === `blinds-${command}` ? 'opacity-50 cursor-wait' : ''}
+                    disabled:opacity-50 disabled:cursor-not-allowed
+                  `}
+                >
+                  {controlLoading === `blinds-${command}` ? '...' : command}
+                </button>
+              ))}
+            </div>
           </div>
 
           {/* ERV Controls */}

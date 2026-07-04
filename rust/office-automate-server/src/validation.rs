@@ -3412,6 +3412,7 @@ mod tests {
             artifacts: crate::config::ArtifactConfig::default(),
             cloudflare_access: crate::config::CloudflareAccessConfig::default(),
             erv: ErvConfig::default(),
+            blinds: crate::config::BlindsConfig::default(),
             mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
             telemetry: crate::config::TelemetryConfig::default(),

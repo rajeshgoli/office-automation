@@ -180,7 +180,8 @@ class SettingsRepository(private val context: Context) {
             val certificates = CertificateFactory.getInstance("X.509")
                 .generateCertificates(ByteArrayInputStream(certificateChainPem.toByteArray()))
                 .filterIsInstance<X509Certificate>()
-            certificates.firstOrNull()?.publicKey?.algorithm.equals("RSA", ignoreCase = true)
+            val algorithm = certificates.firstOrNull()?.publicKey?.algorithm.orEmpty()
+            algorithm.equals("RSA", ignoreCase = true) || algorithm.equals("EC", ignoreCase = true)
         }.getOrDefault(false)
 
     private fun deviceKeyExists(alias: String): Boolean =

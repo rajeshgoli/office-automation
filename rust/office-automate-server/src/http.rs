@@ -44,6 +44,7 @@ use crate::{
         WebSocketAuth,
     },
     automation::ErvPolicyCoordinator,
+    blinds::{BlindsCommand, set_blinds},
     config::{AppConfig, ThresholdsConfig},
     db,
     erv::{
@@ -422,6 +423,7 @@ fn router_from_state(state: AppState) -> Router {
         .route("/occupancy", post(occupancy))
         .route("/presence", post(presence))
         .route("/erv", post(erv))
+        .route("/blinds", post(blinds))
         .route("/hvac", post(hvac))
         .route(
             "/hvac/temperature-bands",
@@ -665,7 +667,7 @@ fn door_grace_policy_delay(state: &AppState) -> Option<Duration> {
         }
         let deadline = state_status.sensors.door_closed_at
             + state.config.thresholds.erv_door_close_grace_seconds as f64;
-        return (deadline > now).then(|| Duration::from_secs_f64(deadline - now));
+        return (deadline > now).then(|| Duration::from_secs_f64((deadline - now).max(0.0)));
     }
 
     if state_status.sensors.door_opened_at <= 0.0 {
@@ -1480,6 +1482,37 @@ async fn erv(State(state): State<AppState>, Json(payload): Json<ErvRequest>) -> 
             }))
             .into_response()
         }
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BlindsRequest {
+    command: String,
+}
+
+async fn blinds(State(state): State<AppState>, Json(payload): Json<BlindsRequest>) -> Response {
+    let command = payload.command.to_ascii_lowercase();
+    let Some(command) = BlindsCommand::parse(&command) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "Invalid blinds command"})),
+        )
+            .into_response();
+    };
+
+    match set_blinds(&state.config.blinds, command).await {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "blinds": {
+                "command": command.as_str(),
+            }
+        }))
+        .into_response(),
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"ok": false, "error": error.to_string()})),
@@ -2950,6 +2983,7 @@ mod tests {
             &'a self,
             _config: &'a ErvConfig,
             speed: ErvFanSpeed,
+            _negative_pressure: bool,
         ) -> ErvBoxFutureResult<'a, ErvDeviceStatus> {
             self.write_speeds
                 .lock()
@@ -3062,6 +3096,7 @@ mod tests {
             artifacts: crate::config::ArtifactConfig::default(),
             cloudflare_access: crate::config::CloudflareAccessConfig::default(),
             erv: ErvConfig::default(),
+            blinds: crate::config::BlindsConfig::default(),
             mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
             telemetry: crate::config::TelemetryConfig::default(),
@@ -3480,6 +3515,7 @@ mod tests {
                 &state.config.erv,
                 erv_writer.as_ref(),
                 ErvFanSpeed::Turbo,
+                false,
                 "test",
                 None,
             )
@@ -3609,6 +3645,7 @@ mod tests {
                 &state.config.erv,
                 erv_writer.as_ref(),
                 ErvFanSpeed::Turbo,
+                false,
                 "test",
                 None,
             )

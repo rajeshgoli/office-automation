@@ -47,6 +47,9 @@ interface ApiService {
     @POST("presence")
     suspend fun setPresence(@Body body: Map<String, String>): JsonObject
 
+    @POST("blinds")
+    suspend fun setBlinds(@Body body: Map<String, String>): JsonObject
+
     @POST("hvac/temperature-bands")
     suspend fun setTemperatureBands(@Body body: JsonObject): TemperatureBandsResponse
 

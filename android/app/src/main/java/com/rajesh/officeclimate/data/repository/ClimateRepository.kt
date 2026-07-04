@@ -176,6 +176,10 @@ class ClimateRepository(
         apiService.setPresence(mapOf("state" to state))
     }
 
+    suspend fun setBlinds(command: String): Result<Unit> = runCatching {
+        apiService.setBlinds(mapOf("command" to command))
+    }
+
     suspend fun setTemperatureBands(bands: TemperatureBands): Result<Unit> = runCatching {
         val body = buildJsonObject {
             put("temperature_bands", buildJsonObject {

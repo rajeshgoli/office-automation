@@ -273,6 +273,7 @@ fun DashboardScreen(
                 onPresenceState = viewModel::setPresence,
                 onErvSpeed = viewModel::setErvSpeed,
                 onHvacMode = viewModel::setHvacMode,
+                onBlindsCommand = viewModel::setBlinds,
                 onTemperatureBandAction = viewModel::updateTemperatureBand,
                 onTemperatureBandReset = viewModel::resetTemperatureBands,
             )

@@ -51,6 +51,26 @@ erv:
   poll_interval_seconds: 60       # Poll while ERV state is unknown/running
   idle_poll_interval_seconds: 300  # Back off status polling when ERV is known off
 
+# Tuya smart blinds over the office window. This is independent of the
+# window open/closed contact sensor.
+blinds:
+  type: "tuya"
+  device_id: "your_blinds_tuya_device_id"
+  local_key: "your_blinds_tuya_local_key"
+  ip: "192.168.1.xxx"   # Leave empty for RF subdevices behind a Tuya bridge
+  active_control_enabled: false
+  # For direct Wi-Fi blinds, local Tuya can use control_dp/open_value/close_value.
+  control_dp: "1"
+  open_value: "open"
+  close_value: "close"
+  # For RF blinds behind a Smart Life Wi-Fi bridge, create Smart Life tap-to-run
+  # scenes and configure these IDs. Scene control is preferred when configured.
+  smart_life_home_id: "your_smart_life_home_id"
+  open_scene_id: "your_open_blinds_scene_id"
+  close_scene_id: "your_close_blinds_scene_id"
+  # Optional; defaults to ~/.office-automate/tuya-sharing-auth.json.
+  # smart_life_auth_file: "~/.office-automate/tuya-sharing-auth.json"
+
 # Option 2: Shelly relay (if using relay instead of Tuya)
 # erv:
 #   type: "shelly"
@@ -84,6 +104,14 @@ thresholds:
   away_stale_flush_interval_hours: 8    # Flush every 8 hours if room stays closed
   away_stale_flush_duration_minutes: 30 # Run each stale flush for 30 minutes
   away_stale_flush_speed: "medium"      # 3/2 airflow (quiet|medium|turbo)
+  post_renovation_enabled: false        # Temporary paint-fume clearing policy
+  post_renovation_expires_at: null      # RFC3339 timestamp, e.g. "2026-07-11T23:59:59-07:00"
+  post_renovation_tvoc_threshold: 150   # Start clearing above this tVOC value
+  post_renovation_present_tvoc_target: 120 # Present-room target before falling back to quiet
+  post_renovation_away_tvoc_target: 40  # Away target near outdoor/baseline air
+  post_renovation_min_speed: "quiet"    # Keep at least this ERV speed while active
+  post_renovation_negative_pressure: false # Use exhaust-biased SA/EA presets while active
+  post_renovation_departure_verification_seconds: 30 # Detect away quickly after door close while active
 
 # Orchestrator network settings (for Mac occupancy detector to report to)
 orchestrator:
