@@ -58,6 +58,8 @@ pub struct ErvPolicyInput {
     pub current_status_known: bool,
     pub current_running: bool,
     pub current_speed: VentilationSpeed,
+    pub current_negative_pressure: Option<bool>,
+    pub target_negative_pressure: bool,
     pub manual_override: Option<VentilationSpeed>,
     pub last_speed_changed_at: Option<f64>,
     pub bypass_dwell: bool,
@@ -841,6 +843,7 @@ fn target_decision(
     if target_speed != VentilationSpeed::Off
         && input.current_running
         && input.current_speed == target_speed
+        && input.current_negative_pressure == Some(input.target_negative_pressure)
     {
         return ErvDecision::NoChange;
     }
@@ -961,6 +964,8 @@ mod tests {
             current_status_known: true,
             current_running: false,
             current_speed: VentilationSpeed::Off,
+            current_negative_pressure: Some(false),
+            target_negative_pressure: false,
             manual_override: None,
             last_speed_changed_at: None,
             bypass_dwell: false,
@@ -1029,6 +1034,56 @@ mod tests {
         );
 
         assert_eq!(decision, ErvDecision::NoChange);
+    }
+
+    #[test]
+    fn pressure_bias_change_rewrites_same_logical_speed() {
+        let thresholds = ThresholdsConfig::default();
+        let normal_to_negative = target_decision(
+            &thresholds,
+            &ErvPolicyInput {
+                current_running: true,
+                current_speed: VentilationSpeed::Quiet,
+                current_negative_pressure: Some(false),
+                target_negative_pressure: true,
+                ..away_input(Some(700), None)
+            },
+            1_000.0,
+            VentilationSpeed::Quiet,
+            "pressure_bias_enable".to_string(),
+            false,
+        );
+        assert_eq!(
+            normal_to_negative,
+            ErvDecision::SetSpeed {
+                target_speed: VentilationSpeed::Quiet,
+                reason: "pressure_bias_enable".to_string(),
+                bypass_dwell: false,
+            }
+        );
+
+        let negative_to_normal = target_decision(
+            &thresholds,
+            &ErvPolicyInput {
+                current_running: true,
+                current_speed: VentilationSpeed::Quiet,
+                current_negative_pressure: Some(true),
+                target_negative_pressure: false,
+                ..away_input(Some(700), None)
+            },
+            1_000.0,
+            VentilationSpeed::Quiet,
+            "pressure_bias_disable".to_string(),
+            false,
+        );
+        assert_eq!(
+            negative_to_normal,
+            ErvDecision::SetSpeed {
+                target_speed: VentilationSpeed::Quiet,
+                reason: "pressure_bias_disable".to_string(),
+                bypass_dwell: false,
+            }
+        );
     }
 
     #[test]
@@ -1120,6 +1175,8 @@ mod tests {
                 current_status_known: true,
                 current_running: false,
                 current_speed: VentilationSpeed::Off,
+                current_negative_pressure: Some(false),
+                target_negative_pressure: false,
                 manual_override: None,
                 door_open: false,
                 door_open_seconds: None,
@@ -1149,6 +1206,8 @@ mod tests {
                 current_status_known: true,
                 current_running: true,
                 current_speed: VentilationSpeed::Quiet,
+                current_negative_pressure: Some(false),
+                target_negative_pressure: false,
                 manual_override: None,
                 door_open: false,
                 door_open_seconds: None,
@@ -1183,6 +1242,8 @@ mod tests {
                 current_status_known: true,
                 current_running: false,
                 current_speed: VentilationSpeed::Off,
+                current_negative_pressure: Some(false),
+                target_negative_pressure: true,
                 manual_override: None,
                 door_open: false,
                 door_open_seconds: None,
@@ -1212,6 +1273,8 @@ mod tests {
                 current_status_known: true,
                 current_running: true,
                 current_speed: VentilationSpeed::Medium,
+                current_negative_pressure: Some(true),
+                target_negative_pressure: true,
                 manual_override: None,
                 door_open: false,
                 door_open_seconds: None,
@@ -1241,6 +1304,8 @@ mod tests {
                 current_status_known: true,
                 current_running: true,
                 current_speed: VentilationSpeed::Medium,
+                current_negative_pressure: Some(true),
+                target_negative_pressure: true,
                 manual_override: None,
                 door_open: false,
                 door_open_seconds: None,
@@ -1270,6 +1335,8 @@ mod tests {
                 current_status_known: true,
                 current_running: false,
                 current_speed: VentilationSpeed::Off,
+                current_negative_pressure: Some(false),
+                target_negative_pressure: true,
                 manual_override: None,
                 door_open: false,
                 door_open_seconds: None,
@@ -1297,6 +1364,8 @@ mod tests {
                 current_status_known: false,
                 current_running: false,
                 current_speed: VentilationSpeed::Off,
+                current_negative_pressure: None,
+                target_negative_pressure: true,
                 manual_override: None,
                 door_open: false,
                 door_open_seconds: None,
@@ -1416,6 +1485,8 @@ mod tests {
                 current_status_known: true,
                 current_running: false,
                 current_speed: VentilationSpeed::Off,
+                current_negative_pressure: Some(false),
+                target_negative_pressure: false,
                 manual_override: None,
                 door_open: false,
                 door_open_seconds: None,

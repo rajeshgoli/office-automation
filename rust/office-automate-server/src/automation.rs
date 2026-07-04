@@ -99,6 +99,7 @@ impl ErvPolicyCoordinator {
             fresh_status_checked = true;
         }
 
+        let negative_pressure_active = self.post_renovation_negative_pressure_active();
         let decision = {
             let mut policy = self.policy.write().expect("ERV policy lock poisoned");
             if let Some(reading) = &qingping_reading {
@@ -136,6 +137,8 @@ impl ErvPolicyCoordinator {
                     current_status_known: erv_snapshot.status_known,
                     current_running: erv_snapshot.running,
                     current_speed: ventilation_speed_from_erv(erv_snapshot.speed),
+                    current_negative_pressure: erv_snapshot.negative_pressure,
+                    target_negative_pressure: negative_pressure_active,
                     manual_override,
                     last_speed_changed_at: erv_snapshot.last_speed_changed_at,
                     bypass_dwell,

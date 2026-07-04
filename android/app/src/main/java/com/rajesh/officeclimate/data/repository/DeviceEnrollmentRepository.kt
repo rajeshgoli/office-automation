@@ -2,7 +2,6 @@ package com.rajesh.officeclimate.data.repository
 
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
-import android.util.Base64
 import com.rajesh.officeclimate.data.remote.HttpClientFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -100,9 +99,7 @@ class DeviceEnrollmentRepository(
                 val payload = json.decodeFromString(DeviceEnrollmentResponse.serializer(), body)
                 settingsRepository.saveDeviceCertificateChainPem(payload.certificateChainPem)
                 settingsRepository.saveDeviceCertificateAlias(alias)
-                settingsRepository.saveDevicePrivateKeyPkcs8(
-                    Base64.encodeToString(keyPair.private.encoded, Base64.NO_WRAP),
-                )
+                settingsRepository.clearDevicePrivateKeyPkcs8()
                 return@withContext DeviceEnrollmentResult(
                     alias = alias,
                     deviceId = payload.deviceId,
@@ -119,8 +116,20 @@ class DeviceEnrollmentRepository(
 
     private fun generateKeyPair(alias: String): KeyPair {
         deleteDeviceKey(alias)
-        val keyPairGenerator = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC)
-        keyPairGenerator.initialize(ECGenParameterSpec("secp256r1"))
+        val keyPairGenerator = KeyPairGenerator.getInstance(
+            KeyProperties.KEY_ALGORITHM_EC,
+            ANDROID_KEYSTORE,
+        )
+        keyPairGenerator.initialize(
+            KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
+                .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+                .setDigests(
+                    KeyProperties.DIGEST_SHA256,
+                    KeyProperties.DIGEST_SHA384,
+                    KeyProperties.DIGEST_SHA512,
+                )
+                .build(),
+        )
         return keyPairGenerator.generateKeyPair()
     }
 

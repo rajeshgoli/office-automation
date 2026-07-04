@@ -155,6 +155,7 @@ pub struct ErvRuntimeSnapshot {
     pub status_known: bool,
     pub running: bool,
     pub speed: ErvFanSpeed,
+    pub negative_pressure: Option<bool>,
     pub last_speed_changed_at: Option<f64>,
     pub local_key_invalid: bool,
 }
@@ -296,7 +297,7 @@ impl ErvState {
             .await
             .context("ERV smoke check failed before active write")?;
 
-        if device_status_matches_speed(&smoked_status, speed) {
+        if device_status_matches_target(&smoked_status, speed, negative_pressure) {
             return Ok(smoked_status);
         }
 
@@ -394,11 +395,16 @@ impl ErvState {
             .as_ref()
             .and_then(|status| status.fan_speed)
             .unwrap_or(ErvFanSpeed::Off);
+        let negative_pressure = inner
+            .latest_status
+            .as_ref()
+            .and_then(ErvDeviceStatus::negative_pressure);
 
         ErvRuntimeSnapshot {
             status_known,
             running,
             speed,
+            negative_pressure,
             last_speed_changed_at: inner.last_speed_changed_at,
             local_key_invalid: inner.control.local_key_invalid,
         }
@@ -1013,6 +1019,7 @@ fn runtime_snapshot_json(snapshot: ErvRuntimeSnapshot) -> Value {
         "status_known": snapshot.status_known,
         "running": snapshot.running,
         "speed": snapshot.speed.as_str(),
+        "negative_pressure": snapshot.negative_pressure,
         "last_speed_changed_at": snapshot.last_speed_changed_at,
         "local_key_invalid": snapshot.local_key_invalid,
     })
@@ -1231,10 +1238,28 @@ fn fan_speed(
     }
 }
 
-fn device_status_matches_speed(status: &ErvDeviceStatus, speed: ErvFanSpeed) -> bool {
+impl ErvDeviceStatus {
+    fn negative_pressure(&self) -> Option<bool> {
+        match (self.supply_speed, self.exhaust_speed) {
+            (Some(1), Some(2)) | (Some(2), Some(3)) | (Some(7), Some(8)) => Some(true),
+            (Some(1), Some(1)) | (Some(3), Some(2)) | (Some(8), Some(8)) => Some(false),
+            _ => None,
+        }
+    }
+}
+
+fn device_status_matches_target(
+    status: &ErvDeviceStatus,
+    speed: ErvFanSpeed,
+    negative_pressure: bool,
+) -> bool {
     match speed {
         ErvFanSpeed::Off => !status.power,
-        _ => status.power && status.fan_speed == Some(speed),
+        _ => {
+            status.power
+                && status.fan_speed == Some(speed)
+                && status.negative_pressure() == Some(negative_pressure)
+        }
     }
 }
 
@@ -1510,6 +1535,35 @@ mod tests {
         assert_eq!(quiet.fan_speed, Some(ErvFanSpeed::Quiet));
         assert_eq!(medium.fan_speed, Some(ErvFanSpeed::Medium));
         assert_eq!(turbo.fan_speed, Some(ErvFanSpeed::Turbo));
+    }
+
+    #[test]
+    fn target_match_includes_pressure_bias() {
+        let normal_quiet =
+            parse_erv_status_payload(r#"{"dps":{"1":true,"101":1,"102":1}}"#).expect("status");
+        let negative_quiet =
+            parse_erv_status_payload(r#"{"dps":{"1":true,"101":1,"102":2}}"#).expect("status");
+
+        assert!(device_status_matches_target(
+            &normal_quiet,
+            ErvFanSpeed::Quiet,
+            false
+        ));
+        assert!(!device_status_matches_target(
+            &normal_quiet,
+            ErvFanSpeed::Quiet,
+            true
+        ));
+        assert!(device_status_matches_target(
+            &negative_quiet,
+            ErvFanSpeed::Quiet,
+            true
+        ));
+        assert!(!device_status_matches_target(
+            &negative_quiet,
+            ErvFanSpeed::Quiet,
+            false
+        ));
     }
 
     #[tokio::test]
