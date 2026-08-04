@@ -143,6 +143,8 @@ impl SmartLifeClient {
     pub async fn check_credentials(&self) -> Result<String> {
         let _auth_guard = AUTH_CACHE_LOCK.lock().await;
         let mut auth = SmartLifeAuthCache::load(&self.auth_file)?;
+        ensure_cache_directory_is_writable(&self.auth_file)
+            .context("refusing to rotate the Smart Life refresh token")?;
         self.refresh_auth(&mut auth)
             .await
             .context("Smart Life refresh token is not usable")?;
@@ -316,12 +318,50 @@ impl SmartLifeAuthCache {
             .with_context(|| format!("failed to parse Smart Life auth cache {}", path.display()))
     }
 
+    /// Write via a sibling temp file and rename over the target, so a reader
+    /// racing this write -- another process attached to the same cache file,
+    /// which the in-process `AUTH_CACHE_LOCK` cannot see -- gets either the
+    /// old complete file or the new one, never a half-written one.
     fn save(&self, path: &Path) -> Result<()> {
         let content = serde_json::to_string_pretty(self)
             .context("failed to serialize Smart Life auth cache")?;
-        fs::write(path, format!("{content}\n"))
-            .with_context(|| format!("failed to write Smart Life auth cache {}", path.display()))
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("Smart Life auth cache path has no file name"))?
+            .to_string_lossy();
+        let tmp_path = path.with_file_name(format!("{file_name}.tmp-{}", Uuid::new_v4()));
+        fs::write(&tmp_path, format!("{content}\n")).with_context(|| {
+            format!(
+                "failed to write Smart Life auth cache temp file {}",
+                tmp_path.display()
+            )
+        })?;
+        fs::rename(&tmp_path, path)
+            .with_context(|| format!("failed to finalize Smart Life auth cache {}", path.display()))
     }
+}
+
+/// Prove the cache's directory can be written to before consuming a refresh
+/// token there is no way to un-consume: a forced rotation invalidates the old
+/// refresh token at Smart Life regardless of whether the new one can be
+/// persisted locally, so a save failure after a successful refresh strands
+/// the credential rather than merely failing the check. A cheap probe write
+/// catches the common causes -- permissions, a full disk -- before the
+/// network call, not after.
+fn ensure_cache_directory_is_writable(path: &Path) -> Result<()> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let probe = dir.join(format!(".smart-life-write-probe-{}", Uuid::new_v4()));
+    fs::write(&probe, b"").with_context(|| {
+        format!(
+            "Smart Life auth cache directory {} is not writable",
+            dir.display()
+        )
+    })?;
+    let _ = fs::remove_file(&probe);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -592,5 +632,59 @@ mod tests {
             PathBuf::from("/tmp/office/auth.json")
         );
         assert_eq!(auth_file_or_default(None), default_auth_file());
+    }
+
+    /// A reader must never observe a half-written cache. `save` proves this
+    /// indirectly: after it returns, the file round-trips and no temp file
+    /// from the write is left behind for a later `load` to trip over.
+    #[test]
+    fn save_leaves_a_clean_file_and_no_temp_debris() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("tuya-sharing-auth.json");
+        let auth = SmartLifeAuthCache {
+            user_code: "user".to_string(),
+            terminal_id: "terminal".to_string(),
+            endpoint: "https://apigw.example".to_string(),
+            token_info: SmartLifeTokenInfo {
+                t: 0,
+                expire_time: 7200,
+                uid: "uid".to_string(),
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+            },
+        };
+
+        auth.save(&path).expect("save");
+        auth.save(&path).expect("re-save over the existing file");
+
+        let loaded = SmartLifeAuthCache::load(&path).expect("load");
+        assert_eq!(loaded.token_info.access_token, "access");
+
+        let leftovers = fs::read_dir(temp_dir.path())
+            .expect("read temp dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name() != "tuya-sharing-auth.json")
+            .count();
+        assert_eq!(leftovers, 0, "save left a temp file behind");
+    }
+
+    /// `check_credentials` forces a token rotation it cannot undo -- the old
+    /// refresh token is dead at Smart Life the moment the call succeeds, so a
+    /// directory that cannot be written to must be caught before that call,
+    /// not after.
+    #[test]
+    fn writability_probe_rejects_a_missing_directory() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let unwritable = temp_dir.path().join("does-not-exist").join("auth.json");
+        let error = ensure_cache_directory_is_writable(&unwritable)
+            .expect_err("missing directory is not writable");
+        assert!(error.to_string().contains("not writable"));
+    }
+
+    #[test]
+    fn writability_probe_accepts_a_writable_directory() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("auth.json");
+        ensure_cache_directory_is_writable(&path).expect("writable temp dir");
     }
 }
