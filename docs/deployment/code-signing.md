@@ -128,6 +128,7 @@ overrides this and warns loudly.
 | `OFFICE_AUTOMATE_SIGNING_IDENTIFIER` | `com.office-automate.server` | Pinned signing identifier |
 | `OFFICE_AUTOMATE_SIGNING_CERT_ROOT` | `36fc54a8…` | Expected certificate root hash |
 | `OFFICE_AUTOMATE_ALLOW_UNSIGNED` | unset | Build unsigned and accept broken readback |
+| `OFFICE_AUTOMATE_SERVER_BIN` | `target/release/office-automate-server` | Where the built binary is deployed and signed. If set to a path other than cargo's own output, the freshly built binary is copied there before signing. |
 
 ### Why the identifier is pinned
 

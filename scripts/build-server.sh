@@ -19,7 +19,9 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 manifest="$root/rust/office-automate-server/Cargo.toml"
-binary="${OFFICE_AUTOMATE_SERVER_BIN:-$root/target/release/office-automate-server}"
+# cargo always writes here regardless of any deploy-path override below.
+cargo_bin="$root/target/release/office-automate-server"
+binary="${OFFICE_AUTOMATE_SERVER_BIN:-$cargo_bin}"
 
 # The identity lives in the login keychain and is not in the repo. The
 # identifier and certificate root are pinned because both are load-bearing:
@@ -116,6 +118,14 @@ case "${1:-}" in
 esac
 
 cargo build --release --manifest-path "$manifest" "$@"
+
+# If OFFICE_AUTOMATE_SERVER_BIN points somewhere other than cargo's own output
+# (a deployment path, for example), deploy the binary that was just built
+# before signing it. Otherwise the freshly built code never reaches $binary
+# and a stale file gets a valid signature.
+if [[ "$binary" != "$cargo_bin" ]]; then
+  cp -p "$cargo_bin" "$binary"
+fi
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   printf 'build-server: not macOS, skipping code signing\n'
