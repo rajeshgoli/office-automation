@@ -116,9 +116,18 @@ def read_erv_config(config_file: Path) -> tuple[str, str | None]:
 def read_client_id(config_file: Path) -> str:
     """Resolve the Smart Life client id, falling back when config is unreadable.
 
+    Environment beats YAML, matching the server's precedence. Otherwise a
+    deployment configured through OFFICE_AUTOMATE_SMART_LIFE_CLIENT_ID would
+    have this script mint credentials for one app key while the server signed
+    with another -- the drift this shared key exists to prevent.
+
     --init-auth runs before there is necessarily a usable config, so a missing
     or malformed file must not block authorization.
     """
+    env_client_id = os.environ.get("OFFICE_AUTOMATE_SMART_LIFE_CLIENT_ID")
+    if env_client_id and env_client_id.strip():
+        return env_client_id.strip()
+
     try:
         _, data = load_config_data(config_file)
     except RefreshError:

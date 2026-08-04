@@ -1995,6 +1995,12 @@ pub fn check_erv_scene_config(config: &AppConfig) -> Result<usize> {
         bail!("ERV scene control is not the selected transport");
     }
 
+    // Without a home id no scene can be triggered at all, however complete the
+    // matrix looks.
+    if config.erv.smart_life_home_id().is_none() {
+        bail!("{}", SceneConfigError::MissingHomeId);
+    }
+
     // The matrix this deployment will command, not the one that happens to be
     // filled in. An incomplete set does not demote anything to local control --
     // the affected writes just fail -- so this has to reject it rather than
@@ -4316,6 +4322,28 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.starts_with("Scene trigger failed:"))
         );
+    }
+
+    /// Without a home id no scene can be triggered at all, so a complete
+    /// matrix must not be mistaken for a working transport.
+    #[test]
+    fn scene_config_check_requires_the_home_id() {
+        let complete = app_config(scene_config());
+        assert_eq!(check_erv_scene_config(&complete).expect("configured"), 4);
+
+        let no_home_id = app_config(ErvConfig {
+            smart_life_home_id: None,
+            ..scene_config()
+        });
+        let error = check_erv_scene_config(&no_home_id).expect_err("no home id");
+        assert!(error.to_string().contains("home id"));
+
+        let no_turbo = app_config(ErvConfig {
+            turbo_scene_id: None,
+            ..scene_config()
+        });
+        let error = check_erv_scene_config(&no_turbo).expect_err("incomplete matrix");
+        assert!(error.to_string().contains("turbo"));
     }
 
     /// While negative pressure is armed, those are the only scenes automation
