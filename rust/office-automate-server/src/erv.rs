@@ -2021,6 +2021,104 @@ pub fn check_erv_scene_config(config: &AppConfig) -> Result<usize> {
     Ok(required.len())
 }
 
+/// Live check of the Smart Life scene transport: credentials, scene id
+/// existence, and (if a device id is configured) a device read.
+///
+/// `check_erv_scene_config` proves the matrix is filled in; it proves nothing
+/// about whether any of it works. The auth cache can be missing, unreadable,
+/// or holding a dead refresh token, and a configured scene id can be stale,
+/// deleted, or mistyped -- none of that shows up until the first ventilation
+/// request. This exercises the credentials and confirms every configured
+/// scene id still exists in Smart Life, without commanding the device.
+///
+/// Existence only, per the Hard Constraints in the ERV design doc: the scene
+/// read view renders every ERV speed scene's action identically, so nothing
+/// may be concluded from it about what a scene *does*. That is verifiable
+/// only physically, at the unit.
+pub async fn smoke_erv_scene(config: &AppConfig) -> Result<String> {
+    let scene_count = check_erv_scene_config(config)?;
+
+    let client = SmartLifeClient::new(
+        config.smart_life.client_id.clone(),
+        auth_file_or_default(config.erv.smart_life_auth_file.as_ref()),
+    );
+    let endpoint = client
+        .check_credentials()
+        .await
+        .context("Smart Life credentials are not usable")?;
+
+    // check_erv_scene_config already confirmed a home id is configured.
+    let home_id = config
+        .erv
+        .smart_life_home_id()
+        .ok_or(SceneConfigError::MissingHomeId)?;
+    let present = client
+        .list_scene_ids(home_id)
+        .await
+        .context("Smart Life scene list failed")?;
+    let missing = configured_scene_ids(&config.erv)
+        .into_iter()
+        .filter(|(_, scene_id)| !present.iter().any(|found| found == scene_id))
+        .map(|(label, scene_id)| format!("{label}={scene_id}"))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "configured ERV scene ids are not present in Smart Life home {home_id}: {}",
+            missing.join(", ")
+        );
+    }
+
+    let device_id = config.erv.device_id.trim();
+    if device_id.is_empty() {
+        return Ok(format!(
+            "Smart Life auth OK at {endpoint}; {scene_count} scene ids present"
+        ));
+    }
+
+    let status = client
+        .device_status(device_id)
+        .await
+        .context("Smart Life device read failed")?;
+    let power = status_code_value(&status, "switch")
+        .and_then(value_as_bool)
+        .map(|power| power.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(format!(
+        "Smart Life auth OK at {endpoint}; {scene_count} scene ids present; switch={power}"
+    ))
+}
+
+/// Every scene id the configuration actually sets, labelled by preset.
+fn configured_scene_ids(config: &ErvConfig) -> Vec<(&'static str, &str)> {
+    [
+        ("off", &config.off_scene_id),
+        ("quiet", &config.quiet_scene_id),
+        ("medium", &config.medium_scene_id),
+        ("turbo", &config.turbo_scene_id),
+        (
+            "quiet_negative_pressure",
+            &config.quiet_negative_pressure_scene_id,
+        ),
+        (
+            "medium_negative_pressure",
+            &config.medium_negative_pressure_scene_id,
+        ),
+        (
+            "turbo_negative_pressure",
+            &config.turbo_negative_pressure_scene_id,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(label, configured)| {
+        configured
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|scene_id| (label, scene_id))
+    })
+    .collect()
+}
+
 fn configured_scene_id(value: &Option<String>) -> Option<&str> {
     value
         .as_deref()
@@ -4344,6 +4442,67 @@ mod tests {
         });
         let error = check_erv_scene_config(&no_turbo).expect_err("incomplete matrix");
         assert!(error.to_string().contains("turbo"));
+    }
+
+    /// `smoke_erv_scene` layers live checks on top of `check_erv_scene_config`
+    /// and must not reach the network -- construct a client, read the auth
+    /// cache -- when the configuration gate itself already fails. Live
+    /// credentials cannot be exercised in a unit test; this covers the
+    /// routing that decides whether the live path is even attempted.
+    #[tokio::test]
+    async fn smoke_erv_scene_rejects_incomplete_config_before_touching_the_network() {
+        let no_home_id = app_config(ErvConfig {
+            smart_life_home_id: None,
+            ..scene_config()
+        });
+        let error = smoke_erv_scene(&no_home_id)
+            .await
+            .expect_err("no home id");
+        assert!(error.to_string().contains("home id"));
+
+        let no_turbo = app_config(ErvConfig {
+            turbo_scene_id: None,
+            ..scene_config()
+        });
+        let error = smoke_erv_scene(&no_turbo).await.expect_err("incomplete matrix");
+        assert!(error.to_string().contains("turbo"));
+
+        let local_mode = app_config(ErvConfig {
+            control_mode: ErvControlMode::Local,
+            ..scene_config()
+        });
+        let error = smoke_erv_scene(&local_mode)
+            .await
+            .expect_err("scene control not selected");
+        assert!(error.to_string().contains("not the selected transport"));
+    }
+
+    /// Every scene id the configuration sets is checked for existence, not
+    /// just the ones the current pressure mode requires -- a dormant
+    /// negative-pressure id that has gone stale should still be caught before
+    /// the mode is re-armed, not discovered for the first time after.
+    #[test]
+    fn configured_scene_ids_includes_dormant_negative_pressure_and_skips_blank_entries() {
+        let config = ErvConfig {
+            quiet_negative_pressure_scene_id: Some("  ".to_string()),
+            medium_negative_pressure_scene_id: Some("medium-np".to_string()),
+            turbo_negative_pressure_scene_id: None,
+            ..scene_config()
+        };
+        assert!(!negative_pressure_armed(&app_config(config.clone())));
+
+        let ids = configured_scene_ids(&config);
+        assert_eq!(
+            ids,
+            vec![
+                ("off", "off-scene"),
+                ("quiet", "quiet-scene"),
+                ("medium", "medium-scene"),
+                ("turbo", "turbo-scene"),
+                ("medium_negative_pressure", "medium-np"),
+            ],
+            "blank ids are skipped and dormant negative-pressure ids are still included"
+        );
     }
 
     /// While negative pressure is armed, those are the only scenes automation
