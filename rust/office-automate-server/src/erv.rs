@@ -110,13 +110,18 @@ pub trait ErvSpeedWriter: Send + Sync {
         ErvWriteReport::default()
     }
 
-    /// Error text from the most recent local readback attempt, if it failed.
+    /// Take the error from the most recent local readback attempt, if it
+    /// failed, clearing it.
     ///
     /// Nothing polls any more, so a read-after-write is often the only local
     /// read that happens. Without reporting it, a local key that dies after a
     /// good boot read would fail every verification while `local_key_invalid`
     /// and the degraded-readback notification stayed clear forever.
-    fn last_readback_failure(&self) -> Option<String> {
+    ///
+    /// Consuming is the point: while the writer is in read backoff it performs
+    /// no local I/O at all, so a value left in place would let one failure be
+    /// counted once per write and manufacture a key-invalid verdict.
+    fn take_readback_failure(&self) -> Option<String> {
         None
     }
 }
@@ -183,25 +188,44 @@ impl ErvCloudClient for SmartLifeErvCloud {
     }
 }
 
-/// A `(speed, pressure)` pair that resolved to no configured scene. Surfaced
-/// rather than silently substituted: a system that reports a mode it is not
-/// delivering is worse than one that reports an error.
+/// The scene path is not configured for this write.
+///
+/// Deterministic configuration errors, not outages: they are surfaced rather
+/// than silently substituted or written locally. A system that reports a mode
+/// it is not delivering is worse than one that reports an error, and falling
+/// back to a local command here would reintroduce the Err 914 path over a
+/// problem no retry can fix.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MissingSceneError {
-    pub preset: String,
+pub enum SceneConfigError {
+    /// No `smart_life_home_id`, so no scene can be triggered at all.
+    MissingHomeId,
+    /// A `(speed, pressure)` pair that resolved to no configured scene.
+    MissingScene { preset: String },
 }
 
-impl fmt::Display for MissingSceneError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "ERV Smart Life scene id for {} is not configured",
-            self.preset
-        )
+impl SceneConfigError {
+    /// Short label for `erv.control.missing_scene`.
+    fn subject(&self) -> String {
+        match self {
+            Self::MissingHomeId => "smart_life_home_id".to_string(),
+            Self::MissingScene { preset } => preset.clone(),
+        }
     }
 }
 
-impl std::error::Error for MissingSceneError {}
+impl fmt::Display for SceneConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingHomeId => write!(formatter, "ERV Smart Life home id is not configured"),
+            Self::MissingScene { preset } => write!(
+                formatter,
+                "ERV Smart Life scene id for {preset} is not configured"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SceneConfigError {}
 
 fn scene_preset_label(speed: ErvFanSpeed, negative_pressure: bool) -> String {
     if speed == ErvFanSpeed::Off || !negative_pressure {
@@ -215,7 +239,7 @@ fn scene_id_for(
     config: &ErvConfig,
     speed: ErvFanSpeed,
     negative_pressure: bool,
-) -> Result<&str, MissingSceneError> {
+) -> Result<&str, SceneConfigError> {
     let configured = match (speed, negative_pressure) {
         (ErvFanSpeed::Off, _) => &config.off_scene_id,
         (ErvFanSpeed::Quiet, false) => &config.quiet_scene_id,
@@ -230,7 +254,7 @@ fn scene_id_for(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| MissingSceneError {
+        .ok_or_else(|| SceneConfigError::MissingScene {
             preset: scene_preset_label(speed, negative_pressure),
         })
 }
@@ -286,7 +310,7 @@ impl ErvSpeedWriter for SceneErvSpeedWriter {
         Box::pin(async move {
             let home_id = config
                 .smart_life_home_id()
-                .ok_or_else(|| anyhow!("ERV Smart Life home id is missing"))?;
+                .ok_or(SceneConfigError::MissingHomeId)?;
             let preset = scene_preset_label(speed, negative_pressure);
             let scene_id = scene_id_for(config, speed, negative_pressure)?;
 
@@ -543,7 +567,7 @@ impl ErvSpeedWriter for SplitErvWriter {
                     // A hole in the scene matrix is a configuration error, not
                     // an outage. Writing it locally would deliver the speed
                     // while hiding the hole, so it has to propagate.
-                    if error.downcast_ref::<MissingSceneError>().is_some() {
+                    if error.downcast_ref::<SceneConfigError>().is_some() {
                         self.finish(primary_report, None);
                         return Err(error);
                     }
@@ -620,8 +644,8 @@ impl ErvSpeedWriter for SplitErvWriter {
         self.state().report
     }
 
-    fn last_readback_failure(&self) -> Option<String> {
-        self.state().readback_failure.clone()
+    fn take_readback_failure(&self) -> Option<String> {
+        self.state().readback_failure.take()
     }
 }
 
@@ -933,7 +957,7 @@ impl ErvState {
                 // A read-after-write is often the only local read that happens
                 // now that nothing polls, so its failure has to reach the
                 // health counters or a dying local key would never be noticed.
-                if let Some(message) = writer.last_readback_failure()
+                if let Some(message) = writer.take_readback_failure()
                     && self.record_read_only_local_failure(config, &message)
                 {
                     self.notify_status();
@@ -1043,6 +1067,12 @@ impl ErvState {
                 Ok(status)
             }
             Err(error) => {
+                // This failure is being recorded right here, so drain the
+                // writer's slot: it exists to carry failures the state layer
+                // has *not* seen, and leaving this one would let the write
+                // path count the same read a second time.
+                let _ = writer.take_readback_failure();
+
                 // A failed *read* backs off reads only. Letting it back off the
                 // write path is what coupled speed readback to control.
                 let message = format!("{error:#}");
@@ -1407,23 +1437,24 @@ impl ErvState {
         );
     }
 
-    /// A `(speed, pressure)` pair with no configured scene is a configuration
+    /// A scene path that is not configured for this write is a configuration
     /// hole, not a transient failure: surface it instead of letting it look
     /// like an ordinary cloud error.
     ///
     /// A hole stays reported until a write actually lands. An unrelated failure
     /// -- a WAN outage on a configured scene, say -- is no evidence that anyone
-    /// went and built the missing scene, so it must not clear this.
+    /// went and fixed the configuration, so it must not clear this.
     fn record_missing_scene(&self, error: &anyhow::Error) {
-        let Some(missing) = error.downcast_ref::<MissingSceneError>() else {
+        let Some(missing) = error.downcast_ref::<SceneConfigError>() else {
             return;
         };
 
+        let subject = missing.subject();
         let now = local_iso_now();
         {
             let mut inner = self.inner.write().expect("ERV state lock poisoned");
-            inner.control.missing_scene = Some(missing.preset.clone());
-            inner.notification = Some(missing_scene_notification(&missing.preset, &now));
+            inner.control.missing_scene = Some(subject.clone());
+            inner.notification = Some(missing_scene_notification(missing, &now));
         }
 
         self.log_health_event(
@@ -1431,7 +1462,7 @@ impl ErvState {
             json!({
                 "type": "erv_scene_missing",
                 "at": now,
-                "preset": missing.preset,
+                "preset": subject,
             }),
         );
     }
@@ -2145,15 +2176,23 @@ fn recovered_notification(created_at: &str) -> AppNotification {
     }
 }
 
-fn missing_scene_notification(preset: &str, created_at: &str) -> AppNotification {
-    AppNotification {
-        id: format!("erv_scene_missing:{preset}:{created_at}"),
-        notification_type: "erv_scene_missing".to_string(),
-        severity: "critical".to_string(),
-        title: "ERV scene missing".to_string(),
-        message: format!(
+fn missing_scene_notification(error: &SceneConfigError, created_at: &str) -> AppNotification {
+    let subject = error.subject();
+    let message = match error {
+        SceneConfigError::MissingHomeId => {
+            "No Smart Life home id is configured, so no ERV scene can be triggered. Set erv.smart_life_home_id in config.yaml.".to_string()
+        }
+        SceneConfigError::MissingScene { preset } => format!(
             "No Smart Life scene is configured for {preset}, so that mode cannot be delivered. Scenes are hand-built in the Smart Life app; the API cannot create them."
         ),
+    };
+
+    AppNotification {
+        id: format!("erv_scene_missing:{subject}:{created_at}"),
+        notification_type: "erv_scene_missing".to_string(),
+        severity: "critical".to_string(),
+        title: "ERV scene control misconfigured".to_string(),
+        message,
         created_at: Some(created_at.to_string()),
         active: true,
         runbook_path: Some("docs/working/154_erv_scene_fallback.md".to_string()),
@@ -3264,7 +3303,7 @@ mod tests {
             .await
             .expect_err("a missing scene must not fall back to another preset");
 
-        assert!(error.downcast_ref::<MissingSceneError>().is_some());
+        assert!(error.downcast_ref::<SceneConfigError>().is_some());
         assert!(
             cloud.triggered_scenes().is_empty(),
             "the normal-pressure scene must not be substituted"
@@ -3510,6 +3549,83 @@ mod tests {
             app_status.notifications[0].notification_type,
             "erv_local_key_invalid"
         );
+    }
+
+    /// One failed read must be counted once. While the writer is in read
+    /// backoff it performs no local I/O at all, so a failure left in place
+    /// would be re-counted on every write and manufacture a key-invalid
+    /// verdict out of a single Err 914.
+    #[tokio::test]
+    async fn a_single_readback_failure_is_counted_once() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let cloud = Arc::new(FakeCloud::default());
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(vec![Err(anyhow!(
+                "Check device key or version (Error 914)"
+            ))])),
+            None,
+        );
+        let config = scene_config();
+
+        // Both backoffs are left alone after this, so no further read happens.
+        for _ in 0..LOCAL_KEY_ERROR_THRESHOLD {
+            state
+                .set_speed_with(
+                    &config,
+                    &writer,
+                    ErvFanSpeed::Turbo,
+                    false,
+                    "manual_override",
+                    None,
+                )
+                .await
+                .expect("scene writes keep succeeding");
+        }
+
+        let mut app_status = Status::read_only_default(&app_config(config));
+        state.overlay_status(&mut app_status);
+        assert_eq!(
+            app_status.erv.control.consecutive_local_key_errors, 1,
+            "one failed read was counted more than once"
+        );
+        assert!(!app_status.erv.control.local_key_invalid);
+    }
+
+    /// A missing home id is as deterministic as a missing scene id, and just
+    /// as ineligible for a local fallback: no retry fixes configuration, and
+    /// the local command is the thing this design exists to never issue.
+    #[tokio::test]
+    async fn missing_home_id_fails_instead_of_falling_back_to_local() {
+        let cloud = Arc::new(FakeCloud::default());
+        let local = Arc::new(FakeErvWriter::new(Vec::new(), vec![Ok(turbo_status())]));
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(Vec::new())),
+            Some(local.clone()),
+        );
+        let config = ErvConfig {
+            smart_life_home_id: None,
+            ..scene_config()
+        };
+
+        let error = writer
+            .set_speed(&config, ErvFanSpeed::Turbo, false)
+            .await
+            .expect_err("no home id means no scene can be triggered");
+
+        assert_eq!(
+            error.downcast_ref::<SceneConfigError>(),
+            Some(&SceneConfigError::MissingHomeId)
+        );
+        assert!(
+            local.write_speeds().is_empty(),
+            "a configuration error must not be written away by the local fallback"
+        );
+        assert!(cloud.triggered_scenes().is_empty());
     }
 
     /// A WAN outage on a configured scene is no evidence that anyone built the
@@ -3793,7 +3909,7 @@ mod tests {
             .expect_err("an incomplete scene set must fail, not fall back to local");
 
         assert!(
-            error.downcast_ref::<MissingSceneError>().is_some(),
+            error.downcast_ref::<SceneConfigError>().is_some(),
             "expected a missing-scene diagnostic, got: {error:#}"
         );
     }
