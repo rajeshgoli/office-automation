@@ -81,7 +81,7 @@ Apply the selected MQTT feed strategy:
 Start the Rust backend and Cloudflare Tunnel services with launchd or the equivalent foreground commands:
 
 ```bash
-./target/release/office-automate-server serve --config "$OFFICE_AUTOMATE_CONFIG"
+"$server_bin" serve --config "$OFFICE_AUTOMATE_CONFIG"
 cloudflared tunnel --config "$CLOUDFLARED_CONFIG" run "$CLOUDFLARED_TUNNEL"
 ```
 
@@ -90,7 +90,7 @@ cloudflared tunnel --config "$CLOUDFLARED_CONFIG" run "$CLOUDFLARED_TUNNEL"
 Run cutover validation after Rust is the only active climate controller:
 
 ```bash
-./target/release/office-automate-server validate \
+"$server_bin" validate \
   --config "$OFFICE_AUTOMATE_CONFIG" \
   cutover \
   --base-url "$OFFICE_AUTOMATE_CUTOVER_BASE_URL" \

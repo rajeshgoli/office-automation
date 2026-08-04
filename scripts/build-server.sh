@@ -19,9 +19,20 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 manifest="$root/rust/office-automate-server/Cargo.toml"
-# cargo always writes here regardless of any deploy-path override below.
+# Deploy path — what launchd runs. Independent of where cargo actually builds;
+# see the CARGO_TARGET_DIR default below and why the two must stay decoupled.
 cargo_bin="$root/target/release/office-automate-server"
 binary="${OFFICE_AUTOMATE_SERVER_BIN:-$cargo_bin}"
+
+# Build into a target directory that is never the deploy path, so a build
+# whose signing later fails cannot have already clobbered $binary before we
+# know that. Persistent (not a fresh mktemp -d per run) so cargo's dependency
+# and incremental cache carries over between builds — forcing a clean
+# target-dir every time would turn every build into a full rebuild. Only used
+# as a default: an operator's own CARGO_TARGET_DIR, --target-dir, or --config
+# build.target-dir is respected untouched.
+: "${CARGO_TARGET_DIR:=$root/target-signing}"
+export CARGO_TARGET_DIR
 
 # The identity lives in the login keychain and is not in the repo. The
 # identifier and certificate root are pinned because both are load-bearing:
@@ -83,25 +94,31 @@ requirement_of() {
     || die "could not read a designated requirement from $1"
 }
 
+# Both take an optional path, defaulting to the deploy path $binary. The main
+# build flow passes an explicit temp path so it can sign/verify a candidate
+# before ever touching $binary; --verify-only calls these with no argument to
+# check the binary already deployed there.
 verify() {
-  [[ -x "$binary" ]] || die "no binary at $binary"
+  local target="${1:-$binary}"
+  [[ -x "$target" ]] || die "no binary at $target"
 
   # `codesign -d -r-` only reads the embedded designated requirement; it does
   # not confirm the signature is cryptographically valid over the file's
   # current contents. Without --verify, a binary edited or corrupted after
   # signing could still show a clean DR here and defeat the fail-closed check.
-  codesign --verify --strict "$binary" \
-    || die "signature on $binary does not verify (codesign --verify --strict failed).
+  codesign --verify --strict "$target" \
+    || die "signature on $target does not verify (codesign --verify --strict failed).
 The binary may have been modified after signing. Re-run scripts/build-server.sh."
 
   local dr
-  dr="$(requirement_of "$binary")"
+  dr="$(requirement_of "$target")"
   printf '%s\n' "$dr" | check_dr
-  printf 'build-server: signature verified\n  %s\n  %s\n' "$binary" "$dr"
+  printf 'build-server: signature verified\n  %s\n  %s\n' "$target" "$dr"
 }
 
 sign() {
-  codesign --force --sign "$identity" -i "$identifier" "$binary" \
+  local target="${1:-$binary}"
+  codesign --force --sign "$identity" -i "$identifier" "$target" \
     || die "codesign failed. If it reported 'no identity found', the certificate is
 missing or not trusted for the Code Signing policy. See $doc"
 }
@@ -122,20 +139,19 @@ command -v jq >/dev/null 2>&1 || die "jq is required to locate cargo's build out
 is_darwin=false
 [[ "$(uname -s)" == "Darwin" ]] && is_darwin=true
 
-# Determine signing availability before cargo runs. Otherwise a build that
-# turns out to be unsignable has already overwritten the deployed binary
-# (default path or --verify-only path) with an ad-hoc artifact by the time
-# the identity check fails, leaving Local Network readback broken despite
-# the script exiting nonzero — the exact silent-breakage this PR removes.
+# Fast-fail before invoking cargo at all when we can already tell signing
+# will not work. This is an optimization, not the safety net — cargo building
+# into an isolated target-dir plus the sign-a-temp-copy-then-atomically-move
+# sequence below is what actually guarantees $binary is never touched by a
+# build that turns out to be unsignable, including failure modes this check
+# cannot see in advance (a keychain-locked or ACL-denied private key, for
+# example).
 #
-# Matching on name alone is not enough: a regenerated certificate (or a
-# duplicate-named identity) can share the name while its root differs from
-# the pinned $cert_root, in which case name-only matching says "available"
-# but signing would produce a different TCC subject and fail verify() only
-# after cargo build has already overwritten the deployed binary. For a
-# self-signed identity, the SHA-1 `security find-identity` reports for it is
-# the same hash `codesign -d -r-` reports as its certificate root, so check
-# both before touching anything.
+# Matching on identity name alone is not enough: a regenerated certificate
+# (or a duplicate-named identity) can share the name while its root differs
+# from the pinned $cert_root. For a self-signed identity, the SHA-1
+# `security find-identity` reports for it is the same hash `codesign -d -r-`
+# reports as its certificate root, so check both.
 signing_available=false
 if $is_darwin; then
   identity_line="$(security find-identity -v -p codesigning 2>/dev/null | grep -F "\"$identity\"" || true)"
@@ -161,9 +177,11 @@ fi
 # CARGO_BUILD_TARGET_DIR/CARGO_BUILD_TARGET, and .cargo/config.toml can all
 # relocate cargo's output — enumerating every such override is an arms race
 # this script keeps losing. Reading cargo's own build-plan output cannot miss
-# a future one.
+# a future one. With our own CARGO_TARGET_DIR default above, this ordinarily
+# resolves under target-signing/, not under $binary's directory.
 json_log="$(mktemp)"
-trap 'rm -f "$json_log"' EXIT
+tmp_binary=""
+trap 'rm -f "$json_log" "${tmp_binary:-}"' EXIT
 
 cargo build --release --manifest-path "$manifest" --message-format=json-render-diagnostics "$@" \
   | tee "$json_log" \
@@ -181,19 +199,16 @@ built_bin="$(jq -r --arg pkg "office-automate-server" '
 [[ -n "$built_bin" && -x "$built_bin" ]] \
   || die "could not determine the built binary's path from cargo's output"
 
-# Deploy the binary cargo actually produced. $binary defaults to $cargo_bin,
-# which built_bin will equal for a plain build with no output override — but
-# never assume that; always deploy from what cargo reported.
-if [[ "$binary" != "$built_bin" ]]; then
-  cp -p "$built_bin" "$binary"
-fi
+mkdir -p "$(dirname "$binary")"
 
 if ! $is_darwin; then
+  cp -p "$built_bin" "$binary"
   printf 'build-server: not macOS, skipping code signing\n'
   exit 0
 fi
 
 if ! $signing_available; then
+  cp -p "$built_bin" "$binary"
   warn "signing identity \"$identity\" not found and OFFICE_AUTOMATE_ALLOW_UNSIGNED=1 is set.
   The binary is ad-hoc signed. ERV local readback WILL fail after restart until
   Local Network is granted to this build, and will break again on the next build.
@@ -201,5 +216,16 @@ if ! $signing_available; then
   exit 0
 fi
 
-sign
-verify
+# Sign and verify a copy, never $binary directly. If codesign fails for any
+# reason — including ones the preflight check above cannot predict, such as
+# the keychain being locked or the private key's access control denying a
+# non-interactive request — $binary is left exactly as it was: the previous,
+# already-signed, working deployment.
+tmp_binary="$(mktemp "$(dirname "$binary")/.office-automate-server.XXXXXX")"
+cp -p "$built_bin" "$tmp_binary"
+sign "$tmp_binary"
+verify "$tmp_binary"
+mv -f "$tmp_binary" "$binary"
+tmp_binary=""
+
+printf 'build-server: deployed\n  %s\n' "$binary"

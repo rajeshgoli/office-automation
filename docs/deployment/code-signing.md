@@ -118,16 +118,40 @@ $ codesign -d -r- target/release/office-automate-server
 Any incidental cargo invocation that touches the release profile is enough. This
 is why verification is a standing step rather than a build-time one.
 
-The script fails closed: if the signing identity is missing it stops **before
-running `cargo build`**, so the deployed binary is left untouched rather than
-overwritten with an ad-hoc artifact that a nonzero exit code would otherwise
-mask. `OFFICE_AUTOMATE_ALLOW_UNSIGNED=1` overrides this and warns loudly.
+The script fails closed in two layers:
 
-The script does not assume where cargo writes its output. `--target-dir`,
-`--target`, `--config build.target-dir=...`/`build.target=...`,
-`CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, and `.cargo/config.toml` can all
-relocate it, so the script reads cargo's own `--message-format=json` build
-output to find the actual executable path and deploys that. Requires `jq`.
+1. **Preflight.** If the signing identity is missing, or its certificate root
+   doesn't match the pinned `OFFICE_AUTOMATE_SIGNING_CERT_ROOT` (for example
+   because the certificate was regenerated), it stops before running `cargo
+   build` at all. This is a fast-fail optimization, not the full guarantee —
+   see the next point for why.
+2. **Isolated build, atomic deploy.** `cargo build` is never pointed at the
+   deploy path. By default it builds into `target-signing/`, a separate,
+   persistent directory next to `target/` — persistent so cargo's dependency
+   and incremental cache still speeds up successive builds, separate so a
+   build can fail or produce something unsignable without having touched the
+   binary launchd runs. The script then copies that output to a temp file
+   next to the deploy path, signs and verifies **the temp file**, and only
+   `mv`s it over the deployed binary once both succeed. A `codesign` failure
+   the preflight check can't predict — a locked keychain, or the private
+   key's access control denying a non-interactive request, for instance —
+   leaves the previously deployed, still-working binary untouched.
+
+`OFFICE_AUTOMATE_ALLOW_UNSIGNED=1` skips both of the above and deploys the
+ad-hoc build directly, warning loudly.
+
+An operator's own `CARGO_TARGET_DIR`, `--target-dir`, `--target`, or `--config
+build.target-dir=...`/`build.target=...` is respected untouched; the script
+only supplies its own `target-signing/` default when none of those is set.
+Whichever applies, the script reads cargo's own `--message-format=json` build
+output to find the actual executable path rather than assuming one — enumerating
+every way cargo's output location can be overridden (there is also
+`CARGO_BUILD_TARGET_DIR`/`CARGO_BUILD_TARGET` and `.cargo/config.toml`) is an
+arms race asking cargo directly avoids. Requires `jq`.
+
+`target-signing/` is gitignored and holds full release build artifacts, so
+expect it to roughly double the disk this repo's build output uses. It is
+safe to delete at any time; the next build recreates it, just slower.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
