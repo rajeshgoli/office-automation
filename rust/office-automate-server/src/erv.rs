@@ -34,6 +34,7 @@ const LOCAL_ACTIVITY_HISTORY_LIMIT: usize = 32;
 const LOCAL_FAILURE_RCA_THRESHOLD: u64 = 3;
 const LOCAL_WRITE_BURST_WINDOW_SECONDS: f64 = 5.0 * 60.0;
 const LOCAL_WRITE_BURST_ATTEMPT_LIMIT: usize = 3;
+const BOOT_RECOVERY_REASON: &str = "boot_unknown_state";
 pub const ERV_MANUAL_OVERRIDE_SECONDS: i64 = 30 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1421,7 +1422,9 @@ impl ErvState {
             // missing-scene state. A successful read says nothing about
             // whether the transport recovered or the scene hole was filled.
             let mut inner = self.inner.write().expect("ERV state lock poisoned");
-            inner.last_speed_changed_at = Some(unix_timestamp_now());
+            if !dwell_exempt(reason) {
+                inner.last_speed_changed_at = Some(unix_timestamp_now());
+            }
             inner.consecutive_scene_failures = 0;
             inner.next_write_retry_at = None;
 
@@ -1661,6 +1664,14 @@ fn write_burst_guard_exempt(reason: &str) -> bool {
     matches!(reason, "manual_override")
 }
 
+/// Dwell damps oscillation between *policy* speed decisions. Boot recovery is
+/// not one: it forces a known state the policy never asked for, so charging its
+/// timestamp to the dwell budget would suppress the first real decision for the
+/// whole window. The burst guard still bounds the device-facing write rate.
+fn dwell_exempt(reason: &str) -> bool {
+    matches!(reason, BOOT_RECOVERY_REASON)
+}
+
 fn push_local_activity_locked(inner: &mut ErvInner, activity: ErvLocalActivity) {
     while inner.recent_local_activity.len() >= LOCAL_ACTIVITY_HISTORY_LIMIT {
         inner.recent_local_activity.pop_front();
@@ -1804,7 +1815,7 @@ where
             writer,
             ErvFanSpeed::Off,
             false,
-            "boot_unknown_state",
+            BOOT_RECOVERY_REASON,
             None,
         )
         .await
@@ -3317,6 +3328,39 @@ mod tests {
             local.write_speeds().is_empty(),
             "a local path that just failed its read must not be used as a fallback"
         );
+    }
+
+    /// Boot recovery forces a state the policy never asked for, so it must not
+    /// spend the dwell budget. Otherwise the first real decision after startup
+    /// -- an AWAY ventilation command, or a PRESENT air-quality response -- is
+    /// suppressed for the whole dwell window while the ERV sits off.
+    #[tokio::test]
+    async fn boot_recovery_does_not_start_the_policy_dwell_timer() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path.clone());
+        let cloud = Arc::new(FakeCloud::default());
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(vec![Err(anyhow!(
+                "Connection reset by peer"
+            ))])),
+            None,
+        );
+
+        run_erv_boot_read(&app_config(scene_config()), &state, &writer).await;
+
+        assert_eq!(cloud.triggered_scenes(), vec!["off-scene".to_string()]);
+        assert!(
+            state.snapshot().last_speed_changed_at.is_none(),
+            "boot recovery charged its forced off to the dwell budget"
+        );
+
+        // It is still a real action and still logged as one.
+        let history = db::read_history(&database_path, 1, 20).expect("history");
+        assert_eq!(history.climate_actions[0]["action"], "off");
+        assert_eq!(history.climate_actions[0]["reason"], BOOT_RECOVERY_REASON);
     }
 
     /// Boot recovery must never overwrite a decision that has already landed.
