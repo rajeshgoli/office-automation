@@ -555,6 +555,14 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     )
     .context("failed to build HTTP app state")?;
     let app = router_from_state(app_state.clone());
+
+    // Establish ERV state before anything that can produce a policy decision.
+    // A retained MQTT reading or a YoLink event can command a speed the moment
+    // its client starts, and boot recovery would then overwrite that newer
+    // decision with the off scene and start the dwell timer from it -- leaving
+    // an away office unventilated until the dwell expires.
+    crate::erv::run_erv_boot_read(&config, &erv_state).await;
+
     let runtime_handle = tokio::runtime::Handle::current();
     let qingping_policy_trigger: mqtt::SensorIngressHook = Arc::new({
         let erv_automation = erv_automation.clone();
@@ -588,12 +596,6 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         Some(yolink_hvac_trigger),
     );
     let _door_grace_task = start_door_grace_policy_poll(app_state.clone(), erv_automation);
-    // One read at boot establishes true state; everything after is
-    // read-after-write. There is no status poll loop.
-    let _erv_boot_read = tokio::spawn({
-        let config = config.clone();
-        async move { crate::erv::run_erv_boot_read(&config, &erv_state).await }
-    });
     let _hvac_task = crate::hvac::start_hvac_status_poll(&config, hvac_state);
     let _presence_task = start_presence_poll(app_state);
 

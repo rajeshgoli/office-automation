@@ -1347,12 +1347,23 @@ impl ErvState {
     ) {
         self.record_status_success(device_status, report.source);
         {
-            // Only a landed write clears the write-path backoff. A successful
-            // read says nothing about whether the transport recovered.
+            // Only a landed write clears the write-path backoff and the
+            // missing-scene state. A successful read says nothing about
+            // whether the transport recovered or the scene hole was filled.
             let mut inner = self.inner.write().expect("ERV state lock poisoned");
             inner.last_speed_changed_at = Some(unix_timestamp_now());
             inner.consecutive_scene_failures = 0;
             inner.next_write_retry_at = None;
+
+            if inner.control.missing_scene.take().is_some()
+                && inner.notification.as_ref().is_some_and(|notification| {
+                    notification.notification_type == "erv_scene_missing"
+                })
+            {
+                // Clear the alert too, or clients keep showing a critical
+                // missing-scene notification after the scene is configured.
+                inner.notification = None;
+            }
         }
 
         if let Err(error) = db::log_climate_action(
@@ -1388,7 +1399,6 @@ impl ErvState {
             inner.control.status_source = source;
             inner.control.last_ok_at = Some(now.clone());
             inner.control.last_error = None;
-            inner.control.missing_scene = None;
             inner.control.using_cloud = source == ErvStatusSource::Cloud;
 
             if observed_locally {
@@ -1673,26 +1683,19 @@ fn sanitize_erv_error(message: &str) -> String {
 /// If the boot read fails and scenes can control the unit, force a known state
 /// by triggering the off scene rather than running blind.
 pub async fn run_erv_boot_read(config: &AppConfig, erv: &ErvState) {
-    // Gate on the selected transport, not on a complete scene matrix: the off
-    // scene is the one this needs, and a hole elsewhere in the matrix is no
-    // reason to leave a possibly-running ERV in an unknown state. A missing
-    // off scene fails loudly on its own.
-    let off_writer =
-        (config.erv.control_mode == ErvControlMode::Scene).then(|| build_erv_writer(config));
-    run_erv_boot_read_with(config, erv, &RustuyaErvStatusReader, off_writer.as_deref()).await;
+    run_erv_boot_read_with(config, erv, build_erv_writer(config).as_ref()).await;
 }
 
-pub(crate) async fn run_erv_boot_read_with<R, W>(
-    config: &AppConfig,
-    erv: &ErvState,
-    reader: &R,
-    off_writer: Option<&W>,
-) where
-    R: ErvStatusReader + ?Sized,
+/// The boot read goes through the *writer's* own read path, not a fresh
+/// reader, so a failure lands in that writer's local-health state. Otherwise a
+/// failed boot read followed by a failed off-scene trigger would find a
+/// pristine health gate and fire a local command at the path that just failed.
+pub(crate) async fn run_erv_boot_read_with<W>(config: &AppConfig, erv: &ErvState, writer: &W)
+where
     W: ErvSpeedWriter + ?Sized,
 {
     if config.erv.local_readback_active() {
-        match erv.refresh_with(&config.erv, reader).await {
+        match erv.smoke_status_with(&config.erv, writer).await {
             Ok(status) => {
                 tracing::info!(
                     "ERV boot read: running={} speed={}",
@@ -1710,15 +1713,26 @@ pub(crate) async fn run_erv_boot_read_with<R, W>(
         tracing::info!("ERV local readback is not configured; skipping the boot read");
     }
 
-    let Some(off_writer) = off_writer else { return };
-    if !config.erv.active_control_enabled {
+    // Gate on the selected transport, not on a complete scene matrix: the off
+    // scene is the one this needs, and a hole elsewhere in the matrix is no
+    // reason to leave a possibly-running ERV in an unknown state. A missing
+    // off scene fails loudly on its own.
+    if config.erv.control_mode != ErvControlMode::Scene || !config.erv.active_control_enabled {
+        return;
+    }
+
+    // Never overwrite a decision that has already been made. Callers are
+    // expected to run this before any policy input can arrive, but a forced
+    // off would be the wrong answer if one slipped through.
+    if erv.snapshot().last_speed_changed_at.is_some() {
+        tracing::info!("ERV boot recovery skipped; a speed was already commanded");
         return;
     }
 
     match erv
         .set_speed_with(
             &config.erv,
-            off_writer,
+            writer,
             ErvFanSpeed::Off,
             false,
             "boot_unknown_state",
@@ -3155,6 +3169,36 @@ mod tests {
             app_status.notifications[0].notification_type,
             "erv_scene_missing"
         );
+
+        // Once the scene is configured and a write lands, the critical alert
+        // has to go with it -- clearing only `missing_scene` would leave
+        // clients showing the alert forever.
+        let repaired = ErvConfig {
+            turbo_negative_pressure_scene_id: Some("turbo-np-scene".to_string()),
+            ..scene_config()
+        };
+        state
+            .set_speed_with(
+                &repaired,
+                &writer,
+                ErvFanSpeed::Turbo,
+                true,
+                "away_refresh",
+                None,
+            )
+            .await
+            .expect("write succeeds once the scene exists");
+
+        let mut app_status = Status::read_only_default(&app_config(repaired));
+        state.overlay_status(&mut app_status);
+        assert!(app_status.erv.control.missing_scene.is_none());
+        assert!(
+            app_status
+                .notifications
+                .iter()
+                .all(|notification| notification.notification_type != "erv_scene_missing"),
+            "a stale missing-scene alert survived recovery"
+        );
     }
 
     #[tokio::test]
@@ -3163,18 +3207,93 @@ mod tests {
         let database_path = temp_dir.path().join("office_climate.db");
         db::migrate_database(&database_path).expect("migration");
         let state = ErvState::new(database_path);
-        let reader = FakeErvReader::new(vec![Err(anyhow!("Connection reset by peer"))]);
         let cloud = Arc::new(FakeCloud::default());
         let writer = split_writer(
             cloud.clone(),
-            Arc::new(FakeErvReader::new(Vec::new())),
+            Arc::new(FakeErvReader::new(vec![Err(anyhow!(
+                "Connection reset by peer"
+            ))])),
             None,
         );
 
-        run_erv_boot_read_with(&app_config(scene_config()), &state, &reader, Some(&writer)).await;
+        run_erv_boot_read_with(&app_config(scene_config()), &state, &writer).await;
 
         assert_eq!(cloud.triggered_scenes(), vec!["off-scene".to_string()]);
         assert!(!state.snapshot().running);
+    }
+
+    /// The boot read must feed the writer's own local health. Otherwise a
+    /// failed boot read plus a failed off-scene trigger finds a pristine
+    /// health gate and fires a local command at the path that just failed --
+    /// the exact WAN-outage-plus-Err-914 case the gate exists for.
+    #[tokio::test]
+    async fn failed_boot_read_marks_local_unhealthy_for_the_fallback() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let cloud = Arc::new(FakeCloud::failing(1));
+        let local = Arc::new(FakeErvWriter::new(Vec::new(), vec![Ok(turbo_status())]));
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(vec![Err(anyhow!(
+                "Check device key or version (Error 914)"
+            ))])),
+            Some(local.clone()),
+        );
+
+        run_erv_boot_read_with(&app_config(scene_config()), &state, &writer).await;
+
+        assert!(
+            local.write_speeds().is_empty(),
+            "a local path that just failed its read must not be used as a fallback"
+        );
+    }
+
+    /// Boot recovery must never overwrite a decision that has already landed.
+    #[tokio::test]
+    async fn boot_recovery_yields_to_an_already_commanded_speed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let cloud = Arc::new(FakeCloud::default());
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(vec![
+                // Pre-write read: not at target, so the write actually goes.
+                Ok(medium_status()),
+                // Read-after-write.
+                Ok(turbo_status()),
+                // Boot read, which fails and would otherwise force off.
+                Err(anyhow!("Connection reset by peer")),
+            ])),
+            None,
+        );
+        let config = app_config(scene_config());
+
+        // A policy decision lands first.
+        state
+            .set_speed_with(
+                &config.erv,
+                &writer,
+                ErvFanSpeed::Turbo,
+                false,
+                "away_refresh",
+                None,
+            )
+            .await
+            .expect("policy write succeeds");
+        let triggered = cloud.triggered_scenes();
+
+        run_erv_boot_read_with(&config, &state, &writer).await;
+
+        assert_eq!(
+            cloud.triggered_scenes(),
+            triggered,
+            "boot recovery overwrote a newer policy decision"
+        );
+        assert_eq!(state.snapshot().speed, ErvFanSpeed::Turbo);
     }
 
     #[tokio::test]
@@ -3183,15 +3302,14 @@ mod tests {
         let database_path = temp_dir.path().join("office_climate.db");
         db::migrate_database(&database_path).expect("migration");
         let state = ErvState::new(database_path);
-        let reader = FakeErvReader::new(vec![Ok(medium_status())]);
         let cloud = Arc::new(FakeCloud::default());
         let writer = split_writer(
             cloud.clone(),
-            Arc::new(FakeErvReader::new(Vec::new())),
+            Arc::new(FakeErvReader::new(vec![Ok(medium_status())])),
             None,
         );
 
-        run_erv_boot_read_with(&app_config(scene_config()), &state, &reader, Some(&writer)).await;
+        run_erv_boot_read_with(&app_config(scene_config()), &state, &writer).await;
 
         assert!(cloud.triggered_scenes().is_empty());
         assert_eq!(state.snapshot().speed, ErvFanSpeed::Medium);
@@ -3258,17 +3376,13 @@ mod tests {
         let cloud = Arc::new(FakeCloud::default());
         let writer = split_writer(
             cloud.clone(),
-            Arc::new(FakeErvReader::new(Vec::new())),
+            Arc::new(FakeErvReader::new(vec![Err(anyhow!(
+                "Connection reset by peer"
+            ))])),
             None,
         );
 
-        run_erv_boot_read_with(
-            &config,
-            &state,
-            &FakeErvReader::new(vec![Err(anyhow!("Connection reset by peer"))]),
-            Some(&writer),
-        )
-        .await;
+        run_erv_boot_read_with(&config, &state, &writer).await;
 
         assert_eq!(cloud.triggered_scenes(), vec!["off-scene".to_string()]);
     }
