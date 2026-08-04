@@ -834,8 +834,14 @@ impl AppConfig {
                 parse_bool_env("OFFICE_AUTOMATE_ERV_LOCAL_WRITE_FALLBACK_ENABLED", &enabled)?;
         }
 
-        if let Some(client_id) = env_lookup("OFFICE_AUTOMATE_SMART_LIFE_CLIENT_ID") {
-            file_config.smart_life.client_id = client_id;
+        // Trim and ignore blanks, matching scripts/refresh-erv-key.py exactly.
+        // Secret and env injection routinely produce padded or empty values,
+        // and disagreeing about them here would have the script authorize with
+        // one app key while the server signed requests with another.
+        if let Some(client_id) = env_lookup("OFFICE_AUTOMATE_SMART_LIFE_CLIENT_ID")
+            && !client_id.trim().is_empty()
+        {
+            file_config.smart_life.client_id = client_id.trim().to_string();
         }
 
         if let Some(ip) = env_lookup("OFFICE_AUTOMATE_BLINDS_IP") {
@@ -1256,6 +1262,34 @@ smart_life:
             config.erv.turbo_negative_pressure_scene_id.as_deref(),
             Some("env-turbo-np")
         );
+    }
+
+    /// The server and `scripts/refresh-erv-key.py` must resolve the client id
+    /// identically, including how they treat padded and blank env values --
+    /// disagreeing means one authorizes with a different app key than the
+    /// other signs with.
+    #[test]
+    fn smart_life_client_id_env_is_trimmed_and_blank_is_ignored() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.yaml");
+        fs::write(&config_path, "smart_life:\n  client_id: \"HA_from_yaml\"\n")
+            .expect("write config");
+
+        let load = |client_id: Option<&str>| {
+            AppConfig::load_with_env(&config_path, |key| match key {
+                "OFFICE_AUTOMATE_ROOT" => Some(temp_dir.path().display().to_string()),
+                "OFFICE_AUTOMATE_SMART_LIFE_CLIENT_ID" => client_id.map(str::to_string),
+                _ => None,
+            })
+            .expect("load config")
+            .smart_life
+            .client_id
+        };
+
+        assert_eq!(load(None), "HA_from_yaml");
+        assert_eq!(load(Some("  HA_from_env  ")), "HA_from_env");
+        assert_eq!(load(Some("   ")), "HA_from_yaml");
+        assert_eq!(load(Some("")), "HA_from_yaml");
     }
 
     /// The intended defaults live in code, not only in the deployed YAML.
