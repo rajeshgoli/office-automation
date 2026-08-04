@@ -3,6 +3,7 @@ config.yaml
 
 # Rust
 target/
+target-signing/
 
 # Tuya local key / Smart Life auth material
 tuya-sharing-auth.json

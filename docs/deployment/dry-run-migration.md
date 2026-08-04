@@ -31,11 +31,13 @@ Cloudflare Tunnel credentials stay in the `cloudflared` config and credential fi
 
 ## Snapshot Command
 
-Build the Rust binary, then run:
+Build the Rust binary via `scripts/build-server.sh`, not a bare
+`cargo build --release` — see [code-signing.md](code-signing.md) — then run:
 
 ```bash
-cargo build --manifest-path rust/office-automate-server/Cargo.toml --release
-./target/release/office-automate-server snapshot \
+scripts/build-server.sh
+server_bin="${OFFICE_AUTOMATE_SERVER_BIN:-target/release/office-automate-server}"
+"$server_bin" snapshot \
   --config "$OFFICE_AUTOMATE_CONFIG" \
   --output-dir "$OFFICE_AUTOMATE_SNAPSHOT_DIR" \
   --cloudflared-config "$CLOUDFLARED_CONFIG"
@@ -87,8 +89,8 @@ For rollback rehearsal, restore from the snapshot into a temporary directory, so
 
 ```bash
 source /absolute/path/to/restored-snapshot/restore-env.sh
-./target/release/office-automate-server migrate --config "$OFFICE_AUTOMATE_CONFIG"
-./target/release/office-automate-server collect --config "$OFFICE_AUTOMATE_CONFIG" telemetry --dry-run
+"$server_bin" migrate --config "$OFFICE_AUTOMATE_CONFIG"
+"$server_bin" collect --config "$OFFICE_AUTOMATE_CONFIG" telemetry --dry-run
 cloudflared tunnel ingress validate --config "$CLOUDFLARED_CONFIG"
 ```
 

@@ -37,11 +37,16 @@ cd android
 ./gradlew --dependency-verification=strict :app:assembleDebug
 cd ..
 
-cargo build --locked --manifest-path rust/office-automate-server/Cargo.toml --release
-scripts/security/release-provenance.sh target/release/office-automate-server
+scripts/build-server.sh --locked
+scripts/security/release-provenance.sh "${OFFICE_AUTOMATE_SERVER_BIN:-target/release/office-automate-server}"
 ```
 
 The provenance script fails if tracked files are dirty and prints the commit, commit date, artifact size, and SHA-256.
+
+`scripts/build-server.sh` passes its arguments through to `cargo build --release` and
+adds the code-signing step described in [code-signing.md](code-signing.md). Note that
+the recorded SHA-256 covers the signed artifact, so it changes when the signature is
+reapplied even if the compiled code is identical.
 
 ## Rust Dependency Review
 

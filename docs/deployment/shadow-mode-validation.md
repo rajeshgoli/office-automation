@@ -39,13 +39,19 @@ Do not run this validation with active-control flags enabled.
 Build the Rust binary:
 
 ```bash
-cargo build --manifest-path rust/office-automate-server/Cargo.toml --release
+scripts/build-server.sh
+server_bin="${OFFICE_AUTOMATE_SERVER_BIN:-target/release/office-automate-server}"
 ```
+
+`scripts/build-server.sh` wraps `cargo build --release` with the code-signing step
+that keeps the binary's macOS Local Network grant alive across rebuilds. A bare
+`cargo build --release` silently breaks ERV local readback — see
+[code-signing.md](code-signing.md).
 
 Start the Rust server on a non-production port:
 
 ```bash
-./target/release/office-automate-server serve \
+"$server_bin" serve \
   --config "$OFFICE_AUTOMATE_CONFIG"
 ```
 
@@ -115,7 +121,7 @@ The evidence file must not contain API tokens, service-token secrets, tunnel cre
 Run the Rust validation command:
 
 ```bash
-./target/release/office-automate-server validate \
+"$server_bin" validate \
   --config "$OFFICE_AUTOMATE_CONFIG" \
   shadow \
   --base-url "$OFFICE_AUTOMATE_SHADOW_BASE_URL" \

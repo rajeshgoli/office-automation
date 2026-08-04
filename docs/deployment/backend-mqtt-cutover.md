@@ -44,12 +44,14 @@ Do not run `office-automate-server serve` with those flags while the Python acti
 
 ## Cutover Sequence
 
-Build and run final preflight checks:
+Build and run final preflight checks. Build via `scripts/build-server.sh`, not a
+bare `cargo build --release` — see [code-signing.md](code-signing.md).
 
 ```bash
-cargo build --manifest-path rust/office-automate-server/Cargo.toml --release
-./target/release/office-automate-server migrate --config "$OFFICE_AUTOMATE_CONFIG"
-./target/release/office-automate-server smoke --config "$OFFICE_AUTOMATE_CONFIG"
+scripts/build-server.sh
+server_bin="${OFFICE_AUTOMATE_SERVER_BIN:-target/release/office-automate-server}"
+"$server_bin" migrate --config "$OFFICE_AUTOMATE_CONFIG"
+"$server_bin" smoke --config "$OFFICE_AUTOMATE_CONFIG"
 cloudflared tunnel ingress validate --config "$CLOUDFLARED_CONFIG"
 ```
 
@@ -79,7 +81,7 @@ Apply the selected MQTT feed strategy:
 Start the Rust backend and Cloudflare Tunnel services with launchd or the equivalent foreground commands:
 
 ```bash
-./target/release/office-automate-server serve --config "$OFFICE_AUTOMATE_CONFIG"
+"$server_bin" serve --config "$OFFICE_AUTOMATE_CONFIG"
 cloudflared tunnel --config "$CLOUDFLARED_CONFIG" run "$CLOUDFLARED_TUNNEL"
 ```
 
@@ -88,7 +90,7 @@ cloudflared tunnel --config "$CLOUDFLARED_CONFIG" run "$CLOUDFLARED_TUNNEL"
 Run cutover validation after Rust is the only active climate controller:
 
 ```bash
-./target/release/office-automate-server validate \
+"$server_bin" validate \
   --config "$OFFICE_AUTOMATE_CONFIG" \
   cutover \
   --base-url "$OFFICE_AUTOMATE_CUTOVER_BASE_URL" \
