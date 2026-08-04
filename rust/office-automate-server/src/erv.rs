@@ -395,6 +395,16 @@ impl SplitErvWriter {
             .is_none_or(|retry_at| unix_timestamp_now() >= retry_at)
     }
 
+    #[cfg(test)]
+    fn clear_local_backoff_for_test(&self) {
+        self.state().local_retry_at = None;
+    }
+
+    #[cfg(test)]
+    fn local_failure_count_for_test(&self) -> u64 {
+        self.state().consecutive_local_failures
+    }
+
     fn record_local_outcome(&self, succeeded: bool) {
         let mut state = self.state();
         if succeeded {
@@ -576,6 +586,13 @@ impl ErvSpeedWriter for SplitErvWriter {
                             tracing::warn!(
                                 "ERV scene trigger failed ({error:#}); wrote locally instead"
                             );
+                            // The local path demonstrably works. Without this
+                            // the old failure count survives, so the next
+                            // intermittent failure resumes the exponential
+                            // backoff where it left off and can disable the
+                            // fallback for an hour despite writes succeeding
+                            // in between.
+                            self.record_local_outcome(true);
                             let report = self
                                 .fallback
                                 .as_ref()
@@ -3846,6 +3863,55 @@ mod tests {
         run_erv_boot_read(&config, &state, &writer).await;
 
         assert_eq!(cloud.triggered_scenes(), vec!["off-scene".to_string()]);
+    }
+
+    /// A fallback write that lands proves local works, so the failure count
+    /// behind the backoff curve has to reset. Otherwise the next intermittent
+    /// failure resumes the exponential climb and can disable the fallback for
+    /// an hour despite successful local writes in between.
+    #[tokio::test]
+    async fn successful_fallback_write_resets_local_health() {
+        let cloud = Arc::new(FakeCloud::failing(3));
+        let local = Arc::new(FakeErvWriter::new(
+            Vec::new(),
+            vec![Ok(turbo_status()), Ok(turbo_status())],
+        ));
+        let writer = split_writer(
+            cloud.clone(),
+            // One failed read to put a failure on the books, then successes.
+            Arc::new(FakeErvReader::new(vec![Err(anyhow!(
+                "Connection reset by peer"
+            ))])),
+            Some(local.clone()),
+        );
+        let config = ErvConfig {
+            local_readback_enabled: false,
+            ..scene_config()
+        };
+
+        // Seed a local failure, then let the backoff lapse.
+        assert!(
+            writer
+                .set_speed(&config, ErvFanSpeed::Turbo, false)
+                .await
+                .is_ok()
+        );
+        assert_eq!(local.write_speeds().len(), 1);
+        writer.clear_local_backoff_for_test();
+
+        // A second fallback write after the reset must still be attempted.
+        assert!(
+            writer
+                .set_speed(&config, ErvFanSpeed::Turbo, false)
+                .await
+                .is_ok()
+        );
+        assert_eq!(local.write_speeds().len(), 2);
+        assert_eq!(
+            writer.local_failure_count_for_test(),
+            0,
+            "a landed local write left the old failure count in place"
+        );
     }
 
     /// A failed fallback write means local is not usable either. Leaving it

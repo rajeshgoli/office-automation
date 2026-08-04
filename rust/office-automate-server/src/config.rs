@@ -778,6 +778,43 @@ impl AppConfig {
             file_config.erv.smart_life_home_id = Some(home_id);
         }
 
+        // The whole matrix, not just the home id: a partial set would look like
+        // env configuration works while every write failed on a missing scene.
+        for (variable, target) in [
+            (
+                "OFFICE_AUTOMATE_ERV_OFF_SCENE_ID",
+                &mut file_config.erv.off_scene_id,
+            ),
+            (
+                "OFFICE_AUTOMATE_ERV_QUIET_SCENE_ID",
+                &mut file_config.erv.quiet_scene_id,
+            ),
+            (
+                "OFFICE_AUTOMATE_ERV_MEDIUM_SCENE_ID",
+                &mut file_config.erv.medium_scene_id,
+            ),
+            (
+                "OFFICE_AUTOMATE_ERV_TURBO_SCENE_ID",
+                &mut file_config.erv.turbo_scene_id,
+            ),
+            (
+                "OFFICE_AUTOMATE_ERV_QUIET_NEGATIVE_PRESSURE_SCENE_ID",
+                &mut file_config.erv.quiet_negative_pressure_scene_id,
+            ),
+            (
+                "OFFICE_AUTOMATE_ERV_MEDIUM_NEGATIVE_PRESSURE_SCENE_ID",
+                &mut file_config.erv.medium_negative_pressure_scene_id,
+            ),
+            (
+                "OFFICE_AUTOMATE_ERV_TURBO_NEGATIVE_PRESSURE_SCENE_ID",
+                &mut file_config.erv.turbo_negative_pressure_scene_id,
+            ),
+        ] {
+            if let Some(scene_id) = env_lookup(variable) {
+                *target = Some(scene_id);
+            }
+        }
+
         if let Some(mode) = env_lookup("OFFICE_AUTOMATE_ERV_CONTROL_MODE") {
             file_config.erv.control_mode = parse_erv_control_mode(&mode)?;
         }
@@ -1162,6 +1199,58 @@ smart_life:
         assert!(config.erv.local_write_fallback_enabled);
         assert_eq!(config.erv.smart_life_home_id(), Some("8171319"));
         assert_eq!(config.smart_life.client_id, "HA_custom_client");
+    }
+
+    /// An env-configured scene deployment must be able to supply the whole
+    /// matrix. A partial set would look like env configuration works while
+    /// every write failed on a missing scene.
+    #[test]
+    fn env_overrides_cover_the_whole_erv_scene_matrix() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.yaml");
+        fs::write(&config_path, "erv:\n  type: \"tuya\"\n").expect("write config");
+
+        let config = AppConfig::load_with_env(&config_path, |key| match key {
+            "OFFICE_AUTOMATE_ROOT" => Some(temp_dir.path().display().to_string()),
+            "OFFICE_AUTOMATE_ERV_SMART_LIFE_HOME_ID" => Some("env-home".to_string()),
+            "OFFICE_AUTOMATE_ERV_OFF_SCENE_ID" => Some("env-off".to_string()),
+            "OFFICE_AUTOMATE_ERV_QUIET_SCENE_ID" => Some("env-quiet".to_string()),
+            "OFFICE_AUTOMATE_ERV_MEDIUM_SCENE_ID" => Some("env-medium".to_string()),
+            "OFFICE_AUTOMATE_ERV_TURBO_SCENE_ID" => Some("env-turbo".to_string()),
+            "OFFICE_AUTOMATE_ERV_QUIET_NEGATIVE_PRESSURE_SCENE_ID" => {
+                Some("env-quiet-np".to_string())
+            }
+            "OFFICE_AUTOMATE_ERV_MEDIUM_NEGATIVE_PRESSURE_SCENE_ID" => {
+                Some("env-medium-np".to_string())
+            }
+            "OFFICE_AUTOMATE_ERV_TURBO_NEGATIVE_PRESSURE_SCENE_ID" => {
+                Some("env-turbo-np".to_string())
+            }
+            _ => None,
+        })
+        .expect("load config");
+
+        assert!(
+            config.erv.scene_configured(),
+            "an env-only scene deployment could not be configured"
+        );
+        assert_eq!(config.erv.smart_life_home_id(), Some("env-home"));
+        assert_eq!(config.erv.off_scene_id.as_deref(), Some("env-off"));
+        assert_eq!(config.erv.quiet_scene_id.as_deref(), Some("env-quiet"));
+        assert_eq!(config.erv.medium_scene_id.as_deref(), Some("env-medium"));
+        assert_eq!(config.erv.turbo_scene_id.as_deref(), Some("env-turbo"));
+        assert_eq!(
+            config.erv.quiet_negative_pressure_scene_id.as_deref(),
+            Some("env-quiet-np")
+        );
+        assert_eq!(
+            config.erv.medium_negative_pressure_scene_id.as_deref(),
+            Some("env-medium-np")
+        );
+        assert_eq!(
+            config.erv.turbo_negative_pressure_scene_id.as_deref(),
+            Some("env-turbo-np")
+        );
     }
 
     /// The intended defaults live in code, not only in the deployed YAML.
