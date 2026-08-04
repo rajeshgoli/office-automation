@@ -49,8 +49,9 @@ bare `cargo build --release` — see [code-signing.md](code-signing.md).
 
 ```bash
 scripts/build-server.sh
-./target/release/office-automate-server migrate --config "$OFFICE_AUTOMATE_CONFIG"
-./target/release/office-automate-server smoke --config "$OFFICE_AUTOMATE_CONFIG"
+server_bin="${OFFICE_AUTOMATE_SERVER_BIN:-target/release/office-automate-server}"
+"$server_bin" migrate --config "$OFFICE_AUTOMATE_CONFIG"
+"$server_bin" smoke --config "$OFFICE_AUTOMATE_CONFIG"
 cloudflared tunnel ingress validate --config "$CLOUDFLARED_CONFIG"
 ```
 

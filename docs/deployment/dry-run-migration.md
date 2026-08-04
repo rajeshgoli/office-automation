@@ -36,7 +36,8 @@ Build the Rust binary via `scripts/build-server.sh`, not a bare
 
 ```bash
 scripts/build-server.sh
-./target/release/office-automate-server snapshot \
+server_bin="${OFFICE_AUTOMATE_SERVER_BIN:-target/release/office-automate-server}"
+"$server_bin" snapshot \
   --config "$OFFICE_AUTOMATE_CONFIG" \
   --output-dir "$OFFICE_AUTOMATE_SNAPSHOT_DIR" \
   --cloudflared-config "$CLOUDFLARED_CONFIG"

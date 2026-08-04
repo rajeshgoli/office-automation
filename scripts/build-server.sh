@@ -127,15 +127,33 @@ is_darwin=false
 # (default path or --verify-only path) with an ad-hoc artifact by the time
 # the identity check fails, leaving Local Network readback broken despite
 # the script exiting nonzero — the exact silent-breakage this PR removes.
+#
+# Matching on name alone is not enough: a regenerated certificate (or a
+# duplicate-named identity) can share the name while its root differs from
+# the pinned $cert_root, in which case name-only matching says "available"
+# but signing would produce a different TCC subject and fail verify() only
+# after cargo build has already overwritten the deployed binary. For a
+# self-signed identity, the SHA-1 `security find-identity` reports for it is
+# the same hash `codesign -d -r-` reports as its certificate root, so check
+# both before touching anything.
 signing_available=false
-if $is_darwin && security find-identity -v -p codesigning 2>/dev/null | grep -qF "\"$identity\""; then
-  signing_available=true
+if $is_darwin; then
+  identity_line="$(security find-identity -v -p codesigning 2>/dev/null | grep -F "\"$identity\"" || true)"
+  # grep exits 1 on no match, e.g. when identity_line is empty; that is an
+  # expected outcome here (identity not found), not a script-ending error.
+  identity_hash="$(printf '%s' "$identity_line" | grep -oE '[0-9A-Fa-f]{40}' | tr 'A-F' 'a-f' || true)"
+  if [[ -n "$identity_line" && "$identity_hash" == "$cert_root" ]]; then
+    signing_available=true
+  fi
 fi
 
 if $is_darwin && ! $signing_available && [[ "${OFFICE_AUTOMATE_ALLOW_UNSIGNED:-}" != "1" ]]; then
-  die "signing identity \"$identity\" not found in the keychain.
-Create and trust it once, per $doc, or set OFFICE_AUTOMATE_ALLOW_UNSIGNED=1 to
-build an unsigned binary and accept broken ERV local readback."
+  die "no keychain identity named \"$identity\" with certificate root $cert_root was found.
+Either the identity is missing, or it was regenerated and no longer matches
+OFFICE_AUTOMATE_SIGNING_CERT_ROOT. Create and trust it once per $doc, update
+OFFICE_AUTOMATE_SIGNING_CERT_ROOT to the new root and re-grant Local Network,
+or set OFFICE_AUTOMATE_ALLOW_UNSIGNED=1 to build unsigned and accept broken
+ERV local readback."
 fi
 
 # Ask cargo where it actually put the binary rather than assuming $cargo_bin.

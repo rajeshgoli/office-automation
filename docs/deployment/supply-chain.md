@@ -38,7 +38,7 @@ cd android
 cd ..
 
 scripts/build-server.sh --locked
-scripts/security/release-provenance.sh target/release/office-automate-server
+scripts/security/release-provenance.sh "${OFFICE_AUTOMATE_SERVER_BIN:-target/release/office-automate-server}"
 ```
 
 The provenance script fails if tracked files are dirty and prints the commit, commit date, artifact size, and SHA-256.
