@@ -117,6 +117,44 @@ case "${1:-}" in
     ;;
 esac
 
+# cargo_bin is hard-coded, so any option or env var that moves cargo's own
+# output elsewhere would make this script sign/deploy a stale leftover binary
+# instead of the one just built. Refuse rather than guess.
+for arg in "$@"; do
+  case "$arg" in
+    --target-dir|--target-dir=*|--target|--target=*)
+      die "scripts/build-server.sh does not support $arg: cargo would write the binary
+somewhere other than $cargo_bin, and this script would then sign whatever stale
+artifact was already at that path. Build and sign manually if you need a
+different Cargo output location."
+      ;;
+  esac
+done
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+  die "CARGO_TARGET_DIR is set ($CARGO_TARGET_DIR): cargo would write the binary there
+instead of $cargo_bin, and this script would sign a stale artifact. Unset it
+before running scripts/build-server.sh, or build and sign manually."
+fi
+
+is_darwin=false
+[[ "$(uname -s)" == "Darwin" ]] && is_darwin=true
+
+# Determine signing availability before cargo runs. Otherwise a build that
+# turns out to be unsignable has already overwritten the deployed binary
+# (default path or --verify-only path) with an ad-hoc artifact by the time
+# the identity check fails, leaving Local Network readback broken despite
+# the script exiting nonzero — the exact silent-breakage this PR removes.
+signing_available=false
+if $is_darwin && security find-identity -v -p codesigning 2>/dev/null | grep -qF "\"$identity\""; then
+  signing_available=true
+fi
+
+if $is_darwin && ! $signing_available && [[ "${OFFICE_AUTOMATE_ALLOW_UNSIGNED:-}" != "1" ]]; then
+  die "signing identity \"$identity\" not found in the keychain.
+Create and trust it once, per $doc, or set OFFICE_AUTOMATE_ALLOW_UNSIGNED=1 to
+build an unsigned binary and accept broken ERV local readback."
+fi
+
 cargo build --release --manifest-path "$manifest" "$@"
 
 # If OFFICE_AUTOMATE_SERVER_BIN points somewhere other than cargo's own output
@@ -127,22 +165,17 @@ if [[ "$binary" != "$cargo_bin" ]]; then
   cp -p "$cargo_bin" "$binary"
 fi
 
-if [[ "$(uname -s)" != "Darwin" ]]; then
+if ! $is_darwin; then
   printf 'build-server: not macOS, skipping code signing\n'
   exit 0
 fi
 
-if ! security find-identity -v -p codesigning 2>/dev/null | grep -qF "\"$identity\""; then
-  if [[ "${OFFICE_AUTOMATE_ALLOW_UNSIGNED:-}" == "1" ]]; then
-    warn "signing identity \"$identity\" not found and OFFICE_AUTOMATE_ALLOW_UNSIGNED=1 is set.
+if ! $signing_available; then
+  warn "signing identity \"$identity\" not found and OFFICE_AUTOMATE_ALLOW_UNSIGNED=1 is set.
   The binary is ad-hoc signed. ERV local readback WILL fail after restart until
   Local Network is granted to this build, and will break again on the next build.
   See $doc"
-    exit 0
-  fi
-  die "signing identity \"$identity\" not found in the keychain.
-Create and trust it once, per $doc, or set OFFICE_AUTOMATE_ALLOW_UNSIGNED=1 to
-build an unsigned binary and accept broken ERV local readback."
+  exit 0
 fi
 
 sign

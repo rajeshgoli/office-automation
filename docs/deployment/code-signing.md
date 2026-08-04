@@ -118,9 +118,16 @@ $ codesign -d -r- target/release/office-automate-server
 Any incidental cargo invocation that touches the release profile is enough. This
 is why verification is a standing step rather than a build-time one.
 
-The script fails closed: if the signing identity is missing it stops rather than
-deploying a binary that will lose the grant. `OFFICE_AUTOMATE_ALLOW_UNSIGNED=1`
-overrides this and warns loudly.
+The script fails closed: if the signing identity is missing it stops **before
+running `cargo build`**, so the deployed binary is left untouched rather than
+overwritten with an ad-hoc artifact that a nonzero exit code would otherwise
+mask. `OFFICE_AUTOMATE_ALLOW_UNSIGNED=1` overrides this and warns loudly.
+
+`--target-dir`, `--target`, and a `CARGO_TARGET_DIR` in the environment are
+rejected. Cargo would then write the binary somewhere other than
+`target/release/office-automate-server`, and this script would sign whatever
+stale artifact was already at the expected path instead of the one just built.
+Build and sign such a binary by hand if you need it.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
