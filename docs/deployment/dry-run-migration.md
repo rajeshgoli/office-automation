@@ -89,8 +89,8 @@ For rollback rehearsal, restore from the snapshot into a temporary directory, so
 
 ```bash
 source /absolute/path/to/restored-snapshot/restore-env.sh
-./target/release/office-automate-server migrate --config "$OFFICE_AUTOMATE_CONFIG"
-./target/release/office-automate-server collect --config "$OFFICE_AUTOMATE_CONFIG" telemetry --dry-run
+"$server_bin" migrate --config "$OFFICE_AUTOMATE_CONFIG"
+"$server_bin" collect --config "$OFFICE_AUTOMATE_CONFIG" telemetry --dry-run
 cloudflared tunnel ingress validate --config "$CLOUDFLARED_CONFIG"
 ```
 

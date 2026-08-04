@@ -201,14 +201,22 @@ built_bin="$(jq -r --arg pkg "office-automate-server" '
 
 mkdir -p "$(dirname "$binary")"
 
+# built_bin and binary can be the same file (no signing on this platform, or
+# --target-dir/--config pointed cargo straight at the deploy path), in which
+# case cargo already left the right bytes there and `cp` would fail with
+# "are the same file".
+deploy_unsigned() {
+  [[ "$built_bin" -ef "$binary" ]] || cp -p "$built_bin" "$binary"
+}
+
 if ! $is_darwin; then
-  cp -p "$built_bin" "$binary"
+  deploy_unsigned
   printf 'build-server: not macOS, skipping code signing\n'
   exit 0
 fi
 
 if ! $signing_available; then
-  cp -p "$built_bin" "$binary"
+  deploy_unsigned
   warn "signing identity \"$identity\" not found and OFFICE_AUTOMATE_ALLOW_UNSIGNED=1 is set.
   The binary is ad-hoc signed. ERV local readback WILL fail after restart until
   Local Network is granted to this build, and will break again on the next build.
