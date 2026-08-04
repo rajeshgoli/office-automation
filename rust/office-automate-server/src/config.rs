@@ -359,6 +359,18 @@ impl ErvConfig {
         self.control_mode == ErvControlMode::Scene && self.scene_configured()
     }
 
+    /// True when *some* transport could carry a write.
+    ///
+    /// Deliberately weaker than [`Self::is_configured`]: scene control needs
+    /// only a home id here, because which individual scene is missing is the
+    /// writer's diagnostic to make. Gating writes on the complete matrix would
+    /// reject a boot recovery that only needs the off scene, and would turn a
+    /// precise missing-scene error into a vague "config incomplete".
+    pub fn write_transport_configured(&self) -> bool {
+        self.local_tuya_configured()
+            || (self.device_type == "tuya" && self.smart_life_home_id().is_some())
+    }
+
     /// True when local reads are both wanted and possible.
     pub fn local_readback_active(&self) -> bool {
         self.local_readback_enabled && self.local_tuya_configured()

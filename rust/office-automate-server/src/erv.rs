@@ -109,6 +109,16 @@ pub trait ErvSpeedWriter: Send + Sync {
     fn last_write_report(&self) -> ErvWriteReport {
         ErvWriteReport::default()
     }
+
+    /// Error text from the most recent local readback attempt, if it failed.
+    ///
+    /// Nothing polls any more, so a read-after-write is often the only local
+    /// read that happens. Without reporting it, a local key that dies after a
+    /// good boot read would fail every verification while `local_key_invalid`
+    /// and the degraded-readback notification stayed clear forever.
+    fn last_readback_failure(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Which transport issued a write.
@@ -306,6 +316,9 @@ struct SplitWriterState {
     /// enough to be used as a write fallback.
     consecutive_local_failures: u64,
     local_retry_at: Option<f64>,
+    /// Surfaced to the state layer so local-key health stays accurate now
+    /// that nothing polls. Cleared by a successful read.
+    readback_failure: Option<String>,
 }
 
 /// Splits the two transports by direction: writes go out over `writer` (the
@@ -401,8 +414,13 @@ impl SplitErvWriter {
     async fn read_local(&self, config: &ErvConfig) -> Result<ErvDeviceStatus> {
         let result = self.reader.read_status(config).await;
         self.record_local_outcome(result.is_ok());
-        if let Ok(status) = &result {
-            self.state().last_known_power = Some(status.power);
+        match &result {
+            Ok(status) => {
+                let mut state = self.state();
+                state.last_known_power = Some(status.power);
+                state.readback_failure = None;
+            }
+            Err(error) => self.state().readback_failure = Some(format!("{error:#}")),
         }
         result
     }
@@ -601,6 +619,10 @@ impl ErvSpeedWriter for SplitErvWriter {
     fn last_write_report(&self) -> ErvWriteReport {
         self.state().report
     }
+
+    fn last_readback_failure(&self) -> Option<String> {
+        self.state().readback_failure.clone()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -776,7 +798,7 @@ impl ErvState {
         if !config.active_control_enabled {
             bail!("ERV active control is disabled");
         }
-        if !config.is_configured() {
+        if !config.write_transport_configured() {
             bail!("ERV control config is incomplete");
         }
 
@@ -840,7 +862,7 @@ impl ErvState {
         if !config.active_control_enabled {
             bail!("ERV active control is disabled");
         }
-        if !config.is_configured() {
+        if !config.write_transport_configured() {
             bail!("ERV control config is incomplete");
         }
 
@@ -905,6 +927,15 @@ impl ErvState {
                 } else {
                     self.record_status_success(status.clone(), report.source);
                     self.record_write_unverified(status.clone(), report, speed, reason, co2_ppm);
+                    self.notify_status();
+                }
+
+                // A read-after-write is often the only local read that happens
+                // now that nothing polls, so its failure has to reach the
+                // health counters or a dying local key would never be noticed.
+                if let Some(message) = writer.last_readback_failure()
+                    && self.record_read_only_local_failure(config, &message)
+                {
                     self.notify_status();
                 }
                 Ok(status)
@@ -988,7 +1019,7 @@ impl ErvState {
     where
         W: ErvSpeedWriter + ?Sized,
     {
-        if !config.is_configured() {
+        if !config.write_transport_configured() {
             bail!("ERV control config is incomplete");
         }
 
@@ -1379,10 +1410,12 @@ impl ErvState {
     /// A `(speed, pressure)` pair with no configured scene is a configuration
     /// hole, not a transient failure: surface it instead of letting it look
     /// like an ordinary cloud error.
+    ///
+    /// A hole stays reported until a write actually lands. An unrelated failure
+    /// -- a WAN outage on a configured scene, say -- is no evidence that anyone
+    /// went and built the missing scene, so it must not clear this.
     fn record_missing_scene(&self, error: &anyhow::Error) {
         let Some(missing) = error.downcast_ref::<MissingSceneError>() else {
-            let mut inner = self.inner.write().expect("ERV state lock poisoned");
-            inner.control.missing_scene = None;
             return;
         };
 
@@ -1428,13 +1461,15 @@ impl ErvState {
             inner.consecutive_scene_failures = 0;
             inner.next_write_retry_at = None;
 
-            if inner.control.missing_scene.take().is_some()
-                && inner.notification.as_ref().is_some_and(|notification| {
-                    notification.notification_type == "erv_scene_missing"
-                })
+            // Clear the alert alongside the flag, and independently of it, so
+            // neither piece can be stranded: a stale critical missing-scene
+            // notification would otherwise pin itself on clients forever.
+            inner.control.missing_scene = None;
+            if inner
+                .notification
+                .as_ref()
+                .is_some_and(|notification| notification.notification_type == "erv_scene_missing")
             {
-                // Clear the alert too, or clients keep showing a critical
-                // missing-scene notification after the scene is configured.
                 inner.notification = None;
             }
         }
@@ -3426,6 +3461,147 @@ mod tests {
 
         assert!(cloud.triggered_scenes().is_empty());
         assert_eq!(state.snapshot().speed, ErvFanSpeed::Medium);
+    }
+
+    /// Nothing polls any more, so a failed read-after-write is often the only
+    /// evidence that the local key has died. It has to reach the health
+    /// counters, or `local_key_invalid` and its notification stay clear while
+    /// every local read fails.
+    #[tokio::test]
+    async fn failed_readback_after_write_marks_the_local_key_invalid() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let cloud = Arc::new(FakeCloud::default());
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(
+                (0..LOCAL_KEY_ERROR_THRESHOLD * 2)
+                    .map(|_| bail!("Check device key or version (Error 914)"))
+                    .collect(),
+            )),
+            None,
+        );
+        let config = scene_config();
+
+        for _ in 0..LOCAL_KEY_ERROR_THRESHOLD {
+            state
+                .set_speed_with(
+                    &config,
+                    &writer,
+                    ErvFanSpeed::Turbo,
+                    false,
+                    "manual_override",
+                    None,
+                )
+                .await
+                .expect("write succeeds while readback fails");
+            state.clear_read_backoff_for_test();
+        }
+
+        let mut app_status = Status::read_only_default(&app_config(config));
+        state.overlay_status(&mut app_status);
+        assert!(
+            app_status.erv.control.local_key_invalid,
+            "a local key failing every readback was never reported"
+        );
+        assert_eq!(
+            app_status.notifications[0].notification_type,
+            "erv_local_key_invalid"
+        );
+    }
+
+    /// A WAN outage on a configured scene is no evidence that anyone built the
+    /// missing one, so it must not clear the hole -- least of all leave the
+    /// flag cleared and the critical alert stranded.
+    #[tokio::test]
+    async fn unrelated_failure_does_not_strand_the_missing_scene_alert() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let cloud = Arc::new(FakeCloud::failing(1));
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(Vec::new())),
+            None,
+        );
+        let config = ErvConfig {
+            local_readback_enabled: false,
+            ..scene_config()
+        };
+
+        // A hole in the matrix is reported.
+        state
+            .set_speed_with(
+                &config,
+                &writer,
+                ErvFanSpeed::Turbo,
+                true,
+                "manual_override",
+                None,
+            )
+            .await
+            .expect_err("no negative-pressure turbo scene");
+
+        // Then an ordinary cloud failure on a configured scene.
+        state
+            .set_speed_with(
+                &config,
+                &writer,
+                ErvFanSpeed::Turbo,
+                false,
+                "manual_override",
+                None,
+            )
+            .await
+            .expect_err("cloud is down");
+
+        let mut app_status = Status::read_only_default(&app_config(config));
+        state.overlay_status(&mut app_status);
+        assert_eq!(
+            app_status.erv.control.missing_scene.as_deref(),
+            Some("turbo (negative pressure)"),
+            "an unrelated failure cleared the missing-scene flag"
+        );
+        assert_eq!(
+            app_status.notifications[0].notification_type,
+            "erv_scene_missing"
+        );
+    }
+
+    /// Boot recovery needs the off scene, not the whole matrix. The write gate
+    /// must not reject the configuration the boot path deliberately permits.
+    #[tokio::test]
+    async fn boot_off_scene_survives_the_write_gate_without_local_credentials() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let config = app_config(ErvConfig {
+            // Scene-only deployment with one unrelated scene missing.
+            ip: String::new(),
+            device_id: String::new(),
+            local_key: String::new(),
+            quiet_scene_id: None,
+            ..scene_config()
+        });
+        assert!(
+            !config.erv.is_configured(),
+            "the strict gate would reject this"
+        );
+
+        let cloud = Arc::new(FakeCloud::default());
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(Vec::new())),
+            None,
+        );
+
+        run_erv_boot_read(&config, &state, &writer).await;
+
+        assert_eq!(cloud.triggered_scenes(), vec!["off-scene".to_string()]);
     }
 
     /// A scene the API accepted but the device ignored must not start the
