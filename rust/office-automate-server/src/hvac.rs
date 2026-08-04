@@ -915,6 +915,7 @@ mod tests {
             cloudflare_access: crate::config::CloudflareAccessConfig::default(),
             erv: crate::config::ErvConfig::default(),
             blinds: crate::config::BlindsConfig::default(),
+            smart_life: crate::config::SmartLifeConfig::default(),
             mitsubishi: crate::config::MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
             telemetry: crate::config::TelemetryConfig::default(),

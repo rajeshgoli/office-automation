@@ -203,6 +203,34 @@ impl Default for ErvStatus {
     }
 }
 
+/// Where the reported ERV state came from. `Assumed` means the command was
+/// accepted but nothing could confirm it landed — reporting "we told it turbo"
+/// as if it were "the ERV is at turbo" is exactly the failure this marker
+/// exists to prevent.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ErvStatusSource {
+    #[default]
+    Unknown,
+    /// Observed over local Tuya: true supply/exhaust speeds.
+    Local,
+    /// Observed over the Smart Life cloud: power state only.
+    Cloud,
+    /// Not observed at all; the last command is being trusted.
+    Assumed,
+}
+
+impl ErvStatusSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Local => "local",
+            Self::Cloud => "cloud",
+            Self::Assumed => "assumed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ErvControlStatus {
     pub last_ok_at: Option<String>,
@@ -213,6 +241,10 @@ pub struct ErvControlStatus {
     pub local_key_invalid: bool,
     pub local_key_invalid_since: Option<String>,
     pub consecutive_local_key_errors: u64,
+    /// Provenance of `ErvStatus.running` / `ErvStatus.speed`.
+    pub status_source: ErvStatusSource,
+    /// Set when a `(speed, pressure)` pair resolved to no configured scene.
+    pub missing_scene: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -315,6 +347,7 @@ mod tests {
             cloudflare_access: crate::config::CloudflareAccessConfig::default(),
             erv: ErvConfig::default(),
             blinds: BlindsConfig::default(),
+            smart_life: crate::config::SmartLifeConfig::default(),
             mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig {
                 hvac_heat_on_temp_f: 70,

@@ -1469,23 +1469,32 @@ async fn validate_live_devices(
     config: &AppConfig,
     report: &mut ShadowValidationReport,
 ) -> Result<()> {
-    if !config.erv.is_configured() {
-        bail!("shadow validation requires configured ERV read credentials");
+    // Local credentials buy speed readback, not control, so their absence is a
+    // skipped check rather than a failed validation.
+    if !config.erv.local_tuya_configured() {
+        if !config.erv.is_configured() {
+            bail!("shadow validation requires a configured ERV control path");
+        }
+        report.push_skip(
+            "erv-read",
+            "ERV local read credentials are not configured; scene control does not need them",
+        );
+    } else {
+        let erv_status = erv::smoke_erv(config)
+            .await
+            .context("ERV read-only smoke check failed")?;
+        report.push_pass(
+            "erv-read",
+            format!(
+                "read local status: running={} speed={}",
+                erv_status.power,
+                erv_status
+                    .fan_speed
+                    .map(|speed| speed.as_str())
+                    .unwrap_or("unknown")
+            ),
+        );
     }
-    let erv_status = erv::smoke_erv(config)
-        .await
-        .context("ERV read-only smoke check failed")?;
-    report.push_pass(
-        "erv-read",
-        format!(
-            "read local status: running={} speed={}",
-            erv_status.power,
-            erv_status
-                .fan_speed
-                .map(|speed| speed.as_str())
-                .unwrap_or("unknown")
-        ),
-    );
 
     if !config.mitsubishi.is_configured() {
         bail!("shadow validation requires configured HVAC read credentials");
@@ -3413,6 +3422,7 @@ mod tests {
             cloudflare_access: crate::config::CloudflareAccessConfig::default(),
             erv: ErvConfig::default(),
             blinds: crate::config::BlindsConfig::default(),
+            smart_life: crate::config::SmartLifeConfig::default(),
             mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
             telemetry: crate::config::TelemetryConfig::default(),

@@ -1014,6 +1014,7 @@ mod tests {
             },
             mitsubishi: MitsubishiConfig::default(),
             blinds: crate::config::BlindsConfig::default(),
+            smart_life: crate::config::SmartLifeConfig::default(),
             thresholds: ThresholdsConfig {
                 erv_min_dwell_seconds: 0,
                 ..ThresholdsConfig::default()

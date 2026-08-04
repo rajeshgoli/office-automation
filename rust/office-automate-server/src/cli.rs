@@ -640,11 +640,11 @@ async fn run_smoke(config: &AppConfig, target: Option<SmokeTarget>) -> Result<()
                 );
             }
             SmokeTarget::BlindsClose => {
-                blinds::set_blinds(&config.blinds, blinds::BlindsCommand::Close).await?;
+                blinds::set_blinds(config, blinds::BlindsCommand::Close).await?;
                 println!("Blinds close scene trigger OK");
             }
             SmokeTarget::BlindsOpen => {
-                blinds::set_blinds(&config.blinds, blinds::BlindsCommand::Open).await?;
+                blinds::set_blinds(config, blinds::BlindsCommand::Open).await?;
                 println!("Blinds open scene trigger OK");
             }
         }

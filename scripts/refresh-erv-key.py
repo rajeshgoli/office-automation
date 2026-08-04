@@ -24,7 +24,11 @@ except ImportError:  # pragma: no cover - exercised by users without deps instal
     SharingTokenListener = object
 
 
-CLIENT_ID = "HA_3y9q4ak7g4ephrvke"
+# Shared Home Assistant Tuya integration identifier. Not a secret, but it has
+# changed before, so config.yaml wins over this fallback -- the server reads the
+# same `smart_life.client_id` key, and the two copies must not drift.
+DEFAULT_CLIENT_ID = "HA_3y9q4ak7g4ephrvke"
+CLIENT_ID = DEFAULT_CLIENT_ID
 SCHEMA = "haauthorize"
 DEFAULT_AUTH_FILE = Path.home() / ".office-automate" / "tuya-sharing-auth.json"
 DEFAULT_CONFIG_FILE = Path("config.yaml")
@@ -107,6 +111,25 @@ def read_device_config(config_file: Path, section: str) -> tuple[str, str | None
 
 def read_erv_config(config_file: Path) -> tuple[str, str | None]:
     return read_device_config(config_file, "erv")
+
+
+def read_client_id(config_file: Path) -> str:
+    """Resolve the Smart Life client id, falling back when config is unreadable.
+
+    --init-auth runs before there is necessarily a usable config, so a missing
+    or malformed file must not block authorization.
+    """
+    try:
+        _, data = load_config_data(config_file)
+    except RefreshError:
+        return DEFAULT_CLIENT_ID
+
+    section = data.get("smart_life")
+    if isinstance(section, dict):
+        client_id = section.get("client_id")
+        if isinstance(client_id, str) and client_id.strip():
+            return client_id.strip()
+    return DEFAULT_CLIENT_ID
 
 
 def update_config_local_key(config_file: Path, section: str, new_local_key: str) -> None:
@@ -648,6 +671,9 @@ def main(
         parser.error("--restart requires --update-config")
     if args.init_auth and not args.user_code:
         parser.error("--init-auth requires --user-code")
+
+    global CLIENT_ID
+    CLIENT_ID = read_client_id(args.config)
 
     try:
         if args.init_auth:

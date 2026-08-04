@@ -16,6 +16,7 @@ pub mod mqtt;
 pub mod policy;
 pub mod presence;
 pub mod qingping;
+pub mod smart_life;
 pub mod state;
 pub mod status;
 pub mod telemetry;

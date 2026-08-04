@@ -18,6 +18,7 @@ pub struct AppConfig {
     pub cloudflare_access: CloudflareAccessConfig,
     pub erv: ErvConfig,
     pub blinds: BlindsConfig,
+    pub smart_life: SmartLifeConfig,
     pub mitsubishi: MitsubishiConfig,
     pub thresholds: ThresholdsConfig,
     pub telemetry: TelemetryConfig,
@@ -285,6 +286,18 @@ impl Default for MitsubishiConfig {
     }
 }
 
+/// Which transport issues ERV writes. Reads are always local — the cloud
+/// cannot see the private speed data points at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ErvControlMode {
+    /// Smart Life tap-to-run scenes. No local command is ever issued.
+    #[default]
+    Scene,
+    /// Local Tuya commands, the pre-#154 behaviour.
+    Local,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ErvConfig {
@@ -298,17 +311,66 @@ pub struct ErvConfig {
     pub port: u16,
     pub status_timeout_seconds: u64,
     pub verify_delay_seconds: u64,
-    pub poll_interval_seconds: u64,
-    pub idle_poll_interval_seconds: u64,
+    pub smart_life_auth_file: Option<PathBuf>,
+    pub smart_life_home_id: Option<String>,
+    pub off_scene_id: Option<String>,
+    pub quiet_scene_id: Option<String>,
+    pub medium_scene_id: Option<String>,
+    pub turbo_scene_id: Option<String>,
+    pub quiet_negative_pressure_scene_id: Option<String>,
+    pub medium_negative_pressure_scene_id: Option<String>,
+    pub turbo_negative_pressure_scene_id: Option<String>,
+    /// Which transport issues writes.
+    pub control_mode: ErvControlMode,
+    /// Local read-after-write, the only view of the true supply/exhaust speeds.
+    pub local_readback_enabled: bool,
+    /// Automatic local write when a scene trigger fails and local is healthy.
+    pub local_write_fallback_enabled: bool,
 }
 
 impl ErvConfig {
+    /// True when *some* transport can control the ERV. Mirrors `BlindsConfig`.
     pub fn is_configured(&self) -> bool {
+        self.local_tuya_configured() || self.scene_configured()
+    }
+
+    pub fn local_tuya_configured(&self) -> bool {
         self.device_type == "tuya"
             && !self.ip.trim().is_empty()
             && !self.device_id.trim().is_empty()
             && !self.local_key.trim().is_empty()
     }
+
+    /// True when the full normal-pressure scene set is present. The
+    /// negative-pressure variants are resolved per write so a missing one fails
+    /// loudly instead of silently substituting the normal-pressure scene.
+    pub fn scene_configured(&self) -> bool {
+        self.device_type == "tuya"
+            && configured_value(self.smart_life_home_id.as_deref()).is_some()
+            && configured_value(self.off_scene_id.as_deref()).is_some()
+            && configured_value(self.quiet_scene_id.as_deref()).is_some()
+            && configured_value(self.medium_scene_id.as_deref()).is_some()
+            && configured_value(self.turbo_scene_id.as_deref()).is_some()
+    }
+
+    /// True when writes go over Smart Life scenes, so no local command is ever
+    /// issued in normal operation.
+    pub fn scene_control_active(&self) -> bool {
+        self.control_mode == ErvControlMode::Scene && self.scene_configured()
+    }
+
+    /// True when local reads are both wanted and possible.
+    pub fn local_readback_active(&self) -> bool {
+        self.local_readback_enabled && self.local_tuya_configured()
+    }
+
+    pub fn smart_life_home_id(&self) -> Option<&str> {
+        configured_value(self.smart_life_home_id.as_deref())
+    }
+}
+
+fn configured_value(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 impl Default for ErvConfig {
@@ -323,8 +385,35 @@ impl Default for ErvConfig {
             port: 6668,
             status_timeout_seconds: 5,
             verify_delay_seconds: 1,
-            poll_interval_seconds: 60,
-            idle_poll_interval_seconds: 300,
+            smart_life_auth_file: None,
+            smart_life_home_id: None,
+            off_scene_id: None,
+            quiet_scene_id: None,
+            medium_scene_id: None,
+            turbo_scene_id: None,
+            quiet_negative_pressure_scene_id: None,
+            medium_negative_pressure_scene_id: None,
+            turbo_negative_pressure_scene_id: None,
+            control_mode: ErvControlMode::Scene,
+            local_readback_enabled: true,
+            local_write_fallback_enabled: true,
+        }
+    }
+}
+
+/// Credentials shared by every Smart Life device (blinds, ERV scenes).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SmartLifeConfig {
+    /// Shared Home Assistant Tuya integration identifier. Not a secret, but it
+    /// has changed before and should not need a rebuild to track.
+    pub client_id: String,
+}
+
+impl Default for SmartLifeConfig {
+    fn default() -> Self {
+        Self {
+            client_id: crate::smart_life::DEFAULT_CLIENT_ID.to_string(),
         }
     }
 }
@@ -567,6 +656,7 @@ struct FileConfig {
     cloudflare_access: CloudflareAccessConfig,
     erv: ErvConfig,
     blinds: BlindsConfig,
+    smart_life: SmartLifeConfig,
     mitsubishi: MitsubishiConfig,
     thresholds: ThresholdsConfig,
     telemetry: TelemetryConfig,
@@ -668,16 +758,30 @@ impl AppConfig {
                 parse_bool_env("OFFICE_AUTOMATE_ERV_ACTIVE_CONTROL_ENABLED", &enabled)?;
         }
 
-        if let Some(seconds) = env_lookup("OFFICE_AUTOMATE_ERV_POLL_INTERVAL_SECONDS") {
-            file_config.erv.poll_interval_seconds = seconds.parse().with_context(|| {
-                format!("invalid OFFICE_AUTOMATE_ERV_POLL_INTERVAL_SECONDS value {seconds:?}")
-            })?;
+        if let Some(path) = env_lookup("OFFICE_AUTOMATE_ERV_SMART_LIFE_AUTH_FILE") {
+            file_config.erv.smart_life_auth_file = Some(PathBuf::from(path));
         }
 
-        if let Some(seconds) = env_lookup("OFFICE_AUTOMATE_ERV_IDLE_POLL_INTERVAL_SECONDS") {
-            file_config.erv.idle_poll_interval_seconds = seconds.parse().with_context(|| {
-                format!("invalid OFFICE_AUTOMATE_ERV_IDLE_POLL_INTERVAL_SECONDS value {seconds:?}")
-            })?;
+        if let Some(home_id) = env_lookup("OFFICE_AUTOMATE_ERV_SMART_LIFE_HOME_ID") {
+            file_config.erv.smart_life_home_id = Some(home_id);
+        }
+
+        if let Some(mode) = env_lookup("OFFICE_AUTOMATE_ERV_CONTROL_MODE") {
+            file_config.erv.control_mode = parse_erv_control_mode(&mode)?;
+        }
+
+        if let Some(enabled) = env_lookup("OFFICE_AUTOMATE_ERV_LOCAL_READBACK_ENABLED") {
+            file_config.erv.local_readback_enabled =
+                parse_bool_env("OFFICE_AUTOMATE_ERV_LOCAL_READBACK_ENABLED", &enabled)?;
+        }
+
+        if let Some(enabled) = env_lookup("OFFICE_AUTOMATE_ERV_LOCAL_WRITE_FALLBACK_ENABLED") {
+            file_config.erv.local_write_fallback_enabled =
+                parse_bool_env("OFFICE_AUTOMATE_ERV_LOCAL_WRITE_FALLBACK_ENABLED", &enabled)?;
+        }
+
+        if let Some(client_id) = env_lookup("OFFICE_AUTOMATE_SMART_LIFE_CLIENT_ID") {
+            file_config.smart_life.client_id = client_id;
         }
 
         if let Some(ip) = env_lookup("OFFICE_AUTOMATE_BLINDS_IP") {
@@ -910,6 +1014,10 @@ impl AppConfig {
             .blinds
             .smart_life_auth_file
             .map(|path| expand_home_relative_path(path, home_dir.as_deref()));
+        file_config.erv.smart_life_auth_file = file_config
+            .erv
+            .smart_life_auth_file
+            .map(|path| expand_home_relative_path(path, home_dir.as_deref()));
 
         let runtime = RuntimeConfig {
             frontend_dist: root.join("frontend").join("dist"),
@@ -940,11 +1048,22 @@ impl AppConfig {
             cloudflare_access: file_config.cloudflare_access,
             erv: file_config.erv,
             blinds: file_config.blinds,
+            smart_life: file_config.smart_life,
             mitsubishi: file_config.mitsubishi,
             thresholds: file_config.thresholds,
             telemetry: file_config.telemetry,
             runtime,
         })
+    }
+}
+
+fn parse_erv_control_mode(value: &str) -> Result<ErvControlMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "scene" => Ok(ErvControlMode::Scene),
+        "local" => Ok(ErvControlMode::Local),
+        _ => anyhow::bail!(
+            "invalid OFFICE_AUTOMATE_ERV_CONTROL_MODE value {value:?}; expected scene/local"
+        ),
     }
 }
 
@@ -983,6 +1102,71 @@ mod tests {
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 8080);
         assert!(config.admin_emails.is_empty());
+    }
+
+    /// Parses the shape the deployed `config.yaml` uses, so a schema change
+    /// that would silently fall back to defaults fails here instead.
+    #[test]
+    fn loads_scene_control_erv_config() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_path = temp_dir.path().join("config.yaml");
+        fs::write(
+            &config_path,
+            r#"
+erv:
+  type: "tuya"
+  active_control_enabled: true
+  device_id: "erv-device"
+  local_key: "erv-key"
+  ip: "192.0.2.59"
+  smart_life_home_id: "8171319"
+  off_scene_id: "off-scene"
+  quiet_scene_id: "quiet-scene"
+  medium_scene_id: "medium-scene"
+  turbo_scene_id: "turbo-scene"
+  quiet_negative_pressure_scene_id: "quiet-np-scene"
+  medium_negative_pressure_scene_id: "medium-np-scene"
+  turbo_negative_pressure_scene_id: "turbo-np-scene"
+  control_mode: "scene"
+  local_readback_enabled: true
+  local_write_fallback_enabled: true
+smart_life:
+  client_id: "HA_custom_client"
+"#,
+        )
+        .expect("write config");
+
+        let config = AppConfig::load_with_env(&config_path, |key| match key {
+            "OFFICE_AUTOMATE_ROOT" => Some(temp_dir.path().display().to_string()),
+            _ => None,
+        })
+        .expect("load config");
+
+        assert_eq!(config.erv.control_mode, ErvControlMode::Scene);
+        assert!(config.erv.scene_configured());
+        assert!(config.erv.local_tuya_configured());
+        assert!(config.erv.scene_control_active());
+        assert!(config.erv.local_readback_active());
+        assert!(config.erv.local_write_fallback_enabled);
+        assert_eq!(config.erv.smart_life_home_id(), Some("8171319"));
+        assert_eq!(config.smart_life.client_id, "HA_custom_client");
+    }
+
+    /// The intended defaults live in code, not only in the deployed YAML.
+    #[test]
+    fn erv_defaults_to_scene_control_with_local_readback_and_fallback() {
+        let config = ErvConfig::default();
+
+        assert_eq!(config.control_mode, ErvControlMode::Scene);
+        assert!(config.local_readback_enabled);
+        assert!(config.local_write_fallback_enabled);
+        // No scenes configured yet, so nothing claims to be able to control it.
+        assert!(!config.scene_configured());
+        assert!(!config.is_configured());
+        assert_eq!(
+            SmartLifeConfig::default().client_id,
+            crate::smart_life::DEFAULT_CLIENT_ID
+        );
     }
 
     #[test]
@@ -1146,8 +1330,6 @@ thresholds:
         assert!(config.erv.active_control_enabled);
         assert_eq!(config.erv.version, "3.4");
         assert_eq!(config.erv.port, 6668);
-        assert_eq!(config.erv.poll_interval_seconds, 60);
-        assert_eq!(config.erv.idle_poll_interval_seconds, 300);
         assert!(config.erv.is_configured());
         assert_eq!(config.runtime.mqtt_host, "rust-broker");
         assert_eq!(config.runtime.mqtt_port, 2883);

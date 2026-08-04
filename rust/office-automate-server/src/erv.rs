@@ -1,10 +1,11 @@
 use std::{
     collections::VecDeque,
+    fmt,
     future::Future,
     path::PathBuf,
     pin::Pin,
     str::FromStr,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -13,14 +14,14 @@ use chrono::Local;
 use serde_json::{Map, Value, json};
 use tokio::{
     sync::{Mutex as AsyncMutex, broadcast},
-    task::JoinHandle,
     time,
 };
 
 use crate::{
     config::{AppConfig, ErvConfig},
     db,
-    status::{AppNotification, ErvControlStatus, Status},
+    smart_life::{SmartLifeClient, auth_file_or_default, status_code_value},
+    status::{AppNotification, ErvControlStatus, ErvStatusSource, Status},
 };
 
 const DP_POWER: &str = "1";
@@ -100,6 +101,480 @@ pub trait ErvSpeedWriter: Send + Sync {
         speed: ErvFanSpeed,
         negative_pressure: bool,
     ) -> BoxFutureResult<'a, ErvDeviceStatus>;
+
+    /// Which transport carried the most recent `set_speed`, and how well the
+    /// returned status was confirmed. Defaults to a local command verified by a
+    /// local read, which is what every writer did before scene control existed.
+    fn last_write_report(&self) -> ErvWriteReport {
+        ErvWriteReport::default()
+    }
+}
+
+/// Which transport issued a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ErvTransport {
+    #[default]
+    Local,
+    Scene,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErvWriteReport {
+    pub transport: ErvTransport,
+    pub source: ErvStatusSource,
+}
+
+impl Default for ErvWriteReport {
+    fn default() -> Self {
+        Self {
+            transport: ErvTransport::Local,
+            source: ErvStatusSource::Local,
+        }
+    }
+}
+
+/// The cloud half of ERV control: triggering tap-to-run scenes, and reading the
+/// one status code the sharing API exposes for this device.
+pub trait ErvCloudClient: Send + Sync {
+    fn trigger_scene<'a>(&'a self, home_id: &'a str, scene_id: &'a str) -> BoxFutureResult<'a, ()>;
+
+    /// The device's `switch` bit. `None` when the device reports no `switch`
+    /// code at all. Speed is never available here — the speed data points are
+    /// private and the sharing API hides them.
+    fn read_power<'a>(&'a self, device_id: &'a str) -> BoxFutureResult<'a, Option<bool>>;
+}
+
+pub struct SmartLifeErvCloud {
+    client: SmartLifeClient,
+}
+
+impl SmartLifeErvCloud {
+    pub fn new(client_id: impl Into<String>, config: &ErvConfig) -> Self {
+        Self {
+            client: SmartLifeClient::new(
+                client_id,
+                auth_file_or_default(config.smart_life_auth_file.as_ref()),
+            ),
+        }
+    }
+}
+
+impl ErvCloudClient for SmartLifeErvCloud {
+    fn trigger_scene<'a>(&'a self, home_id: &'a str, scene_id: &'a str) -> BoxFutureResult<'a, ()> {
+        Box::pin(async move { self.client.trigger_scene(home_id, scene_id).await })
+    }
+
+    fn read_power<'a>(&'a self, device_id: &'a str) -> BoxFutureResult<'a, Option<bool>> {
+        Box::pin(async move {
+            let status = self.client.device_status(device_id).await?;
+            Ok(status_code_value(&status, "switch").and_then(value_as_bool))
+        })
+    }
+}
+
+/// A `(speed, pressure)` pair that resolved to no configured scene. Surfaced
+/// rather than silently substituted: a system that reports a mode it is not
+/// delivering is worse than one that reports an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingSceneError {
+    pub preset: String,
+}
+
+impl fmt::Display for MissingSceneError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "ERV Smart Life scene id for {} is not configured",
+            self.preset
+        )
+    }
+}
+
+impl std::error::Error for MissingSceneError {}
+
+fn scene_preset_label(speed: ErvFanSpeed, negative_pressure: bool) -> String {
+    if speed == ErvFanSpeed::Off || !negative_pressure {
+        speed.as_str().to_string()
+    } else {
+        format!("{} (negative pressure)", speed.as_str())
+    }
+}
+
+fn scene_id_for(
+    config: &ErvConfig,
+    speed: ErvFanSpeed,
+    negative_pressure: bool,
+) -> Result<&str, MissingSceneError> {
+    let configured = match (speed, negative_pressure) {
+        (ErvFanSpeed::Off, _) => &config.off_scene_id,
+        (ErvFanSpeed::Quiet, false) => &config.quiet_scene_id,
+        (ErvFanSpeed::Medium, false) => &config.medium_scene_id,
+        (ErvFanSpeed::Turbo, false) => &config.turbo_scene_id,
+        (ErvFanSpeed::Quiet, true) => &config.quiet_negative_pressure_scene_id,
+        (ErvFanSpeed::Medium, true) => &config.medium_negative_pressure_scene_id,
+        (ErvFanSpeed::Turbo, true) => &config.turbo_negative_pressure_scene_id,
+    };
+
+    configured
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| MissingSceneError {
+            preset: scene_preset_label(speed, negative_pressure),
+        })
+}
+
+/// The state a command asks for, used when nothing could observe the result.
+fn assumed_status(speed: ErvFanSpeed, negative_pressure: bool) -> ErvDeviceStatus {
+    let power = speed != ErvFanSpeed::Off;
+    let (supply_speed, exhaust_speed) = match speed.speed_preset(negative_pressure) {
+        Some((supply, exhaust)) => (Some(supply), Some(exhaust)),
+        None => (None, None),
+    };
+    let mut dps = Map::new();
+    dps.insert(DP_POWER.to_string(), Value::Bool(power));
+    if let (Some(supply), Some(exhaust)) = (supply_speed, exhaust_speed) {
+        dps.insert(DP_SUPPLY_SPEED.to_string(), json!(supply));
+        dps.insert(DP_EXHAUST_SPEED.to_string(), json!(exhaust));
+    }
+
+    ErvDeviceStatus {
+        power,
+        fan_speed: Some(speed),
+        supply_speed,
+        exhaust_speed,
+        raw_dps: Value::Object(dps),
+    }
+}
+
+/// Writes through Smart Life tap-to-run scenes. Issues no local command ever —
+/// local commands are the documented cause of the Err 914 lockout.
+pub struct SceneErvSpeedWriter {
+    cloud: Arc<dyn ErvCloudClient>,
+}
+
+impl SceneErvSpeedWriter {
+    pub fn new(cloud: Arc<dyn ErvCloudClient>) -> Self {
+        Self { cloud }
+    }
+}
+
+impl ErvSpeedWriter for SceneErvSpeedWriter {
+    fn smoke_status<'a>(&'a self, _config: &'a ErvConfig) -> BoxFutureResult<'a, ErvDeviceStatus> {
+        Box::pin(async move {
+            bail!("ERV scene control cannot read status; the cloud does not expose the speed DPs")
+        })
+    }
+
+    fn set_speed<'a>(
+        &'a self,
+        config: &'a ErvConfig,
+        speed: ErvFanSpeed,
+        negative_pressure: bool,
+    ) -> BoxFutureResult<'a, ErvDeviceStatus> {
+        Box::pin(async move {
+            let home_id = config
+                .smart_life_home_id()
+                .ok_or_else(|| anyhow!("ERV Smart Life home id is missing"))?;
+            let preset = scene_preset_label(speed, negative_pressure);
+            let scene_id = scene_id_for(config, speed, negative_pressure)?;
+
+            self.cloud
+                .trigger_scene(home_id, scene_id)
+                .await
+                .with_context(|| format!("failed to trigger ERV {preset} scene"))?;
+
+            Ok(assumed_status(speed, negative_pressure))
+        })
+    }
+
+    fn last_write_report(&self) -> ErvWriteReport {
+        ErvWriteReport {
+            transport: ErvTransport::Scene,
+            source: ErvStatusSource::Assumed,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SplitWriterState {
+    report: ErvWriteReport,
+    last_known_power: Option<bool>,
+    consecutive_read_failures: u64,
+    read_retry_at: Option<f64>,
+}
+
+/// Splits the two transports by direction: writes go out over `writer` (the
+/// scene path by default), reads come back over `reader` (local Tuya, the only
+/// view of the speed DPs).
+pub struct SplitErvWriter {
+    writer: Arc<dyn ErvSpeedWriter>,
+    reader: Arc<dyn ErvStatusReader>,
+    fallback: Option<Arc<dyn ErvSpeedWriter>>,
+    cloud: Option<Arc<dyn ErvCloudClient>>,
+    state: Mutex<SplitWriterState>,
+}
+
+impl SplitErvWriter {
+    pub fn new(writer: Arc<dyn ErvSpeedWriter>, reader: Arc<dyn ErvStatusReader>) -> Self {
+        Self {
+            writer,
+            reader,
+            fallback: None,
+            cloud: None,
+            state: Mutex::new(SplitWriterState::default()),
+        }
+    }
+
+    /// The local writer used when a scene trigger fails and local is healthy.
+    pub fn with_local_write_fallback(mut self, fallback: Arc<dyn ErvSpeedWriter>) -> Self {
+        self.fallback = Some(fallback);
+        self
+    }
+
+    /// The cloud client used to confirm power transitions when local reads are
+    /// unavailable.
+    pub fn with_cloud_verifier(mut self, cloud: Arc<dyn ErvCloudClient>) -> Self {
+        self.cloud = Some(cloud);
+        self
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, SplitWriterState> {
+        self.state.lock().expect("ERV split writer lock poisoned")
+    }
+
+    /// Local reads back off after failures so a dead local key costs one slow
+    /// read every few minutes instead of one per write.
+    fn local_read_allowed(&self, config: &ErvConfig) -> bool {
+        if !config.local_readback_active() {
+            return false;
+        }
+        self.state()
+            .read_retry_at
+            .is_none_or(|retry_at| unix_timestamp_now() >= retry_at)
+    }
+
+    fn record_read_outcome(&self, succeeded: bool) {
+        let mut state = self.state();
+        if succeeded {
+            state.consecutive_read_failures = 0;
+            state.read_retry_at = None;
+            return;
+        }
+        state.consecutive_read_failures = state.consecutive_read_failures.saturating_add(1);
+        state.read_retry_at = Some(
+            unix_timestamp_now()
+                + local_failure_retry_delay_seconds(state.consecutive_read_failures),
+        );
+    }
+
+    fn finish(&self, report: ErvWriteReport, status: Option<&ErvDeviceStatus>) {
+        let mut state = self.state();
+        state.report = report;
+        if let Some(status) = status {
+            state.last_known_power = Some(status.power);
+        }
+    }
+
+    /// A power transition is the only change the cloud's `switch` bit can
+    /// confirm; on a speed-only change it reads `true` before and after.
+    fn is_power_transition(&self, speed: ErvFanSpeed) -> bool {
+        self.state()
+            .last_known_power
+            .is_none_or(|power| power != (speed != ErvFanSpeed::Off))
+    }
+
+    async fn read_local(&self, config: &ErvConfig) -> Result<ErvDeviceStatus> {
+        let result = self.reader.read_status(config).await;
+        self.record_read_outcome(result.is_ok());
+        if let Ok(status) = &result {
+            self.state().last_known_power = Some(status.power);
+        }
+        result
+    }
+
+    async fn write_fallback(
+        &self,
+        config: &ErvConfig,
+        speed: ErvFanSpeed,
+        negative_pressure: bool,
+    ) -> Option<Result<ErvDeviceStatus>> {
+        let fallback = self.fallback.as_ref()?;
+        if !config.local_write_fallback_enabled || !config.local_tuya_configured() {
+            return None;
+        }
+        // "Healthy" is the same signal the readback path uses: a local key that
+        // has been failing is not going to accept a command either.
+        if self
+            .state()
+            .read_retry_at
+            .is_some_and(|retry_at| unix_timestamp_now() < retry_at)
+        {
+            return None;
+        }
+        Some(fallback.set_speed(config, speed, negative_pressure).await)
+    }
+
+    async fn verify_locally(
+        &self,
+        config: &ErvConfig,
+        speed: ErvFanSpeed,
+        negative_pressure: bool,
+    ) -> Option<ErvDeviceStatus> {
+        if !self.local_read_allowed(config) {
+            return None;
+        }
+
+        match self.read_local(config).await {
+            Ok(status) => {
+                // A mismatch is real information, not a reason to fail the
+                // write: report what the device says and let policy re-decide.
+                if let Err(error) = verify_speed(speed, &status, negative_pressure) {
+                    tracing::warn!("ERV scene write did not verify: {error:#}");
+                }
+                Some(status)
+            }
+            Err(error) => {
+                tracing::warn!("ERV local readback after write failed: {error:#}");
+                None
+            }
+        }
+    }
+
+    async fn verify_via_cloud(
+        &self,
+        config: &ErvConfig,
+        speed: ErvFanSpeed,
+        negative_pressure: bool,
+    ) -> Option<ErvDeviceStatus> {
+        let cloud = self.cloud.as_ref()?;
+        let device_id = config.device_id.trim();
+        if device_id.is_empty() {
+            return None;
+        }
+
+        match cloud.read_power(device_id).await {
+            Ok(Some(power)) if power == (speed != ErvFanSpeed::Off) => {
+                Some(assumed_status(speed, negative_pressure))
+            }
+            Ok(Some(power)) => {
+                tracing::warn!(
+                    "ERV cloud verification says power={power} after a {} command",
+                    speed.as_str()
+                );
+                let mut dps = Map::new();
+                dps.insert(DP_POWER.to_string(), Value::Bool(power));
+                Some(ErvDeviceStatus {
+                    power,
+                    fan_speed: (!power).then_some(ErvFanSpeed::Off),
+                    supply_speed: None,
+                    exhaust_speed: None,
+                    raw_dps: Value::Object(dps),
+                })
+            }
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!("ERV cloud verification failed: {error:#}");
+                None
+            }
+        }
+    }
+}
+
+impl ErvSpeedWriter for SplitErvWriter {
+    fn smoke_status<'a>(&'a self, config: &'a ErvConfig) -> BoxFutureResult<'a, ErvDeviceStatus> {
+        Box::pin(async move {
+            if !config.local_readback_active() {
+                bail!("ERV local readback is not configured");
+            }
+            self.read_local(config).await
+        })
+    }
+
+    fn set_speed<'a>(
+        &'a self,
+        config: &'a ErvConfig,
+        speed: ErvFanSpeed,
+        negative_pressure: bool,
+    ) -> BoxFutureResult<'a, ErvDeviceStatus> {
+        Box::pin(async move {
+            let power_transition = self.is_power_transition(speed);
+
+            let (report, status) = match self
+                .writer
+                .set_speed(config, speed, negative_pressure)
+                .await
+            {
+                Ok(status) => (self.writer.last_write_report(), status),
+                Err(error) => {
+                    let primary_report = self.writer.last_write_report();
+                    match self.write_fallback(config, speed, negative_pressure).await {
+                        Some(Ok(status)) => {
+                            tracing::warn!(
+                                "ERV scene trigger failed ({error:#}); wrote locally instead"
+                            );
+                            let report = self
+                                .fallback
+                                .as_ref()
+                                .map(|fallback| fallback.last_write_report())
+                                .unwrap_or_default();
+                            (report, status)
+                        }
+                        Some(Err(fallback_error)) => {
+                            self.finish(primary_report, None);
+                            return Err(error.context(format!(
+                                "ERV local write fallback also failed: {fallback_error:#}"
+                            )));
+                        }
+                        None => {
+                            self.finish(primary_report, None);
+                            return Err(error);
+                        }
+                    }
+                }
+            };
+
+            // A local write verifies itself, so only an assumed status needs
+            // the ladder below.
+            if report.source != ErvStatusSource::Assumed {
+                self.finish(report, Some(&status));
+                return Ok(status);
+            }
+
+            if config.verify_delay_seconds > 0 {
+                time::sleep(Duration::from_secs(config.verify_delay_seconds)).await;
+            }
+
+            if let Some(observed) = self.verify_locally(config, speed, negative_pressure).await {
+                let report = ErvWriteReport {
+                    source: ErvStatusSource::Local,
+                    ..report
+                };
+                self.finish(report, Some(&observed));
+                return Ok(observed);
+            }
+
+            if power_transition
+                && let Some(observed) = self
+                    .verify_via_cloud(config, speed, negative_pressure)
+                    .await
+            {
+                let report = ErvWriteReport {
+                    source: ErvStatusSource::Cloud,
+                    ..report
+                };
+                self.finish(report, Some(&observed));
+                return Ok(observed);
+            }
+
+            self.finish(report, Some(&status));
+            Ok(status)
+        })
+    }
+
+    fn last_write_report(&self) -> ErvWriteReport {
+        self.state().report
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -108,7 +583,7 @@ pub struct RustuyaErvStatusReader;
 impl ErvStatusReader for RustuyaErvStatusReader {
     fn read_status<'a>(&'a self, config: &'a ErvConfig) -> BoxFutureResult<'a, ErvDeviceStatus> {
         Box::pin(async move {
-            if !config.is_configured() {
+            if !config.local_tuya_configured() {
                 bail!("ERV local Tuya config is incomplete");
             }
 
@@ -138,7 +613,7 @@ impl ErvSpeedWriter for RustuyaErvSpeedWriter {
         negative_pressure: bool,
     ) -> BoxFutureResult<'a, ErvDeviceStatus> {
         Box::pin(async move {
-            if !config.is_configured() {
+            if !config.local_tuya_configured() {
                 bail!("ERV local Tuya config is incomplete");
             }
 
@@ -202,8 +677,11 @@ struct ErvInner {
     last_speed_changed_at: Option<f64>,
     manual_override: Option<ErvManualOverride>,
     consecutive_local_failures: u64,
-    next_local_retry_at: Option<f64>,
-    next_status_poll_retry_at: Option<f64>,
+    consecutive_scene_failures: u64,
+    /// Backoff on the *write* path: burst suppression and failed writes.
+    next_write_retry_at: Option<f64>,
+    /// Backoff on the *read* path: failed local status reads.
+    next_read_retry_at: Option<f64>,
     recent_local_activity: VecDeque<ErvLocalActivity>,
 }
 
@@ -242,14 +720,14 @@ impl ErvState {
     {
         match reader.read_status(config).await {
             Ok(status) => {
-                if self.record_local_success(status.clone()) {
+                if self.record_status_success(status.clone(), ErvStatusSource::Local) {
                     self.notify_status();
                 }
                 Ok(status)
             }
             Err(error) => {
                 let message = format!("{error:#}");
-                if self.record_read_only_local_failure(&message) {
+                if self.record_read_only_local_failure(config, &message) {
                     self.notify_status();
                 }
                 Err(error)
@@ -273,10 +751,7 @@ impl ErvState {
             bail!("ERV active control is disabled");
         }
         if !config.is_configured() {
-            bail!("ERV local Tuya config is incomplete");
-        }
-        if self.snapshot().local_key_invalid {
-            bail!("ERV local Tuya key is invalid");
+            bail!("ERV control config is incomplete");
         }
 
         let _local_io_guard = self.local_io_lock.lock().await;
@@ -292,13 +767,19 @@ impl ErvState {
             }
         }
 
-        let smoked_status = self
-            .smoke_status_with_locked(config, writer)
-            .await
-            .context("ERV smoke check failed before active write")?;
-
-        if device_status_matches_target(&smoked_status, speed, negative_pressure) {
-            return Ok(smoked_status);
+        // The pre-write read is an optimisation that skips redundant writes, not
+        // a gate. Requiring it to succeed is what let one dead local key take
+        // out every control path for a month.
+        if self.pre_write_read_allowed(config) {
+            match self.smoke_status_with_locked(config, writer).await {
+                Ok(status) if device_status_matches_target(&status, speed, negative_pressure) => {
+                    return Ok(status);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!("ERV read before write failed, writing anyway: {error:#}");
+                }
+            }
         }
 
         self.write_speed_after_gate_locked(
@@ -310,6 +791,12 @@ impl ErvState {
             co2_ppm,
         )
         .await
+    }
+
+    /// Only read before writing when local readback is available and not in
+    /// failure backoff. In scene mode with a dead local key this simply skips.
+    fn pre_write_read_allowed(&self, config: &ErvConfig) -> bool {
+        config.local_readback_active() && self.read_retry_allowed(unix_timestamp_now())
     }
 
     pub(crate) async fn set_speed_after_smoke_with<W>(
@@ -328,10 +815,7 @@ impl ErvState {
             bail!("ERV active control is disabled");
         }
         if !config.is_configured() {
-            bail!("ERV local Tuya config is incomplete");
-        }
-        if self.snapshot().local_key_invalid {
-            bail!("ERV local Tuya key is invalid");
+            bail!("ERV control config is incomplete");
         }
 
         let _local_io_guard = self.local_io_lock.lock().await;
@@ -370,14 +854,23 @@ impl ErvState {
 
         match writer.set_speed(config, speed, negative_pressure).await {
             Ok(status) => {
-                self.record_speed_success(status.clone(), speed, reason, co2_ppm);
-                self.record_write_success(status.clone(), speed, reason, co2_ppm, &attempt);
+                let report = writer.last_write_report();
+                self.record_speed_success(status.clone(), report, speed, reason, co2_ppm);
+                self.record_write_success(status.clone(), report, speed, reason, co2_ppm, &attempt);
                 Ok(status)
             }
             Err(error) => {
+                let report = writer.last_write_report();
                 let message = format!("{error:#}");
-                self.record_write_failure(speed, reason, co2_ppm, &message);
-                self.record_local_failure(&message);
+                self.record_write_failure(report, speed, reason, co2_ppm, &message);
+                self.record_missing_scene(&error);
+                match report.transport {
+                    ErvTransport::Local => {
+                        self.record_local_failure(config, &message);
+                    }
+                    ErvTransport::Scene => self.record_scene_failure(&message),
+                }
+                self.notify_status();
                 Err(error)
             }
         }
@@ -410,34 +903,31 @@ impl ErvState {
         }
     }
 
-    pub fn local_retry_allowed(&self, now: f64) -> bool {
+    /// Whether the write path is out of backoff. Failed local *reads* never set
+    /// this — a stale local key costs speed readback, never control.
+    pub fn write_retry_allowed(&self, now: f64) -> bool {
         self.inner
             .read()
             .expect("ERV state lock poisoned")
-            .next_local_retry_at
-            .map_or(true, |retry_at| now >= retry_at)
+            .next_write_retry_at
+            .is_none_or(|retry_at| now >= retry_at)
     }
 
-    pub fn status_poll_delay(&self, config: &ErvConfig, now: f64) -> Duration {
-        let inner = self.inner.read().expect("ERV state lock poisoned");
-        if let Some(retry_at) = inner.next_status_poll_retry_at
-            && retry_at > now
-        {
-            return Duration::from_secs(((retry_at - now).ceil() as u64).max(1));
-        }
+    #[cfg(test)]
+    fn clear_read_backoff_for_test(&self) {
+        self.inner
+            .write()
+            .expect("ERV state lock poisoned")
+            .next_read_retry_at = None;
+    }
 
-        let active_interval = config.poll_interval_seconds.max(5);
-        let idle_interval = config.idle_poll_interval_seconds.max(active_interval);
-        let status_known_idle = inner
-            .latest_status
-            .as_ref()
-            .is_some_and(|status| !status.power);
-
-        Duration::from_secs(if status_known_idle {
-            idle_interval
-        } else {
-            active_interval
-        })
+    /// Whether a local status read is out of backoff.
+    pub fn read_retry_allowed(&self, now: f64) -> bool {
+        self.inner
+            .read()
+            .expect("ERV state lock poisoned")
+            .next_read_retry_at
+            .is_none_or(|retry_at| now >= retry_at)
     }
 
     pub async fn smoke_status_with<W>(
@@ -449,10 +939,7 @@ impl ErvState {
         W: ErvSpeedWriter + ?Sized,
     {
         if !config.is_configured() {
-            bail!("ERV local Tuya config is incomplete");
-        }
-        if self.snapshot().local_key_invalid {
-            bail!("ERV local Tuya key is invalid");
+            bail!("ERV control config is incomplete");
         }
 
         let _local_io_guard = self.local_io_lock.lock().await;
@@ -469,14 +956,16 @@ impl ErvState {
     {
         match writer.smoke_status(config).await {
             Ok(status) => {
-                if self.record_local_success(status.clone()) {
+                if self.record_status_success(status.clone(), ErvStatusSource::Local) {
                     self.notify_status();
                 }
                 Ok(status)
             }
             Err(error) => {
+                // A failed *read* backs off reads only. Letting it back off the
+                // write path is what coupled speed readback to control.
                 let message = format!("{error:#}");
-                if self.record_local_failure(&message) {
+                if self.record_read_only_local_failure(config, &message) {
                     self.notify_status();
                 }
                 Err(error)
@@ -660,7 +1149,7 @@ impl ErvState {
         let timestamp = local_iso_now();
         {
             let mut inner = self.inner.write().expect("ERV state lock poisoned");
-            inner.next_local_retry_at = Some(at + LOCAL_WRITE_BURST_WINDOW_SECONDS);
+            inner.next_write_retry_at = Some(at + LOCAL_WRITE_BURST_WINDOW_SECONDS);
             push_local_activity_locked(
                 &mut inner,
                 ErvLocalActivity {
@@ -697,6 +1186,7 @@ impl ErvState {
     fn record_write_success(
         &self,
         device_status: ErvDeviceStatus,
+        report: ErvWriteReport,
         speed: ErvFanSpeed,
         reason: &str,
         co2_ppm: Option<i64>,
@@ -729,6 +1219,8 @@ impl ErvState {
                 "target_speed": speed.as_str(),
                 "reason": reason,
                 "co2_ppm": co2_ppm,
+                "transport": transport_label(report.transport),
+                "status_source": report.source.as_str(),
                 "device_status": device_status_json(&device_status),
                 "recent_write_attempts_5m": attempt.recent_write_attempts_5m,
                 "attempted_at": attempt.timestamp.clone(),
@@ -740,6 +1232,7 @@ impl ErvState {
 
     fn record_write_failure(
         &self,
+        report: ErvWriteReport,
         speed: ErvFanSpeed,
         reason: &str,
         co2_ppm: Option<i64>,
@@ -779,9 +1272,37 @@ impl ErvState {
                 "target_speed": speed.as_str(),
                 "reason": reason,
                 "co2_ppm": co2_ppm,
+                "transport": transport_label(report.transport),
                 "error": sanitized_message,
                 "recent_write_attempts_5m": recent_write_attempts_5m,
                 "recent_local_activity": recent_activity,
+            }),
+        );
+    }
+
+    /// A `(speed, pressure)` pair with no configured scene is a configuration
+    /// hole, not a transient failure: surface it instead of letting it look
+    /// like an ordinary cloud error.
+    fn record_missing_scene(&self, error: &anyhow::Error) {
+        let Some(missing) = error.downcast_ref::<MissingSceneError>() else {
+            let mut inner = self.inner.write().expect("ERV state lock poisoned");
+            inner.control.missing_scene = None;
+            return;
+        };
+
+        let now = local_iso_now();
+        {
+            let mut inner = self.inner.write().expect("ERV state lock poisoned");
+            inner.control.missing_scene = Some(missing.preset.clone());
+            inner.notification = Some(missing_scene_notification(&missing.preset, &now));
+        }
+
+        self.log_health_event(
+            "scene_missing",
+            json!({
+                "type": "erv_scene_missing",
+                "at": now,
+                "preset": missing.preset,
             }),
         );
     }
@@ -794,15 +1315,20 @@ impl ErvState {
     fn record_speed_success(
         &self,
         device_status: ErvDeviceStatus,
+        report: ErvWriteReport,
         speed: ErvFanSpeed,
         reason: &str,
         co2_ppm: Option<i64>,
     ) {
-        self.record_local_success(device_status);
-        self.inner
-            .write()
-            .expect("ERV state lock poisoned")
-            .last_speed_changed_at = Some(unix_timestamp_now());
+        self.record_status_success(device_status, report.source);
+        {
+            // Only a landed write clears the write-path backoff. A successful
+            // read says nothing about whether the transport recovered.
+            let mut inner = self.inner.write().expect("ERV state lock poisoned");
+            inner.last_speed_changed_at = Some(unix_timestamp_now());
+            inner.consecutive_scene_failures = 0;
+            inner.next_write_retry_at = None;
+        }
 
         if let Err(error) = db::log_climate_action(
             &self.database_path,
@@ -816,25 +1342,38 @@ impl ErvState {
         }
     }
 
-    fn record_local_success(&self, device_status: ErvDeviceStatus) -> bool {
+    /// Record a status we believe in, tagged with where it came from. Only a
+    /// local observation clears the local-key state — an assumed or cloud
+    /// status says nothing about whether local reads work.
+    fn record_status_success(
+        &self,
+        device_status: ErvDeviceStatus,
+        source: ErvStatusSource,
+    ) -> bool {
         let now = local_iso_now();
+        let observed_locally = source == ErvStatusSource::Local;
         let (status_changed, was_invalid, invalid_since) = {
             let mut inner = self.inner.write().expect("ERV state lock poisoned");
-            let status_changed = inner.latest_status.as_ref() != Some(&device_status);
-            let was_invalid = inner.control.local_key_invalid;
+            let status_changed = inner.latest_status.as_ref() != Some(&device_status)
+                || inner.control.status_source != source;
+            let was_invalid = observed_locally && inner.control.local_key_invalid;
             let invalid_since = inner.control.local_key_invalid_since.clone();
 
             inner.latest_status = Some(device_status);
+            inner.control.status_source = source;
             inner.control.last_ok_at = Some(now.clone());
-            inner.control.last_local_ok_at = Some(now.clone());
             inner.control.last_error = None;
-            inner.control.using_cloud = false;
-            inner.control.local_key_invalid = false;
-            inner.control.local_key_invalid_since = None;
-            inner.consecutive_local_failures = 0;
-            inner.control.consecutive_local_key_errors = 0;
-            inner.next_local_retry_at = None;
-            inner.next_status_poll_retry_at = None;
+            inner.control.missing_scene = None;
+            inner.control.using_cloud = source == ErvStatusSource::Cloud;
+
+            if observed_locally {
+                inner.control.last_local_ok_at = Some(now.clone());
+                inner.control.local_key_invalid = false;
+                inner.control.local_key_invalid_since = None;
+                inner.consecutive_local_failures = 0;
+                inner.control.consecutive_local_key_errors = 0;
+                inner.next_read_retry_at = None;
+            }
 
             if was_invalid {
                 inner.notification = Some(recovered_notification(&now));
@@ -857,15 +1396,52 @@ impl ErvState {
         status_changed || was_invalid
     }
 
-    fn record_local_failure(&self, message: &str) -> bool {
-        self.record_local_failure_with_retry(message, true)
+    fn record_local_failure(&self, config: &ErvConfig, message: &str) -> bool {
+        self.record_local_failure_with_retry(config, message, true)
     }
 
-    fn record_read_only_local_failure(&self, message: &str) -> bool {
-        self.record_local_failure_with_retry(message, false)
+    fn record_read_only_local_failure(&self, config: &ErvConfig, message: &str) -> bool {
+        self.record_local_failure_with_retry(config, message, false)
     }
 
-    fn record_local_failure_with_retry(&self, message: &str, active_retry: bool) -> bool {
+    /// A scene trigger failed. This says nothing about the local key, so the
+    /// local-key counters must not move; it only backs off the write path.
+    fn record_scene_failure(&self, message: &str) {
+        let at = unix_timestamp_now();
+        let now = local_iso_now();
+        let sanitized_message = sanitize_erv_error(message);
+        let mut inner = self.inner.write().expect("ERV state lock poisoned");
+
+        inner.control.last_error = Some(format!("Scene trigger failed: {sanitized_message}"));
+        inner.control.last_error_at = Some(now.clone());
+        inner.control.using_cloud = false;
+        inner.consecutive_scene_failures = inner.consecutive_scene_failures.saturating_add(1);
+        inner.next_write_retry_at =
+            Some(at + local_failure_retry_delay_seconds(inner.consecutive_scene_failures));
+        let recent_write_attempts_5m =
+            recent_write_attempts_locked(&inner, at, LOCAL_WRITE_BURST_WINDOW_SECONDS);
+
+        push_local_activity_locked(
+            &mut inner,
+            ErvLocalActivity {
+                at,
+                timestamp: now,
+                event: "scene_write_failed",
+                target_speed: None,
+                reason: None,
+                co2_ppm: None,
+                message: Some(sanitized_message),
+                recent_write_attempts_5m: Some(recent_write_attempts_5m),
+            },
+        );
+    }
+
+    fn record_local_failure_with_retry(
+        &self,
+        config: &ErvConfig,
+        message: &str,
+        active_retry: bool,
+    ) -> bool {
         let now = local_iso_now();
         let at = unix_timestamp_now();
         let mut invalid_event = None;
@@ -879,10 +1455,9 @@ impl ErvState {
             inner.consecutive_local_failures = inner.consecutive_local_failures.saturating_add(1);
             let retry_at = unix_timestamp_now()
                 + local_failure_retry_delay_seconds(inner.consecutive_local_failures);
+            inner.next_read_retry_at = Some(retry_at);
             if active_retry {
-                inner.next_local_retry_at = Some(retry_at);
-            } else {
-                inner.next_status_poll_retry_at = Some(retry_at);
+                inner.next_write_retry_at = Some(retry_at);
             }
             let recent_write_attempts_5m =
                 recent_write_attempts_locked(&inner, at, LOCAL_WRITE_BURST_WINDOW_SECONDS);
@@ -920,7 +1495,10 @@ impl ErvState {
                 {
                     inner.control.local_key_invalid = true;
                     inner.control.local_key_invalid_since = Some(now.clone());
-                    inner.notification = Some(invalid_key_notification(&now));
+                    inner.notification = Some(invalid_key_notification(
+                        &now,
+                        config.scene_control_active(),
+                    ));
                     invalid_event = Some(json!({
                         "type": "erv_local_key_invalid",
                         "started_at": now,
@@ -1025,6 +1603,13 @@ fn runtime_snapshot_json(snapshot: ErvRuntimeSnapshot) -> Value {
     })
 }
 
+fn transport_label(transport: ErvTransport) -> &'static str {
+    match transport {
+        ErvTransport::Local => "local",
+        ErvTransport::Scene => "scene",
+    }
+}
+
 fn device_status_json(status: &ErvDeviceStatus) -> Value {
     json!({
         "power": status.power,
@@ -1056,26 +1641,94 @@ fn sanitize_erv_error(message: &str) -> String {
     truncated
 }
 
-pub fn start_erv_status_poll(config: &AppConfig, erv: ErvState) -> Option<JoinHandle<()>> {
-    if !config.erv.is_configured() {
-        tracing::info!("ERV local Tuya config is incomplete; read-only ERV polling disabled");
-        return None;
+/// Establish true state once at startup, replacing the status poll loop.
+///
+/// The loop it replaces issued 288-1440 local reads a day and its failures were
+/// the trigger for the Err 914 lockout. Everything after boot is read-after-write.
+/// If the boot read fails and scenes can control the unit, force a known state
+/// by triggering the off scene rather than running blind.
+pub async fn run_erv_boot_read(config: &AppConfig, erv: &ErvState) {
+    let off_writer = config
+        .erv
+        .scene_control_active()
+        .then(|| build_erv_writer(config));
+    run_erv_boot_read_with(config, erv, &RustuyaErvStatusReader, off_writer.as_deref()).await;
+}
+
+pub(crate) async fn run_erv_boot_read_with<R, W>(
+    config: &AppConfig,
+    erv: &ErvState,
+    reader: &R,
+    off_writer: Option<&W>,
+) where
+    R: ErvStatusReader + ?Sized,
+    W: ErvSpeedWriter + ?Sized,
+{
+    if config.erv.local_readback_active() {
+        match erv.refresh_with(&config.erv, reader).await {
+            Ok(status) => {
+                tracing::info!(
+                    "ERV boot read: running={} speed={}",
+                    status.power,
+                    status
+                        .fan_speed
+                        .map(ErvFanSpeed::as_str)
+                        .unwrap_or("unknown")
+                );
+                return;
+            }
+            Err(error) => tracing::warn!("ERV boot read failed: {error:#}"),
+        }
+    } else {
+        tracing::info!("ERV local readback is not configured; skipping the boot read");
     }
 
-    let config = config.erv.clone();
-    Some(tokio::spawn(async move {
-        let reader = RustuyaErvStatusReader;
-        loop {
-            if !erv.local_retry_allowed(unix_timestamp_now()) {
-                time::sleep(erv.status_poll_delay(&config, unix_timestamp_now())).await;
-                continue;
-            }
-            if let Err(error) = erv.refresh_with(&config, &reader).await {
-                tracing::warn!("ERV read-only status poll failed: {error:#}");
-            }
-            time::sleep(erv.status_poll_delay(&config, unix_timestamp_now())).await;
-        }
-    }))
+    let Some(off_writer) = off_writer else { return };
+    if !config.erv.active_control_enabled {
+        return;
+    }
+
+    match erv
+        .set_speed_with(
+            &config.erv,
+            off_writer,
+            ErvFanSpeed::Off,
+            false,
+            "boot_unknown_state",
+            None,
+        )
+        .await
+    {
+        Ok(_) => tracing::info!("ERV boot state unknown; forced off via the Smart Life off scene"),
+        Err(error) => tracing::warn!("ERV boot off-scene trigger failed: {error:#}"),
+    }
+}
+
+/// Assemble the ERV writer for a configuration.
+///
+/// The default is `SplitErvWriter { writer: SceneErvSpeedWriter, reader:
+/// RustuyaErvStatusReader }`: writes go out as scene triggers, reads come back
+/// over local Tuya. `control_mode: local` keeps the pre-#154 all-local path.
+pub fn build_erv_writer(config: &AppConfig) -> Arc<dyn ErvSpeedWriter> {
+    if !config.erv.scene_control_active() {
+        return Arc::new(RustuyaErvSpeedWriter);
+    }
+
+    let cloud: Arc<dyn ErvCloudClient> = Arc::new(SmartLifeErvCloud::new(
+        config.smart_life.client_id.clone(),
+        &config.erv,
+    ));
+    let mut writer = SplitErvWriter::new(
+        Arc::new(SceneErvSpeedWriter::new(cloud.clone())),
+        Arc::new(RustuyaErvStatusReader),
+    )
+    .with_cloud_verifier(cloud);
+
+    if config.erv.local_write_fallback_enabled && config.erv.local_tuya_configured() {
+        writer = writer.with_local_write_fallback(Arc::new(RustuyaErvSpeedWriter));
+    }
+
+    Arc::new(writer)
 }
 
 pub async fn smoke_erv(config: &AppConfig) -> Result<ErvDeviceStatus> {
@@ -1290,15 +1943,29 @@ fn looks_like_tuya_error(message: &str) -> bool {
     message.contains("\"Error\"") || message.contains("\"Err\"") || message.contains("Error:")
 }
 
-fn invalid_key_notification(created_at: &str) -> AppNotification {
+fn invalid_key_notification(created_at: &str, scene_control_active: bool) -> AppNotification {
+    // With scene control this is a degraded-observability notice, not an
+    // outage: writes never touch the local key.
+    let (severity, title, message) = if scene_control_active {
+        (
+            "warning",
+            "ERV speed readback degraded",
+            "Local Tuya reads are failing with Err 914, so reported fan speed may be assumed rather than observed. Control is unaffected — writes go through Smart Life scenes. Run docs/tuya-local-key.md to restore readback.",
+        )
+    } else {
+        (
+            "critical",
+            "ERV local key rotated",
+            "Local Tuya control is failing with Err 914. Run docs/tuya-local-key.md to recover it.",
+        )
+    };
+
     AppNotification {
         id: format!("erv_local_key_invalid:{created_at}"),
         notification_type: "erv_local_key_invalid".to_string(),
-        severity: "critical".to_string(),
-        title: "ERV local key rotated".to_string(),
-        message:
-            "Local Tuya control is failing with Err 914. Run docs/tuya-local-key.md to recover it."
-                .to_string(),
+        severity: severity.to_string(),
+        title: title.to_string(),
+        message: message.to_string(),
         created_at: Some(created_at.to_string()),
         active: true,
         runbook_path: Some("docs/tuya-local-key.md".to_string()),
@@ -1310,11 +1977,26 @@ fn recovered_notification(created_at: &str) -> AppNotification {
         id: format!("erv_local_key_recovered:{created_at}"),
         notification_type: "erv_local_key_recovered".to_string(),
         severity: "info".to_string(),
-        title: "ERV local control recovered".to_string(),
-        message: "Local Tuya control is working again.".to_string(),
+        title: "ERV local readback recovered".to_string(),
+        message: "Local Tuya reads are working again; reported fan speed is observed.".to_string(),
         created_at: Some(created_at.to_string()),
         active: true,
         runbook_path: Some("docs/tuya-local-key.md".to_string()),
+    }
+}
+
+fn missing_scene_notification(preset: &str, created_at: &str) -> AppNotification {
+    AppNotification {
+        id: format!("erv_scene_missing:{preset}:{created_at}"),
+        notification_type: "erv_scene_missing".to_string(),
+        severity: "critical".to_string(),
+        title: "ERV scene missing".to_string(),
+        message: format!(
+            "No Smart Life scene is configured for {preset}, so that mode cannot be delivered. Scenes are hand-built in the Smart Life app; the API cannot create them."
+        ),
+        created_at: Some(created_at.to_string()),
+        active: true,
+        runbook_path: Some("docs/working/154_erv_scene_fallback.md".to_string()),
     }
 }
 
@@ -1381,6 +2063,7 @@ mod tests {
         write_results: Mutex<VecDeque<Result<ErvDeviceStatus>>>,
         smoke_calls: AtomicUsize,
         write_speeds: Mutex<Vec<ErvFanSpeed>>,
+        report: ErvWriteReport,
     }
 
     impl FakeErvWriter {
@@ -1393,7 +2076,17 @@ mod tests {
                 write_results: Mutex::new(write_results.into()),
                 smoke_calls: AtomicUsize::new(0),
                 write_speeds: Mutex::new(Vec::new()),
+                report: ErvWriteReport::default(),
             }
+        }
+
+        /// Model a scene write whose result nothing could observe.
+        fn with_scene_report(mut self) -> Self {
+            self.report = ErvWriteReport {
+                transport: ErvTransport::Scene,
+                source: ErvStatusSource::Assumed,
+            };
+            self
         }
 
         fn smoke_calls(&self) -> usize {
@@ -1441,6 +2134,10 @@ mod tests {
                 .unwrap_or_else(|| bail!("no fake ERV write result configured"));
             Box::pin(async move { result })
         }
+
+        fn last_write_report(&self) -> ErvWriteReport {
+            self.report
+        }
     }
 
     fn test_config() -> ErvConfig {
@@ -1460,6 +2157,18 @@ mod tests {
         }
     }
 
+    /// A fully configured scene write path on top of the local read path.
+    fn scene_config() -> ErvConfig {
+        ErvConfig {
+            smart_life_home_id: Some("home-id".to_string()),
+            off_scene_id: Some("off-scene".to_string()),
+            quiet_scene_id: Some("quiet-scene".to_string()),
+            medium_scene_id: Some("medium-scene".to_string()),
+            turbo_scene_id: Some("turbo-scene".to_string()),
+            ..active_config()
+        }
+    }
+
     fn app_config(erv: ErvConfig) -> AppConfig {
         AppConfig {
             orchestrator: OrchestratorConfig::default(),
@@ -1471,6 +2180,7 @@ mod tests {
             cloudflare_access: crate::config::CloudflareAccessConfig::default(),
             erv,
             blinds: crate::config::BlindsConfig::default(),
+            smart_life: crate::config::SmartLifeConfig::default(),
             mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
             telemetry: crate::config::TelemetryConfig::default(),
@@ -1667,7 +2377,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_status_failure_backs_off_polling_without_blocking_writes() {
+    async fn local_read_failure_backs_off_reads_without_blocking_writes() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let database_path = temp_dir.path().join("office_climate.db");
         db::migrate_database(&database_path).expect("migration");
@@ -1680,53 +2390,37 @@ mod tests {
         assert!(state.refresh_with(&test_config(), &reader).await.is_err());
 
         let now = unix_timestamp_now();
-        assert!(state.local_retry_allowed(now));
-        let delay = state.status_poll_delay(&test_config(), now);
-        assert!(delay >= Duration::from_secs(LOCAL_FAILURE_BASE_RETRY_SECONDS as u64 - 1));
-        assert!(delay <= Duration::from_secs(LOCAL_FAILURE_BASE_RETRY_SECONDS as u64));
+        assert!(state.write_retry_allowed(now));
+        assert!(!state.read_retry_allowed(now));
+        assert!(state.read_retry_allowed(now + LOCAL_FAILURE_BASE_RETRY_SECONDS + 1.0));
 
         assert!(state.refresh_with(&test_config(), &reader).await.is_err());
         let now = unix_timestamp_now();
-        assert!(state.local_retry_allowed(now + LOCAL_FAILURE_BASE_RETRY_SECONDS + 1.0));
-        let delay = state.status_poll_delay(&test_config(), now);
-        assert!(delay >= Duration::from_secs((LOCAL_FAILURE_BASE_RETRY_SECONDS * 2.0) as u64 - 1));
-        assert!(delay <= Duration::from_secs((LOCAL_FAILURE_BASE_RETRY_SECONDS * 2.0) as u64));
+        assert!(state.write_retry_allowed(now));
+        assert!(!state.read_retry_allowed(now + LOCAL_FAILURE_BASE_RETRY_SECONDS + 1.0));
+        assert!(state.read_retry_allowed(now + LOCAL_FAILURE_BASE_RETRY_SECONDS * 2.0 + 1.0));
     }
 
     #[tokio::test]
-    async fn status_poll_delay_uses_idle_interval_and_failure_backoff() {
+    async fn successful_local_read_clears_the_read_backoff() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let database_path = temp_dir.path().join("office_climate.db");
         db::migrate_database(&database_path).expect("migration");
         let state = ErvState::new(database_path);
         let reader = FakeErvReader::new(vec![
-            Ok(parse_erv_status_payload(r#"{"dps":{"1":false}}"#).expect("status")),
             Err(anyhow!("Connection reset by peer")),
+            Ok(medium_status()),
         ]);
-        let config = ErvConfig {
-            poll_interval_seconds: 11,
-            idle_poll_interval_seconds: 97,
-            ..test_config()
-        };
 
-        assert_eq!(
-            state.status_poll_delay(&config, unix_timestamp_now()),
-            Duration::from_secs(11)
-        );
+        assert!(state.refresh_with(&test_config(), &reader).await.is_err());
+        assert!(!state.read_retry_allowed(unix_timestamp_now()));
 
         state
-            .refresh_with(&config, &reader)
+            .refresh_with(&test_config(), &reader)
             .await
-            .expect("idle status poll succeeds");
-        assert_eq!(
-            state.status_poll_delay(&config, unix_timestamp_now()),
-            Duration::from_secs(97)
-        );
+            .expect("read succeeds");
 
-        assert!(state.refresh_with(&config, &reader).await.is_err());
-        let delay = state.status_poll_delay(&config, unix_timestamp_now());
-        assert!(delay >= Duration::from_secs(LOCAL_FAILURE_BASE_RETRY_SECONDS as u64 - 1));
-        assert!(delay <= Duration::from_secs(LOCAL_FAILURE_BASE_RETRY_SECONDS as u64));
+        assert!(state.read_retry_allowed(unix_timestamp_now()));
     }
 
     #[tokio::test]
@@ -1928,7 +2622,7 @@ mod tests {
             writer.write_speeds(),
             vec![ErvFanSpeed::Turbo, ErvFanSpeed::Turbo, ErvFanSpeed::Turbo]
         );
-        assert!(!state.local_retry_allowed(unix_timestamp_now()));
+        assert!(!state.write_retry_allowed(unix_timestamp_now()));
 
         let history = db::read_history(&database_path, 1, 20).expect("history");
         let suppressed = history
@@ -1991,7 +2685,7 @@ mod tests {
 
         assert!(error.to_string().contains("burst guard"));
         assert_eq!(writer.write_speeds().len(), LOCAL_WRITE_BURST_ATTEMPT_LIMIT);
-        assert!(!state.local_retry_allowed(unix_timestamp_now()));
+        assert!(!state.write_retry_allowed(unix_timestamp_now()));
     }
 
     #[tokio::test]
@@ -2041,8 +2735,10 @@ mod tests {
         assert_eq!(writer.write_speeds().len(), LOCAL_WRITE_BURST_ATTEMPT_LIMIT);
     }
 
+    /// The regression this whole change exists for: repeated Err 914 reads mark
+    /// the local key invalid, and control keeps working through all of it.
     #[tokio::test]
-    async fn smoke_local_key_failures_close_active_write_gate() {
+    async fn local_key_failures_degrade_readback_without_closing_the_write_gate() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let database_path = temp_dir.path().join("office_climate.db");
         db::migrate_database(&database_path).expect("migration");
@@ -2051,34 +2747,47 @@ mod tests {
             (0..LOCAL_KEY_ERROR_THRESHOLD)
                 .map(|_| bail!("Check device key or version (Error 914)"))
                 .collect(),
-            vec![Ok(turbo_status())],
-        );
+            (0..LOCAL_KEY_ERROR_THRESHOLD + 1)
+                .map(|_| Ok(turbo_status()))
+                .collect(),
+        )
+        .with_scene_report();
 
+        // Reads keep failing, but every write lands. The read backoff is
+        // stepped over here so each attempt actually tries a read.
         for _ in 0..LOCAL_KEY_ERROR_THRESHOLD {
-            assert!(
-                state
-                    .set_speed_with(
-                        &active_config(),
-                        &writer,
-                        ErvFanSpeed::Turbo,
-                        false,
-                        "manual_override",
-                        None,
-                    )
-                    .await
-                    .is_err()
-            );
+            state
+                .set_speed_with(
+                    &scene_config(),
+                    &writer,
+                    ErvFanSpeed::Turbo,
+                    false,
+                    "manual_override",
+                    None,
+                )
+                .await
+                .expect("write succeeds while reads fail");
+            state.clear_read_backoff_for_test();
         }
 
-        let mut status = Status::read_only_default(&app_config(active_config()));
+        let mut status = Status::read_only_default(&app_config(scene_config()));
         state.overlay_status(&mut status);
         assert!(status.erv.control.local_key_invalid);
+        assert_eq!(
+            status.notifications[0].notification_type,
+            "erv_local_key_invalid"
+        );
+        assert_eq!(status.notifications[0].severity, "warning");
         assert_eq!(writer.smoke_calls(), LOCAL_KEY_ERROR_THRESHOLD as usize);
-        assert!(writer.write_speeds().is_empty());
+        assert_eq!(
+            writer.write_speeds().len(),
+            LOCAL_KEY_ERROR_THRESHOLD as usize
+        );
 
-        let error = state
+        // And a write issued once the key is already marked invalid still goes.
+        state
             .set_speed_with(
-                &active_config(),
+                &scene_config(),
                 &writer,
                 ErvFanSpeed::Quiet,
                 false,
@@ -2086,9 +2795,438 @@ mod tests {
                 None,
             )
             .await
-            .expect_err("invalid local key should fail before smoke");
-        assert!(error.to_string().contains("local Tuya key is invalid"));
-        assert_eq!(writer.smoke_calls(), LOCAL_KEY_ERROR_THRESHOLD as usize);
-        assert!(writer.write_speeds().is_empty());
+            .expect("invalid local key must not block control");
+        assert_eq!(
+            writer.write_speeds().len(),
+            LOCAL_KEY_ERROR_THRESHOLD as usize + 1
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeCloud {
+        triggers: Mutex<Vec<(String, String)>>,
+        trigger_results: Mutex<VecDeque<Result<()>>>,
+        power_results: Mutex<VecDeque<Result<Option<bool>>>>,
+        power_reads: AtomicUsize,
+    }
+
+    impl FakeCloud {
+        fn failing(errors: usize) -> Self {
+            Self {
+                trigger_results: Mutex::new(
+                    (0..errors)
+                        .map(|_| Err(anyhow!("Smart Life API error code=1106")))
+                        .collect(),
+                ),
+                ..Self::default()
+            }
+        }
+
+        fn with_power_reads(self, results: Vec<Result<Option<bool>>>) -> Self {
+            *self.power_results.lock().expect("power lock") = results.into();
+            self
+        }
+
+        fn triggered_scenes(&self) -> Vec<String> {
+            self.triggers
+                .lock()
+                .expect("trigger lock")
+                .iter()
+                .map(|(_, scene_id)| scene_id.clone())
+                .collect()
+        }
+
+        fn power_reads(&self) -> usize {
+            self.power_reads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ErvCloudClient for FakeCloud {
+        fn trigger_scene<'a>(
+            &'a self,
+            home_id: &'a str,
+            scene_id: &'a str,
+        ) -> BoxFutureResult<'a, ()> {
+            self.triggers
+                .lock()
+                .expect("trigger lock")
+                .push((home_id.to_string(), scene_id.to_string()));
+            let result = self
+                .trigger_results
+                .lock()
+                .expect("trigger results lock")
+                .pop_front()
+                .unwrap_or(Ok(()));
+            Box::pin(async move { result })
+        }
+
+        fn read_power<'a>(&'a self, _device_id: &'a str) -> BoxFutureResult<'a, Option<bool>> {
+            self.power_reads.fetch_add(1, Ordering::SeqCst);
+            let result = self
+                .power_results
+                .lock()
+                .expect("power lock")
+                .pop_front()
+                .unwrap_or(Ok(None));
+            Box::pin(async move { result })
+        }
+    }
+
+    fn split_writer(
+        cloud: Arc<FakeCloud>,
+        reader: Arc<FakeErvReader>,
+        fallback: Option<Arc<FakeErvWriter>>,
+    ) -> SplitErvWriter {
+        let mut writer =
+            SplitErvWriter::new(Arc::new(SceneErvSpeedWriter::new(cloud.clone())), reader)
+                .with_cloud_verifier(cloud);
+        if let Some(fallback) = fallback {
+            writer = writer.with_local_write_fallback(fallback);
+        }
+        writer
+    }
+
+    /// The property the whole design rests on: in the default configuration a
+    /// write reaches the device as a scene trigger and never as a local
+    /// command, because local commands are what trigger the Err 914 lockout.
+    #[tokio::test]
+    async fn default_write_path_triggers_a_scene_and_issues_no_local_command() {
+        let cloud = Arc::new(FakeCloud::default());
+        let local = Arc::new(FakeErvWriter::new(Vec::new(), Vec::new()));
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(vec![Ok(turbo_status())])),
+            Some(local.clone()),
+        );
+
+        let status = writer
+            .set_speed(&scene_config(), ErvFanSpeed::Turbo, false)
+            .await
+            .expect("scene write succeeds");
+
+        assert_eq!(cloud.triggered_scenes(), vec!["turbo-scene".to_string()]);
+        assert!(
+            local.write_speeds().is_empty(),
+            "no local command may be issued on the scene path"
+        );
+        assert_eq!(status.fan_speed, Some(ErvFanSpeed::Turbo));
+    }
+
+    #[tokio::test]
+    async fn scene_write_verified_by_a_local_read_reports_observed_speeds() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let cloud = Arc::new(FakeCloud::default());
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(vec![
+                Ok(medium_status()),
+                Ok(turbo_status()),
+            ])),
+            None,
+        );
+
+        let status = state
+            .set_speed_with(
+                &scene_config(),
+                &writer,
+                ErvFanSpeed::Turbo,
+                false,
+                "away_refresh",
+                None,
+            )
+            .await
+            .expect("scene write succeeds");
+
+        assert_eq!(status.supply_speed, Some(8));
+        assert_eq!(status.exhaust_speed, Some(8));
+
+        let mut app_status = Status::read_only_default(&app_config(scene_config()));
+        state.overlay_status(&mut app_status);
+        assert_eq!(app_status.erv.control.status_source, ErvStatusSource::Local);
+        assert_eq!(app_status.erv.speed, "turbo");
+    }
+
+    #[tokio::test]
+    async fn scene_write_survives_a_failed_readback_and_reports_assumed_state() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let cloud = Arc::new(FakeCloud::default());
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(vec![
+                Err(anyhow!("Check device key or version (Error 914)")),
+                Err(anyhow!("Check device key or version (Error 914)")),
+            ])),
+            None,
+        );
+
+        let status = state
+            .set_speed_with(
+                &scene_config(),
+                &writer,
+                ErvFanSpeed::Turbo,
+                false,
+                "away_refresh",
+                None,
+            )
+            .await
+            .expect("a failed readback must not fail the write");
+
+        assert_eq!(cloud.triggered_scenes(), vec!["turbo-scene".to_string()]);
+        assert_eq!(status.fan_speed, Some(ErvFanSpeed::Turbo));
+
+        let mut app_status = Status::read_only_default(&app_config(scene_config()));
+        state.overlay_status(&mut app_status);
+        assert_eq!(
+            app_status.erv.control.status_source,
+            ErvStatusSource::Assumed
+        );
+    }
+
+    /// The cloud only exposes the `switch` bit, so it is worth a call when the
+    /// power state changes and pure noise when only the speed does.
+    #[tokio::test]
+    async fn cloud_verification_runs_on_power_transitions_only() {
+        let cloud =
+            Arc::new(FakeCloud::default().with_power_reads(vec![Ok(Some(true)), Ok(Some(true))]));
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(vec![
+                Err(anyhow!("Check device key or version (Error 914)")),
+                Err(anyhow!("Check device key or version (Error 914)")),
+            ])),
+            None,
+        );
+        let config = scene_config();
+
+        // Power state is unknown, so off -> turbo is a transition.
+        writer
+            .set_speed(&config, ErvFanSpeed::Turbo, false)
+            .await
+            .expect("scene write succeeds");
+        assert_eq!(cloud.power_reads(), 1);
+        assert_eq!(
+            writer.last_write_report().source,
+            ErvStatusSource::Cloud,
+            "a confirmed power bit is better than an assumption"
+        );
+
+        // Turbo -> medium leaves the switch on, so there is nothing to learn.
+        writer
+            .set_speed(&config, ErvFanSpeed::Medium, false)
+            .await
+            .expect("scene write succeeds");
+        assert_eq!(cloud.power_reads(), 1);
+        assert_eq!(writer.last_write_report().source, ErvStatusSource::Assumed);
+    }
+
+    #[tokio::test]
+    async fn failed_scene_trigger_falls_back_to_a_local_write() {
+        let cloud = Arc::new(FakeCloud::failing(1));
+        let local = Arc::new(FakeErvWriter::new(Vec::new(), vec![Ok(turbo_status())]));
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(Vec::new())),
+            Some(local.clone()),
+        );
+
+        let status = writer
+            .set_speed(&scene_config(), ErvFanSpeed::Turbo, false)
+            .await
+            .expect("local fallback keeps the ERV controllable");
+
+        assert_eq!(local.write_speeds(), vec![ErvFanSpeed::Turbo]);
+        assert_eq!(status.fan_speed, Some(ErvFanSpeed::Turbo));
+        assert_eq!(writer.last_write_report().transport, ErvTransport::Local);
+        assert_eq!(writer.last_write_report().source, ErvStatusSource::Local);
+    }
+
+    #[tokio::test]
+    async fn failed_scene_trigger_surfaces_an_error_when_local_is_unhealthy() {
+        let cloud = Arc::new(FakeCloud::failing(1));
+        let local = Arc::new(FakeErvWriter::new(Vec::new(), vec![Ok(turbo_status())]));
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(vec![Err(anyhow!(
+                "Check device key or version (Error 914)"
+            ))])),
+            Some(local.clone()),
+        );
+        let config = scene_config();
+
+        // A failed read is what marks local unhealthy.
+        assert!(writer.smoke_status(&config).await.is_err());
+
+        let error = writer
+            .set_speed(&config, ErvFanSpeed::Turbo, false)
+            .await
+            .expect_err("no usable transport should surface an error");
+
+        assert!(format!("{error:#}").contains("Smart Life API error"));
+        assert!(
+            local.write_speeds().is_empty(),
+            "an unhealthy local path must not be used as a fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_scene_fails_loudly_instead_of_substituting() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let cloud = Arc::new(FakeCloud::default());
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(Vec::new())),
+            None,
+        );
+
+        // Negative-pressure turbo has no configured scene here.
+        let error = state
+            .set_speed_with(
+                &scene_config(),
+                &writer,
+                ErvFanSpeed::Turbo,
+                true,
+                "away_refresh",
+                None,
+            )
+            .await
+            .expect_err("a missing scene must not fall back to another preset");
+
+        assert!(error.downcast_ref::<MissingSceneError>().is_some());
+        assert!(
+            cloud.triggered_scenes().is_empty(),
+            "the normal-pressure scene must not be substituted"
+        );
+
+        let mut app_status = Status::read_only_default(&app_config(scene_config()));
+        state.overlay_status(&mut app_status);
+        assert_eq!(
+            app_status.erv.control.missing_scene.as_deref(),
+            Some("turbo (negative pressure)")
+        );
+        assert_eq!(
+            app_status.notifications[0].notification_type,
+            "erv_scene_missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_read_forces_a_known_state_when_the_local_read_fails() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let reader = FakeErvReader::new(vec![Err(anyhow!("Connection reset by peer"))]);
+        let cloud = Arc::new(FakeCloud::default());
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(Vec::new())),
+            None,
+        );
+
+        run_erv_boot_read_with(&app_config(scene_config()), &state, &reader, Some(&writer)).await;
+
+        assert_eq!(cloud.triggered_scenes(), vec!["off-scene".to_string()]);
+        assert!(!state.snapshot().running);
+    }
+
+    #[tokio::test]
+    async fn boot_read_establishes_state_without_touching_the_cloud() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let reader = FakeErvReader::new(vec![Ok(medium_status())]);
+        let cloud = Arc::new(FakeCloud::default());
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(Vec::new())),
+            None,
+        );
+
+        run_erv_boot_read_with(&app_config(scene_config()), &state, &reader, Some(&writer)).await;
+
+        assert!(cloud.triggered_scenes().is_empty());
+        assert_eq!(state.snapshot().speed, ErvFanSpeed::Medium);
+    }
+
+    /// A cloud failure backs off the write path and says nothing about the
+    /// local key, which is a different subsystem entirely.
+    #[tokio::test]
+    async fn scene_failure_backs_off_writes_without_blaming_the_local_key() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let cloud = Arc::new(FakeCloud::failing(1));
+        let writer = split_writer(cloud, Arc::new(FakeErvReader::new(Vec::new())), None);
+        let config = ErvConfig {
+            local_readback_enabled: false,
+            ..scene_config()
+        };
+
+        state
+            .set_speed_with(
+                &config,
+                &writer,
+                ErvFanSpeed::Turbo,
+                false,
+                "away_refresh",
+                None,
+            )
+            .await
+            .expect_err("scene trigger failed with no fallback");
+
+        let now = unix_timestamp_now();
+        assert!(!state.write_retry_allowed(now));
+        assert!(state.read_retry_allowed(now));
+
+        let mut app_status = Status::read_only_default(&app_config(config));
+        state.overlay_status(&mut app_status);
+        assert!(!app_status.erv.control.local_key_invalid);
+        assert_eq!(app_status.erv.control.consecutive_local_key_errors, 0);
+        assert!(
+            app_status
+                .erv
+                .control
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("Scene trigger failed:"))
+        );
+    }
+
+    #[test]
+    fn scene_ids_cover_the_full_speed_by_pressure_matrix() {
+        let config = ErvConfig {
+            quiet_negative_pressure_scene_id: Some("quiet-np".to_string()),
+            medium_negative_pressure_scene_id: Some("medium-np".to_string()),
+            turbo_negative_pressure_scene_id: Some("turbo-np".to_string()),
+            ..scene_config()
+        };
+
+        for (speed, negative_pressure, expected) in [
+            (ErvFanSpeed::Off, false, "off-scene"),
+            (ErvFanSpeed::Off, true, "off-scene"),
+            (ErvFanSpeed::Quiet, false, "quiet-scene"),
+            (ErvFanSpeed::Medium, false, "medium-scene"),
+            (ErvFanSpeed::Turbo, false, "turbo-scene"),
+            (ErvFanSpeed::Quiet, true, "quiet-np"),
+            (ErvFanSpeed::Medium, true, "medium-np"),
+            (ErvFanSpeed::Turbo, true, "turbo-np"),
+        ] {
+            assert_eq!(
+                scene_id_for(&config, speed, negative_pressure),
+                Ok(expected),
+                "wrong scene for {speed:?} negative_pressure={negative_pressure}"
+            );
+        }
     }
 }
