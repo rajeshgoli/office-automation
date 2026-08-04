@@ -1486,6 +1486,13 @@ async fn validate_live_devices(
         if erv_local_credentials_required(&config.erv) {
             bail!("shadow validation requires a configured ERV control path");
         }
+        // Scene ids being non-empty strings proves nothing about whether the
+        // transport works. This is a cutover gate, so exercise the credentials
+        // that every ERV command depends on.
+        let detail = erv::smoke_erv_scene(config)
+            .await
+            .context("ERV Smart Life scene credential check failed")?;
+        report.push_pass("erv-scene-auth", detail);
         report.push_skip(
             "erv-read",
             "ERV local read credentials are not configured; scene control does not need them",

@@ -856,19 +856,31 @@ impl ErvState {
             }
         }
 
-        // The pre-write read is an optimisation that skips redundant writes, not
-        // a gate. Requiring it to succeed is what let one dead local key take
-        // out every control path for a month.
+        // On the scene path the pre-write read is an optimisation that skips
+        // redundant writes, not a gate: requiring it to succeed is what let one
+        // dead local key take out every control path for a month.
+        //
+        // In local control mode it is still a gate, because there the local key
+        // *is* the control path. Writing through credentials a read just
+        // rejected is the command pattern that produces the lockout.
+        let local_control = config.control_mode == ErvControlMode::Local;
         if self.pre_write_read_allowed(config) {
             match self.smoke_status_with_locked(config, writer).await {
                 Ok(status) if device_status_matches_target(&status, speed, negative_pressure) => {
                     return Ok(status);
                 }
                 Ok(_) => {}
+                Err(error) if local_control => {
+                    return Err(error.context("ERV read before a local write failed"));
+                }
                 Err(error) => {
                     tracing::warn!("ERV read before write failed, writing anyway: {error:#}");
                 }
             }
+        } else if local_control && config.local_readback_active() {
+            // The read was skipped because reads are in failure backoff, which
+            // in local mode means the write would fail the same way.
+            bail!("ERV local reads are in failure backoff; refusing to issue a local command");
         }
 
         self.write_speed_after_gate_locked(
@@ -1937,6 +1949,41 @@ pub fn build_erv_writer(config: &AppConfig) -> Arc<dyn ErvSpeedWriter> {
     }
 
     Arc::new(writer)
+}
+
+/// Read-only check of the Smart Life scene transport.
+///
+/// Scene ids being non-empty strings proves nothing: the auth cache can be
+/// missing, unreadable, or holding a dead refresh token, and every ERV command
+/// would fail. This exercises the credentials without commanding the device.
+pub async fn smoke_erv_scene(config: &AppConfig) -> Result<String> {
+    if !config.erv.scene_control_active() {
+        bail!("ERV scene control is not configured");
+    }
+
+    let client = SmartLifeClient::new(
+        config.smart_life.client_id.clone(),
+        auth_file_or_default(config.erv.smart_life_auth_file.as_ref()),
+    );
+    let endpoint = client
+        .check_credentials()
+        .await
+        .context("Smart Life credentials are not usable")?;
+
+    let device_id = config.erv.device_id.trim();
+    if device_id.is_empty() {
+        return Ok(format!("Smart Life auth OK at {endpoint}"));
+    }
+
+    let status = client
+        .device_status(device_id)
+        .await
+        .context("Smart Life device read failed")?;
+    let power = status_code_value(&status, "switch")
+        .and_then(value_as_bool)
+        .map(|power| power.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(format!("Smart Life auth OK at {endpoint}; switch={power}"))
 }
 
 pub async fn smoke_erv(config: &AppConfig) -> Result<ErvDeviceStatus> {
@@ -3863,6 +3910,87 @@ mod tests {
         run_erv_boot_read(&config, &state, &writer).await;
 
         assert_eq!(cloud.triggered_scenes(), vec!["off-scene".to_string()]);
+    }
+
+    /// §6 scopes "a failed read must not block control" to the scene path. In
+    /// local control mode the local key *is* control, so writing through
+    /// credentials a read just rejected is the command pattern that produces
+    /// the lockout.
+    #[tokio::test]
+    async fn local_control_mode_keeps_the_failed_read_gate() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let writer = FakeErvWriter::new(
+            vec![Err(anyhow!("Check device key or version (Error 914)"))],
+            vec![Ok(turbo_status())],
+        );
+        let config = ErvConfig {
+            control_mode: ErvControlMode::Local,
+            ..active_config()
+        };
+
+        let error = state
+            .set_speed_with(
+                &config,
+                &writer,
+                ErvFanSpeed::Turbo,
+                false,
+                "manual_override",
+                None,
+            )
+            .await
+            .expect_err("a rejected read must not be followed by a local command");
+
+        assert!(format!("{error:#}").contains("read before a local write failed"));
+        assert!(writer.write_speeds().is_empty());
+
+        // And once reads are in backoff, the write is refused without even
+        // attempting one.
+        let error = state
+            .set_speed_with(
+                &config,
+                &writer,
+                ErvFanSpeed::Turbo,
+                false,
+                "manual_override",
+                None,
+            )
+            .await
+            .expect_err("local writes stay gated while reads are backing off");
+
+        assert!(error.to_string().contains("failure backoff"));
+        assert_eq!(writer.smoke_calls(), 1);
+        assert!(writer.write_speeds().is_empty());
+    }
+
+    /// The same failure on the scene path must not block control.
+    #[tokio::test]
+    async fn scene_control_mode_writes_through_a_failed_read() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let writer = FakeErvWriter::new(
+            vec![Err(anyhow!("Check device key or version (Error 914)"))],
+            vec![Ok(turbo_status())],
+        )
+        .with_scene_report();
+
+        state
+            .set_speed_with(
+                &scene_config(),
+                &writer,
+                ErvFanSpeed::Turbo,
+                false,
+                "manual_override",
+                None,
+            )
+            .await
+            .expect("a failed read must not block a scene write");
+
+        assert_eq!(writer.write_speeds(), vec![ErvFanSpeed::Turbo]);
     }
 
     /// A fallback write that lands proves local works, so the failure count

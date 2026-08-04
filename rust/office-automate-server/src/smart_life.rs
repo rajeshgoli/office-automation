@@ -106,6 +106,17 @@ impl SmartLifeClient {
             .ok_or_else(|| anyhow!("Smart Life returned no status for device {device_id}"))
     }
 
+    /// Read-only credential check: the cache is present, parseable, and its
+    /// refresh token is usable. Issues no device command.
+    pub async fn check_credentials(&self) -> Result<String> {
+        let _auth_guard = AUTH_CACHE_LOCK.lock().await;
+        let mut auth = SmartLifeAuthCache::load(&self.auth_file)?;
+        if self.refresh_auth_if_needed(&mut auth).await? {
+            auth.save(&self.auth_file)?;
+        }
+        Ok(auth.endpoint.clone())
+    }
+
     async fn call(
         &self,
         method: &str,
