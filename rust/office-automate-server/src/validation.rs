@@ -1484,15 +1484,15 @@ async fn validate_live_devices(
     // *and* scene control, so keying this off the absence of local credentials
     // would check everything except the path in use.
     //
-    // Configuration only. Whether the credentials work and the scene ids still
-    // exist needs a live Smart Life call, which is tracked separately.
+    // Live: this exercises the Smart Life credentials and confirms every
+    // configured scene id still exists, not just that the matrix is filled
+    // in. A stale id passes configuration-only validation and fails at the
+    // first ventilation request instead.
     if config.erv.scene_control_selected() {
-        let checked =
-            erv::check_erv_scene_config(config).context("ERV scene configuration is incomplete")?;
-        report.push_pass(
-            "erv-scene-config",
-            format!("{checked} required scene ids configured (not verified live)"),
-        );
+        let detail = erv::smoke_erv_scene(config)
+            .await
+            .context("ERV Smart Life scene check failed")?;
+        report.push_pass("erv-scene-auth", detail);
     }
 
     if !config.erv.local_tuya_configured() {
