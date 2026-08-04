@@ -8,6 +8,7 @@ testable on any machine.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -18,6 +19,17 @@ CERT_ROOT = "36fc54a873d584a34fcfeea7d1f519b19a39de72"
 
 STABLE_DR = f'designated => identifier "{IDENTIFIER}" and certificate root = H"{CERT_ROOT}"'
 
+# These fixtures assume the script's hard-coded defaults for identifier and
+# cert root. A host with its own real certificate configured via
+# OFFICE_AUTOMATE_SIGNING_IDENTIFIER/OFFICE_AUTOMATE_SIGNING_CERT_ROOT would
+# leak those into the subprocess and mismatch the fixtures below, failing the
+# guard tests for a reason that has nothing to do with the guard itself.
+_TEST_ENV = {
+    k: v
+    for k, v in os.environ.items()
+    if k not in ("OFFICE_AUTOMATE_SIGNING_IDENTIFIER", "OFFICE_AUTOMATE_SIGNING_CERT_ROOT")
+}
+
 
 def check_dr(requirement: str) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -25,6 +37,7 @@ def check_dr(requirement: str) -> subprocess.CompletedProcess:
         input=requirement,
         capture_output=True,
         text=True,
+        env=_TEST_ENV,
     )
 
 

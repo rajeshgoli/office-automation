@@ -40,6 +40,10 @@ export CARGO_TARGET_DIR
 identity="${OFFICE_AUTOMATE_SIGNING_IDENTITY:-Office Automate Local Signing}"
 identifier="${OFFICE_AUTOMATE_SIGNING_IDENTIFIER:-com.office-automate.server}"
 cert_root="${OFFICE_AUTOMATE_SIGNING_CERT_ROOT:-36fc54a873d584a34fcfeea7d1f519b19a39de72}"
+# Normalized once here so every comparison against it (the preflight identity
+# hash, which security find-identity reports uppercase, and check_dr's
+# case-insensitive grep) is comparing like with like.
+cert_root="$(printf '%s' "$cert_root" | tr 'A-F' 'a-f')"
 
 doc="docs/deployment/code-signing.md"
 
