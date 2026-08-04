@@ -475,14 +475,19 @@ impl SplitErvWriter {
     /// only an exhausted budget does, which is what keeps this from fighting
     /// the backoff that already gates how often a dead path gets tried.
     ///
-    /// Returns the *first* error, not the last: it is the one that actually
-    /// describes the device, and downstream health accounting classifies on
-    /// its message (e.g. an Err 914 local-key diagnosis).
+    /// Returns the first *local-key-classified* error if any attempt saw one,
+    /// else the first error overall. A cold-radio attempt fails before ever
+    /// reaching the device, so it can precede a later attempt that actually
+    /// gets far enough to receive a real Err 914 rejection; preferring the
+    /// earliest transient error in that case would discard the one diagnosis
+    /// downstream health accounting (`is_local_key_error`) can act on, and
+    /// could mask a genuinely invalid key behind cold-radio noise forever.
     async fn read_local_with_cold_contact_retry(
         &self,
         config: &ErvConfig,
     ) -> Result<ErvDeviceStatus> {
         let mut first_error = None;
+        let mut first_key_error = None;
         for attempt in 1..=LOCAL_COLD_CONTACT_RETRY_ATTEMPTS {
             match self.reader.read_status(config).await {
                 Ok(status) => return Ok(status),
@@ -494,11 +499,17 @@ impl SplitErvWriter {
                         );
                         time::sleep(LOCAL_COLD_CONTACT_RETRY_DELAY).await;
                     }
-                    first_error.get_or_insert(error);
+                    if first_key_error.is_none() && is_local_key_error(&format!("{error:#}")) {
+                        first_key_error = Some(error);
+                    } else {
+                        first_error.get_or_insert(error);
+                    }
                 }
             }
         }
-        Err(first_error.expect("loop runs at least once so an error was recorded"))
+        Err(first_key_error
+            .or(first_error)
+            .expect("loop runs at least once so an error was recorded"))
     }
 
     async fn write_fallback(
@@ -3730,6 +3741,33 @@ mod tests {
             "a genuinely dead local path retried past its bounded budget"
         );
         assert_eq!(cloud.triggered_scenes(), vec!["off-scene".to_string()]);
+    }
+
+    /// A cold-radio attempt fails before ever reaching the device, so it can
+    /// precede a later attempt that gets far enough to receive a real Err 914
+    /// rejection. The retry must surface that diagnosis, not the earlier
+    /// transient one, or a genuinely invalid key hides behind cold-radio
+    /// noise indefinitely -- `local_key_invalid` classifies on this message.
+    #[tokio::test]
+    async fn cold_contact_retry_prefers_a_later_local_key_diagnosis() {
+        let cloud = Arc::new(FakeCloud::default());
+        let reader = Arc::new(FakeErvReader::new(vec![
+            Err(anyhow!("No route to host (os error 65)")),
+            Err(anyhow!("Check device key or version (Error 914)")),
+            Err(anyhow!("Check device key or version (Error 914)")),
+        ]));
+        let writer = split_writer(cloud, reader.clone(), None);
+
+        let error = writer
+            .smoke_status(&scene_config())
+            .await
+            .expect_err("every attempt failed");
+
+        assert!(
+            format!("{error:#}").contains("Check device key or version"),
+            "a later local-key diagnosis was discarded for an earlier transient error"
+        );
+        assert_eq!(reader.call_count(), 3);
     }
 
     /// The boot read must feed the writer's own local health. Otherwise a
