@@ -374,9 +374,19 @@ impl SplitErvWriter {
     fn finish(&self, report: ErvWriteReport, status: Option<&ErvDeviceStatus>) {
         let mut state = self.state();
         state.report = report;
-        if let Some(status) = status {
-            state.last_known_power = Some(status.power);
-        }
+        let Some(status) = status else {
+            // Nothing was commanded successfully, so power is whatever it was.
+            return;
+        };
+
+        // Only an observation may claim to know the power state. Trusting an
+        // assumed one would classify the next on-to-on command as speed-only
+        // and skip the cloud check, so an ERV that never ran the scene would
+        // keep being reported as ventilating.
+        state.last_known_power = match report.source {
+            ErvStatusSource::Local | ErvStatusSource::Cloud => Some(status.power),
+            ErvStatusSource::Assumed | ErvStatusSource::Unknown => None,
+        };
     }
 
     /// A power transition is the only change the cloud's `switch` bit can
@@ -1663,10 +1673,12 @@ fn sanitize_erv_error(message: &str) -> String {
 /// If the boot read fails and scenes can control the unit, force a known state
 /// by triggering the off scene rather than running blind.
 pub async fn run_erv_boot_read(config: &AppConfig, erv: &ErvState) {
-    let off_writer = config
-        .erv
-        .scene_control_active()
-        .then(|| build_erv_writer(config));
+    // Gate on the selected transport, not on a complete scene matrix: the off
+    // scene is the one this needs, and a hole elsewhere in the matrix is no
+    // reason to leave a possibly-running ERV in an unknown state. A missing
+    // off scene fails loudly on its own.
+    let off_writer =
+        (config.erv.control_mode == ErvControlMode::Scene).then(|| build_erv_writer(config));
     run_erv_boot_read_with(config, erv, &RustuyaErvStatusReader, off_writer.as_deref()).await;
 }
 
@@ -3183,6 +3195,82 @@ mod tests {
 
         assert!(cloud.triggered_scenes().is_empty());
         assert_eq!(state.snapshot().speed, ErvFanSpeed::Medium);
+    }
+
+    /// An unverified write leaves power unknown, so the next command still
+    /// pays for a cloud check. Trusting the assumption would let an ERV that
+    /// never ran the scene be reported as ventilating indefinitely.
+    #[tokio::test]
+    async fn assumed_status_does_not_count_as_known_power() {
+        let cloud = Arc::new(FakeCloud::default().with_power_reads(vec![
+            Err(anyhow!("Smart Life API error code=1106")),
+            Ok(Some(true)),
+        ]));
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(vec![
+                Err(anyhow!("Check device key or version (Error 914)")),
+                Err(anyhow!("Check device key or version (Error 914)")),
+            ])),
+            None,
+        );
+        let config = scene_config();
+
+        // Neither rung confirms anything, so the result is assumed.
+        writer
+            .set_speed(&config, ErvFanSpeed::Turbo, false)
+            .await
+            .expect("scene write succeeds");
+        assert_eq!(cloud.power_reads(), 1);
+        assert_eq!(writer.last_write_report().source, ErvStatusSource::Assumed);
+
+        // Turbo -> medium is on-to-on, but power was never observed, so this
+        // must still be treated as worth a cloud check.
+        writer
+            .set_speed(&config, ErvFanSpeed::Medium, false)
+            .await
+            .expect("scene write succeeds");
+        assert_eq!(
+            cloud.power_reads(),
+            2,
+            "an assumed power state must not suppress cloud verification"
+        );
+        assert_eq!(writer.last_write_report().source, ErvStatusSource::Cloud);
+    }
+
+    /// The off scene is the only one boot recovery needs. A hole elsewhere in
+    /// the matrix is no reason to leave a possibly-running ERV unknown.
+    #[tokio::test]
+    async fn boot_off_scene_runs_with_a_partial_scene_matrix() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let config = app_config(ErvConfig {
+            quiet_scene_id: None,
+            ..scene_config()
+        });
+        assert!(
+            !config.erv.scene_configured(),
+            "the scene set is deliberately incomplete"
+        );
+
+        let cloud = Arc::new(FakeCloud::default());
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(Vec::new())),
+            None,
+        );
+
+        run_erv_boot_read_with(
+            &config,
+            &state,
+            &FakeErvReader::new(vec![Err(anyhow!("Connection reset by peer"))]),
+            Some(&writer),
+        )
+        .await;
+
+        assert_eq!(cloud.triggered_scenes(), vec!["off-scene".to_string()]);
     }
 
     /// A failed fallback write means local is not usable either. Leaving it

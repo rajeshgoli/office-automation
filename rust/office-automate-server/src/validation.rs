@@ -33,7 +33,7 @@ use tokio_tungstenite::{
 use crate::{
     artifacts::{is_valid_artifact_hash, is_valid_sha256_digest, normalize_cert_digest},
     auth::AuthManager,
-    config::{AppConfig, OrchestratorConfig},
+    config::{AppConfig, ErvConfig, OrchestratorConfig},
     db, edge, erv, http, hvac,
     state::StateMachine,
     yolink::{self, YoLinkCloudClient, YoLinkState},
@@ -1465,14 +1465,25 @@ fn validate_sqlite_quick_check(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether missing local ERV credentials should fail validation.
+///
+/// Only a fully configured scene transport can do without them. In
+/// `control_mode: local` they are the control path, and a complete scene set
+/// does not substitute for them -- the selected writer would reject every
+/// command as incomplete local configuration.
+fn erv_local_credentials_required(config: &ErvConfig) -> bool {
+    !config.scene_control_active()
+}
+
 async fn validate_live_devices(
     config: &AppConfig,
     report: &mut ShadowValidationReport,
 ) -> Result<()> {
     // Local credentials buy speed readback, not control, so their absence is a
-    // skipped check rather than a failed validation.
+    // skipped check rather than a failed validation -- but only when the
+    // selected transport genuinely does not need them.
     if !config.erv.local_tuya_configured() {
-        if !config.erv.is_configured() {
+        if erv_local_credentials_required(&config.erv) {
             bail!("shadow validation requires a configured ERV control path");
         }
         report.push_skip(
@@ -3406,6 +3417,37 @@ mod tests {
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    /// Missing local credentials are only acceptable when a complete scene
+    /// transport is what will actually issue the writes.
+    #[test]
+    fn erv_local_credentials_are_required_unless_scene_control_is_complete() {
+        use crate::config::ErvControlMode;
+
+        let scenes = ErvConfig {
+            smart_life_home_id: Some("home-id".to_string()),
+            off_scene_id: Some("off-scene".to_string()),
+            quiet_scene_id: Some("quiet-scene".to_string()),
+            medium_scene_id: Some("medium-scene".to_string()),
+            turbo_scene_id: Some("turbo-scene".to_string()),
+            ..ErvConfig::default()
+        };
+
+        assert!(!erv_local_credentials_required(&scenes));
+
+        // A complete scene set does not substitute for local credentials when
+        // local is the selected transport.
+        assert!(erv_local_credentials_required(&ErvConfig {
+            control_mode: ErvControlMode::Local,
+            ..scenes.clone()
+        }));
+
+        // Nor does an incomplete one in scene mode.
+        assert!(erv_local_credentials_required(&ErvConfig {
+            turbo_scene_id: None,
+            ..scenes
+        }));
+    }
 
     fn test_config(database_path: &Path) -> AppConfig {
         let root = database_path
