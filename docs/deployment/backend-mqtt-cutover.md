@@ -44,10 +44,11 @@ Do not run `office-automate-server serve` with those flags while the Python acti
 
 ## Cutover Sequence
 
-Build and run final preflight checks:
+Build and run final preflight checks. Build via `scripts/build-server.sh`, not a
+bare `cargo build --release` — see [code-signing.md](code-signing.md).
 
 ```bash
-cargo build --manifest-path rust/office-automate-server/Cargo.toml --release
+scripts/build-server.sh
 ./target/release/office-automate-server migrate --config "$OFFICE_AUTOMATE_CONFIG"
 ./target/release/office-automate-server smoke --config "$OFFICE_AUTOMATE_CONFIG"
 cloudflared tunnel ingress validate --config "$CLOUDFLARED_CONFIG"

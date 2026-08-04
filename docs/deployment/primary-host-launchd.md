@@ -14,6 +14,25 @@ The templates live in `scripts/launchd/primary-host/`:
 
 LocalTunnel is intentionally not represented. Public access is Cloudflare Tunnel only. `cloudflared` should route to `office-automate-server serve-edge`; the edge then calls the controller over the local authenticated IPC token.
 
+## Code Signing
+
+Build the binary these jobs point at with `scripts/build-server.sh`, never a bare
+`cargo build --release`. The server reads the ERV over the LAN, and macOS attaches
+that Local Network permission to the binary's code-signing identity. An ad-hoc
+`cargo` build is keyed on its cdhash, so every rebuild loses the grant and ERV local
+readback fails with an instant `No route to host (os error 65)` while the device is
+perfectly reachable.
+
+After deploying a new binary, verify the signature survived and confirm readback
+recovered:
+
+```bash
+scripts/build-server.sh --verify-only
+grep "ERV boot read" logs/office-automate-server.out.log | tail -1
+```
+
+Full background and the one-time certificate setup: [code-signing.md](code-signing.md).
+
 ## Template Values
 
 Render the templates with deployment-specific absolute paths before loading them:

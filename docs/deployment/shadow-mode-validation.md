@@ -39,8 +39,13 @@ Do not run this validation with active-control flags enabled.
 Build the Rust binary:
 
 ```bash
-cargo build --manifest-path rust/office-automate-server/Cargo.toml --release
+scripts/build-server.sh
 ```
+
+`scripts/build-server.sh` wraps `cargo build --release` with the code-signing step
+that keeps the binary's macOS Local Network grant alive across rebuilds. A bare
+`cargo build --release` silently breaks ERV local readback — see
+[code-signing.md](code-signing.md).
 
 Start the Rust server on a non-production port:
 

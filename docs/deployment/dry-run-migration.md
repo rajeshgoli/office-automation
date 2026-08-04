@@ -31,10 +31,11 @@ Cloudflare Tunnel credentials stay in the `cloudflared` config and credential fi
 
 ## Snapshot Command
 
-Build the Rust binary, then run:
+Build the Rust binary via `scripts/build-server.sh`, not a bare
+`cargo build --release` — see [code-signing.md](code-signing.md) — then run:
 
 ```bash
-cargo build --manifest-path rust/office-automate-server/Cargo.toml --release
+scripts/build-server.sh
 ./target/release/office-automate-server snapshot \
   --config "$OFFICE_AUTOMATE_CONFIG" \
   --output-dir "$OFFICE_AUTOMATE_SNAPSHOT_DIR" \
