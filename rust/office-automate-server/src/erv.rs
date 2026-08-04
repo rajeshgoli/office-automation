@@ -691,23 +691,29 @@ impl ErvSpeedWriter for SplitErvWriter {
 /// aggregate outcome, so a cold contact that recovers on retry never trips
 /// backoff -- only an exhausted budget does.
 ///
-/// Returns the first *local-key-classified* error if any attempt saw one,
-/// else the first error overall. A cold-radio attempt fails before ever
-/// reaching the device, so it can precede a later attempt that actually gets
-/// far enough to receive a real Err 914 rejection; preferring the earliest
-/// transient error in that case would discard the one diagnosis downstream
-/// health accounting (`is_local_key_error`) can act on, and could mask a
-/// genuinely invalid key behind cold-radio noise forever.
+/// A local-key-classified error (e.g. Err 914, or a protocol version
+/// mismatch) stops the retry immediately rather than spending the rest of
+/// the budget: the device responded and rejected the connection, which a
+/// cold radio waking up wouldn't change in the next second. Retrying it
+/// anyway would triple the rejected traffic on every contact and delay a
+/// write or boot recovery without any prospect of success; the existing
+/// cross-call threshold (`LOCAL_KEY_ERROR_THRESHOLD`) is what decides
+/// whether it's really invalid, not this retry. A short-circuit on the
+/// first key-classified error is also, incidentally, always the *earliest*
+/// one seen -- so a cold-radio attempt followed by a later Err 914 still
+/// surfaces that diagnosis instead of the transient error that preceded it.
 async fn read_status_with_cold_contact_retry(
     reader: &(impl ErvStatusReader + ?Sized),
     config: &ErvConfig,
 ) -> Result<ErvDeviceStatus> {
     let mut first_error = None;
-    let mut first_key_error = None;
     for attempt in 1..=LOCAL_COLD_CONTACT_RETRY_ATTEMPTS {
         match reader.read_status(config).await {
             Ok(status) => return Ok(status),
             Err(error) => {
+                if is_local_key_error(&format!("{error:#}")) {
+                    return Err(error);
+                }
                 if attempt < LOCAL_COLD_CONTACT_RETRY_ATTEMPTS {
                     tracing::debug!(
                         "ERV local read attempt {attempt}/{LOCAL_COLD_CONTACT_RETRY_ATTEMPTS} \
@@ -715,17 +721,11 @@ async fn read_status_with_cold_contact_retry(
                     );
                     time::sleep(LOCAL_COLD_CONTACT_RETRY_DELAY).await;
                 }
-                if first_key_error.is_none() && is_local_key_error(&format!("{error:#}")) {
-                    first_key_error = Some(error);
-                } else {
-                    first_error.get_or_insert(error);
-                }
+                first_error.get_or_insert(error);
             }
         }
     }
-    Err(first_key_error
-        .or(first_error)
-        .expect("loop runs at least once so an error was recorded"))
+    Err(first_error.expect("loop runs at least once so an error was recorded"))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3571,9 +3571,11 @@ mod tests {
         let local = Arc::new(FakeErvWriter::new(Vec::new(), vec![Ok(turbo_status())]));
         let writer = split_writer(
             cloud.clone(),
-            Arc::new(FakeErvReader::new(repeated_local_read_failure(
-                "Check device key or version (Error 914)",
-            ))),
+            // A local-key-classified error stops the cold-contact retry
+            // immediately, so a single queued failure is enough here.
+            Arc::new(FakeErvReader::new(vec![Err(anyhow!(
+                "Check device key or version (Error 914)"
+            ))])),
             Some(local.clone()),
         );
         let config = scene_config();
@@ -3759,7 +3761,6 @@ mod tests {
         let reader = Arc::new(FakeErvReader::new(vec![
             Err(anyhow!("No route to host (os error 65)")),
             Err(anyhow!("Check device key or version (Error 914)")),
-            Err(anyhow!("Check device key or version (Error 914)")),
         ]));
         let writer = split_writer(cloud, reader.clone(), None);
 
@@ -3772,7 +3773,33 @@ mod tests {
             format!("{error:#}").contains("Check device key or version"),
             "a later local-key diagnosis was discarded for an earlier transient error"
         );
-        assert_eq!(reader.call_count(), 3);
+        // The key diagnosis also stops the retry immediately -- a third,
+        // pointless attempt at a definitive rejection never happens.
+        assert_eq!(reader.call_count(), 2);
+    }
+
+    /// A definitive rejection isn't a cold radio waking up -- it's the
+    /// device responding and saying no. Retrying it anyway would triple the
+    /// rejected traffic on every contact and add pointless latency to a
+    /// write or boot recovery, so it must stop after the first attempt.
+    #[tokio::test]
+    async fn cold_contact_retry_does_not_retry_a_definitive_local_key_error() {
+        let cloud = Arc::new(FakeCloud::default());
+        let reader = Arc::new(FakeErvReader::new(vec![Err(anyhow!(
+            "Check device key or version (Error 914)"
+        ))]));
+        let writer = split_writer(cloud, reader.clone(), None);
+
+        writer
+            .smoke_status(&scene_config())
+            .await
+            .expect_err("a key rejection is a real failure");
+
+        assert_eq!(
+            reader.call_count(),
+            1,
+            "a definitive local-key error must not be retried"
+        );
     }
 
     /// Local control mode's `RustuyaErvSpeedWriter::smoke_status` delegates
@@ -3809,9 +3836,11 @@ mod tests {
         let local = Arc::new(FakeErvWriter::new(Vec::new(), vec![Ok(turbo_status())]));
         let writer = split_writer(
             cloud.clone(),
-            Arc::new(FakeErvReader::new(repeated_local_read_failure(
-                "Check device key or version (Error 914)",
-            ))),
+            // A local-key-classified error stops the cold-contact retry
+            // immediately, so a single queued failure is enough here.
+            Arc::new(FakeErvReader::new(vec![Err(anyhow!(
+                "Check device key or version (Error 914)"
+            ))])),
             Some(local.clone()),
         );
 
@@ -3935,11 +3964,10 @@ mod tests {
         let writer = split_writer(
             cloud.clone(),
             Arc::new(FakeErvReader::new(
-                // Each write's pre-write read retries a cold contact up to
-                // LOCAL_COLD_CONTACT_RETRY_ATTEMPTS times before giving up, so
-                // a genuinely dead local path drains that many queue entries
-                // per iteration, not one.
-                (0..LOCAL_KEY_ERROR_THRESHOLD * LOCAL_COLD_CONTACT_RETRY_ATTEMPTS as u64)
+                // A local-key-classified error stops the cold-contact retry
+                // immediately, so each write's pre-write read drains exactly
+                // one queue entry, not the full retry budget.
+                (0..LOCAL_KEY_ERROR_THRESHOLD)
                     .map(|_| bail!("Check device key or version (Error 914)"))
                     .collect(),
             )),
