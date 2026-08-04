@@ -1479,20 +1479,20 @@ async fn validate_live_devices(
     config: &AppConfig,
     report: &mut ShadowValidationReport,
 ) -> Result<()> {
-    // Local credentials buy speed readback, not control, so their absence is a
-    // skipped check rather than a failed validation -- but only when the
-    // selected transport genuinely does not need them.
-    // Validate whichever transport will actually issue writes, independently
-    // of the optional local read below. Scene ids being non-empty strings
-    // proves nothing about whether the transport works, and this is a cutover
-    // gate -- the deployed config has local credentials *and* scene control,
-    // so keying this off the absence of local credentials checked everything
-    // except the path in use.
+    // Check whichever transport will actually issue writes, independently of
+    // the optional local read below: the deployed config has local credentials
+    // *and* scene control, so keying this off the absence of local credentials
+    // would check everything except the path in use.
+    //
+    // Configuration only. Whether the credentials work and the scene ids still
+    // exist needs a live Smart Life call, which is tracked separately.
     if config.erv.scene_control_selected() {
-        let detail = erv::smoke_erv_scene(config)
-            .await
-            .context("ERV Smart Life scene check failed")?;
-        report.push_pass("erv-scene-auth", detail);
+        let checked =
+            erv::check_erv_scene_config(config).context("ERV scene configuration is incomplete")?;
+        report.push_pass(
+            "erv-scene-config",
+            format!("{checked} required scene ids configured (not verified live)"),
+        );
     }
 
     if !config.erv.local_tuya_configured() {

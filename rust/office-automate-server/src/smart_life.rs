@@ -34,7 +34,6 @@ pub const DEFAULT_CLIENT_ID: &str = "HA_3y9q4ak7g4ephrvke";
 
 const DEFAULT_AUTH_FILE: &str = ".office-automate/tuya-sharing-auth.json";
 const SCENE_TRIGGER_PATH: &str = "/v1.0/m/scene/ha/trigger";
-const SCENE_LIST_PATH: &str = "/v1.0/m/scene/ha/home/scenes";
 const DEVICE_DETAIL_PATH: &str = "/v1.0/m/life/ha/devices/detail";
 
 /// Serializes the whole load -> refresh -> save cycle across every caller in
@@ -96,31 +95,6 @@ impl SmartLifeClient {
         .map(|_| ())
     }
 
-    /// List the scene ids in a home.
-    ///
-    /// Existence only. The rendered *actions* of a scene are lossy -- the
-    /// sharing API hides the private speed data points there exactly as it
-    /// hides them in device status -- so nothing may be concluded from them
-    /// about what a scene does. An id being present is still worth knowing:
-    /// a deleted or mistyped one fails at the first ventilation request.
-    pub async fn list_scene_ids(&self, home_id: &str) -> Result<Vec<String>> {
-        let result = self
-            .get(SCENE_LIST_PATH, Some(json!({"homeId": home_id})))
-            .await?;
-        let scenes = result
-            .as_array()
-            .ok_or_else(|| anyhow!("Smart Life scene list is not an array"))?;
-        Ok(scenes
-            .iter()
-            .filter_map(|scene| {
-                ["scene_id", "sceneId", "id"]
-                    .iter()
-                    .find_map(|key| scene.get(*key).and_then(Value::as_str))
-                    .map(str::to_string)
-            })
-            .collect())
-    }
-
     /// Read a device's cloud status codes. The sharing API exposes only the
     /// standard codes (`switch`, `mode`, air-quality values); private data
     /// points such as the ERV speed DPs are never returned.
@@ -130,17 +104,6 @@ impl SmartLifeClient {
             .await?;
         device_status_codes(&result, device_id)
             .ok_or_else(|| anyhow!("Smart Life returned no status for device {device_id}"))
-    }
-
-    /// Read-only credential check: the cache is present, parseable, and its
-    /// refresh token is usable. Issues no device command.
-    pub async fn check_credentials(&self) -> Result<String> {
-        let _auth_guard = AUTH_CACHE_LOCK.lock().await;
-        let mut auth = SmartLifeAuthCache::load(&self.auth_file)?;
-        if self.refresh_auth_if_needed(&mut auth).await? {
-            auth.save(&self.auth_file)?;
-        }
-        Ok(auth.endpoint.clone())
     }
 
     async fn call(

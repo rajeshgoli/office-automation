@@ -1887,6 +1887,16 @@ pub async fn run_erv_boot_read<W>(config: &AppConfig, erv: &ErvState, writer: &W
 where
     W: ErvSpeedWriter + ?Sized,
 {
+    // Say so at startup rather than at the first ventilation request. This is
+    // the moment after someone re-arms negative pressure with a date change,
+    // which is exactly when a scene id nobody has looked at in months starts
+    // carrying every command.
+    if config.erv.scene_control_selected()
+        && let Err(error) = check_erv_scene_config(config)
+    {
+        tracing::warn!("ERV scene configuration is incomplete: {error:#}");
+    }
+
     if config.erv.local_readback_active() {
         match erv.smoke_status_with(&config.erv, writer).await {
             Ok(status) => {
@@ -1969,24 +1979,31 @@ pub fn build_erv_writer(config: &AppConfig) -> Arc<dyn ErvSpeedWriter> {
     Arc::new(writer)
 }
 
-/// Read-only check of the Smart Life scene transport.
+/// Check that every preset this deployment will actually command has a scene
+/// id configured. Returns how many were checked.
 ///
-/// Scene ids being non-empty strings proves nothing: the auth cache can be
-/// missing, unreadable, or holding a dead refresh token, and every ERV command
-/// would fail. This exercises the credentials without commanding the device.
-pub async fn smoke_erv_scene(config: &AppConfig) -> Result<String> {
+/// Pure configuration, no network. A selected transport that cannot deliver is
+/// otherwise invisible until ventilation is requested, and that matters most
+/// for the negative-pressure scenes: re-arming that mode is a one-line date
+/// change made months after anyone last looked at the scene list, and from
+/// that moment they are the only scenes automation uses.
+///
+/// Whether a configured id still *exists* in Smart Life, and whether the
+/// credentials work, needs a live call — see the follow-up issue.
+pub fn check_erv_scene_config(config: &AppConfig) -> Result<usize> {
     if !config.erv.scene_control_selected() {
         bail!("ERV scene control is not the selected transport");
     }
 
-    // Check the matrix this deployment will actually command, not the one that
-    // happens to be filled in. An incomplete set does not demote anything to
-    // local control -- the affected writes just fail -- so validation has to
-    // reject it here rather than skip itself.
-    let unconfigured = required_scene_presets(config)
-        .into_iter()
+    // The matrix this deployment will command, not the one that happens to be
+    // filled in. An incomplete set does not demote anything to local control --
+    // the affected writes just fail -- so this has to reject it rather than
+    // skip itself.
+    let required = required_scene_presets(config);
+    let unconfigured = required
+        .iter()
         .filter(|(_, scene_id)| scene_id.is_none())
-        .map(|(label, _)| label)
+        .map(|(label, _)| *label)
         .collect::<Vec<_>>();
     if !unconfigured.is_empty() {
         bail!(
@@ -1995,58 +2012,7 @@ pub async fn smoke_erv_scene(config: &AppConfig) -> Result<String> {
         );
     }
 
-    let client = SmartLifeClient::new(
-        config.smart_life.client_id.clone(),
-        auth_file_or_default(config.erv.smart_life_auth_file.as_ref()),
-    );
-    let endpoint = client
-        .check_credentials()
-        .await
-        .context("Smart Life credentials are not usable")?;
-
-    // Every configured scene id must actually exist. A stale, deleted, or
-    // mistyped id otherwise passes validation and fails at the first
-    // ventilation request. Existence only -- what a scene *does* cannot be read
-    // back, which is why the ids are hand-built and verified physically.
-    let home_id = config
-        .erv
-        .smart_life_home_id()
-        .ok_or(SceneConfigError::MissingHomeId)?;
-    let present = client
-        .list_scene_ids(home_id)
-        .await
-        .context("Smart Life scene list failed")?;
-    let missing = configured_scene_ids(&config.erv)
-        .into_iter()
-        .filter(|(_, scene_id)| !present.iter().any(|found| found == scene_id))
-        .map(|(label, scene_id)| format!("{label}={scene_id}"))
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        bail!(
-            "configured ERV scene ids are not present in Smart Life home {home_id}: {}",
-            missing.join(", ")
-        );
-    }
-    let scene_count = configured_scene_ids(&config.erv).len();
-
-    let device_id = config.erv.device_id.trim();
-    if device_id.is_empty() {
-        return Ok(format!(
-            "Smart Life auth OK at {endpoint}; {scene_count} scene ids present"
-        ));
-    }
-
-    let status = client
-        .device_status(device_id)
-        .await
-        .context("Smart Life device read failed")?;
-    let power = status_code_value(&status, "switch")
-        .and_then(value_as_bool)
-        .map(|power| power.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    Ok(format!(
-        "Smart Life auth OK at {endpoint}; {scene_count} scene ids present; switch={power}"
-    ))
+    Ok(required.len())
 }
 
 fn configured_scene_id(value: &Option<String>) -> Option<&str> {
@@ -2095,37 +2061,6 @@ fn required_scene_presets(config: &AppConfig) -> Vec<(&'static str, Option<&str>
         ]);
     }
     required
-}
-
-/// Every scene id the configuration actually sets, labelled by preset.
-fn configured_scene_ids(config: &ErvConfig) -> Vec<(&'static str, &str)> {
-    [
-        ("off", &config.off_scene_id),
-        ("quiet", &config.quiet_scene_id),
-        ("medium", &config.medium_scene_id),
-        ("turbo", &config.turbo_scene_id),
-        (
-            "quiet_negative_pressure",
-            &config.quiet_negative_pressure_scene_id,
-        ),
-        (
-            "medium_negative_pressure",
-            &config.medium_negative_pressure_scene_id,
-        ),
-        (
-            "turbo_negative_pressure",
-            &config.turbo_negative_pressure_scene_id,
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(label, configured)| {
-        configured
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|scene_id| (label, scene_id))
-    })
-    .collect()
 }
 
 pub async fn smoke_erv(config: &AppConfig) -> Result<ErvDeviceStatus> {
