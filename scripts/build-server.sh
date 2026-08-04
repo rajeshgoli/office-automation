@@ -117,24 +117,7 @@ case "${1:-}" in
     ;;
 esac
 
-# cargo_bin is hard-coded, so any option or env var that moves cargo's own
-# output elsewhere would make this script sign/deploy a stale leftover binary
-# instead of the one just built. Refuse rather than guess.
-for arg in "$@"; do
-  case "$arg" in
-    --target-dir|--target-dir=*|--target|--target=*)
-      die "scripts/build-server.sh does not support $arg: cargo would write the binary
-somewhere other than $cargo_bin, and this script would then sign whatever stale
-artifact was already at that path. Build and sign manually if you need a
-different Cargo output location."
-      ;;
-  esac
-done
-if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-  die "CARGO_TARGET_DIR is set ($CARGO_TARGET_DIR): cargo would write the binary there
-instead of $cargo_bin, and this script would sign a stale artifact. Unset it
-before running scripts/build-server.sh, or build and sign manually."
-fi
+command -v jq >/dev/null 2>&1 || die "jq is required to locate cargo's build output reliably"
 
 is_darwin=false
 [[ "$(uname -s)" == "Darwin" ]] && is_darwin=true
@@ -155,14 +138,36 @@ Create and trust it once, per $doc, or set OFFICE_AUTOMATE_ALLOW_UNSIGNED=1 to
 build an unsigned binary and accept broken ERV local readback."
 fi
 
-cargo build --release --manifest-path "$manifest" "$@"
+# Ask cargo where it actually put the binary rather than assuming $cargo_bin.
+# --target-dir/--target, --config overrides of build.target-dir/build.target,
+# CARGO_BUILD_TARGET_DIR/CARGO_BUILD_TARGET, and .cargo/config.toml can all
+# relocate cargo's output — enumerating every such override is an arms race
+# this script keeps losing. Reading cargo's own build-plan output cannot miss
+# a future one.
+json_log="$(mktemp)"
+trap 'rm -f "$json_log"' EXIT
 
-# If OFFICE_AUTOMATE_SERVER_BIN points somewhere other than cargo's own output
-# (a deployment path, for example), deploy the binary that was just built
-# before signing it. Otherwise the freshly built code never reaches $binary
-# and a stale file gets a valid signature.
-if [[ "$binary" != "$cargo_bin" ]]; then
-  cp -p "$cargo_bin" "$binary"
+cargo build --release --manifest-path "$manifest" --message-format=json-render-diagnostics "$@" \
+  | tee "$json_log" \
+  | jq -r 'select(.reason == "compiler-message") | .message.rendered // empty' >&2
+build_status="${PIPESTATUS[0]}"
+[[ "$build_status" -eq 0 ]] || exit "$build_status"
+
+built_bin="$(jq -r --arg pkg "office-automate-server" '
+  select(.reason == "compiler-artifact"
+    and .target.name == $pkg
+    and (.target.kind | index("bin"))
+    and .executable != null) | .executable
+' "$json_log" | tail -n1)"
+
+[[ -n "$built_bin" && -x "$built_bin" ]] \
+  || die "could not determine the built binary's path from cargo's output"
+
+# Deploy the binary cargo actually produced. $binary defaults to $cargo_bin,
+# which built_bin will equal for a plain build with no output override — but
+# never assume that; always deploy from what cargo reported.
+if [[ "$binary" != "$built_bin" ]]; then
+  cp -p "$built_bin" "$binary"
 fi
 
 if ! $is_darwin; then

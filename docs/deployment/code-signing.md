@@ -123,11 +123,11 @@ running `cargo build`**, so the deployed binary is left untouched rather than
 overwritten with an ad-hoc artifact that a nonzero exit code would otherwise
 mask. `OFFICE_AUTOMATE_ALLOW_UNSIGNED=1` overrides this and warns loudly.
 
-`--target-dir`, `--target`, and a `CARGO_TARGET_DIR` in the environment are
-rejected. Cargo would then write the binary somewhere other than
-`target/release/office-automate-server`, and this script would sign whatever
-stale artifact was already at the expected path instead of the one just built.
-Build and sign such a binary by hand if you need it.
+The script does not assume where cargo writes its output. `--target-dir`,
+`--target`, `--config build.target-dir=...`/`build.target=...`,
+`CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, and `.cargo/config.toml` can all
+relocate it, so the script reads cargo's own `--message-format=json` build
+output to find the actual executable path and deploys that. Requires `jq`.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
