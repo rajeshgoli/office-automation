@@ -83,6 +83,15 @@ requirement_of() {
 
 verify() {
   [[ -x "$binary" ]] || die "no binary at $binary"
+
+  # `codesign -d -r-` only reads the embedded designated requirement; it does
+  # not confirm the signature is cryptographically valid over the file's
+  # current contents. Without --verify, a binary edited or corrupted after
+  # signing could still show a clean DR here and defeat the fail-closed check.
+  codesign --verify --strict "$binary" \
+    || die "signature on $binary does not verify (codesign --verify --strict failed).
+The binary may have been modified after signing. Re-run scripts/build-server.sh."
+
   local dr
   dr="$(requirement_of "$binary")"
   printf '%s\n' "$dr" | check_dr
