@@ -880,8 +880,32 @@ impl ErvState {
         match writer.set_speed(config, speed, negative_pressure).await {
             Ok(status) => {
                 let report = writer.last_write_report();
-                self.record_speed_success(status.clone(), report, speed, reason, co2_ppm);
-                self.record_write_success(status.clone(), report, speed, reason, co2_ppm, &attempt);
+                // An observation that contradicts the target means the command
+                // did not land. Keep the observed status -- it is the truth --
+                // but do not claim the speed changed: that would start the
+                // dwell timer and suppress the corrective command for the
+                // whole dwell window. The burst guard, not dwell, is what
+                // bounds retries here.
+                let landed = !matches!(
+                    report.source,
+                    ErvStatusSource::Local | ErvStatusSource::Cloud
+                ) || device_status_matches_target(&status, speed, negative_pressure);
+
+                if landed {
+                    self.record_speed_success(status.clone(), report, speed, reason, co2_ppm);
+                    self.record_write_success(
+                        status.clone(),
+                        report,
+                        speed,
+                        reason,
+                        co2_ppm,
+                        &attempt,
+                    );
+                } else {
+                    self.record_status_success(status.clone(), report.source);
+                    self.record_write_unverified(status.clone(), report, speed, reason, co2_ppm);
+                    self.notify_status();
+                }
                 Ok(status)
             }
             Err(error) => {
@@ -1250,6 +1274,52 @@ impl ErvState {
                 "recent_write_attempts_5m": attempt.recent_write_attempts_5m,
                 "attempted_at": attempt.timestamp.clone(),
                 "activity_at_attempt": attempt.recent_activity.clone(),
+                "recent_local_activity": self.recent_local_activity_json(),
+            }),
+        );
+    }
+
+    /// The transport accepted the command but the device says otherwise. Not a
+    /// failed write and not a landed one: the status is real, the speed change
+    /// is not, and no climate action is logged for a change that did not happen.
+    fn record_write_unverified(
+        &self,
+        device_status: ErvDeviceStatus,
+        report: ErvWriteReport,
+        speed: ErvFanSpeed,
+        reason: &str,
+        co2_ppm: Option<i64>,
+    ) {
+        let at = unix_timestamp_now();
+        let timestamp = local_iso_now();
+        {
+            let mut inner = self.inner.write().expect("ERV state lock poisoned");
+            push_local_activity_locked(
+                &mut inner,
+                ErvLocalActivity {
+                    at,
+                    timestamp: timestamp.clone(),
+                    event: "write_not_verified",
+                    target_speed: Some(speed),
+                    reason: Some(reason.to_string()),
+                    co2_ppm,
+                    message: Some("device state contradicts the commanded speed".to_string()),
+                    recent_write_attempts_5m: None,
+                },
+            );
+        }
+
+        self.log_health_event(
+            "write_not_verified",
+            json!({
+                "type": "erv_write_not_verified",
+                "at": timestamp,
+                "target_speed": speed.as_str(),
+                "reason": reason,
+                "co2_ppm": co2_ppm,
+                "transport": transport_label(report.transport),
+                "status_source": report.source.as_str(),
+                "device_status": device_status_json(&device_status),
                 "recent_local_activity": self.recent_local_activity_json(),
             }),
         );
@@ -1682,15 +1752,14 @@ fn sanitize_erv_error(message: &str) -> String {
 /// the trigger for the Err 914 lockout. Everything after boot is read-after-write.
 /// If the boot read fails and scenes can control the unit, force a known state
 /// by triggering the off scene rather than running blind.
-pub async fn run_erv_boot_read(config: &AppConfig, erv: &ErvState) {
-    run_erv_boot_read_with(config, erv, build_erv_writer(config).as_ref()).await;
-}
-
 /// The boot read goes through the *writer's* own read path, not a fresh
 /// reader, so a failure lands in that writer's local-health state. Otherwise a
 /// failed boot read followed by a failed off-scene trigger would find a
 /// pristine health gate and fire a local command at the path that just failed.
-pub(crate) async fn run_erv_boot_read_with<W>(config: &AppConfig, erv: &ErvState, writer: &W)
+///
+/// Pass the same writer the policy coordinator uses. A second instance has its
+/// own health state, which puts the pristine-gate hole back one level up.
+pub async fn run_erv_boot_read<W>(config: &AppConfig, erv: &ErvState, writer: &W)
 where
     W: ErvSpeedWriter + ?Sized,
 {
@@ -3216,7 +3285,7 @@ mod tests {
             None,
         );
 
-        run_erv_boot_read_with(&app_config(scene_config()), &state, &writer).await;
+        run_erv_boot_read(&app_config(scene_config()), &state, &writer).await;
 
         assert_eq!(cloud.triggered_scenes(), vec!["off-scene".to_string()]);
         assert!(!state.snapshot().running);
@@ -3242,7 +3311,7 @@ mod tests {
             Some(local.clone()),
         );
 
-        run_erv_boot_read_with(&app_config(scene_config()), &state, &writer).await;
+        run_erv_boot_read(&app_config(scene_config()), &state, &writer).await;
 
         assert!(
             local.write_speeds().is_empty(),
@@ -3286,7 +3355,7 @@ mod tests {
             .expect("policy write succeeds");
         let triggered = cloud.triggered_scenes();
 
-        run_erv_boot_read_with(&config, &state, &writer).await;
+        run_erv_boot_read(&config, &state, &writer).await;
 
         assert_eq!(
             cloud.triggered_scenes(),
@@ -3309,10 +3378,66 @@ mod tests {
             None,
         );
 
-        run_erv_boot_read_with(&app_config(scene_config()), &state, &writer).await;
+        run_erv_boot_read(&app_config(scene_config()), &state, &writer).await;
 
         assert!(cloud.triggered_scenes().is_empty());
         assert_eq!(state.snapshot().speed, ErvFanSpeed::Medium);
+    }
+
+    /// A scene the API accepted but the device ignored must not start the
+    /// dwell timer. Dwell exists to stop thrash between real speed changes; if
+    /// a non-change starts it, the corrective command is suppressed for the
+    /// whole dwell window. The burst guard is what bounds retries here.
+    #[tokio::test]
+    async fn contradicted_write_reports_truth_without_starting_dwell() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path.clone());
+        let cloud = Arc::new(FakeCloud::default());
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(vec![
+                // Pre-write read: still at medium.
+                Ok(medium_status()),
+                // Read-after-write: the scene was accepted but nothing moved.
+                Ok(medium_status()),
+            ])),
+            None,
+        );
+
+        let status = state
+            .set_speed_with(
+                &scene_config(),
+                &writer,
+                ErvFanSpeed::Turbo,
+                false,
+                "away_refresh",
+                None,
+            )
+            .await
+            .expect("a contradicted verification must not fail the write");
+
+        // The observed state is reported truthfully...
+        assert_eq!(status.fan_speed, Some(ErvFanSpeed::Medium));
+        assert_eq!(state.snapshot().speed, ErvFanSpeed::Medium);
+        // ...and the speed is not claimed to have changed.
+        assert!(
+            state.snapshot().last_speed_changed_at.is_none(),
+            "a command the device ignored started the dwell timer"
+        );
+
+        let history = db::read_history(&database_path, 1, 20).expect("history");
+        assert!(
+            history.climate_actions.is_empty(),
+            "a change that did not happen was logged as a climate action"
+        );
+        assert!(
+            history
+                .device_events
+                .iter()
+                .any(|event| event["event"] == "write_not_verified")
+        );
     }
 
     /// An unverified write leaves power unknown, so the next command still
@@ -3382,7 +3507,7 @@ mod tests {
             None,
         );
 
-        run_erv_boot_read_with(&config, &state, &writer).await;
+        run_erv_boot_read(&config, &state, &writer).await;
 
         assert_eq!(cloud.triggered_scenes(), vec!["off-scene".to_string()]);
     }

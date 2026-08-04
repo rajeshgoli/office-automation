@@ -543,6 +543,9 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
     let erv_state = ErvState::new(config.runtime.database_path.clone());
     let hvac_state = HvacState::new(config.runtime.database_path.clone());
+    // One writer for the whole process. A second instance carries its own
+    // local-health state, so a failure seen by one would not gate the other.
+    let erv_writer = build_erv_writer(&config);
     let (app_state, erv_automation) = build_app_state(
         config.clone(),
         qingping.clone(),
@@ -550,7 +553,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         yolink.clone(),
         erv_state.clone(),
         hvac_state.clone(),
-        build_erv_writer(&config),
+        erv_writer.clone(),
         Arc::new(KumoHvacModeWriter),
     )
     .context("failed to build HTTP app state")?;
@@ -561,7 +564,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     // its client starts, and boot recovery would then overwrite that newer
     // decision with the off scene and start the dwell timer from it -- leaving
     // an away office unventilated until the dwell expires.
-    crate::erv::run_erv_boot_read(&config, &erv_state).await;
+    crate::erv::run_erv_boot_read(&config, &erv_state, erv_writer.as_ref()).await;
 
     let runtime_handle = tokio::runtime::Handle::current();
     let qingping_policy_trigger: mqtt::SensorIngressHook = Arc::new({
