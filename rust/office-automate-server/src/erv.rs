@@ -455,7 +455,7 @@ impl SplitErvWriter {
     }
 
     async fn read_local(&self, config: &ErvConfig) -> Result<ErvDeviceStatus> {
-        let result = self.read_local_with_cold_contact_retry(config).await;
+        let result = read_status_with_cold_contact_retry(self.reader.as_ref(), config).await;
         self.record_local_outcome(result.is_ok());
         match &result {
             Ok(status) => {
@@ -466,50 +466,6 @@ impl SplitErvWriter {
             Err(error) => self.state().unreported_local_failure = Some(format!("{error:#}")),
         }
         result
-    }
-
-    /// The first packet to a sleeping Wi-Fi radio drops while it wakes; retry
-    /// a bounded handful of times, a second or so apart, before treating a
-    /// local read as a real failure. Callers see one aggregate outcome, so a
-    /// cold contact that recovers on retry never touches `local_retry_at` --
-    /// only an exhausted budget does, which is what keeps this from fighting
-    /// the backoff that already gates how often a dead path gets tried.
-    ///
-    /// Returns the first *local-key-classified* error if any attempt saw one,
-    /// else the first error overall. A cold-radio attempt fails before ever
-    /// reaching the device, so it can precede a later attempt that actually
-    /// gets far enough to receive a real Err 914 rejection; preferring the
-    /// earliest transient error in that case would discard the one diagnosis
-    /// downstream health accounting (`is_local_key_error`) can act on, and
-    /// could mask a genuinely invalid key behind cold-radio noise forever.
-    async fn read_local_with_cold_contact_retry(
-        &self,
-        config: &ErvConfig,
-    ) -> Result<ErvDeviceStatus> {
-        let mut first_error = None;
-        let mut first_key_error = None;
-        for attempt in 1..=LOCAL_COLD_CONTACT_RETRY_ATTEMPTS {
-            match self.reader.read_status(config).await {
-                Ok(status) => return Ok(status),
-                Err(error) => {
-                    if attempt < LOCAL_COLD_CONTACT_RETRY_ATTEMPTS {
-                        tracing::debug!(
-                            "ERV local read attempt {attempt}/{LOCAL_COLD_CONTACT_RETRY_ATTEMPTS} \
-                             failed, retrying for a cold radio: {error:#}"
-                        );
-                        time::sleep(LOCAL_COLD_CONTACT_RETRY_DELAY).await;
-                    }
-                    if first_key_error.is_none() && is_local_key_error(&format!("{error:#}")) {
-                        first_key_error = Some(error);
-                    } else {
-                        first_error.get_or_insert(error);
-                    }
-                }
-            }
-        }
-        Err(first_key_error
-            .or(first_error)
-            .expect("loop runs at least once so an error was recorded"))
     }
 
     async fn write_fallback(
@@ -726,6 +682,52 @@ impl ErvSpeedWriter for SplitErvWriter {
     }
 }
 
+/// The first packet to a sleeping Wi-Fi radio drops while it wakes; retry a
+/// bounded handful of times, a second or so apart, before treating a local
+/// read as a real failure. Shared by every writer that performs its own
+/// local status reads -- scene control's `SplitErvWriter` and local
+/// control's `RustuyaErvSpeedWriter` -- so a cold contact is tolerated the
+/// same way regardless of which transport mode is selected. Callers see one
+/// aggregate outcome, so a cold contact that recovers on retry never trips
+/// backoff -- only an exhausted budget does.
+///
+/// Returns the first *local-key-classified* error if any attempt saw one,
+/// else the first error overall. A cold-radio attempt fails before ever
+/// reaching the device, so it can precede a later attempt that actually gets
+/// far enough to receive a real Err 914 rejection; preferring the earliest
+/// transient error in that case would discard the one diagnosis downstream
+/// health accounting (`is_local_key_error`) can act on, and could mask a
+/// genuinely invalid key behind cold-radio noise forever.
+async fn read_status_with_cold_contact_retry(
+    reader: &(impl ErvStatusReader + ?Sized),
+    config: &ErvConfig,
+) -> Result<ErvDeviceStatus> {
+    let mut first_error = None;
+    let mut first_key_error = None;
+    for attempt in 1..=LOCAL_COLD_CONTACT_RETRY_ATTEMPTS {
+        match reader.read_status(config).await {
+            Ok(status) => return Ok(status),
+            Err(error) => {
+                if attempt < LOCAL_COLD_CONTACT_RETRY_ATTEMPTS {
+                    tracing::debug!(
+                        "ERV local read attempt {attempt}/{LOCAL_COLD_CONTACT_RETRY_ATTEMPTS} \
+                         failed, retrying for a cold radio: {error:#}"
+                    );
+                    time::sleep(LOCAL_COLD_CONTACT_RETRY_DELAY).await;
+                }
+                if first_key_error.is_none() && is_local_key_error(&format!("{error:#}")) {
+                    first_key_error = Some(error);
+                } else {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+    }
+    Err(first_key_error
+        .or(first_error)
+        .expect("loop runs at least once so an error was recorded"))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RustuyaErvStatusReader;
 
@@ -752,7 +754,10 @@ pub struct RustuyaErvSpeedWriter;
 
 impl ErvSpeedWriter for RustuyaErvSpeedWriter {
     fn smoke_status<'a>(&'a self, config: &'a ErvConfig) -> BoxFutureResult<'a, ErvDeviceStatus> {
-        RustuyaErvStatusReader.read_status(config)
+        Box::pin(read_status_with_cold_contact_retry(
+            &RustuyaErvStatusReader,
+            config,
+        ))
     }
 
     fn set_speed<'a>(
@@ -3768,6 +3773,26 @@ mod tests {
             "a later local-key diagnosis was discarded for an earlier transient error"
         );
         assert_eq!(reader.call_count(), 3);
+    }
+
+    /// Local control mode's `RustuyaErvSpeedWriter::smoke_status` delegates
+    /// to this same function -- it can't be exercised directly without real
+    /// hardware, since it always constructs its own device connection -- so
+    /// this is the coverage for that mode's pre-write read gate recovering
+    /// from a cold contact instead of rejecting a legitimate write.
+    #[tokio::test]
+    async fn read_status_retry_recovers_a_cold_local_contact() {
+        let reader = FakeErvReader::new(vec![
+            Err(anyhow!("No route to host (os error 65)")),
+            Ok(medium_status()),
+        ]);
+
+        let status = read_status_with_cold_contact_retry(&reader, &scene_config())
+            .await
+            .expect("recovers on retry");
+
+        assert_eq!(status.fan_speed, Some(ErvFanSpeed::Medium));
+        assert_eq!(reader.call_count(), 2);
     }
 
     /// The boot read must feed the writer's own local health. Otherwise a
