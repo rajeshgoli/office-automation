@@ -18,7 +18,7 @@ use tokio::{
 };
 
 use crate::{
-    config::{AppConfig, ErvConfig},
+    config::{AppConfig, ErvConfig, ErvControlMode},
     db,
     smart_life::{SmartLifeClient, auth_file_or_default, status_code_value},
     status::{AppNotification, ErvControlStatus, ErvStatusSource, Status},
@@ -300,8 +300,11 @@ impl ErvSpeedWriter for SceneErvSpeedWriter {
 struct SplitWriterState {
     report: ErvWriteReport,
     last_known_power: Option<bool>,
-    consecutive_read_failures: u64,
-    read_retry_at: Option<f64>,
+    /// Health of the local path, fed by both failed readbacks and failed
+    /// fallback writes. It gates readback *and* whether local is healthy
+    /// enough to be used as a write fallback.
+    consecutive_local_failures: u64,
+    local_retry_at: Option<f64>,
 }
 
 /// Splits the two transports by direction: writes go out over `writer` (the
@@ -350,21 +353,21 @@ impl SplitErvWriter {
             return false;
         }
         self.state()
-            .read_retry_at
+            .local_retry_at
             .is_none_or(|retry_at| unix_timestamp_now() >= retry_at)
     }
 
-    fn record_read_outcome(&self, succeeded: bool) {
+    fn record_local_outcome(&self, succeeded: bool) {
         let mut state = self.state();
         if succeeded {
-            state.consecutive_read_failures = 0;
-            state.read_retry_at = None;
+            state.consecutive_local_failures = 0;
+            state.local_retry_at = None;
             return;
         }
-        state.consecutive_read_failures = state.consecutive_read_failures.saturating_add(1);
-        state.read_retry_at = Some(
+        state.consecutive_local_failures = state.consecutive_local_failures.saturating_add(1);
+        state.local_retry_at = Some(
             unix_timestamp_now()
-                + local_failure_retry_delay_seconds(state.consecutive_read_failures),
+                + local_failure_retry_delay_seconds(state.consecutive_local_failures),
         );
     }
 
@@ -386,7 +389,7 @@ impl SplitErvWriter {
 
     async fn read_local(&self, config: &ErvConfig) -> Result<ErvDeviceStatus> {
         let result = self.reader.read_status(config).await;
-        self.record_read_outcome(result.is_ok());
+        self.record_local_outcome(result.is_ok());
         if let Ok(status) = &result {
             self.state().last_known_power = Some(status.power);
         }
@@ -407,7 +410,7 @@ impl SplitErvWriter {
         // has been failing is not going to accept a command either.
         if self
             .state()
-            .read_retry_at
+            .local_retry_at
             .is_some_and(|retry_at| unix_timestamp_now() < retry_at)
         {
             return None;
@@ -508,6 +511,13 @@ impl ErvSpeedWriter for SplitErvWriter {
                 Ok(status) => (self.writer.last_write_report(), status),
                 Err(error) => {
                     let primary_report = self.writer.last_write_report();
+                    // A hole in the scene matrix is a configuration error, not
+                    // an outage. Writing it locally would deliver the speed
+                    // while hiding the hole, so it has to propagate.
+                    if error.downcast_ref::<MissingSceneError>().is_some() {
+                        self.finish(primary_report, None);
+                        return Err(error);
+                    }
                     match self.write_fallback(config, speed, negative_pressure).await {
                         Some(Ok(status)) => {
                             tracing::warn!(
@@ -521,6 +531,11 @@ impl ErvSpeedWriter for SplitErvWriter {
                             (report, status)
                         }
                         Some(Err(fallback_error)) => {
+                            // Mark local unhealthy, or the next cloud failure
+                            // fires another command at a known-bad local key —
+                            // exactly the command pattern that causes the
+                            // Err 914 lockout.
+                            self.record_local_outcome(false);
                             self.finish(primary_report, None);
                             return Err(error.context(format!(
                                 "ERV local write fallback also failed: {fallback_error:#}"
@@ -1709,8 +1724,12 @@ pub(crate) async fn run_erv_boot_read_with<R, W>(
 /// The default is `SplitErvWriter { writer: SceneErvSpeedWriter, reader:
 /// RustuyaErvStatusReader }`: writes go out as scene triggers, reads come back
 /// over local Tuya. `control_mode: local` keeps the pre-#154 all-local path.
+///
+/// Selection follows `control_mode` alone. An incomplete scene set must fail
+/// per write with a missing-scene diagnostic, never quietly demote the whole
+/// deployment to the local transport this change exists to stop using.
 pub fn build_erv_writer(config: &AppConfig) -> Arc<dyn ErvSpeedWriter> {
-    if !config.erv.scene_control_active() {
+    if config.erv.control_mode == ErvControlMode::Local {
         return Arc::new(RustuyaErvSpeedWriter);
     }
 
@@ -3081,10 +3100,14 @@ mod tests {
         db::migrate_database(&database_path).expect("migration");
         let state = ErvState::new(database_path);
         let cloud = Arc::new(FakeCloud::default());
+        // The fallback is configured and healthy, as it is by default. A hole
+        // in the scene matrix must still surface instead of being papered over
+        // by a local write that happens to be able to deliver the speed.
+        let local = Arc::new(FakeErvWriter::new(Vec::new(), vec![Ok(turbo_status())]));
         let writer = split_writer(
             cloud.clone(),
             Arc::new(FakeErvReader::new(Vec::new())),
-            None,
+            Some(local.clone()),
         );
 
         // Negative-pressure turbo has no configured scene here.
@@ -3104,6 +3127,10 @@ mod tests {
         assert!(
             cloud.triggered_scenes().is_empty(),
             "the normal-pressure scene must not be substituted"
+        );
+        assert!(
+            local.write_speeds().is_empty(),
+            "a configuration hole must not be written away by the local fallback"
         );
 
         let mut app_status = Status::read_only_default(&app_config(scene_config()));
@@ -3156,6 +3183,115 @@ mod tests {
 
         assert!(cloud.triggered_scenes().is_empty());
         assert_eq!(state.snapshot().speed, ErvFanSpeed::Medium);
+    }
+
+    /// A failed fallback write means local is not usable either. Leaving it
+    /// marked healthy would fire another command at a known-bad local key on
+    /// the next cloud failure, which is the command pattern that causes the
+    /// Err 914 lockout in the first place.
+    #[tokio::test]
+    async fn failed_fallback_write_marks_the_local_path_unhealthy() {
+        let cloud = Arc::new(FakeCloud::failing(2));
+        let local = Arc::new(FakeErvWriter::new(
+            Vec::new(),
+            vec![Err(anyhow!("Check device key or version (Error 914)"))],
+        ));
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(Vec::new())),
+            Some(local.clone()),
+        );
+        let config = scene_config();
+
+        writer
+            .set_speed(&config, ErvFanSpeed::Turbo, false)
+            .await
+            .expect_err("both transports failed");
+        assert_eq!(local.write_speeds().len(), 1);
+
+        // Second cloud failure must not reach for local again.
+        writer
+            .set_speed(&config, ErvFanSpeed::Turbo, false)
+            .await
+            .expect_err("both transports still failing");
+        assert_eq!(
+            local.write_speeds().len(),
+            1,
+            "local was retried while still in failure backoff"
+        );
+    }
+
+    /// Writer selection follows `control_mode`. An incomplete scene set fails
+    /// per write with a missing-scene diagnostic; it must never quietly demote
+    /// the deployment to the local transport.
+    #[tokio::test]
+    async fn incomplete_scene_config_does_not_silently_select_the_local_writer() {
+        let config = app_config(ErvConfig {
+            turbo_scene_id: None,
+            status_timeout_seconds: 1,
+            ..scene_config()
+        });
+        assert!(
+            !config.erv.scene_configured(),
+            "the scene set is deliberately incomplete"
+        );
+        assert!(
+            config.erv.local_tuya_configured(),
+            "local credentials are present, as they are pre-upgrade"
+        );
+
+        let error = build_erv_writer(&config)
+            .set_speed(&config.erv, ErvFanSpeed::Turbo, false)
+            .await
+            .expect_err("an incomplete scene set must fail, not fall back to local");
+
+        assert!(
+            error.downcast_ref::<MissingSceneError>().is_some(),
+            "expected a missing-scene diagnostic, got: {error:#}"
+        );
+    }
+
+    /// `control_mode` picks the writer in both directions. The two writers are
+    /// told apart by how they refuse a read with no local credentials, which
+    /// needs no network.
+    #[tokio::test]
+    async fn control_mode_selects_the_writer_in_both_directions() {
+        let without_local_credentials = ErvConfig {
+            ip: String::new(),
+            device_id: String::new(),
+            local_key: String::new(),
+            ..scene_config()
+        };
+
+        let local_mode = app_config(ErvConfig {
+            control_mode: ErvControlMode::Local,
+            ..without_local_credentials.clone()
+        });
+        let error = build_erv_writer(&local_mode)
+            .smoke_status(&local_mode.erv)
+            .await
+            .expect_err("no local credentials");
+        assert!(
+            error
+                .to_string()
+                .contains("local Tuya config is incomplete"),
+            "expected the local writer, got: {error:#}"
+        );
+
+        let scene_mode = app_config(ErvConfig {
+            control_mode: ErvControlMode::Scene,
+            ..without_local_credentials
+        });
+        let error = build_erv_writer(&scene_mode)
+            .smoke_status(&scene_mode.erv)
+            .await
+            .expect_err("no local credentials");
+        assert!(
+            error
+                .to_string()
+                .contains("local readback is not configured"),
+            "expected the split writer, got: {error:#}"
+        );
     }
 
     /// A cloud failure backs off the write path and says nothing about the
