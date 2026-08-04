@@ -691,16 +691,17 @@ impl ErvSpeedWriter for SplitErvWriter {
 /// aggregate outcome, so a cold contact that recovers on retry never trips
 /// backoff -- only an exhausted budget does.
 ///
-/// A local-key-classified error (e.g. Err 914, or a protocol version
-/// mismatch) stops the retry immediately rather than spending the rest of
-/// the budget: the device responded and rejected the connection, which a
-/// cold radio waking up wouldn't change in the next second. Retrying it
-/// anyway would triple the rejected traffic on every contact and delay a
-/// write or boot recovery without any prospect of success; the existing
-/// cross-call threshold (`LOCAL_KEY_ERROR_THRESHOLD`) is what decides
-/// whether it's really invalid, not this retry. A short-circuit on the
-/// first key-classified error is also, incidentally, always the *earliest*
-/// one seen -- so a cold-radio attempt followed by a later Err 914 still
+/// A non-retryable error (see [`is_non_retryable_local_error`]) stops the
+/// retry immediately rather than spending the rest of the budget: it is
+/// either a static configuration problem that will read identically on
+/// every attempt, or the device responding and rejecting the connection --
+/// neither of which a cold radio waking up in the next second would change.
+/// Retrying anyway would triple the rejected traffic on every contact and
+/// delay a write or boot recovery without any prospect of success; the
+/// existing cross-call threshold (`LOCAL_KEY_ERROR_THRESHOLD`) is what
+/// decides whether a key is really invalid, not this retry. A short-circuit
+/// on the first such error is also, incidentally, always the *earliest* one
+/// seen -- so a cold-radio attempt followed by a later Err 914 still
 /// surfaces that diagnosis instead of the transient error that preceded it.
 async fn read_status_with_cold_contact_retry(
     reader: &(impl ErvStatusReader + ?Sized),
@@ -711,7 +712,7 @@ async fn read_status_with_cold_contact_retry(
         match reader.read_status(config).await {
             Ok(status) => return Ok(status),
             Err(error) => {
-                if is_local_key_error(&format!("{error:#}")) {
+                if is_non_retryable_local_error(&format!("{error:#}")) {
                     return Err(error);
                 }
                 if attempt < LOCAL_COLD_CONTACT_RETRY_ATTEMPTS {
@@ -726,6 +727,19 @@ async fn read_status_with_cold_contact_retry(
         }
     }
     Err(first_error.expect("loop runs at least once so an error was recorded"))
+}
+
+/// True for local-read errors that no amount of retrying will change: a
+/// static configuration problem (an unparseable protocol version, incomplete
+/// Tuya credentials) that reads identically on every attempt because no
+/// network I/O ever happens, or a definitive device-level rejection (Err
+/// 914). Used only to decide whether the cold-contact retry should give up
+/// early -- `is_local_key_error` alone still gates the separate
+/// local-key-invalid notification, which must not fire for a config error.
+fn is_non_retryable_local_error(message: &str) -> bool {
+    is_local_key_error(message)
+        || message.contains("invalid ERV Tuya protocol version")
+        || message.contains("ERV local Tuya config is incomplete")
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3799,6 +3813,30 @@ mod tests {
             reader.call_count(),
             1,
             "a definitive local-key error must not be retried"
+        );
+    }
+
+    /// A bad protocol version or incomplete Tuya credentials fail before any
+    /// network I/O happens, so every attempt would read identically -- an
+    /// even more clear-cut case than Err 914 for not spending the retry
+    /// budget on it.
+    #[tokio::test]
+    async fn cold_contact_retry_does_not_retry_a_static_config_error() {
+        let cloud = Arc::new(FakeCloud::default());
+        let reader = Arc::new(FakeErvReader::new(vec![Err(anyhow!(
+            "invalid ERV Tuya protocol version: unsupported version \"9.9\""
+        ))]));
+        let writer = split_writer(cloud, reader.clone(), None);
+
+        writer
+            .smoke_status(&scene_config())
+            .await
+            .expect_err("a static config error is a real failure");
+
+        assert_eq!(
+            reader.call_count(),
+            1,
+            "a static configuration error must not be retried"
         );
     }
 
