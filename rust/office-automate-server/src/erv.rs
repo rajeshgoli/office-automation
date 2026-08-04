@@ -121,7 +121,7 @@ pub trait ErvSpeedWriter: Send + Sync {
     /// Consuming is the point: while the writer is in read backoff it performs
     /// no local I/O at all, so a value left in place would let one failure be
     /// counted once per write and manufacture a key-invalid verdict.
-    fn take_readback_failure(&self) -> Option<String> {
+    fn take_local_failure(&self) -> Option<String> {
         None
     }
 }
@@ -342,7 +342,7 @@ struct SplitWriterState {
     local_retry_at: Option<f64>,
     /// Surfaced to the state layer so local-key health stays accurate now
     /// that nothing polls. Cleared by a successful read.
-    readback_failure: Option<String>,
+    unreported_local_failure: Option<String>,
 }
 
 /// Splits the two transports by direction: writes go out over `writer` (the
@@ -452,9 +452,9 @@ impl SplitErvWriter {
             Ok(status) => {
                 let mut state = self.state();
                 state.last_known_power = Some(status.power);
-                state.readback_failure = None;
+                state.unreported_local_failure = None;
             }
-            Err(error) => self.state().readback_failure = Some(format!("{error:#}")),
+            Err(error) => self.state().unreported_local_failure = Some(format!("{error:#}")),
         }
         result
     }
@@ -606,6 +606,13 @@ impl ErvSpeedWriter for SplitErvWriter {
                             // exactly the command pattern that causes the
                             // Err 914 lockout.
                             self.record_local_outcome(false);
+                            // The outer report stays Scene, so without this the
+                            // state layer records a scene failure and the
+                            // local-key counters never move: /status would say
+                            // the local key is fine while the fallback is known
+                            // bad.
+                            self.state().unreported_local_failure =
+                                Some(format!("{fallback_error:#}"));
                             self.finish(primary_report, None);
                             return Err(error.context(format!(
                                 "ERV local write fallback also failed: {fallback_error:#}"
@@ -661,8 +668,8 @@ impl ErvSpeedWriter for SplitErvWriter {
         self.state().report
     }
 
-    fn take_readback_failure(&self) -> Option<String> {
-        self.state().readback_failure.take()
+    fn take_local_failure(&self) -> Option<String> {
+        self.state().unreported_local_failure.take()
     }
 }
 
@@ -983,14 +990,7 @@ impl ErvState {
                     self.notify_status();
                 }
 
-                // A read-after-write is often the only local read that happens
-                // now that nothing polls, so its failure has to reach the
-                // health counters or a dying local key would never be noticed.
-                if let Some(message) = writer.take_readback_failure()
-                    && self.record_read_only_local_failure(config, &message)
-                {
-                    self.notify_status();
-                }
+                self.record_unreported_local_failure(config, writer);
                 Ok(status)
             }
             Err(error) => {
@@ -1004,9 +1004,27 @@ impl ErvState {
                     }
                     ErvTransport::Scene => self.record_scene_failure(&message),
                 }
+                // A scene report can still hide a local failure underneath it:
+                // a fallback write that was attempted and failed.
+                self.record_unreported_local_failure(config, writer);
                 self.notify_status();
                 Err(error)
             }
+        }
+    }
+
+    /// Drain any local failure the writer saw that the state layer has not
+    /// recorded yet: a failed read-after-write, or a failed fallback write
+    /// hidden under a scene report. Nothing polls any more, so these are often
+    /// the only evidence that the local path has gone bad.
+    fn record_unreported_local_failure<W>(&self, config: &ErvConfig, writer: &W)
+    where
+        W: ErvSpeedWriter + ?Sized,
+    {
+        if let Some(message) = writer.take_local_failure()
+            && self.record_read_only_local_failure(config, &message)
+        {
+            self.notify_status();
         }
     }
 
@@ -1100,7 +1118,7 @@ impl ErvState {
                 // writer's slot: it exists to carry failures the state layer
                 // has *not* seen, and leaving this one would let the write
                 // path count the same read a second time.
-                let _ = writer.take_readback_failure();
+                let _ = writer.take_local_failure();
 
                 // A failed *read* backs off reads only. Letting it back off the
                 // write path is what coupled speed readback to control.
@@ -1970,9 +1988,36 @@ pub async fn smoke_erv_scene(config: &AppConfig) -> Result<String> {
         .await
         .context("Smart Life credentials are not usable")?;
 
+    // Every configured scene id must actually exist. A stale, deleted, or
+    // mistyped id otherwise passes validation and fails at the first
+    // ventilation request. Existence only -- what a scene *does* cannot be read
+    // back, which is why the ids are hand-built and verified physically.
+    let home_id = config
+        .erv
+        .smart_life_home_id()
+        .ok_or(SceneConfigError::MissingHomeId)?;
+    let present = client
+        .list_scene_ids(home_id)
+        .await
+        .context("Smart Life scene list failed")?;
+    let missing = configured_scene_ids(&config.erv)
+        .into_iter()
+        .filter(|(_, scene_id)| !present.iter().any(|found| found == scene_id))
+        .map(|(label, scene_id)| format!("{label}={scene_id}"))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "configured ERV scene ids are not present in Smart Life home {home_id}: {}",
+            missing.join(", ")
+        );
+    }
+    let scene_count = configured_scene_ids(&config.erv).len();
+
     let device_id = config.erv.device_id.trim();
     if device_id.is_empty() {
-        return Ok(format!("Smart Life auth OK at {endpoint}"));
+        return Ok(format!(
+            "Smart Life auth OK at {endpoint}; {scene_count} scene ids present"
+        ));
     }
 
     let status = client
@@ -1983,7 +2028,40 @@ pub async fn smoke_erv_scene(config: &AppConfig) -> Result<String> {
         .and_then(value_as_bool)
         .map(|power| power.to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    Ok(format!("Smart Life auth OK at {endpoint}; switch={power}"))
+    Ok(format!(
+        "Smart Life auth OK at {endpoint}; {scene_count} scene ids present; switch={power}"
+    ))
+}
+
+/// Every scene id the configuration actually sets, labelled by preset.
+fn configured_scene_ids(config: &ErvConfig) -> Vec<(&'static str, &str)> {
+    [
+        ("off", &config.off_scene_id),
+        ("quiet", &config.quiet_scene_id),
+        ("medium", &config.medium_scene_id),
+        ("turbo", &config.turbo_scene_id),
+        (
+            "quiet_negative_pressure",
+            &config.quiet_negative_pressure_scene_id,
+        ),
+        (
+            "medium_negative_pressure",
+            &config.medium_negative_pressure_scene_id,
+        ),
+        (
+            "turbo_negative_pressure",
+            &config.turbo_negative_pressure_scene_id,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(label, configured)| {
+        configured
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|scene_id| (label, scene_id))
+    })
+    .collect()
 }
 
 pub async fn smoke_erv(config: &AppConfig) -> Result<ErvDeviceStatus> {
@@ -3991,6 +4069,51 @@ mod tests {
             .expect("a failed read must not block a scene write");
 
         assert_eq!(writer.write_speeds(), vec![ErvFanSpeed::Turbo]);
+    }
+
+    /// A failed fallback write is hidden under a Scene write report, so
+    /// without draining it the state layer records a scene failure and the
+    /// local-key counters never move -- `/status` would report the local key
+    /// as fine while the fallback path is known bad.
+    #[tokio::test]
+    async fn failed_fallback_write_reaches_the_local_key_counters() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let cloud = Arc::new(FakeCloud::failing(1));
+        let local = Arc::new(FakeErvWriter::new(
+            Vec::new(),
+            vec![Err(anyhow!("Check device key or version (Error 914)"))],
+        ));
+        let writer = split_writer(
+            cloud.clone(),
+            Arc::new(FakeErvReader::new(Vec::new())),
+            Some(local.clone()),
+        );
+        let config = ErvConfig {
+            local_readback_enabled: false,
+            ..scene_config()
+        };
+
+        state
+            .set_speed_with(
+                &config,
+                &writer,
+                ErvFanSpeed::Turbo,
+                false,
+                "manual_override",
+                None,
+            )
+            .await
+            .expect_err("both transports failed");
+
+        let mut app_status = Status::read_only_default(&app_config(config));
+        state.overlay_status(&mut app_status);
+        assert_eq!(
+            app_status.erv.control.consecutive_local_key_errors, 1,
+            "a failed local fallback never reached the local-key counters"
+        );
     }
 
     /// A fallback write that lands proves local works, so the failure count

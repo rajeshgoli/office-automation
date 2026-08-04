@@ -1482,17 +1482,23 @@ async fn validate_live_devices(
     // Local credentials buy speed readback, not control, so their absence is a
     // skipped check rather than a failed validation -- but only when the
     // selected transport genuinely does not need them.
+    // Validate whichever transport will actually issue writes, independently
+    // of the optional local read below. Scene ids being non-empty strings
+    // proves nothing about whether the transport works, and this is a cutover
+    // gate -- the deployed config has local credentials *and* scene control,
+    // so keying this off the absence of local credentials checked everything
+    // except the path in use.
+    if config.erv.scene_control_active() {
+        let detail = erv::smoke_erv_scene(config)
+            .await
+            .context("ERV Smart Life scene check failed")?;
+        report.push_pass("erv-scene-auth", detail);
+    }
+
     if !config.erv.local_tuya_configured() {
         if erv_local_credentials_required(&config.erv) {
             bail!("shadow validation requires a configured ERV control path");
         }
-        // Scene ids being non-empty strings proves nothing about whether the
-        // transport works. This is a cutover gate, so exercise the credentials
-        // that every ERV command depends on.
-        let detail = erv::smoke_erv_scene(config)
-            .await
-            .context("ERV Smart Life scene credential check failed")?;
-        report.push_pass("erv-scene-auth", detail);
         report.push_skip(
             "erv-read",
             "ERV local read credentials are not configured; scene control does not need them",
