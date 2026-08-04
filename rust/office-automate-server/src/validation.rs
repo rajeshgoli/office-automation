@@ -1472,7 +1472,7 @@ fn validate_sqlite_quick_check(path: &Path, label: &str) -> Result<()> {
 /// does not substitute for them -- the selected writer would reject every
 /// command as incomplete local configuration.
 fn erv_local_credentials_required(config: &ErvConfig) -> bool {
-    !config.scene_control_active()
+    !config.scene_control_selected()
 }
 
 async fn validate_live_devices(
@@ -1488,7 +1488,7 @@ async fn validate_live_devices(
     // gate -- the deployed config has local credentials *and* scene control,
     // so keying this off the absence of local credentials checked everything
     // except the path in use.
-    if config.erv.scene_control_active() {
+    if config.erv.scene_control_selected() {
         let detail = erv::smoke_erv_scene(config)
             .await
             .context("ERV Smart Life scene check failed")?;
@@ -3431,10 +3431,12 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    /// Missing local credentials are only acceptable when a complete scene
-    /// transport is what will actually issue the writes.
+    /// Missing local credentials are acceptable exactly when scene control is
+    /// the selected transport. An incomplete scene matrix is not this check's
+    /// problem -- local credentials would not fix it, and `smoke_erv_scene`
+    /// rejects it directly -- so this must not demand them as a substitute.
     #[test]
-    fn erv_local_credentials_are_required_unless_scene_control_is_complete() {
+    fn erv_local_credentials_are_required_unless_scene_control_is_selected() {
         use crate::config::ErvControlMode;
 
         let scenes = ErvConfig {
@@ -3455,8 +3457,9 @@ mod tests {
             ..scenes.clone()
         }));
 
-        // Nor does an incomplete one in scene mode.
-        assert!(erv_local_credentials_required(&ErvConfig {
+        // An incomplete matrix in scene mode is rejected by the scene check
+        // itself, so this must not ask for local credentials instead.
+        assert!(!erv_local_credentials_required(&ErvConfig {
             turbo_scene_id: None,
             ..scenes
         }));

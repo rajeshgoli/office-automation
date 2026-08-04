@@ -18,7 +18,7 @@ use tokio::{
 };
 
 use crate::{
-    config::{AppConfig, ErvConfig, ErvControlMode},
+    config::{AppConfig, ErvConfig},
     db,
     smart_life::{SmartLifeClient, auth_file_or_default, status_code_value},
     status::{AppNotification, ErvControlStatus, ErvStatusSource, Status},
@@ -870,7 +870,7 @@ impl ErvState {
         // In local control mode it is still a gate, because there the local key
         // *is* the control path. Writing through credentials a read just
         // rejected is the command pattern that produces the lockout.
-        let local_control = config.control_mode == ErvControlMode::Local;
+        let local_control = !config.scene_control_selected();
         if self.pre_write_read_allowed(config) {
             match self.smoke_status_with_locked(config, writer).await {
                 Ok(status) if device_status_matches_target(&status, speed, negative_pressure) => {
@@ -1718,7 +1718,7 @@ impl ErvState {
                     inner.control.local_key_invalid_since = Some(now.clone());
                     inner.notification = Some(invalid_key_notification(
                         &now,
-                        config.scene_control_active(),
+                        config.scene_control_selected(),
                     ));
                     invalid_event = Some(json!({
                         "type": "erv_local_key_invalid",
@@ -1910,7 +1910,7 @@ where
     // scene is the one this needs, and a hole elsewhere in the matrix is no
     // reason to leave a possibly-running ERV in an unknown state. A missing
     // off scene fails loudly on its own.
-    if config.erv.control_mode != ErvControlMode::Scene || !config.erv.active_control_enabled {
+    if !config.erv.scene_control_selected() || !config.erv.active_control_enabled {
         return;
     }
 
@@ -1948,7 +1948,7 @@ where
 /// per write with a missing-scene diagnostic, never quietly demote the whole
 /// deployment to the local transport this change exists to stop using.
 pub fn build_erv_writer(config: &AppConfig) -> Arc<dyn ErvSpeedWriter> {
-    if config.erv.control_mode == ErvControlMode::Local {
+    if !config.erv.scene_control_selected() {
         return Arc::new(RustuyaErvSpeedWriter);
     }
 
@@ -1975,8 +1975,24 @@ pub fn build_erv_writer(config: &AppConfig) -> Arc<dyn ErvSpeedWriter> {
 /// missing, unreadable, or holding a dead refresh token, and every ERV command
 /// would fail. This exercises the credentials without commanding the device.
 pub async fn smoke_erv_scene(config: &AppConfig) -> Result<String> {
-    if !config.erv.scene_control_active() {
-        bail!("ERV scene control is not configured");
+    if !config.erv.scene_control_selected() {
+        bail!("ERV scene control is not the selected transport");
+    }
+
+    // Check the matrix this deployment will actually command, not the one that
+    // happens to be filled in. An incomplete set does not demote anything to
+    // local control -- the affected writes just fail -- so validation has to
+    // reject it here rather than skip itself.
+    let unconfigured = required_scene_presets(config)
+        .into_iter()
+        .filter(|(_, scene_id)| scene_id.is_none())
+        .map(|(label, _)| label)
+        .collect::<Vec<_>>();
+    if !unconfigured.is_empty() {
+        bail!(
+            "ERV scene control is selected but these scene ids are not configured: {}",
+            unconfigured.join(", ")
+        );
     }
 
     let client = SmartLifeClient::new(
@@ -2031,6 +2047,54 @@ pub async fn smoke_erv_scene(config: &AppConfig) -> Result<String> {
     Ok(format!(
         "Smart Life auth OK at {endpoint}; {scene_count} scene ids present; switch={power}"
     ))
+}
+
+fn configured_scene_id(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// True when automation will pass `negative_pressure = true` on every non-off
+/// command, which makes those scenes mandatory rather than optional.
+fn negative_pressure_armed(config: &AppConfig) -> bool {
+    config.thresholds.post_renovation_negative_pressure
+        && config
+            .thresholds
+            .post_renovation_active_at(unix_timestamp_now())
+}
+
+/// The presets this deployment will actually command, and whether each has a
+/// scene id. The negative-pressure variants are required only while that mode
+/// is armed -- but while it *is* armed they are the only ones automation uses,
+/// so treating them as optional would let validation pass a configuration in
+/// which every non-off command fails.
+fn required_scene_presets(config: &AppConfig) -> Vec<(&'static str, Option<&str>)> {
+    let erv = &config.erv;
+    let mut required = vec![
+        ("off", configured_scene_id(&erv.off_scene_id)),
+        ("quiet", configured_scene_id(&erv.quiet_scene_id)),
+        ("medium", configured_scene_id(&erv.medium_scene_id)),
+        ("turbo", configured_scene_id(&erv.turbo_scene_id)),
+    ];
+    if negative_pressure_armed(config) {
+        required.extend([
+            (
+                "quiet_negative_pressure",
+                configured_scene_id(&erv.quiet_negative_pressure_scene_id),
+            ),
+            (
+                "medium_negative_pressure",
+                configured_scene_id(&erv.medium_negative_pressure_scene_id),
+            ),
+            (
+                "turbo_negative_pressure",
+                configured_scene_id(&erv.turbo_negative_pressure_scene_id),
+            ),
+        ]);
+    }
+    required
 }
 
 /// Every scene id the configuration actually sets, labelled by preset.
@@ -2276,10 +2340,10 @@ fn looks_like_tuya_error(message: &str) -> bool {
     message.contains("\"Error\"") || message.contains("\"Err\"") || message.contains("Error:")
 }
 
-fn invalid_key_notification(created_at: &str, scene_control_active: bool) -> AppNotification {
+fn invalid_key_notification(created_at: &str, scene_control_selected: bool) -> AppNotification {
     // With scene control this is a degraded-observability notice, not an
     // outage: writes never touch the local key.
-    let (severity, title, message) = if scene_control_active {
+    let (severity, title, message) = if scene_control_selected {
         (
             "warning",
             "ERV speed readback degraded",
@@ -2365,8 +2429,8 @@ mod tests {
     use super::*;
     use crate::{
         config::{
-            AppConfig, ErvConfig, MitsubishiConfig, OrchestratorConfig, QingpingConfig,
-            RuntimeConfig, ThresholdsConfig, YoLinkConfig,
+            AppConfig, ErvConfig, ErvControlMode, MitsubishiConfig, OrchestratorConfig,
+            QingpingConfig, RuntimeConfig, ThresholdsConfig, YoLinkConfig,
         },
         db,
         status::Status,
@@ -4316,6 +4380,41 @@ mod tests {
                 .last_error
                 .as_deref()
                 .is_some_and(|error| error.starts_with("Scene trigger failed:"))
+        );
+    }
+
+    /// While negative pressure is armed, those are the only scenes automation
+    /// uses, so treating them as optional would let validation pass a
+    /// configuration in which every non-off command fails.
+    #[test]
+    fn armed_negative_pressure_makes_those_scenes_required() {
+        let normal = app_config(scene_config());
+        assert!(
+            required_scene_presets(&normal)
+                .iter()
+                .all(|(label, _)| !label.contains("negative_pressure")),
+            "negative-pressure scenes are not required while the mode is dormant"
+        );
+
+        let mut armed = app_config(scene_config());
+        armed.thresholds.post_renovation_enabled = true;
+        armed.thresholds.post_renovation_negative_pressure = true;
+        armed.thresholds.post_renovation_expires_at = Some("2099-01-01T00:00:00Z".to_string());
+        assert!(negative_pressure_armed(&armed));
+
+        let missing = required_scene_presets(&armed)
+            .into_iter()
+            .filter(|(_, scene_id)| scene_id.is_none())
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            missing,
+            vec![
+                "quiet_negative_pressure",
+                "medium_negative_pressure",
+                "turbo_negative_pressure"
+            ],
+            "an armed negative-pressure deployment must require its scenes"
         );
     }
 

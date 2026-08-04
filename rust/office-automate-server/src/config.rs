@@ -355,8 +355,13 @@ impl ErvConfig {
 
     /// True when writes go over Smart Life scenes, so no local command is ever
     /// issued in normal operation.
-    pub fn scene_control_active(&self) -> bool {
-        self.control_mode == ErvControlMode::Scene && self.scene_configured()
+    ///
+    /// This asks only what transport is *selected*, deliberately: an incomplete
+    /// scene matrix does not demote the deployment to local control, it fails
+    /// the affected writes. Anything that reasons about which transport carries
+    /// control must ask this, not whether the matrix happens to be complete.
+    pub fn scene_control_selected(&self) -> bool {
+        self.control_mode == ErvControlMode::Scene
     }
 
     /// True when *some* transport could carry a write.
@@ -1194,7 +1199,7 @@ smart_life:
         assert_eq!(config.erv.control_mode, ErvControlMode::Scene);
         assert!(config.erv.scene_configured());
         assert!(config.erv.local_tuya_configured());
-        assert!(config.erv.scene_control_active());
+        assert!(config.erv.scene_control_selected());
         assert!(config.erv.local_readback_active());
         assert!(config.erv.local_write_fallback_enabled);
         assert_eq!(config.erv.smart_life_home_id(), Some("8171319"));
