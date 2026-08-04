@@ -47,9 +47,7 @@ use crate::{
     blinds::{BlindsCommand, set_blinds},
     config::{AppConfig, ThresholdsConfig},
     db,
-    erv::{
-        ERV_MANUAL_OVERRIDE_SECONDS, ErvFanSpeed, ErvSpeedWriter, ErvState, RustuyaErvSpeedWriter,
-    },
+    erv::{ERV_MANUAL_OVERRIDE_SECONDS, ErvFanSpeed, ErvSpeedWriter, ErvState, build_erv_writer},
     hvac::{
         HvacControlMode, HvacModeCommand, HvacModeWriter, HvacRuntimeSnapshot, HvacState,
         KumoHvacModeWriter,
@@ -293,6 +291,7 @@ fn try_app_with_state(
     erv_state: ErvState,
     hvac_state: HvacState,
 ) -> Result<Router> {
+    let erv_writer = build_erv_writer(&config);
     try_app_with_erv_writer(
         config,
         qingping,
@@ -300,7 +299,7 @@ fn try_app_with_state(
         yolink,
         erv_state,
         hvac_state,
-        Arc::new(RustuyaErvSpeedWriter),
+        erv_writer,
         Arc::new(KumoHvacModeWriter),
     )
 }
@@ -544,6 +543,9 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
     let erv_state = ErvState::new(config.runtime.database_path.clone());
     let hvac_state = HvacState::new(config.runtime.database_path.clone());
+    // One writer for the whole process. A second instance carries its own
+    // local-health state, so a failure seen by one would not gate the other.
+    let erv_writer = build_erv_writer(&config);
     let (app_state, erv_automation) = build_app_state(
         config.clone(),
         qingping.clone(),
@@ -551,11 +553,19 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         yolink.clone(),
         erv_state.clone(),
         hvac_state.clone(),
-        Arc::new(RustuyaErvSpeedWriter),
+        erv_writer.clone(),
         Arc::new(KumoHvacModeWriter),
     )
     .context("failed to build HTTP app state")?;
     let app = router_from_state(app_state.clone());
+
+    // Establish ERV state before anything that can produce a policy decision.
+    // A retained MQTT reading or a YoLink event can command a speed the moment
+    // its client starts, and boot recovery would then overwrite that newer
+    // decision with the off scene and start the dwell timer from it -- leaving
+    // an away office unventilated until the dwell expires.
+    crate::erv::run_erv_boot_read(&config, &erv_state, erv_writer.as_ref()).await;
+
     let runtime_handle = tokio::runtime::Handle::current();
     let qingping_policy_trigger: mqtt::SensorIngressHook = Arc::new({
         let erv_automation = erv_automation.clone();
@@ -589,7 +599,6 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         Some(yolink_hvac_trigger),
     );
     let _door_grace_task = start_door_grace_policy_poll(app_state.clone(), erv_automation);
-    let _erv_task = crate::erv::start_erv_status_poll(&config, erv_state);
     let _hvac_task = crate::hvac::start_hvac_status_poll(&config, hvac_state);
     let _presence_task = start_presence_poll(app_state);
 
@@ -1505,7 +1514,7 @@ async fn blinds(State(state): State<AppState>, Json(payload): Json<BlindsRequest
             .into_response();
     };
 
-    match set_blinds(&state.config.blinds, command).await {
+    match set_blinds(&state.config, command).await {
         Ok(()) => Json(json!({
             "ok": true,
             "blinds": {
@@ -3097,6 +3106,7 @@ mod tests {
             cloudflare_access: crate::config::CloudflareAccessConfig::default(),
             erv: ErvConfig::default(),
             blinds: crate::config::BlindsConfig::default(),
+            smart_life: crate::config::SmartLifeConfig::default(),
             mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
             telemetry: crate::config::TelemetryConfig::default(),

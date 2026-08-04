@@ -48,8 +48,31 @@ erv:
   device_id: "your_tuya_device_id"
   local_key: "your_tuya_local_key"
   ip: "192.168.1.xxx"
-  poll_interval_seconds: 60       # Poll while ERV state is unknown/running
-  idle_poll_interval_seconds: 300  # Back off status polling when ERV is known off
+
+  # Writes go out as Smart Life tap-to-run scenes; local Tuya is read-only.
+  # Scenes are the only cloud mechanism that reaches fan speed, because the
+  # speed data points (101/102) are private and the sharing API hides them.
+  # Scenes cannot be created via API -- hand-build them in the Smart Life app.
+  smart_life_home_id: "your_smart_life_home_id"
+  off_scene_id: "scene_id_for_off"
+  quiet_scene_id: "scene_id_for_quiet"
+  medium_scene_id: "scene_id_for_medium"
+  turbo_scene_id: "scene_id_for_turbo"
+  # Negative-pressure (exhaust-biased) variants, used while renovation mode is armed.
+  quiet_negative_pressure_scene_id: "scene_id_for_quiet_np"
+  medium_negative_pressure_scene_id: "scene_id_for_medium_np"
+  turbo_negative_pressure_scene_id: "scene_id_for_turbo_np"
+
+  control_mode: "scene"                # scene | local -- which transport issues writes
+  local_readback_enabled: true         # local read-after-write for true supply/exhaust
+  local_write_fallback_enabled: true   # write locally if a scene trigger fails and local is healthy
+  # smart_life_auth_file: "~/.office-automate/tuya-sharing-auth.json"  # defaults to this
+
+# Smart Life (Tuya sharing API) credentials shared by the ERV and the blinds.
+smart_life:
+  # Shared Home Assistant Tuya integration identifier. Not a secret, but it has
+  # changed before; overriding it here avoids needing a rebuild to track it.
+  client_id: "HA_3y9q4ak7g4ephrvke"
 
 # Tuya smart blinds over the office window. This is independent of the
 # window open/closed contact sensor.

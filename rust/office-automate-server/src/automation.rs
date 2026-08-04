@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, RwLock};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
 use crate::{
@@ -91,12 +91,21 @@ impl ErvPolicyCoordinator {
             qingping_reading.as_ref(),
             manual_override,
         ) {
-            self.erv
+            // A failed read must not stop the policy from acting: it only means
+            // the decision is made without fresh state.
+            match self
+                .erv
                 .smoke_status_with(&self.config.erv, self.writer.as_ref())
                 .await
-                .context("ERV smoke check failed before policy evaluation")?;
-            erv_snapshot = self.erv.snapshot();
-            fresh_status_checked = true;
+            {
+                Ok(_) => {
+                    erv_snapshot = self.erv.snapshot();
+                    fresh_status_checked = true;
+                }
+                Err(error) => {
+                    tracing::warn!("ERV read before policy evaluation failed: {error:#}");
+                }
+            }
         }
 
         let negative_pressure_active = self.post_renovation_negative_pressure_active();
@@ -154,7 +163,7 @@ impl ErvPolicyCoordinator {
                 reason,
                 ..
             } => {
-                if !self.erv.local_retry_allowed(now) {
+                if !self.erv.write_retry_allowed(now) {
                     return Ok(());
                 }
                 self.apply_policy_erv_speed(
@@ -288,11 +297,12 @@ impl ErvPolicyCoordinator {
         qingping_reading: Option<&crate::qingping::QingpingReading>,
         manual_override: Option<VentilationSpeed>,
     ) -> bool {
+        // This decides whether to spend a *local read*, so it is gated on local
+        // health only. Control does not depend on the answer.
         if snapshot.status_known
             || !self.config.erv.active_control_enabled
-            || !self.config.erv.is_configured()
-            || snapshot.local_key_invalid
-            || !self.erv.local_retry_allowed(unix_timestamp_now())
+            || !self.config.erv.local_readback_active()
+            || !self.erv.read_retry_allowed(unix_timestamp_now())
         {
             return false;
         }
@@ -508,6 +518,7 @@ mod tests {
             },
             mitsubishi: MitsubishiConfig::default(),
             blinds: crate::config::BlindsConfig::default(),
+            smart_life: crate::config::SmartLifeConfig::default(),
             thresholds: ThresholdsConfig::default(),
             telemetry: TelemetryConfig::default(),
             runtime: RuntimeConfig {
@@ -906,8 +917,11 @@ mod tests {
         );
     }
 
+    /// A local read is the only view of true fan speed, but it is not a
+    /// prerequisite for control: when it fails the policy still acts, it just
+    /// acts without fresh state.
     #[tokio::test]
-    async fn automated_policy_write_respects_local_failure_backoff() {
+    async fn failed_local_read_does_not_block_the_automated_write() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let database_path = temp_dir.path().join("office_climate.db");
         db::migrate_database(&database_path).expect("migration");
@@ -941,16 +955,13 @@ mod tests {
         coordinator
             .evaluate_erv_policy(false)
             .await
-            .expect_err("first automated write should fail");
-        assert_eq!(writer.smoke_calls(), 1);
-        assert!(writer.writes().is_empty());
+            .expect("policy still applies without a fresh status read");
 
-        coordinator
-            .evaluate_erv_policy(false)
-            .await
-            .expect("second policy evaluation respects backoff");
         assert_eq!(writer.smoke_calls(), 1);
-        assert!(writer.writes().is_empty());
+        assert!(
+            !writer.writes().is_empty(),
+            "a failed read must not suppress the write"
+        );
     }
 
     #[tokio::test]
@@ -995,7 +1006,7 @@ mod tests {
         )
         .await
         .expect_err("fourth automated write is suppressed");
-        assert!(!erv.local_retry_allowed(unix_timestamp_now()));
+        assert!(!erv.write_retry_allowed(unix_timestamp_now()));
 
         let policy = Arc::new(RwLock::new(ErvPolicyState::new(&config.thresholds)));
         let (status_broadcast, _) = broadcast::channel(4);

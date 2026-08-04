@@ -443,3 +443,28 @@ def test_restart_uses_current_launchd_server_label(monkeypatch):
             True,
         )
     ]
+
+
+def test_client_id_precedence_matches_the_server(tmp_path, monkeypatch):
+    """Environment beats YAML beats the built-in default.
+
+    The server applies the same precedence. If this script disagreed, it would
+    mint credentials for one app key while the server signed requests with
+    another -- the drift the shared config key exists to prevent.
+    """
+    module = load_script_module()
+    config_file = tmp_path / "config.yaml"
+
+    # No config file at all: --init-auth must still work off the default.
+    monkeypatch.delenv("OFFICE_AUTOMATE_SMART_LIFE_CLIENT_ID", raising=False)
+    assert module.read_client_id(config_file) == module.DEFAULT_CLIENT_ID
+
+    config_file.write_text('smart_life:\n  client_id: "HA_from_yaml"\n', encoding="utf-8")
+    assert module.read_client_id(config_file) == "HA_from_yaml"
+
+    monkeypatch.setenv("OFFICE_AUTOMATE_SMART_LIFE_CLIENT_ID", "HA_from_env")
+    assert module.read_client_id(config_file) == "HA_from_env"
+
+    # Blank env is not an override.
+    monkeypatch.setenv("OFFICE_AUTOMATE_SMART_LIFE_CLIENT_ID", "   ")
+    assert module.read_client_id(config_file) == "HA_from_yaml"

@@ -1,6 +1,16 @@
 # Tuya Local Key Recovery (Smart Life / ERV)
 
-This is the repeatable process to restore ERV local control when Tuya local commands start failing (e.g., Err 914 or dashboard control not working). Two paths depending on whether the local key has actually rotated or just gotten out of sync:
+> **Since #154, this restores *speed readback*, not control.** ERV writes go out
+> over Smart Life tap-to-run scenes, which do not use the local key at all. A
+> broken local key means the reported fan speed is assumed rather than observed
+> (`erv.control.status_source` in `/status` reads `assumed`), and the
+> `erv_local_key_invalid` notification is a warning, not an outage. Ventilation
+> keeps working. Run this at your convenience, not at 2am.
+>
+> The exception is `control_mode: "local"` in `config.yaml`, where the local key
+> is still the control path and this is urgent.
+
+This is the repeatable process to restore ERV local reads when Tuya local traffic starts failing (e.g., Err 914). Two paths depending on whether the local key has actually rotated or just gotten out of sync:
 
 - **Preferred: Smart Life sharing API refresh** using `scripts/refresh-erv-key.py`. This avoids the Android emulator and does **not** require a Tuya IoT Platform subscription.
 - **Path A: Re-extract** the cached local key from the Smart Life app. Works if the key in `config.yaml` is wrong but Smart Life still has working local control.
@@ -10,7 +20,7 @@ Start with the preferred path. Use Path A only if Smart Life sharing auth fails,
 
 ## When To Run This
 
-- Local control fails with Err 914 (“Check device key or version”).
+- Local reads fail with Err 914 (“Check device key or version”), so `/status` reports `erv.control.status_source: "assumed"`.
 - Dashboard or automations can’t turn on the ERV but the Smart Life app still works locally.
 - The device firmware was updated.
 - Orchestrator (or another local Tuya client) issued a rapid burst of commands that the device interpreted as adversarial. This is what happened on 2026-05-21 and is fixed by issue #59.
@@ -62,6 +72,8 @@ scripts/refresh-erv-key.py --update-config --restart
 ```
 
 If the API returns the same key that is already in `config.yaml`, the script prints `no rotation needed` and exits 0 without editing or restarting.
+
+**This script cannot fix a both-copies-stale desync.** It only helps when the cloud holds a *newer* key than `config.yaml`. The recurring failure is different: the configured key matches the cloud's copy exactly, the protocol version matches the device's own broadcast, and the handshake still returns Err 914 — because the *device* has moved on from the key both copies share. `no rotation needed` plus continued Err 914 is exactly that case. The only fix is a hardware re-pair (Path B).
 
 ## Prereqs
 
@@ -228,10 +240,12 @@ ssh USER@SERVER_IP 'U=$(id -u); launchctl kickstart -k gui/$U/com.office-automat
 ssh USER@SERVER_IP 'tail -n 50 /tmp/office-automate.error.log'
 ```
 
-You should see:
+You should see the boot read succeed:
 ```
-Connected to ERV via local API. Status: ...
+ERV boot read: running=... speed=...
 ```
+
+`/status` should then report `erv.control.status_source: "local"` and clear `erv.control.local_key_invalid`.
 
 ## 6) Tear Down (Reclaim ~1.7GB)
 
@@ -269,6 +283,11 @@ Known Err 914 triggers for this ERV:
 - **Firmware OTA** — disabling auto firmware updates in Smart Life is still useful if the toggle exists (look for "Check for firmware updates" or similar), though we have not confirmed that Smart Life reliably honors it.
 - **Command burst from a misbehaving local client** — the orchestrator-side cause from 2026-05-21 was fixed in issue #59 with CO2 plateau latching and a minimum ERV dwell timer.
 - **Alert on 914** in the orchestrator logs so you catch the rotation immediately, not days/weeks later when CO2 is high and the dashboard is silent.
+
+Since #154 the orchestrator issues no local *commands* in normal operation and no
+longer polls status on a cadence, which removes both documented triggers. Local
+traffic is now a boot read plus one read after each write (~30/day, down from
+288–1440).
 
 ## Notes
 

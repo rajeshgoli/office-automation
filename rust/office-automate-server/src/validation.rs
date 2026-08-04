@@ -33,7 +33,7 @@ use tokio_tungstenite::{
 use crate::{
     artifacts::{is_valid_artifact_hash, is_valid_sha256_digest, normalize_cert_digest},
     auth::AuthManager,
-    config::{AppConfig, OrchestratorConfig},
+    config::{AppConfig, ErvConfig, OrchestratorConfig},
     db, edge, erv, http, hvac,
     state::StateMachine,
     yolink::{self, YoLinkCloudClient, YoLinkState},
@@ -1465,27 +1465,60 @@ fn validate_sqlite_quick_check(path: &Path, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether missing local ERV credentials should fail validation.
+///
+/// Only a fully configured scene transport can do without them. In
+/// `control_mode: local` they are the control path, and a complete scene set
+/// does not substitute for them -- the selected writer would reject every
+/// command as incomplete local configuration.
+fn erv_local_credentials_required(config: &ErvConfig) -> bool {
+    !config.scene_control_selected()
+}
+
 async fn validate_live_devices(
     config: &AppConfig,
     report: &mut ShadowValidationReport,
 ) -> Result<()> {
-    if !config.erv.is_configured() {
-        bail!("shadow validation requires configured ERV read credentials");
+    // Check whichever transport will actually issue writes, independently of
+    // the optional local read below: the deployed config has local credentials
+    // *and* scene control, so keying this off the absence of local credentials
+    // would check everything except the path in use.
+    //
+    // Configuration only. Whether the credentials work and the scene ids still
+    // exist needs a live Smart Life call, which is tracked separately.
+    if config.erv.scene_control_selected() {
+        let checked =
+            erv::check_erv_scene_config(config).context("ERV scene configuration is incomplete")?;
+        report.push_pass(
+            "erv-scene-config",
+            format!("{checked} required scene ids configured (not verified live)"),
+        );
     }
-    let erv_status = erv::smoke_erv(config)
-        .await
-        .context("ERV read-only smoke check failed")?;
-    report.push_pass(
-        "erv-read",
-        format!(
-            "read local status: running={} speed={}",
-            erv_status.power,
-            erv_status
-                .fan_speed
-                .map(|speed| speed.as_str())
-                .unwrap_or("unknown")
-        ),
-    );
+
+    if !config.erv.local_tuya_configured() {
+        if erv_local_credentials_required(&config.erv) {
+            bail!("shadow validation requires a configured ERV control path");
+        }
+        report.push_skip(
+            "erv-read",
+            "ERV local read credentials are not configured; scene control does not need them",
+        );
+    } else {
+        let erv_status = erv::smoke_erv(config)
+            .await
+            .context("ERV read-only smoke check failed")?;
+        report.push_pass(
+            "erv-read",
+            format!(
+                "read local status: running={} speed={}",
+                erv_status.power,
+                erv_status
+                    .fan_speed
+                    .map(|speed| speed.as_str())
+                    .unwrap_or("unknown")
+            ),
+        );
+    }
 
     if !config.mitsubishi.is_configured() {
         bail!("shadow validation requires configured HVAC read credentials");
@@ -3398,6 +3431,40 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    /// Missing local credentials are acceptable exactly when scene control is
+    /// the selected transport. An incomplete scene matrix is not this check's
+    /// problem -- local credentials would not fix it, and `smoke_erv_scene`
+    /// rejects it directly -- so this must not demand them as a substitute.
+    #[test]
+    fn erv_local_credentials_are_required_unless_scene_control_is_selected() {
+        use crate::config::ErvControlMode;
+
+        let scenes = ErvConfig {
+            smart_life_home_id: Some("home-id".to_string()),
+            off_scene_id: Some("off-scene".to_string()),
+            quiet_scene_id: Some("quiet-scene".to_string()),
+            medium_scene_id: Some("medium-scene".to_string()),
+            turbo_scene_id: Some("turbo-scene".to_string()),
+            ..ErvConfig::default()
+        };
+
+        assert!(!erv_local_credentials_required(&scenes));
+
+        // A complete scene set does not substitute for local credentials when
+        // local is the selected transport.
+        assert!(erv_local_credentials_required(&ErvConfig {
+            control_mode: ErvControlMode::Local,
+            ..scenes.clone()
+        }));
+
+        // An incomplete matrix in scene mode is rejected by the scene check
+        // itself, so this must not ask for local credentials instead.
+        assert!(!erv_local_credentials_required(&ErvConfig {
+            turbo_scene_id: None,
+            ..scenes
+        }));
+    }
+
     fn test_config(database_path: &Path) -> AppConfig {
         let root = database_path
             .parent()
@@ -3413,6 +3480,7 @@ mod tests {
             cloudflare_access: crate::config::CloudflareAccessConfig::default(),
             erv: ErvConfig::default(),
             blinds: crate::config::BlindsConfig::default(),
+            smart_life: crate::config::SmartLifeConfig::default(),
             mitsubishi: MitsubishiConfig::default(),
             thresholds: ThresholdsConfig::default(),
             telemetry: crate::config::TelemetryConfig::default(),
