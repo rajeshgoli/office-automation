@@ -103,6 +103,21 @@ A bare `cargo build --release` overwrites the signed binary in place with an
 ad-hoc one and silently breaks ERV local readback on the next restart. If you
 do run one, re-sign afterwards by running `scripts/build-server.sh` again.
 
+This happens even when nothing needs recompiling. Cargo keeps the real artifact
+under `target/release/deps/` and copies it to `target/release/`; signing modifies
+the copy, so the next cargo invocation re-copies over it. Verified:
+
+```
+$ scripts/build-server.sh          # signed
+$ cargo build --release
+    Finished `release` profile [optimized] target(s) in 0.11s
+$ codesign -d -r- target/release/office-automate-server
+# designated => cdhash H"..."      # signature gone, nothing was rebuilt
+```
+
+Any incidental cargo invocation that touches the release profile is enough. This
+is why verification is a standing step rather than a build-time one.
+
 The script fails closed: if the signing identity is missing it stops rather than
 deploying a binary that will lose the grant. `OFFICE_AUTOMATE_ALLOW_UNSIGNED=1`
 overrides this and warns loudly.
