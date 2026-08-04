@@ -35,6 +35,15 @@ const LOCAL_FAILURE_RCA_THRESHOLD: u64 = 3;
 const LOCAL_WRITE_BURST_WINDOW_SECONDS: f64 = 5.0 * 60.0;
 const LOCAL_WRITE_BURST_ATTEMPT_LIMIT: usize = 3;
 const BOOT_RECOVERY_REASON: &str = "boot_unknown_state";
+/// A local read after any idle period is often the first packet to a sleeping
+/// Wi-Fi radio, which drops while the radio wakes -- nothing keeps it warm any
+/// more now that the status poll loop is gone. Bounded so a genuinely dead
+/// local path still fails fast and falls through to recovery.
+const LOCAL_COLD_CONTACT_RETRY_ATTEMPTS: u32 = 3;
+#[cfg(not(test))]
+const LOCAL_COLD_CONTACT_RETRY_DELAY: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const LOCAL_COLD_CONTACT_RETRY_DELAY: Duration = Duration::from_millis(1);
 pub const ERV_MANUAL_OVERRIDE_SECONDS: i64 = 30 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,7 +455,7 @@ impl SplitErvWriter {
     }
 
     async fn read_local(&self, config: &ErvConfig) -> Result<ErvDeviceStatus> {
-        let result = self.reader.read_status(config).await;
+        let result = read_status_with_cold_contact_retry(self.reader.as_ref(), config).await;
         self.record_local_outcome(result.is_ok());
         match &result {
             Ok(status) => {
@@ -673,6 +682,66 @@ impl ErvSpeedWriter for SplitErvWriter {
     }
 }
 
+/// The first packet to a sleeping Wi-Fi radio drops while it wakes; retry a
+/// bounded handful of times, a second or so apart, before treating a local
+/// read as a real failure. Shared by every writer that performs its own
+/// local status reads -- scene control's `SplitErvWriter` and local
+/// control's `RustuyaErvSpeedWriter` -- so a cold contact is tolerated the
+/// same way regardless of which transport mode is selected. Callers see one
+/// aggregate outcome, so a cold contact that recovers on retry never trips
+/// backoff -- only an exhausted budget does.
+///
+/// A non-retryable error (see [`is_non_retryable_local_error`]) stops the
+/// retry immediately rather than spending the rest of the budget: it is
+/// either a static configuration problem that will read identically on
+/// every attempt, or the device responding and rejecting the connection --
+/// neither of which a cold radio waking up in the next second would change.
+/// Retrying anyway would triple the rejected traffic on every contact and
+/// delay a write or boot recovery without any prospect of success; the
+/// existing cross-call threshold (`LOCAL_KEY_ERROR_THRESHOLD`) is what
+/// decides whether a key is really invalid, not this retry. A short-circuit
+/// on the first such error is also, incidentally, always the *earliest* one
+/// seen -- so a cold-radio attempt followed by a later Err 914 still
+/// surfaces that diagnosis instead of the transient error that preceded it.
+async fn read_status_with_cold_contact_retry(
+    reader: &(impl ErvStatusReader + ?Sized),
+    config: &ErvConfig,
+) -> Result<ErvDeviceStatus> {
+    let mut first_error = None;
+    for attempt in 1..=LOCAL_COLD_CONTACT_RETRY_ATTEMPTS {
+        match reader.read_status(config).await {
+            Ok(status) => return Ok(status),
+            Err(error) => {
+                if is_non_retryable_local_error(&format!("{error:#}")) {
+                    return Err(error);
+                }
+                if attempt < LOCAL_COLD_CONTACT_RETRY_ATTEMPTS {
+                    tracing::debug!(
+                        "ERV local read attempt {attempt}/{LOCAL_COLD_CONTACT_RETRY_ATTEMPTS} \
+                         failed, retrying for a cold radio: {error:#}"
+                    );
+                    time::sleep(LOCAL_COLD_CONTACT_RETRY_DELAY).await;
+                }
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    Err(first_error.expect("loop runs at least once so an error was recorded"))
+}
+
+/// True for local-read errors that no amount of retrying will change: a
+/// static configuration problem (an unparseable protocol version, incomplete
+/// Tuya credentials) that reads identically on every attempt because no
+/// network I/O ever happens, or a definitive device-level rejection (Err
+/// 914). Used only to decide whether the cold-contact retry should give up
+/// early -- `is_local_key_error` alone still gates the separate
+/// local-key-invalid notification, which must not fire for a config error.
+fn is_non_retryable_local_error(message: &str) -> bool {
+    is_local_key_error(message)
+        || message.contains("invalid ERV Tuya protocol version")
+        || message.contains("ERV local Tuya config is incomplete")
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RustuyaErvStatusReader;
 
@@ -699,7 +768,10 @@ pub struct RustuyaErvSpeedWriter;
 
 impl ErvSpeedWriter for RustuyaErvSpeedWriter {
     fn smoke_status<'a>(&'a self, config: &'a ErvConfig) -> BoxFutureResult<'a, ErvDeviceStatus> {
-        RustuyaErvStatusReader.read_status(config)
+        Box::pin(read_status_with_cold_contact_retry(
+            &RustuyaErvStatusReader,
+            config,
+        ))
     }
 
     fn set_speed<'a>(
@@ -2477,13 +2549,19 @@ mod tests {
 
     struct FakeErvReader {
         results: Mutex<VecDeque<Result<ErvDeviceStatus>>>,
+        calls: AtomicUsize,
     }
 
     impl FakeErvReader {
         fn new(results: Vec<Result<ErvDeviceStatus>>) -> Self {
             Self {
                 results: Mutex::new(results.into()),
+                calls: AtomicUsize::new(0),
             }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
         }
     }
 
@@ -2492,6 +2570,7 @@ mod tests {
             &'a self,
             _config: &'a ErvConfig,
         ) -> BoxFutureResult<'a, ErvDeviceStatus> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             let result = self
                 .results
                 .lock()
@@ -2500,6 +2579,16 @@ mod tests {
                 .unwrap_or_else(|| bail!("no fake ERV result configured"));
             Box::pin(async move { result })
         }
+    }
+
+    /// A cold local read is retried [`LOCAL_COLD_CONTACT_RETRY_ATTEMPTS`]
+    /// times before it counts as a real failure, so a fake modelling a
+    /// genuinely dead local path needs that many queued results to fail with
+    /// the message under test instead of the fake's own empty-queue error.
+    fn repeated_local_read_failure(message: &str) -> Vec<Result<ErvDeviceStatus>> {
+        (0..LOCAL_COLD_CONTACT_RETRY_ATTEMPTS)
+            .map(|_| Err(anyhow!(message.to_string())))
+            .collect()
     }
 
     struct FakeErvWriter {
@@ -3496,6 +3585,8 @@ mod tests {
         let local = Arc::new(FakeErvWriter::new(Vec::new(), vec![Ok(turbo_status())]));
         let writer = split_writer(
             cloud.clone(),
+            // A local-key-classified error stops the cold-contact retry
+            // immediately, so a single queued failure is enough here.
             Arc::new(FakeErvReader::new(vec![Err(anyhow!(
                 "Check device key or version (Error 914)"
             ))])),
@@ -3609,9 +3700,9 @@ mod tests {
         let cloud = Arc::new(FakeCloud::default());
         let writer = split_writer(
             cloud.clone(),
-            Arc::new(FakeErvReader::new(vec![Err(anyhow!(
-                "Connection reset by peer"
-            ))])),
+            Arc::new(FakeErvReader::new(repeated_local_read_failure(
+                "Connection reset by peer",
+            ))),
             None,
         );
 
@@ -3619,6 +3710,154 @@ mod tests {
 
         assert_eq!(cloud.triggered_scenes(), vec!["off-scene".to_string()]);
         assert!(!state.snapshot().running);
+    }
+
+    /// Issue #163: a boot read that fails once and succeeds immediately after
+    /// is the actual failure mode observed live -- the first packet to a
+    /// sleeping Wi-Fi radio dropping while it wakes, not a genuinely
+    /// unreachable device. The retry must recover it without forcing off.
+    #[tokio::test]
+    async fn boot_read_retries_a_cold_local_contact_and_skips_recovery() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let cloud = Arc::new(FakeCloud::default());
+        let reader = Arc::new(FakeErvReader::new(vec![
+            Err(anyhow!("No route to host (os error 65)")),
+            Ok(medium_status()),
+        ]));
+        let writer = split_writer(cloud.clone(), reader.clone(), None);
+
+        run_erv_boot_read(&app_config(scene_config()), &state, &writer).await;
+
+        assert!(
+            cloud.triggered_scenes().is_empty(),
+            "a cold contact that recovered on retry must not force the off scene"
+        );
+        assert_eq!(state.snapshot().speed, ErvFanSpeed::Medium);
+        assert_eq!(reader.call_count(), 2);
+    }
+
+    /// The other direction: a local path that is actually dead must not
+    /// retry forever. It has to exhaust the bounded budget and still fall
+    /// through to boot recovery, exactly as before this change.
+    #[tokio::test]
+    async fn boot_read_cold_contact_retry_is_bounded() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let state = ErvState::new(database_path);
+        let cloud = Arc::new(FakeCloud::default());
+        let reader = Arc::new(FakeErvReader::new(repeated_local_read_failure(
+            "No route to host (os error 65)",
+        )));
+        let writer = split_writer(cloud.clone(), reader.clone(), None);
+
+        run_erv_boot_read(&app_config(scene_config()), &state, &writer).await;
+
+        assert_eq!(
+            reader.call_count(),
+            LOCAL_COLD_CONTACT_RETRY_ATTEMPTS as usize,
+            "a genuinely dead local path retried past its bounded budget"
+        );
+        assert_eq!(cloud.triggered_scenes(), vec!["off-scene".to_string()]);
+    }
+
+    /// A cold-radio attempt fails before ever reaching the device, so it can
+    /// precede a later attempt that gets far enough to receive a real Err 914
+    /// rejection. The retry must surface that diagnosis, not the earlier
+    /// transient one, or a genuinely invalid key hides behind cold-radio
+    /// noise indefinitely -- `local_key_invalid` classifies on this message.
+    #[tokio::test]
+    async fn cold_contact_retry_prefers_a_later_local_key_diagnosis() {
+        let cloud = Arc::new(FakeCloud::default());
+        let reader = Arc::new(FakeErvReader::new(vec![
+            Err(anyhow!("No route to host (os error 65)")),
+            Err(anyhow!("Check device key or version (Error 914)")),
+        ]));
+        let writer = split_writer(cloud, reader.clone(), None);
+
+        let error = writer
+            .smoke_status(&scene_config())
+            .await
+            .expect_err("every attempt failed");
+
+        assert!(
+            format!("{error:#}").contains("Check device key or version"),
+            "a later local-key diagnosis was discarded for an earlier transient error"
+        );
+        // The key diagnosis also stops the retry immediately -- a third,
+        // pointless attempt at a definitive rejection never happens.
+        assert_eq!(reader.call_count(), 2);
+    }
+
+    /// A definitive rejection isn't a cold radio waking up -- it's the
+    /// device responding and saying no. Retrying it anyway would triple the
+    /// rejected traffic on every contact and add pointless latency to a
+    /// write or boot recovery, so it must stop after the first attempt.
+    #[tokio::test]
+    async fn cold_contact_retry_does_not_retry_a_definitive_local_key_error() {
+        let cloud = Arc::new(FakeCloud::default());
+        let reader = Arc::new(FakeErvReader::new(vec![Err(anyhow!(
+            "Check device key or version (Error 914)"
+        ))]));
+        let writer = split_writer(cloud, reader.clone(), None);
+
+        writer
+            .smoke_status(&scene_config())
+            .await
+            .expect_err("a key rejection is a real failure");
+
+        assert_eq!(
+            reader.call_count(),
+            1,
+            "a definitive local-key error must not be retried"
+        );
+    }
+
+    /// A bad protocol version or incomplete Tuya credentials fail before any
+    /// network I/O happens, so every attempt would read identically -- an
+    /// even more clear-cut case than Err 914 for not spending the retry
+    /// budget on it.
+    #[tokio::test]
+    async fn cold_contact_retry_does_not_retry_a_static_config_error() {
+        let cloud = Arc::new(FakeCloud::default());
+        let reader = Arc::new(FakeErvReader::new(vec![Err(anyhow!(
+            "invalid ERV Tuya protocol version: unsupported version \"9.9\""
+        ))]));
+        let writer = split_writer(cloud, reader.clone(), None);
+
+        writer
+            .smoke_status(&scene_config())
+            .await
+            .expect_err("a static config error is a real failure");
+
+        assert_eq!(
+            reader.call_count(),
+            1,
+            "a static configuration error must not be retried"
+        );
+    }
+
+    /// Local control mode's `RustuyaErvSpeedWriter::smoke_status` delegates
+    /// to this same function -- it can't be exercised directly without real
+    /// hardware, since it always constructs its own device connection -- so
+    /// this is the coverage for that mode's pre-write read gate recovering
+    /// from a cold contact instead of rejecting a legitimate write.
+    #[tokio::test]
+    async fn read_status_retry_recovers_a_cold_local_contact() {
+        let reader = FakeErvReader::new(vec![
+            Err(anyhow!("No route to host (os error 65)")),
+            Ok(medium_status()),
+        ]);
+
+        let status = read_status_with_cold_contact_retry(&reader, &scene_config())
+            .await
+            .expect("recovers on retry");
+
+        assert_eq!(status.fan_speed, Some(ErvFanSpeed::Medium));
+        assert_eq!(reader.call_count(), 2);
     }
 
     /// The boot read must feed the writer's own local health. Otherwise a
@@ -3635,6 +3874,8 @@ mod tests {
         let local = Arc::new(FakeErvWriter::new(Vec::new(), vec![Ok(turbo_status())]));
         let writer = split_writer(
             cloud.clone(),
+            // A local-key-classified error stops the cold-contact retry
+            // immediately, so a single queued failure is enough here.
             Arc::new(FakeErvReader::new(vec![Err(anyhow!(
                 "Check device key or version (Error 914)"
             ))])),
@@ -3662,9 +3903,9 @@ mod tests {
         let cloud = Arc::new(FakeCloud::default());
         let writer = split_writer(
             cloud.clone(),
-            Arc::new(FakeErvReader::new(vec![Err(anyhow!(
-                "Connection reset by peer"
-            ))])),
+            Arc::new(FakeErvReader::new(repeated_local_read_failure(
+                "Connection reset by peer",
+            ))),
             None,
         );
 
@@ -3761,7 +4002,10 @@ mod tests {
         let writer = split_writer(
             cloud.clone(),
             Arc::new(FakeErvReader::new(
-                (0..LOCAL_KEY_ERROR_THRESHOLD * 2)
+                // A local-key-classified error stops the cold-contact retry
+                // immediately, so each write's pre-write read drains exactly
+                // one queue entry, not the full retry budget.
+                (0..LOCAL_KEY_ERROR_THRESHOLD)
                     .map(|_| bail!("Check device key or version (Error 914)"))
                     .collect(),
             )),
@@ -4021,6 +4265,30 @@ mod tests {
         );
     }
 
+    /// Issue #163's other exposed path: the read-after-write verification in
+    /// `verify_locally` shares `read_local` with the boot path, so a cold
+    /// contact there must also recover on retry instead of downgrading a
+    /// perfectly good write to an unverified `assumed` status.
+    #[tokio::test]
+    async fn verify_locally_retries_a_cold_readback_after_write() {
+        let cloud = Arc::new(FakeCloud::default());
+        let reader = Arc::new(FakeErvReader::new(vec![
+            Err(anyhow!("No route to host (os error 65)")),
+            Ok(turbo_status()),
+        ]));
+        let writer = split_writer(cloud.clone(), reader.clone(), None);
+        let config = scene_config();
+
+        let status = writer
+            .set_speed(&config, ErvFanSpeed::Turbo, false)
+            .await
+            .expect("scene write succeeds");
+
+        assert_eq!(status.fan_speed, Some(ErvFanSpeed::Turbo));
+        assert_eq!(writer.last_write_report().source, ErvStatusSource::Local);
+        assert_eq!(reader.call_count(), 2);
+    }
+
     /// An unverified write leaves power unknown, so the next command still
     /// pays for a cloud check. Trusting the assumption would let an ERV that
     /// never ran the scene be reported as ventilating indefinitely.
@@ -4082,9 +4350,9 @@ mod tests {
         let cloud = Arc::new(FakeCloud::default());
         let writer = split_writer(
             cloud.clone(),
-            Arc::new(FakeErvReader::new(vec![Err(anyhow!(
-                "Connection reset by peer"
-            ))])),
+            Arc::new(FakeErvReader::new(repeated_local_read_failure(
+                "Connection reset by peer",
+            ))),
             None,
         );
 
