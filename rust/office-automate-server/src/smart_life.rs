@@ -134,12 +134,19 @@ impl SmartLifeClient {
 
     /// Read-only credential check: the cache is present, parseable, and its
     /// refresh token is usable. Issues no device command.
+    ///
+    /// Unconditionally refreshes rather than deferring to
+    /// `refresh_auth_if_needed`'s expiry check. A cached access token with
+    /// time left on it would otherwise let this pass while the refresh token
+    /// behind it is dead -- exactly the "credentials are fine until the day
+    /// they aren't" gap this check exists to close.
     pub async fn check_credentials(&self) -> Result<String> {
         let _auth_guard = AUTH_CACHE_LOCK.lock().await;
         let mut auth = SmartLifeAuthCache::load(&self.auth_file)?;
-        if self.refresh_auth_if_needed(&mut auth).await? {
-            auth.save(&self.auth_file)?;
-        }
+        self.refresh_auth(&mut auth)
+            .await
+            .context("Smart Life refresh token is not usable")?;
+        auth.save(&self.auth_file)?;
         Ok(auth.endpoint.clone())
     }
 
@@ -165,7 +172,16 @@ impl SmartLifeClient {
         if expires_at - 60_000 > now_ms {
             return Ok(false);
         }
+        self.refresh_auth(auth).await?;
+        Ok(true)
+    }
 
+    /// Unconditionally rotate the access and refresh tokens. Callers that
+    /// only need to avoid an unnecessary round trip should go through
+    /// `refresh_auth_if_needed`; this is for the cases -- like
+    /// `check_credentials` -- where skipping the call because the cached
+    /// access token isn't expired yet would defeat the point.
+    async fn refresh_auth(&self, auth: &mut SmartLifeAuthCache) -> Result<()> {
         let path = format!("/v1.0/m/token/{}", auth.token_info.refresh_token);
         let result = self
             .request(auth, "GET", &path, None, None)
@@ -193,7 +209,7 @@ impl SmartLifeClient {
                 .ok_or_else(|| anyhow!("Smart Life token refresh missing refreshToken"))?
                 .to_string(),
         };
-        Ok(true)
+        Ok(())
     }
 
     async fn request(
