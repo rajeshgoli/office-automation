@@ -2,15 +2,20 @@ use std::{
     future::Future,
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, RwLock},
-    time::Duration,
+    sync::{Arc, OnceLock, RwLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{Local, Timelike};
-use reqwest::{Client, header};
+use reqwest::{Client, RequestBuilder, Response, StatusCode, header};
 use serde_json::{Value, json};
-use tokio::{sync::broadcast, task::JoinHandle, time};
+use tokio::{
+    sync::{Mutex as AsyncMutex, broadcast},
+    task::JoinHandle,
+    time,
+};
 
 use crate::{
     config::{AppConfig, MitsubishiConfig},
@@ -19,6 +24,26 @@ use crate::{
 };
 
 const KUMO_APP_VERSION: &str = "1297";
+/// Re-login this long before the access token's `exp` so a request never
+/// races the expiry.
+const KUMO_TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(60);
+/// Used only if the access token's `exp` cannot be read. Kumo issues
+/// 20-minute access tokens.
+const KUMO_TOKEN_FALLBACK_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Process-wide Kumo access token. Logging in on every call made the safety
+/// interlock hit `/v3/login` every few seconds and Kumo throttled it (#173).
+/// The async mutex is held across login so concurrent callers share one.
+static KUMO_TOKEN_CACHE: OnceLock<AsyncMutex<Option<CachedKumoToken>>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct CachedKumoToken {
+    base_url: String,
+    username: String,
+    access: String,
+    refresh_after: Instant,
+}
+
 pub const HVAC_MANUAL_OVERRIDE_SECONDS: i64 = 30 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +202,7 @@ pub struct HvacState {
 #[derive(Debug, Default)]
 struct HvacInner {
     latest_status: Option<HvacDeviceStatus>,
+    latest_status_at: Option<Instant>,
     suspended: bool,
     last_mode: Option<String>,
     suspended_heat_setpoint_c: Option<f64>,
@@ -348,6 +374,7 @@ impl HvacState {
             inner.suspended_cool_setpoint_c = None;
         }
         inner.latest_status = Some(status);
+        inner.latest_status_at = Some(Instant::now());
         changed
     }
 
@@ -357,6 +384,24 @@ impl HvacState {
             .expect("HVAC state lock poisoned")
             .latest_status
             .clone()
+    }
+
+    #[cfg(test)]
+    pub fn age_latest_status_for_test(&self, age: Duration) {
+        let mut inner = self.inner.write().expect("HVAC state lock poisoned");
+        inner.latest_status_at = inner
+            .latest_status_at
+            .and_then(|recorded_at| recorded_at.checked_sub(age));
+    }
+
+    /// Latest recorded status, only if it was recorded within `max_age`.
+    pub fn fresh_status(&self, max_age: Duration) -> Option<HvacDeviceStatus> {
+        let inner = self.inner.read().expect("HVAC state lock poisoned");
+        let recorded_at = inner.latest_status_at?;
+        if recorded_at.elapsed() > max_age {
+            return None;
+        }
+        inner.latest_status.clone()
     }
 
     pub fn snapshot(&self) -> HvacRuntimeSnapshot {
@@ -563,8 +608,7 @@ impl KumoClient {
     }
 
     async fn get_full_status(&self) -> Result<HvacDeviceStatus> {
-        let token = self.login().await?;
-        let sites = self.get_json("/v3/sites", &token).await?;
+        let sites = self.get_json("/v3/sites").await?;
         let Some(sites) = sites.as_array() else {
             bail!("Kumo sites response is not an array");
         };
@@ -573,9 +617,7 @@ impl KumoClient {
             let Some(site_id) = site.get("id").and_then(Value::as_str) else {
                 continue;
             };
-            let zones = self
-                .get_json(&format!("/v3/sites/{site_id}/zones"), &token)
-                .await?;
+            let zones = self.get_json(&format!("/v3/sites/{site_id}/zones")).await?;
             let Some(zones) = zones.as_array() else {
                 bail!("Kumo zones response for site {site_id} is not an array");
             };
@@ -593,6 +635,64 @@ impl KumoClient {
         }
 
         bail!("Kumo device {} not found in any zone", self.device_serial)
+    }
+
+    async fn access_token(&self) -> Result<String> {
+        let mut cached = KUMO_TOKEN_CACHE
+            .get_or_init(|| AsyncMutex::new(None))
+            .lock()
+            .await;
+        if let Some(token) = cached.as_ref()
+            && token.base_url == self.base_url
+            && token.username == self.username
+            && Instant::now() < token.refresh_after
+        {
+            return Ok(token.access.clone());
+        }
+
+        let access = self.login().await?;
+        let reuse_window = token_reuse_window(&access);
+        tracing::info!(
+            "Kumo login succeeded; reusing access token for {}s",
+            reuse_window.as_secs()
+        );
+        *cached = Some(CachedKumoToken {
+            base_url: self.base_url.clone(),
+            username: self.username.clone(),
+            refresh_after: Instant::now() + reuse_window,
+            access: access.clone(),
+        });
+        Ok(access)
+    }
+
+    async fn invalidate_token(&self, access: &str) {
+        let mut cached = KUMO_TOKEN_CACHE
+            .get_or_init(|| AsyncMutex::new(None))
+            .lock()
+            .await;
+        if cached.as_ref().is_some_and(|token| token.access == access) {
+            *cached = None;
+        }
+    }
+
+    /// Sends an authenticated request with the cached token. If Kumo rejects
+    /// the token early (401/403), logs in again and retries once.
+    async fn send_authorized<F>(&self, build: F) -> Result<Response>
+    where
+        F: Fn(&str) -> RequestBuilder,
+    {
+        let token = self.access_token().await?;
+        let response = build(&token).send().await?;
+        if !matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            return Ok(response);
+        }
+
+        self.invalidate_token(&token).await;
+        let token = self.access_token().await?;
+        Ok(build(&token).send().await?)
     }
 
     async fn login(&self) -> Result<String> {
@@ -627,13 +727,14 @@ impl KumoClient {
             .ok_or_else(|| anyhow!("Kumo login response missing token.access"))
     }
 
-    async fn get_json(&self, path: &str, token: &str) -> Result<Value> {
+    async fn get_json(&self, path: &str) -> Result<Value> {
         let response = self
-            .http
-            .get(self.url(path))
-            .headers(kumo_headers())
-            .bearer_auth(token)
-            .send()
+            .send_authorized(|token| {
+                self.http
+                    .get(self.url(path))
+                    .headers(kumo_headers())
+                    .bearer_auth(token)
+            })
             .await
             .with_context(|| format!("failed to send Kumo GET {path}"))?;
 
@@ -650,7 +751,6 @@ impl KumoClient {
     }
 
     async fn send_mode_command(&self, command: HvacModeCommand) -> Result<Value> {
-        let token = self.login().await?;
         let mode = command.mode;
         let mut commands = serde_json::Map::new();
         commands.insert(
@@ -682,16 +782,18 @@ impl KumoClient {
             }
         }
 
+        let body = json!({
+            "deviceSerial": self.device_serial,
+            "commands": commands,
+        });
         let response = self
-            .http
-            .post(self.url("/v3/devices/send-command"))
-            .headers(kumo_headers())
-            .bearer_auth(token)
-            .json(&json!({
-                "deviceSerial": self.device_serial,
-                "commands": commands,
-            }))
-            .send()
+            .send_authorized(|token| {
+                self.http
+                    .post(self.url("/v3/devices/send-command"))
+                    .headers(kumo_headers())
+                    .bearer_auth(token)
+                    .json(&body)
+            })
             .await
             .context("failed to send Kumo command request")?;
 
@@ -710,6 +812,30 @@ impl KumoClient {
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
+}
+
+/// How long to reuse a freshly issued access token: until `exp` minus the
+/// refresh margin, or a short fallback if `exp` cannot be read.
+fn token_reuse_window(access: &str) -> Duration {
+    let Some(expires_at) = jwt_expiry_unix(access) else {
+        return KUMO_TOKEN_FALLBACK_TTL;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Duration::from_secs(expires_at.saturating_sub(now)).saturating_sub(KUMO_TOKEN_REFRESH_MARGIN)
+}
+
+/// Reads the unverified `exp` claim. The token is only used as an opaque
+/// bearer credential; this just schedules re-login.
+fn jwt_expiry_unix(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()?
+        .get("exp")?
+        .as_u64()
 }
 
 fn kumo_headers() -> header::HeaderMap {
@@ -1007,5 +1133,157 @@ mod tests {
         assert!(should_skip_hvac_poll(true, 5));
         assert!(!should_skip_hvac_poll(true, 6));
         assert!(!should_skip_hvac_poll(true, 22));
+    }
+
+    fn fake_kumo_jwt(expires_in_seconds: u64) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let payload = URL_SAFE_NO_PAD.encode(json!({"exp": now + expires_in_seconds}).to_string());
+        format!("e30.{payload}.sig")
+    }
+
+    /// Fake Kumo cloud. Issues `token-<n>` style JWTs on each login and
+    /// rejects any token in `rejected` with 401.
+    async fn spawn_fake_kumo(
+        logins: Arc<std::sync::atomic::AtomicUsize>,
+        rejected: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> String {
+        use axum::{
+            Json, Router,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::{get, post},
+        };
+
+        let issued = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let login_issued = issued.clone();
+        let authorized = move |headers: &HeaderMap| {
+            let bearer = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .unwrap_or_default()
+                .to_string();
+            issued.lock().unwrap().contains(&bearer) && !rejected.lock().unwrap().contains(&bearer)
+        };
+        let sites_auth = authorized.clone();
+        let zones_auth = authorized;
+        let app = Router::new()
+            .route(
+                "/v3/login",
+                post(move || {
+                    let logins = logins.clone();
+                    let issued = login_issued.clone();
+                    async move {
+                        let count = logins.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        let token = format!("{}{count}", fake_kumo_jwt(1200));
+                        issued.lock().unwrap().push(token.clone());
+                        Json(json!({"token": {"access": token, "refresh": "refresh"}}))
+                    }
+                }),
+            )
+            .route(
+                "/v3/sites",
+                get(move |headers: HeaderMap| async move {
+                    if sites_auth(&headers) {
+                        Json(json!([{"id": "site-1"}])).into_response()
+                    } else {
+                        StatusCode::UNAUTHORIZED.into_response()
+                    }
+                }),
+            )
+            .route(
+                "/v3/sites/site-1/zones",
+                get(move |headers: HeaderMap| async move {
+                    if zones_auth(&headers) {
+                        Json(json!([{"adapter": {
+                            "deviceSerial": "serial-1",
+                            "power": 1,
+                            "operationMode": "heat",
+                            "spHeat": 21.0,
+                            "spCool": 25.0
+                        }}]))
+                        .into_response()
+                    } else {
+                        StatusCode::UNAUTHORIZED.into_response()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake kumo");
+        let address = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("fake kumo");
+        });
+        format!("http://{address}")
+    }
+
+    fn fake_kumo_config(base_url: String) -> MitsubishiConfig {
+        MitsubishiConfig {
+            username: Some("user@example.test".to_string()),
+            password: Some("password".to_string()),
+            device_serial: Some("serial-1".to_string()),
+            base_url,
+            ..MitsubishiConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn kumo_status_reads_reuse_one_login() {
+        let logins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let base_url = spawn_fake_kumo(logins.clone(), Arc::default()).await;
+        let config = fake_kumo_config(base_url);
+
+        for _ in 0..3 {
+            let status = KumoHvacStatusReader
+                .read_status(&config)
+                .await
+                .expect("status");
+            assert_eq!(status.mode, "heat");
+        }
+
+        assert_eq!(logins.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn kumo_relogs_once_when_cached_token_is_rejected() {
+        let logins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rejected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let base_url = spawn_fake_kumo(logins.clone(), rejected.clone()).await;
+        let config = fake_kumo_config(base_url.clone());
+
+        KumoHvacStatusReader
+            .read_status(&config)
+            .await
+            .expect("first status");
+        let first_token = KUMO_TOKEN_CACHE
+            .get()
+            .expect("cache initialized")
+            .lock()
+            .await
+            .as_ref()
+            .filter(|token| token.base_url == base_url)
+            .map(|token| token.access.clone())
+            .expect("cached token");
+        rejected.lock().unwrap().push(first_token);
+
+        let status = KumoHvacStatusReader
+            .read_status(&config)
+            .await
+            .expect("status after re-login");
+
+        assert_eq!(status.mode, "heat");
+        assert_eq!(logins.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn token_reuse_window_tracks_jwt_expiry() {
+        let window = token_reuse_window(&fake_kumo_jwt(1200));
+        assert!(window > Duration::from_secs(1100) && window <= Duration::from_secs(1140));
+        assert_eq!(token_reuse_window("not-a-jwt"), KUMO_TOKEN_FALLBACK_TTL);
+        assert_eq!(token_reuse_window(&fake_kumo_jwt(30)), Duration::ZERO);
     }
 }
