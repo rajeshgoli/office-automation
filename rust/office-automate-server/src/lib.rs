@@ -11,6 +11,7 @@ pub mod edge;
 pub mod erv;
 pub mod http;
 pub mod hvac;
+pub mod lan;
 pub mod migration;
 pub mod mqtt;
 pub mod policy;

@@ -304,6 +304,9 @@ pub struct ErvConfig {
     #[serde(rename = "type")]
     pub device_type: String,
     pub ip: String,
+    /// The ERV's MAC. When set and `ip` stops answering, the server finds the
+    /// device's current DHCP lease by this MAC and uses it (#175).
+    pub mac: Option<String>,
     pub device_id: String,
     pub local_key: String,
     pub active_control_enabled: bool,
@@ -395,6 +398,7 @@ impl Default for ErvConfig {
         Self {
             device_type: "tuya".to_string(),
             ip: String::new(),
+            mac: None,
             device_id: String::new(),
             local_key: String::new(),
             active_control_enabled: false,
@@ -760,6 +764,10 @@ impl AppConfig {
 
         if let Some(ip) = env_lookup("OFFICE_AUTOMATE_ERV_IP") {
             file_config.erv.ip = ip;
+        }
+
+        if let Some(mac) = env_lookup("OFFICE_AUTOMATE_ERV_MAC") {
+            file_config.erv.mac = Some(mac);
         }
 
         if let Some(device_id) = env_lookup("OFFICE_AUTOMATE_ERV_DEVICE_ID") {
