@@ -20,8 +20,8 @@ the PR body for each ticket the PR finishes; "Implements #N" does not close it. 
  4. Once functionality is in place, create a PR for your changes.
  5. Use instructions in Review loop section to get your PR in a clean mergable state.
  6. Once clean, squash merge the PR, delete local and remote branches or worktrees you may have created.
- 7. Rebuild and restart office-automation server if required.
- 8. Clean up any old builds and binary detritus so it's in clean state. Let me know. `Cargo clean` is a must. Office automate server binary should survive `cargo clean` and must not be deleted.
+ 7. Run `cargo clean && scripts/build-server.sh && cargo clean --target-dir target-signing`, then restart the server. Run all three in one go, because the first clean deletes the deployed binary.
+ 8. Let me know.
     
 ## 4. Review loop
 Request a review with `sm request-codex-review <pr-number>`. Treat the response as registration only, then go idle — do not poll. If Session Manager cannot take the request, post `@codex review` as a PR comment, check back after five minutes, again after five more. If codex hasn't acknowledged your review after 10 minutes with 👀 smiley, you can re-post the request. If nothing has landed after 20 minutes, you can re-post the review request.
