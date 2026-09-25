@@ -1,12 +1,14 @@
 use std::{
-    collections::VecDeque,
+    borrow::Cow,
+    collections::{HashMap, VecDeque},
     fmt,
     future::Future,
+    net::Ipv4Addr,
     path::PathBuf,
     pin::Pin,
     str::FromStr,
-    sync::{Arc, Mutex, RwLock},
-    time::Duration,
+    sync::{Arc, Mutex, OnceLock, RwLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,6 +22,7 @@ use tokio::{
 use crate::{
     config::{AppConfig, ErvConfig},
     db,
+    lan::{self, MacAddress},
     smart_life::{SmartLifeClient, auth_file_or_default, status_code_value},
     status::{AppNotification, ErvControlStatus, ErvStatusSource, Status},
 };
@@ -40,6 +43,22 @@ const BOOT_RECOVERY_REASON: &str = "boot_unknown_state";
 /// more now that the status poll loop is gone. Bounded so a genuinely dead
 /// local path still fails fast and falls through to recovery.
 const LOCAL_COLD_CONTACT_RETRY_ATTEMPTS: u32 = 3;
+/// Minimum time between LAN sweeps for the ERV's MAC, so a genuinely offline
+/// ERV does not sweep the subnet on every read (#175).
+const ERV_REDISCOVERY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Addresses found by MAC after the configured `erv.ip` stopped answering
+/// (#175), keyed by device id. Lives for the process: a restart starts from
+/// the configured IP again and rediscovers only if it is still stale.
+static ERV_REDISCOVERIES: OnceLock<Mutex<HashMap<String, ErvRediscovery>>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct ErvRediscovery {
+    /// The configured IP this was found for; a config change voids it.
+    configured_ip: String,
+    found_ip: Option<String>,
+    last_attempt: Option<Instant>,
+}
 #[cfg(not(test))]
 const LOCAL_COLD_CONTACT_RETRY_DELAY: Duration = Duration::from_secs(1);
 #[cfg(test)]
@@ -707,6 +726,42 @@ async fn read_status_with_cold_contact_retry(
     reader: &(impl ErvStatusReader + ?Sized),
     config: &ErvConfig,
 ) -> Result<ErvDeviceStatus> {
+    read_status_with_rediscovery(reader, &LanErvLocator, config).await
+}
+
+/// The cold-contact retry, then -- only if the device was unreachable and
+/// `erv.mac` is set -- one attempt at the address its MAC is found at now.
+async fn read_status_with_rediscovery(
+    reader: &(impl ErvStatusReader + ?Sized),
+    locator: &(impl ErvLocator + ?Sized),
+    config: &ErvConfig,
+) -> Result<ErvDeviceStatus> {
+    let effective = effective_erv_config(config);
+    let error = match read_status_with_cold_contact_retry_at(reader, &effective).await {
+        Ok(status) => return Ok(status),
+        Err(error) => error,
+    };
+    if !is_unreachable_local_error(&error) {
+        return Err(error);
+    }
+    let Some(found_ip) = rediscover_erv_address(locator, config, &effective.ip).await else {
+        return Err(error);
+    };
+    let mut relocated = config.clone();
+    relocated.ip = found_ip;
+    reader.read_status(&relocated).await.with_context(|| {
+        format!(
+            "ERV unreachable at {} and the read at its rediscovered address {} failed too \
+             (first error: {error:#})",
+            effective.ip, relocated.ip
+        )
+    })
+}
+
+async fn read_status_with_cold_contact_retry_at(
+    reader: &(impl ErvStatusReader + ?Sized),
+    config: &ErvConfig,
+) -> Result<ErvDeviceStatus> {
     let mut first_error = None;
     for attempt in 1..=LOCAL_COLD_CONTACT_RETRY_ATTEMPTS {
         match reader.read_status(config).await {
@@ -727,6 +782,178 @@ async fn read_status_with_cold_contact_retry(
         }
     }
     Err(first_error.expect("loop runs at least once so an error was recorded"))
+}
+
+/// True when a local error means the device did not answer at its address
+/// (unreachable, timed out, offline) as opposed to answering badly (wrong
+/// key, protocol or payload). Only these warrant looking for it elsewhere.
+fn is_unreachable_local_error(error: &anyhow::Error) -> bool {
+    let typed = error.chain().any(|cause| {
+        if let Some(error) = cause.downcast_ref::<rustuya::TuyaError>() {
+            return matches!(
+                error,
+                rustuya::TuyaError::Io { .. }
+                    | rustuya::TuyaError::Timeout
+                    | rustuya::TuyaError::ConnectionFailed
+                    | rustuya::TuyaError::Offline
+            );
+        }
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkUnreachable
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionRefused
+            )
+        })
+    });
+    if typed {
+        return true;
+    }
+    let message = format!("{error:#}");
+    !is_non_retryable_local_error(&message)
+        && [
+            "No route to host",
+            "Host is down",
+            "Network is unreachable",
+            "Timeout waiting for device",
+        ]
+        .iter()
+        .any(|needle| message.contains(needle))
+}
+
+/// Finds a device by MAC on the LAN. Behind a trait so tests need no network.
+pub trait ErvLocator: Send + Sync {
+    fn locate<'a>(
+        &'a self,
+        mac: &'a MacAddress,
+        near: Ipv4Addr,
+    ) -> BoxFutureResult<'a, Option<Ipv4Addr>>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LanErvLocator;
+
+impl ErvLocator for LanErvLocator {
+    fn locate<'a>(
+        &'a self,
+        mac: &'a MacAddress,
+        near: Ipv4Addr,
+    ) -> BoxFutureResult<'a, Option<Ipv4Addr>> {
+        Box::pin(lan::locate_mac_near(mac, near))
+    }
+}
+
+fn erv_rediscoveries() -> &'static Mutex<HashMap<String, ErvRediscovery>> {
+    ERV_REDISCOVERIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `config` with `ip` replaced by the address found by MAC, if one was found
+/// for this exact configured IP.
+fn effective_erv_config(config: &ErvConfig) -> Cow<'_, ErvConfig> {
+    let found_ip = erv_rediscoveries()
+        .lock()
+        .expect("ERV rediscovery lock poisoned")
+        .get(&config.device_id)
+        .filter(|entry| entry.configured_ip == config.ip)
+        .and_then(|entry| entry.found_ip.clone());
+    match found_ip {
+        Some(ip) if ip != config.ip => {
+            let mut relocated = config.clone();
+            relocated.ip = ip;
+            Cow::Owned(relocated)
+        }
+        _ => Cow::Borrowed(config),
+    }
+}
+
+/// Looks the ERV up by MAC and returns its address if it moved away from
+/// `current_ip`. Rate-limited per device; failures are logged, not returned,
+/// because the caller already has the more useful unreachable error.
+async fn rediscover_erv_address(
+    locator: &(impl ErvLocator + ?Sized),
+    config: &ErvConfig,
+    current_ip: &str,
+) -> Option<String> {
+    let mac_text = config.mac.as_deref()?.trim();
+    if mac_text.is_empty() {
+        return None;
+    }
+    let mac = match lan::parse_mac(mac_text) {
+        Ok(mac) => mac,
+        Err(error) => {
+            tracing::warn!("ERV MAC rediscovery disabled: erv.mac is invalid: {error:#}");
+            return None;
+        }
+    };
+    let Ok(near) = current_ip.parse::<Ipv4Addr>() else {
+        tracing::warn!("ERV MAC rediscovery skipped: {current_ip:?} is not an IPv4 address");
+        return None;
+    };
+
+    {
+        let mut entries = erv_rediscoveries()
+            .lock()
+            .expect("ERV rediscovery lock poisoned");
+        let entry = entries
+            .entry(config.device_id.clone())
+            .or_insert_with(|| ErvRediscovery {
+                configured_ip: config.ip.clone(),
+                found_ip: None,
+                last_attempt: None,
+            });
+        if entry.configured_ip != config.ip {
+            *entry = ErvRediscovery {
+                configured_ip: config.ip.clone(),
+                found_ip: None,
+                last_attempt: None,
+            };
+        }
+        if entry
+            .last_attempt
+            .is_some_and(|attempt| attempt.elapsed() < ERV_REDISCOVERY_INTERVAL)
+        {
+            return None;
+        }
+        entry.last_attempt = Some(Instant::now());
+    }
+
+    let mac_display = lan::format_mac(&mac);
+    let found = match locator.locate(&mac, near).await {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            tracing::warn!(
+                "ERV unreachable at {current_ip} and MAC {mac_display} was not found on the LAN"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!("ERV MAC rediscovery failed: {error:#}");
+            return None;
+        }
+    };
+    let found = found.to_string();
+    if found == current_ip {
+        tracing::warn!(
+            "ERV MAC {mac_display} is still at {current_ip} but did not answer; not relocating"
+        );
+        return None;
+    }
+
+    tracing::warn!(
+        "ERV unreachable at {current_ip}; found MAC {mac_display} at {found}. Using it from now \
+         on -- set erv.ip to \"{found}\" in config.yaml or reserve it in DHCP"
+    );
+    if let Some(entry) = erv_rediscoveries()
+        .lock()
+        .expect("ERV rediscovery lock poisoned")
+        .get_mut(&config.device_id)
+        .filter(|entry| entry.configured_ip == config.ip)
+    {
+        entry.found_ip = Some(found.clone());
+    }
+    Some(found)
 }
 
 /// True for local-read errors that no amount of retrying will change: a
@@ -2240,11 +2467,11 @@ fn required_scene_presets(config: &AppConfig) -> Vec<(&'static str, Option<&str>
 }
 
 pub async fn smoke_erv(config: &AppConfig) -> Result<ErvDeviceStatus> {
-    let reader = RustuyaErvStatusReader;
-    reader.read_status(&config.erv).await
+    read_status_with_cold_contact_retry(&RustuyaErvStatusReader, &config.erv).await
 }
 
 fn build_rustuya_device(config: &ErvConfig) -> Result<rustuya::Device> {
+    let config = effective_erv_config(config);
     let version = rustuya::Version::from_str(&config.version)
         .map_err(|error| anyhow!("invalid ERV Tuya protocol version: {error}"))?;
     Ok(rustuya::Device::builder(
@@ -4723,16 +4950,16 @@ mod tests {
             smart_life_home_id: None,
             ..scene_config()
         });
-        let error = smoke_erv_scene(&no_home_id)
-            .await
-            .expect_err("no home id");
+        let error = smoke_erv_scene(&no_home_id).await.expect_err("no home id");
         assert!(error.to_string().contains("home id"));
 
         let no_turbo = app_config(ErvConfig {
             turbo_scene_id: None,
             ..scene_config()
         });
-        let error = smoke_erv_scene(&no_turbo).await.expect_err("incomplete matrix");
+        let error = smoke_erv_scene(&no_turbo)
+            .await
+            .expect_err("incomplete matrix");
         assert!(error.to_string().contains("turbo"));
 
         let local_mode = app_config(ErvConfig {
@@ -4832,6 +5059,208 @@ mod tests {
                 Ok(expected),
                 "wrong scene for {speed:?} negative_pressure={negative_pressure}"
             );
+        }
+    }
+
+    /// Answers only at `reachable_ip`; anywhere else it fails the way a
+    /// moved DHCP lease does.
+    struct AddressedFakeReader {
+        reachable_ip: String,
+        seen_ips: Mutex<Vec<String>>,
+    }
+
+    impl AddressedFakeReader {
+        fn new(reachable_ip: &str) -> Self {
+            Self {
+                reachable_ip: reachable_ip.to_string(),
+                seen_ips: Mutex::default(),
+            }
+        }
+
+        fn seen_ips(&self) -> Vec<String> {
+            self.seen_ips.lock().unwrap().clone()
+        }
+    }
+
+    impl ErvStatusReader for AddressedFakeReader {
+        fn read_status<'a>(
+            &'a self,
+            config: &'a ErvConfig,
+        ) -> BoxFutureResult<'a, ErvDeviceStatus> {
+            self.seen_ips.lock().unwrap().push(config.ip.clone());
+            let result = if config.ip == self.reachable_ip {
+                Ok(medium_status())
+            } else {
+                Err(anyhow::Error::new(rustuya::TuyaError::Io {
+                    kind: std::io::ErrorKind::HostUnreachable,
+                    message: "No route to host (os error 65)".to_string(),
+                })
+                .context("failed to read ERV local Tuya status"))
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeLocator {
+        found: Option<Ipv4Addr>,
+        calls: Mutex<Vec<(MacAddress, Ipv4Addr)>>,
+    }
+
+    impl FakeLocator {
+        fn finding(ip: &str) -> Self {
+            Self {
+                found: Some(ip.parse().unwrap()),
+                ..Self::default()
+            }
+        }
+
+        fn calls(&self) -> Vec<(MacAddress, Ipv4Addr)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ErvLocator for FakeLocator {
+        fn locate<'a>(
+            &'a self,
+            mac: &'a MacAddress,
+            near: Ipv4Addr,
+        ) -> BoxFutureResult<'a, Option<Ipv4Addr>> {
+            self.calls.lock().unwrap().push((*mac, near));
+            let found = self.found;
+            Box::pin(async move { Ok(found) })
+        }
+    }
+
+    /// Each test gets its own device id: the rediscovery table is process-wide.
+    fn mac_config(device_id: &str) -> ErvConfig {
+        ErvConfig {
+            ip: "192.168.4.59".to_string(),
+            mac: Some("C0-F8-53-75-1F-CF".to_string()),
+            device_id: device_id.to_string(),
+            ..test_config()
+        }
+    }
+
+    #[tokio::test]
+    async fn unreachable_erv_is_found_by_mac_and_its_new_ip_is_kept() {
+        let config = mac_config("rediscovery-moved");
+        let reader = AddressedFakeReader::new("192.168.4.68");
+        let locator = FakeLocator::finding("192.168.4.68");
+
+        let status = read_status_with_rediscovery(&reader, &locator, &config)
+            .await
+            .expect("read at the rediscovered address");
+
+        assert_eq!(status, medium_status());
+        assert_eq!(
+            locator.calls(),
+            vec![(
+                [0xc0, 0xf8, 0x53, 0x75, 0x1f, 0xcf],
+                Ipv4Addr::new(192, 168, 4, 59)
+            )]
+        );
+        assert_eq!(effective_erv_config(&config).ip, "192.168.4.68");
+
+        // Later reads go straight to the new address, with no second sweep.
+        read_status_with_rediscovery(&reader, &locator, &config)
+            .await
+            .expect("second read");
+        assert_eq!(locator.calls().len(), 1);
+        assert_eq!(
+            reader.seen_ips().last().map(String::as_str),
+            Some("192.168.4.68")
+        );
+    }
+
+    #[tokio::test]
+    async fn rediscovered_ip_is_dropped_when_the_configured_ip_changes() {
+        let config = mac_config("rediscovery-config-change");
+        let reader = AddressedFakeReader::new("192.168.4.68");
+        read_status_with_rediscovery(&reader, &FakeLocator::finding("192.168.4.68"), &config)
+            .await
+            .expect("rediscovered");
+
+        let updated = ErvConfig {
+            ip: "192.168.4.70".to_string(),
+            ..config.clone()
+        };
+        assert_eq!(effective_erv_config(&updated).ip, "192.168.4.70");
+    }
+
+    #[tokio::test]
+    async fn rediscovery_needs_a_mac_and_an_unreachable_error() {
+        let locator = FakeLocator::finding("192.168.4.68");
+
+        let no_mac = ErvConfig {
+            mac: None,
+            ..mac_config("rediscovery-no-mac")
+        };
+        let reader = AddressedFakeReader::new("192.168.4.68");
+        assert!(
+            read_status_with_rediscovery(&reader, &locator, &no_mac)
+                .await
+                .is_err()
+        );
+
+        let key_error = Arc::new(FakeErvReader::new(vec![Err(anyhow!(
+            "Check device key or version (Error 914)"
+        ))]));
+        assert!(
+            read_status_with_rediscovery(
+                key_error.as_ref(),
+                &locator,
+                &mac_config("rediscovery-key-error")
+            )
+            .await
+            .is_err()
+        );
+
+        assert!(locator.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rediscovery_is_rate_limited_and_ignores_the_same_address() {
+        let config = mac_config("rediscovery-rate-limit");
+        let reader = AddressedFakeReader::new("192.168.4.200");
+        let locator = FakeLocator::finding("192.168.4.59");
+
+        for _ in 0..3 {
+            let error = read_status_with_rediscovery(&reader, &locator, &config)
+                .await
+                .expect_err("still unreachable");
+            assert!(format!("{error:#}").contains("No route to host"));
+        }
+
+        assert_eq!(locator.calls().len(), 1);
+        assert_eq!(effective_erv_config(&config).ip, "192.168.4.59");
+    }
+
+    #[test]
+    fn classifies_unreachable_local_errors() {
+        let unreachable = [
+            anyhow::Error::new(rustuya::TuyaError::Timeout)
+                .context("failed to read ERV local Tuya status"),
+            anyhow::Error::new(rustuya::TuyaError::Io {
+                kind: std::io::ErrorKind::HostUnreachable,
+                message: "No route to host (os error 65)".to_string(),
+            }),
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NetworkUnreachable)),
+            anyhow!("IO error (Uncategorized): Host is down (os error 64)"),
+        ];
+        for error in &unreachable {
+            assert!(is_unreachable_local_error(error), "{error:#}");
+        }
+
+        let answered = [
+            anyhow::Error::new(rustuya::TuyaError::KeyOrVersionError)
+                .context("failed to read ERV local Tuya status"),
+            anyhow::Error::new(rustuya::TuyaError::HmacMismatch),
+            anyhow!("ERV local Tuya status returned no payload"),
+            anyhow!("ERV local Tuya config is incomplete"),
+        ];
+        for error in &answered {
+            assert!(!is_unreachable_local_error(error), "{error:#}");
         }
     }
 }
