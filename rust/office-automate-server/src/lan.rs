@@ -103,17 +103,26 @@ pub fn sweep_network(networks: &[Ipv4Net], near: Ipv4Addr) -> Option<Ipv4Net> {
         .copied()
 }
 
-pub fn lookup_mac(table: &[(Ipv4Addr, MacAddress)], mac: &MacAddress) -> Option<Ipv4Addr> {
+/// The IP holding `mac`, ignoring `exclude`. After a lease change the ARP
+/// cache can still map the MAC to the address that just failed, alongside
+/// (or instead of) the new one; that stale entry must not end the search.
+pub fn lookup_mac(
+    table: &[(Ipv4Addr, MacAddress)],
+    mac: &MacAddress,
+    exclude: Ipv4Addr,
+) -> Option<Ipv4Addr> {
     table
         .iter()
-        .find(|(_, entry)| entry == mac)
+        .find(|(ip, entry)| entry == mac && *ip != exclude)
         .map(|(ip, _)| *ip)
 }
 
-/// Finds `mac` on the local network around `near`. Returns `Ok(None)` if it
-/// is not seen, including when `near` is not on a sweepable local network.
+/// Finds `mac` on the local network around `near`, the address that just
+/// failed. Returns another address if the MAC moved, `near` itself only if
+/// the sweep still shows the MAC nowhere else, and `Ok(None)` if it is not
+/// seen at all or `near` is not on a sweepable local network.
 pub async fn locate_mac_near(mac: &MacAddress, near: Ipv4Addr) -> Result<Option<Ipv4Addr>> {
-    if let Some(ip) = lookup_mac(&arp_table().await?, mac) {
+    if let Some(ip) = lookup_mac(&arp_table().await?, mac, near) {
         return Ok(Some(ip));
     }
 
@@ -124,13 +133,18 @@ pub async fn locate_mac_near(mac: &MacAddress, near: Ipv4Addr) -> Result<Option<
     };
     sweep(network).await?;
 
+    let mut table = Vec::new();
     for _ in 0..ARP_SETTLE_POLLS {
         time::sleep(ARP_SETTLE_INTERVAL).await;
-        if let Some(ip) = lookup_mac(&arp_table().await?, mac) {
+        table = arp_table().await?;
+        if let Some(ip) = lookup_mac(&table, mac, near) {
             return Ok(Some(ip));
         }
     }
-    Ok(None)
+    Ok(table
+        .iter()
+        .any(|(ip, entry)| entry == mac && *ip == near)
+        .then_some(near))
 }
 
 async fn sweep(network: Ipv4Net) -> Result<()> {
@@ -203,17 +217,21 @@ mod tests {
         let output = "\
 ? (192.168.4.1) at d4:3f:32:89:5c:12 on en1 ifscope [ethernet]
 ? (192.168.4.20) at a:4d:c6:4a:b1:37 on en1 ifscope [ethernet]
-? (192.168.4.59) at (incomplete) on en1 ifscope [ethernet]
+? (192.168.4.30) at (incomplete) on en1 ifscope [ethernet]
+? (192.168.4.59) at c0:f8:53:75:1f:cf on en1 ifscope [ethernet]
 ? (192.168.4.68) at c0:f8:53:75:1f:cf on en1 ifscope [ethernet]
 ? (224.0.0.251) at 1:0:5e:0:0:fb on en1 ifscope permanent [ethernet]
 ";
         let table = parse_arp_table(output);
-        assert_eq!(table.len(), 4);
+        assert_eq!(table.len(), 5);
+        let failed = Ipv4Addr::new(192, 168, 4, 59);
+        // The stale entry for the address that just failed is skipped.
         assert_eq!(
-            lookup_mac(&table, &ERV_MAC),
+            lookup_mac(&table, &ERV_MAC, failed),
             Some(Ipv4Addr::new(192, 168, 4, 68))
         );
-        assert_eq!(lookup_mac(&table, &[0; 6]), None);
+        assert_eq!(lookup_mac(&table[..3], &ERV_MAC, failed), None);
+        assert_eq!(lookup_mac(&table, &[0; 6], failed), None);
     }
 
     #[test]
