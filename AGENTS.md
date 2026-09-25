@@ -19,7 +19,7 @@ the PR body for each ticket the PR finishes; "Implements #N" does not close it. 
  3. Once all feature requests above are completed and verified, you may exit to step 4. If I have feedback or if you find live test failures, repeat steps 1 and 2 until exit to 4 criteria is met. 
  4. Once functionality is in place, create a PR for your changes.
  5. Use instructions in Review loop section to get your PR in a clean mergable state.
- 6. Once clean, squash merge the PR, delete local and remote branches or worktrees you may have created.
+ 6. Once clean, `gh pr merge --squash --delete-branch`. `main` requires signed commits so that only I can land changes. You're working as me with my gh creds, so if the merge is blocked only because the commits are unsigned, add `--admin`. For any other blocker, such as conflicts or failing checks, fix it or ask me. Then delete any local branches and worktrees you created.
  7. In `~/projects/office-automate`: `git pull --ff-only && scripts/build-server.sh && cargo clean --target-dir target-signing`, then restart the server. Never `cargo clean` `target/`; the deployed binary lives there.
  8. Let me know.
     
