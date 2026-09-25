@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     future::Future,
     path::PathBuf,
     pin::Pin,
@@ -31,15 +32,15 @@ const KUMO_TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(60);
 /// 20-minute access tokens.
 const KUMO_TOKEN_FALLBACK_TTL: Duration = Duration::from_secs(5 * 60);
 
-/// Process-wide Kumo access token. Logging in on every call made the safety
-/// interlock hit `/v3/login` every few seconds and Kumo throttled it (#173).
-/// The async mutex is held across login so concurrent callers share one.
-static KUMO_TOKEN_CACHE: OnceLock<AsyncMutex<Option<CachedKumoToken>>> = OnceLock::new();
+/// Process-wide Kumo access tokens, keyed by (base URL, username). Logging in
+/// on every call made the safety interlock hit `/v3/login` every few seconds
+/// and Kumo throttled it (#173). The async mutex is held across login so
+/// concurrent callers share one.
+static KUMO_TOKEN_CACHE: OnceLock<AsyncMutex<HashMap<(String, String), CachedKumoToken>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct CachedKumoToken {
-    base_url: String,
-    username: String,
     access: String,
     refresh_after: Instant,
 }
@@ -637,14 +638,13 @@ impl KumoClient {
         bail!("Kumo device {} not found in any zone", self.device_serial)
     }
 
+    fn token_cache_key(&self) -> (String, String) {
+        (self.base_url.clone(), self.username.clone())
+    }
+
     async fn access_token(&self) -> Result<String> {
-        let mut cached = KUMO_TOKEN_CACHE
-            .get_or_init(|| AsyncMutex::new(None))
-            .lock()
-            .await;
-        if let Some(token) = cached.as_ref()
-            && token.base_url == self.base_url
-            && token.username == self.username
+        let mut cache = kumo_token_cache().lock().await;
+        if let Some(token) = cache.get(&self.token_cache_key())
             && Instant::now() < token.refresh_after
         {
             return Ok(token.access.clone());
@@ -656,22 +656,21 @@ impl KumoClient {
             "Kumo login succeeded; reusing access token for {}s",
             reuse_window.as_secs()
         );
-        *cached = Some(CachedKumoToken {
-            base_url: self.base_url.clone(),
-            username: self.username.clone(),
-            refresh_after: Instant::now() + reuse_window,
-            access: access.clone(),
-        });
+        cache.insert(
+            self.token_cache_key(),
+            CachedKumoToken {
+                refresh_after: Instant::now() + reuse_window,
+                access: access.clone(),
+            },
+        );
         Ok(access)
     }
 
     async fn invalidate_token(&self, access: &str) {
-        let mut cached = KUMO_TOKEN_CACHE
-            .get_or_init(|| AsyncMutex::new(None))
-            .lock()
-            .await;
-        if cached.as_ref().is_some_and(|token| token.access == access) {
-            *cached = None;
+        let key = self.token_cache_key();
+        let mut cache = kumo_token_cache().lock().await;
+        if cache.get(&key).is_some_and(|token| token.access == access) {
+            cache.remove(&key);
         }
     }
 
@@ -812,6 +811,10 @@ impl KumoClient {
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
+}
+
+fn kumo_token_cache() -> &'static AsyncMutex<HashMap<(String, String), CachedKumoToken>> {
+    KUMO_TOKEN_CACHE.get_or_init(|| AsyncMutex::new(HashMap::new()))
 }
 
 /// How long to reuse a freshly issued access token: until `exp` minus the
@@ -1259,13 +1262,10 @@ mod tests {
             .read_status(&config)
             .await
             .expect("first status");
-        let first_token = KUMO_TOKEN_CACHE
-            .get()
-            .expect("cache initialized")
+        let first_token = kumo_token_cache()
             .lock()
             .await
-            .as_ref()
-            .filter(|token| token.base_url == base_url)
+            .get(&(base_url, "user@example.test".to_string()))
             .map(|token| token.access.clone())
             .expect("cached token");
         rejected.lock().unwrap().push(first_token);
