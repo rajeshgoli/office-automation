@@ -238,6 +238,9 @@ fn is_loopback_bind_host(host: &str) -> bool {
 const HVAC_TEMPERATURE_BANDS_SETTING: &str = "hvac_temperature_bands";
 const DOOR_GRACE_IDLE_POLL_SECONDS: u64 = 60;
 const DOOR_GRACE_RETRY_SECONDS: u64 = 30;
+/// How long a live HVAC read showing "inactive" is trusted by the turn-off
+/// checks before Kumo is asked again (#173).
+const HVAC_INACTIVE_STATUS_REUSE: std::time::Duration = std::time::Duration::from_secs(60);
 pub(crate) const CONTROLLER_IPC_TOKEN_HEADER: &str = "x-office-automate-controller-token";
 
 #[derive(Clone)]
@@ -1574,10 +1577,7 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
     }
 
     if hvac_safety_interlock {
-        let verified_status = state
-            .hvac
-            .smoke_status_with(&state.config.mitsubishi, state.hvac_writer.as_ref())
-            .await?;
+        let verified_status = hvac_status_for_turn_off_check(state).await?;
         if let Some(previous_mode) = active_hvac_control_mode(&verified_status.mode) {
             let previous_heat_setpoint_c = verified_status.heat_setpoint_c;
             let previous_cool_setpoint_c = verified_status.cool_setpoint_c;
@@ -1633,10 +1633,7 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
         && !hvac_snapshot.suspended
         && temp_f.is_some_and(|temp_f| temp_f > state.config.thresholds.hvac_min_temp_f as f64)
     {
-        let verified_status = state
-            .hvac
-            .smoke_status_with(&state.config.mitsubishi, state.hvac_writer.as_ref())
-            .await?;
+        let verified_status = hvac_status_for_turn_off_check(state).await?;
         if let Some(previous_mode) = active_hvac_control_mode(&verified_status.mode) {
             let previous_heat_setpoint_c = verified_status.heat_setpoint_c;
             let previous_cool_setpoint_c = verified_status.cool_setpoint_c;
@@ -1869,6 +1866,23 @@ async fn apply_hvac_mode_after_verified_status(
             setpoint_c,
             reason,
         )
+        .await
+}
+
+/// Status used to decide whether HVAC must be turned off. These checks re-run
+/// on every sensor update while their condition holds (e.g. window open), so a
+/// live Kumo read each time throttled the account (#173). A recent live read
+/// that already shows HVAC inactive is reused; an active or stale status is
+/// always re-read live before any write.
+async fn hvac_status_for_turn_off_check(state: &AppState) -> Result<crate::hvac::HvacDeviceStatus> {
+    if let Some(status) = state.hvac.fresh_status(HVAC_INACTIVE_STATUS_REUSE)
+        && active_hvac_control_mode(&status.mode).is_none()
+    {
+        return Ok(status);
+    }
+    state
+        .hvac
+        .smoke_status_with(&state.config.mitsubishi, state.hvac_writer.as_ref())
         .await
 }
 
@@ -5885,6 +5899,11 @@ mod tests {
         let erv_state = ErvState::new(config.runtime.database_path.clone());
         let hvac_state = HvacState::new(config.runtime.database_path.clone());
         hvac_state.record_status(hvac_status(HvacControlMode::Off, 22.0));
+        // A cached "off" older than the reuse window must not suppress the
+        // live read: the device may have been turned on since.
+        hvac_state.age_latest_status_for_test(
+            HVAC_INACTIVE_STATUS_REUSE + std::time::Duration::from_secs(1),
+        );
         let writer = Arc::new(FakeHvacWriter::new(
             vec![Ok(hvac_status(HvacControlMode::Heat, 22.0))],
             vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
@@ -5910,6 +5929,85 @@ mod tests {
         let snapshot = state.hvac.snapshot();
         assert!(snapshot.suspended);
         assert_eq!(snapshot.last_mode.as_deref(), Some("heat"));
+    }
+
+    #[tokio::test]
+    async fn safety_interlock_reuses_fresh_inactive_status_without_kumo_read() {
+        let config = configured_hvac_config(true);
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            now,
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .update_window(true, now + 1.0);
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Off, 22.0));
+        let writer = Arc::new(FakeHvacWriter::new(vec![], vec![]));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            QingpingState::default(),
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        for _ in 0..3 {
+            evaluate_and_apply_hvac_policy(&state)
+                .await
+                .expect("HVAC policy is a no-op while HVAC is already off");
+        }
+
+        assert_eq!(writer.smoke_calls(), 0);
+        assert!(writer.write_modes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn safety_interlock_rereads_fresh_active_status_before_off() {
+        let config = configured_hvac_config(true);
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            now,
+        )));
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .update_window(true, now + 1.0);
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(hvac_status(HvacControlMode::Heat, 22.0));
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![Ok(hvac_status(HvacControlMode::Heat, 22.0))],
+            vec![Ok(hvac_status(HvacControlMode::Off, 22.0))],
+        ));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            QingpingState::default(),
+            state_machine,
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy applies safety off");
+
+        assert_eq!(writer.smoke_calls(), 1);
+        assert_eq!(writer.write_modes(), vec![(HvacControlMode::Off, None)]);
     }
 
     #[tokio::test]
