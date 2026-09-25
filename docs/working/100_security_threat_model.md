@@ -1,8 +1,43 @@
 # Office Automate Security Threat Model
 
 **Issue:** #100
-**Status:** Draft
-**Last updated:** 2026-06-06
+**Status:** Closed — code complete; OS-level process isolation accepted as risk (see Resolution)
+**Last updated:** 2026-09-25
+
+## Resolution (2026-09-25)
+
+All sub-tickets (#101–#114) shipped, plus the follow-up #136 (Office OAuth required after Cloudflare mTLS). The epic is closed with a narrower production posture than the Desired End State below. The operator decided this deliberately; it is not an oversight.
+
+**Decision:** Office Automate is a single-user app. Cloudflare Access sits in front of every public route, then the per-device client certificate (mTLS), then Office OAuth. Given that, the OS-level containment layer (P0 "Contain Tunnel And Origin 0-Day Blast Radius") is **accepted risk** and is not deployed. `cloudflared` and `office-automate-server` both run as the operator's user from LaunchAgents, as one all-in-one controller process.
+
+**Why:** That layer only matters after something has gone wrong in front of the server: a `cloudflared` 0-day, a Cloudflare edge compromise, or Access misconfiguration. The first two are unlikely targets for a one-user home app. Access misconfiguration is covered by drift validation (#111) and the negative probe below. Deploying the layer would cost dedicated macOS users, LaunchDaemons, a deployed edge/controller split with IPC, and PF egress rules. It would also conflict with the Local Network permission (#168) and with the collectors' need to read the operator's home directory and repos.
+
+**Device/cloud ingress** (Qingping MQTT on the LAN, YoLink/Kumo/Tuya cloud responses) is not behind Access. Exploiting it requires LAN presence or a vendor-cloud compromise. It is mitigated in-process by hardened, memory-safe Rust parsing (#108, #109) rather than by separate least-privilege ingester processes. This is also accepted risk.
+
+**Acceptance criteria not met by design** (see Acceptance Criteria below):
+
+- Tunnel/public-HTTP process compromise cannot read controller secrets, data, repos, telemetry, or user home.
+- OS/network policy blocks LAN/RFC1918 egress from tunnel and edge.
+- Validation as the tunnel and edge users proves file-read and LAN-connect denial.
+- Narrow edge/controller IPC. The edge split exists in code (#104) but production runs the combined controller.
+- Device/cloud ingesters run as separate least-privilege processes with typed IPC.
+- Incident response is "rehearsed". The runbook exists (#114); no rehearsal is recorded.
+
+**Android:** #136 superseded the pairing-only bootstrap. Android now uses the Office OAuth device flow, gated at the edge by the enrolled per-device mTLS certificate. `/auth/*` stays behind Access.
+
+**Verified 2026-09-25:** unauthenticated requests to `https://office.rajeshgo.li` for `/`, `/status`, `/auth/login`, `/auth/device/start`, `/apk`, `/deploy/*`, `/assets/*`, and a WebSocket upgrade on `/ws` all return a 302 to the Cloudflare Access login and never reach the server. The tunnel ingress targets `http://127.0.0.1:8080` and ends in `http_status:404`.
+
+**Ongoing obligation:** this posture relies entirely on Access staying correct. Re-run the negative probe after any Cloudflare Access, DNS, or tunnel change:
+
+```bash
+for p in / /status /auth/login /auth/device/start /apk /deploy/x /assets/x.js; do
+  printf '%-20s ' "$p"; curl -s -o /dev/null -w '%{http_code}\n' "https://office.rajeshgo.li$p"
+done
+```
+
+Every line must be `302` (redirect to `*.cloudflareaccess.com`). If any other code appears, treat it as an incident and use the kill switch in #114.
+
+Revisit this decision if the app gains additional users, if any origin route is exempted from Access, or if the host starts holding materially more sensitive data.
 
 ## Goal
 
