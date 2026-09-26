@@ -754,18 +754,7 @@ async fn read_status_with_rediscovery(
     locator: &(impl ErvLocator + ?Sized),
     config: &ErvConfig,
 ) -> Result<ErvDeviceStatus> {
-    let mut effective = effective_erv_config(config);
-    // With no IP, `local_tuya_configured` holds only if a MAC is set; an
-    // otherwise incomplete config falls through to the reader's own error.
-    if effective.ip.trim().is_empty() && config.local_tuya_configured() {
-        let Some(found_ip) = rediscover_erv_address(locator, config, "").await else {
-            bail!(
-                "ERV address unknown: erv.ip is not set and MAC {} was not found on the LAN",
-                config.mac.as_deref().unwrap_or("(none)")
-            );
-        };
-        effective.to_mut().ip = found_ip;
-    }
+    let effective = resolve_erv_address(locator, config).await?;
     let error = match read_status_with_cold_contact_retry_at(reader, &effective).await {
         Ok(status) => return Ok(status),
         Err(error) => error,
@@ -785,6 +774,28 @@ async fn read_status_with_rediscovery(
             effective.ip, relocated.ip
         )
     })
+}
+
+/// `config` with a usable address: `erv.ip`, the address found by MAC
+/// earlier, or -- for a MAC-only config with none yet -- a lookup now. Local
+/// writes go through this too, since they are not always preceded by a read.
+async fn resolve_erv_address<'a>(
+    locator: &(impl ErvLocator + ?Sized),
+    config: &'a ErvConfig,
+) -> Result<Cow<'a, ErvConfig>> {
+    let mut effective = effective_erv_config(config);
+    // With no IP, `local_tuya_configured` holds only if a MAC is set; an
+    // otherwise incomplete config falls through to the caller's own error.
+    if effective.ip.trim().is_empty() && config.local_tuya_configured() {
+        let Some(found_ip) = rediscover_erv_address(locator, config, "").await else {
+            bail!(
+                "ERV address unknown: erv.ip is not set and MAC {} was not found on the LAN",
+                config.mac.as_deref().unwrap_or("(none)")
+            );
+        };
+        effective.to_mut().ip = found_ip;
+    }
+    Ok(effective)
 }
 
 async fn read_status_with_cold_contact_retry_at(
@@ -1108,8 +1119,9 @@ impl ErvSpeedWriter for RustuyaErvSpeedWriter {
                 bail!("ERV local Tuya config is incomplete");
             }
 
-            let device = build_rustuya_device(config)?;
-            let result = set_rustuya_speed(&device, config, speed, negative_pressure).await;
+            let config = resolve_erv_address(&LanErvLocator, config).await?;
+            let device = build_rustuya_device(&config)?;
+            let result = set_rustuya_speed(&device, &config, speed, negative_pressure).await;
             device.close().await;
             result
         })
@@ -5497,5 +5509,27 @@ mod tests {
             load_persisted_erv_address(&database_path, &explicit_ip),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn local_write_resolves_a_mac_only_address_first() {
+        let config = ErvConfig {
+            ip: String::new(),
+            ..mac_config("mac-only-write-resolves")
+        };
+        let locator = FakeLocator::finding("192.168.4.68");
+
+        let resolved = resolve_erv_address(&locator, &config)
+            .await
+            .expect("address found for a write");
+
+        assert_eq!(resolved.ip, "192.168.4.68");
+        assert_eq!(locator.calls().len(), 1);
+        // A later write reuses it.
+        assert_eq!(
+            resolve_erv_address(&locator, &config).await.unwrap().ip,
+            "192.168.4.68"
+        );
+        assert_eq!(locator.calls().len(), 1);
     }
 }
