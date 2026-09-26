@@ -512,6 +512,14 @@ fn write_restore_env(
     if !config.erv.ip.trim().is_empty() {
         write_literal_env(&mut contents, "OFFICE_AUTOMATE_ERV_IP", &config.erv.ip)?;
     }
+    if let Some(mac) = config
+        .erv
+        .mac
+        .as_deref()
+        .filter(|mac| !mac.trim().is_empty())
+    {
+        write_literal_env(&mut contents, "OFFICE_AUTOMATE_ERV_MAC", mac)?;
+    }
     if !config.erv.device_id.trim().is_empty() {
         write_literal_env(
             &mut contents,

@@ -337,9 +337,15 @@ impl ErvConfig {
         self.local_tuya_configured() || self.scene_configured()
     }
 
+    /// True when local Tuya can be reached: credentials plus an address,
+    /// either `ip` or a `mac` to find it by (#177).
     pub fn local_tuya_configured(&self) -> bool {
         self.device_type == "tuya"
-            && !self.ip.trim().is_empty()
+            && (!self.ip.trim().is_empty()
+                || self
+                    .mac
+                    .as_deref()
+                    .is_some_and(|mac| !mac.trim().is_empty()))
             && !self.device_id.trim().is_empty()
             && !self.local_key.trim().is_empty()
     }
