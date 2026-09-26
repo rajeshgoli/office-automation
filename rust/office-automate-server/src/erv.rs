@@ -4,7 +4,7 @@ use std::{
     fmt,
     future::Future,
     net::Ipv4Addr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
     sync::{Arc, Mutex, OnceLock, RwLock},
@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::{
     sync::{Mutex as AsyncMutex, broadcast},
@@ -47,17 +48,33 @@ const LOCAL_COLD_CONTACT_RETRY_ATTEMPTS: u32 = 3;
 /// ERV does not sweep the subnet on every read (#175).
 const ERV_REDISCOVERY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-/// Addresses found by MAC after the configured `erv.ip` stopped answering
-/// (#175), keyed by device id. Lives for the process: a restart starts from
-/// the configured IP again and rediscovers only if it is still stale.
+/// App setting holding the last address the ERV's MAC was found at (#177).
+const ERV_ADDRESS_SETTING: &str = "erv_address";
+
+/// Addresses found by MAC (#175, #177), keyed by device id. With `erv.mac`
+/// alone this is the only source of the ERV's IP; with `erv.ip` set it
+/// overrides that IP once it has stopped answering.
 static ERV_REDISCOVERIES: OnceLock<Mutex<HashMap<String, ErvRediscovery>>> = OnceLock::new();
+/// Where found addresses are persisted. Set once by `serve`; unset in the
+/// CLI and in tests, which then keep them in memory only.
+static ERV_ADDRESS_DATABASE: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct ErvRediscovery {
-    /// The configured IP this was found for; a config change voids it.
+    /// The configured IP (possibly empty) this was found for; a config
+    /// change voids it.
     configured_ip: String,
     found_ip: Option<String>,
     last_attempt: Option<Instant>,
+}
+
+/// Persisted form of a found address. Used only while both the MAC and the
+/// configured IP still match the config it was found under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedErvAddress {
+    mac: String,
+    configured_ip: String,
+    ip: String,
 }
 #[cfg(not(test))]
 const LOCAL_COLD_CONTACT_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -729,14 +746,15 @@ async fn read_status_with_cold_contact_retry(
     read_status_with_rediscovery(reader, &LanErvLocator, config).await
 }
 
-/// The cold-contact retry, then -- only if the device was unreachable and
-/// `erv.mac` is set -- one attempt at the address its MAC is found at now.
+/// Resolves the address (MAC-only configs), runs the cold-contact retry,
+/// then -- only if the device was unreachable and `erv.mac` is set -- makes
+/// one attempt at the address its MAC is found at now.
 async fn read_status_with_rediscovery(
     reader: &(impl ErvStatusReader + ?Sized),
     locator: &(impl ErvLocator + ?Sized),
     config: &ErvConfig,
 ) -> Result<ErvDeviceStatus> {
-    let effective = effective_erv_config(config);
+    let effective = resolve_erv_address(locator, config).await?;
     let error = match read_status_with_cold_contact_retry_at(reader, &effective).await {
         Ok(status) => return Ok(status),
         Err(error) => error,
@@ -756,6 +774,28 @@ async fn read_status_with_rediscovery(
             effective.ip, relocated.ip
         )
     })
+}
+
+/// `config` with a usable address: `erv.ip`, the address found by MAC
+/// earlier, or -- for a MAC-only config with none yet -- a lookup now. Local
+/// writes go through this too, since they are not always preceded by a read.
+async fn resolve_erv_address<'a>(
+    locator: &(impl ErvLocator + ?Sized),
+    config: &'a ErvConfig,
+) -> Result<Cow<'a, ErvConfig>> {
+    let mut effective = effective_erv_config(config);
+    // With no IP, `local_tuya_configured` holds only if a MAC is set; an
+    // otherwise incomplete config falls through to the caller's own error.
+    if effective.ip.trim().is_empty() && config.local_tuya_configured() {
+        let Some(found_ip) = rediscover_erv_address(locator, config, "").await else {
+            bail!(
+                "ERV address unknown: erv.ip is not set and MAC {} was not found on the LAN",
+                config.mac.as_deref().unwrap_or("(none)")
+            );
+        };
+        effective.to_mut().ip = found_ip;
+    }
+    Ok(effective)
 }
 
 async fn read_status_with_cold_contact_retry_at(
@@ -825,10 +865,11 @@ fn is_unreachable_local_error(error: &anyhow::Error) -> bool {
 
 /// Finds a device by MAC on the LAN. Behind a trait so tests need no network.
 pub trait ErvLocator: Send + Sync {
+    /// `failed` is the address that just stopped answering, if any.
     fn locate<'a>(
         &'a self,
         mac: &'a MacAddress,
-        near: Ipv4Addr,
+        failed: Option<Ipv4Addr>,
     ) -> BoxFutureResult<'a, Option<Ipv4Addr>>;
 }
 
@@ -839,9 +880,9 @@ impl ErvLocator for LanErvLocator {
     fn locate<'a>(
         &'a self,
         mac: &'a MacAddress,
-        near: Ipv4Addr,
+        failed: Option<Ipv4Addr>,
     ) -> BoxFutureResult<'a, Option<Ipv4Addr>> {
-        Box::pin(lan::locate_mac_near(mac, near))
+        Box::pin(lan::locate_mac(mac, failed))
     }
 }
 
@@ -849,15 +890,37 @@ fn erv_rediscoveries() -> &'static Mutex<HashMap<String, ErvRediscovery>> {
     ERV_REDISCOVERIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Persist found ERV addresses in `database_path` and reuse them after a
+/// restart. Called once by `serve`.
+pub fn persist_erv_addresses_in(database_path: PathBuf) {
+    let _ = ERV_ADDRESS_DATABASE.set(database_path);
+}
+
 /// `config` with `ip` replaced by the address found by MAC, if one was found
-/// for this exact configured IP.
+/// for this exact configured IP -- in this process, or persisted by an
+/// earlier one.
 fn effective_erv_config(config: &ErvConfig) -> Cow<'_, ErvConfig> {
-    let found_ip = erv_rediscoveries()
-        .lock()
-        .expect("ERV rediscovery lock poisoned")
-        .get(&config.device_id)
-        .filter(|entry| entry.configured_ip == config.ip)
-        .and_then(|entry| entry.found_ip.clone());
+    let found_ip = {
+        let mut entries = erv_rediscoveries()
+            .lock()
+            .expect("ERV rediscovery lock poisoned");
+        let in_memory = entries
+            .get(&config.device_id)
+            .filter(|entry| entry.configured_ip == config.ip)
+            .and_then(|entry| entry.found_ip.clone());
+        in_memory.or_else(|| {
+            let persisted = load_persisted_erv_address(ERV_ADDRESS_DATABASE.get()?, config)?;
+            entries.insert(
+                config.device_id.clone(),
+                ErvRediscovery {
+                    configured_ip: config.ip.clone(),
+                    found_ip: Some(persisted.clone()),
+                    last_attempt: None,
+                },
+            );
+            Some(persisted)
+        })
+    };
     match found_ip {
         Some(ip) if ip != config.ip => {
             let mut relocated = config.clone();
@@ -868,9 +931,36 @@ fn effective_erv_config(config: &ErvConfig) -> Cow<'_, ErvConfig> {
     }
 }
 
-/// Looks the ERV up by MAC and returns its address if it moved away from
-/// `current_ip`. Rate-limited per device; failures are logged, not returned,
-/// because the caller already has the more useful unreachable error.
+fn load_persisted_erv_address(database_path: &Path, config: &ErvConfig) -> Option<String> {
+    let mac = lan::parse_mac(config.mac.as_deref()?).ok()?;
+    let persisted: PersistedErvAddress = match db::get_setting(database_path, ERV_ADDRESS_SETTING) {
+        Ok(persisted) => persisted?,
+        Err(error) => {
+            tracing::warn!("failed to read the saved ERV address: {error:#}");
+            return None;
+        }
+    };
+    let matches = lan::parse_mac(&persisted.mac).is_ok_and(|saved| saved == mac)
+        && persisted.configured_ip == config.ip
+        && persisted.ip.parse::<Ipv4Addr>().is_ok();
+    matches.then_some(persisted.ip)
+}
+
+fn persist_erv_address(database_path: &Path, config: &ErvConfig, mac: &MacAddress, ip: &str) {
+    let persisted = PersistedErvAddress {
+        mac: lan::format_mac(mac),
+        configured_ip: config.ip.clone(),
+        ip: ip.to_string(),
+    };
+    if let Err(error) = db::set_setting(database_path, ERV_ADDRESS_SETTING, &persisted) {
+        tracing::warn!("failed to save the ERV address found by MAC: {error:#}");
+    }
+}
+
+/// Looks the ERV up by MAC and returns its address if it differs from
+/// `current_ip` (empty when not yet resolved). Rate-limited per device;
+/// failures are logged, not returned, because the caller has a more useful
+/// error of its own.
 async fn rediscover_erv_address(
     locator: &(impl ErvLocator + ?Sized),
     config: &ErvConfig,
@@ -887,9 +977,14 @@ async fn rediscover_erv_address(
             return None;
         }
     };
-    let Ok(near) = current_ip.parse::<Ipv4Addr>() else {
-        tracing::warn!("ERV MAC rediscovery skipped: {current_ip:?} is not an IPv4 address");
-        return None;
+    let failed = if current_ip.trim().is_empty() {
+        None
+    } else {
+        let Ok(failed) = current_ip.parse::<Ipv4Addr>() else {
+            tracing::warn!("ERV MAC rediscovery skipped: {current_ip:?} is not an IPv4 address");
+            return None;
+        };
+        Some(failed)
     };
 
     {
@@ -920,12 +1015,15 @@ async fn rediscover_erv_address(
     }
 
     let mac_display = lan::format_mac(&mac);
-    let found = match locator.locate(&mac, near).await {
+    let found = match locator.locate(&mac, failed).await {
         Ok(Some(found)) => found,
         Ok(None) => {
-            tracing::warn!(
-                "ERV unreachable at {current_ip} and MAC {mac_display} was not found on the LAN"
-            );
+            match failed {
+                Some(failed) => tracing::warn!(
+                    "ERV unreachable at {failed} and MAC {mac_display} was not found on the LAN"
+                ),
+                None => tracing::warn!("ERV MAC {mac_display} was not found on the LAN"),
+            }
             return None;
         }
         Err(error) => {
@@ -941,10 +1039,19 @@ async fn rediscover_erv_address(
         return None;
     }
 
-    tracing::warn!(
-        "ERV unreachable at {current_ip}; found MAC {mac_display} at {found}. Using it from now \
-         on -- set erv.ip to \"{found}\" in config.yaml or reserve it in DHCP"
-    );
+    match failed {
+        None => tracing::info!("ERV MAC {mac_display} found at {found}"),
+        Some(failed) if config.ip.trim().is_empty() => {
+            tracing::info!("ERV unreachable at {failed}; MAC {mac_display} is now at {found}")
+        }
+        Some(failed) => tracing::warn!(
+            "ERV unreachable at {failed}; found MAC {mac_display} at {found} and using it. \
+             erv.ip is stale -- remove it to rely on erv.mac"
+        ),
+    }
+    if let Some(database_path) = ERV_ADDRESS_DATABASE.get() {
+        persist_erv_address(database_path, config, &mac, &found);
+    }
     if let Some(entry) = erv_rediscoveries()
         .lock()
         .expect("ERV rediscovery lock poisoned")
@@ -1012,8 +1119,9 @@ impl ErvSpeedWriter for RustuyaErvSpeedWriter {
                 bail!("ERV local Tuya config is incomplete");
             }
 
-            let device = build_rustuya_device(config)?;
-            let result = set_rustuya_speed(&device, config, speed, negative_pressure).await;
+            let config = resolve_erv_address(&LanErvLocator, config).await?;
+            let device = build_rustuya_device(&config)?;
+            let result = set_rustuya_speed(&device, &config, speed, negative_pressure).await;
             device.close().await;
             result
         })
@@ -2472,6 +2580,11 @@ pub async fn smoke_erv(config: &AppConfig) -> Result<ErvDeviceStatus> {
 
 fn build_rustuya_device(config: &ErvConfig) -> Result<rustuya::Device> {
     let config = effective_erv_config(config);
+    // An empty address makes rustuya run its own UDP discovery; the address
+    // must come from erv.ip or a MAC lookup instead.
+    if config.ip.trim().is_empty() {
+        bail!("ERV address unknown: erv.ip is not set and no address has been found by MAC yet");
+    }
     let version = rustuya::Version::from_str(&config.version)
         .map_err(|error| anyhow!("invalid ERV Tuya protocol version: {error}"))?;
     Ok(rustuya::Device::builder(
@@ -5104,7 +5217,7 @@ mod tests {
     #[derive(Default)]
     struct FakeLocator {
         found: Option<Ipv4Addr>,
-        calls: Mutex<Vec<(MacAddress, Ipv4Addr)>>,
+        calls: Mutex<Vec<(MacAddress, Option<Ipv4Addr>)>>,
     }
 
     impl FakeLocator {
@@ -5115,7 +5228,7 @@ mod tests {
             }
         }
 
-        fn calls(&self) -> Vec<(MacAddress, Ipv4Addr)> {
+        fn calls(&self) -> Vec<(MacAddress, Option<Ipv4Addr>)> {
             self.calls.lock().unwrap().clone()
         }
     }
@@ -5124,9 +5237,9 @@ mod tests {
         fn locate<'a>(
             &'a self,
             mac: &'a MacAddress,
-            near: Ipv4Addr,
+            failed: Option<Ipv4Addr>,
         ) -> BoxFutureResult<'a, Option<Ipv4Addr>> {
-            self.calls.lock().unwrap().push((*mac, near));
+            self.calls.lock().unwrap().push((*mac, failed));
             let found = self.found;
             Box::pin(async move { Ok(found) })
         }
@@ -5157,7 +5270,7 @@ mod tests {
             locator.calls(),
             vec![(
                 [0xc0, 0xf8, 0x53, 0x75, 0x1f, 0xcf],
-                Ipv4Addr::new(192, 168, 4, 59)
+                Some(Ipv4Addr::new(192, 168, 4, 59))
             )]
         );
         assert_eq!(effective_erv_config(&config).ip, "192.168.4.68");
@@ -5262,5 +5375,161 @@ mod tests {
         for error in &answered {
             assert!(!is_unreachable_local_error(error), "{error:#}");
         }
+    }
+
+    #[tokio::test]
+    async fn mac_only_config_resolves_the_address_by_mac() {
+        let config = ErvConfig {
+            ip: String::new(),
+            ..mac_config("mac-only-resolves")
+        };
+        assert!(config.local_tuya_configured());
+        let reader = AddressedFakeReader::new("192.168.4.68");
+        let locator = FakeLocator::finding("192.168.4.68");
+
+        let status = read_status_with_rediscovery(&reader, &locator, &config)
+            .await
+            .expect("read at the address found by MAC");
+
+        assert_eq!(status, medium_status());
+        assert_eq!(
+            locator.calls(),
+            vec![([0xc0, 0xf8, 0x53, 0x75, 0x1f, 0xcf], None)]
+        );
+        assert_eq!(reader.seen_ips(), vec!["192.168.4.68".to_string()]);
+        assert_eq!(effective_erv_config(&config).ip, "192.168.4.68");
+
+        read_status_with_rediscovery(&reader, &locator, &config)
+            .await
+            .expect("second read reuses the address");
+        assert_eq!(locator.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mac_only_config_moves_with_the_device() {
+        let config = ErvConfig {
+            ip: String::new(),
+            ..mac_config("mac-only-moves")
+        };
+        let first = AddressedFakeReader::new("192.168.4.68");
+        read_status_with_rediscovery(&first, &FakeLocator::finding("192.168.4.68"), &config)
+            .await
+            .expect("first address");
+
+        // The lease changes; the found address stops answering.
+        let moved = AddressedFakeReader::new("192.168.4.70");
+        let locator = FakeLocator::finding("192.168.4.70");
+        // Let the rate limit allow a second lookup for this device.
+        erv_rediscoveries()
+            .lock()
+            .unwrap()
+            .get_mut(&config.device_id)
+            .unwrap()
+            .last_attempt = None;
+
+        read_status_with_rediscovery(&moved, &locator, &config)
+            .await
+            .expect("read at the new address");
+
+        assert_eq!(
+            locator.calls(),
+            vec![(
+                [0xc0, 0xf8, 0x53, 0x75, 0x1f, 0xcf],
+                Some(Ipv4Addr::new(192, 168, 4, 68))
+            )]
+        );
+        assert_eq!(effective_erv_config(&config).ip, "192.168.4.70");
+    }
+
+    #[tokio::test]
+    async fn mac_only_config_fails_clearly_when_the_mac_is_not_found() {
+        let config = ErvConfig {
+            ip: String::new(),
+            ..mac_config("mac-only-missing")
+        };
+        let reader = AddressedFakeReader::new("192.168.4.68");
+
+        let error = read_status_with_rediscovery(&reader, &FakeLocator::default(), &config)
+            .await
+            .expect_err("no address");
+
+        assert!(
+            format!("{error:#}").contains("ERV address unknown"),
+            "{error:#}"
+        );
+        assert!(reader.seen_ips().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unresolved_address_never_reaches_rustuya_discovery() {
+        let config = ErvConfig {
+            ip: String::new(),
+            ..mac_config("mac-only-unresolved-build")
+        };
+
+        let error = RustuyaErvStatusReader
+            .read_status(&config)
+            .await
+            .expect_err("no address yet");
+
+        assert!(
+            format!("{error:#}").contains("ERV address unknown"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn persisted_address_is_reused_only_for_the_same_mac_and_configured_ip() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let database_path = temp_dir.path().join("office_climate.db");
+        db::migrate_database(&database_path).expect("migration");
+        let config = ErvConfig {
+            ip: String::new(),
+            ..mac_config("persisted-address")
+        };
+        let mac = lan::parse_mac("c0:f8:53:75:1f:cf").unwrap();
+
+        assert_eq!(load_persisted_erv_address(&database_path, &config), None);
+        persist_erv_address(&database_path, &config, &mac, "192.168.4.68");
+        assert_eq!(
+            load_persisted_erv_address(&database_path, &config).as_deref(),
+            Some("192.168.4.68")
+        );
+
+        let other_mac = ErvConfig {
+            mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+            ..config.clone()
+        };
+        assert_eq!(load_persisted_erv_address(&database_path, &other_mac), None);
+        let explicit_ip = ErvConfig {
+            ip: "192.168.4.59".to_string(),
+            ..config.clone()
+        };
+        assert_eq!(
+            load_persisted_erv_address(&database_path, &explicit_ip),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn local_write_resolves_a_mac_only_address_first() {
+        let config = ErvConfig {
+            ip: String::new(),
+            ..mac_config("mac-only-write-resolves")
+        };
+        let locator = FakeLocator::finding("192.168.4.68");
+
+        let resolved = resolve_erv_address(&locator, &config)
+            .await
+            .expect("address found for a write");
+
+        assert_eq!(resolved.ip, "192.168.4.68");
+        assert_eq!(locator.calls().len(), 1);
+        // A later write reuses it.
+        assert_eq!(
+            resolve_erv_address(&locator, &config).await.unwrap().ip,
+            "192.168.4.68"
+        );
+        assert_eq!(locator.calls().len(), 1);
     }
 }

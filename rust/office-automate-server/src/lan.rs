@@ -1,11 +1,11 @@
-//! Find a LAN device's current IPv4 address by its MAC (#175).
+//! Find a LAN device's current IPv4 address by its MAC (#175, #177).
 //!
 //! DHCP can move a device between leases, which silently breaks any config
 //! that pins its IP. The kernel ARP table maps IP to MAC for every host this
 //! Mac has recently talked to, so the lookup is: check the table, and if the
 //! MAC is not there, send one UDP datagram to every host on the local subnet
-//! that contains the last known IP (which makes the kernel ARP each of them)
-//! and check again.
+//! containing the address that failed -- or, with none, on every local
+//! private subnet -- which makes the kernel ARP each of them, and check again.
 //!
 //! The sweep's UDP sends are subject to macOS Local Network privacy, so this
 //! only finds anything when run from a process holding that grant -- the
@@ -94,13 +94,22 @@ pub fn parse_ifconfig_networks(output: &str) -> Vec<Ipv4Net> {
         .collect()
 }
 
-/// The local network containing `near`, if it is small enough to sweep.
-pub fn sweep_network(networks: &[Ipv4Net], near: Ipv4Addr) -> Option<Ipv4Net> {
-    networks
+/// The local networks to sweep: the one containing `failed` if given,
+/// otherwise every private (RFC 1918) one. Only networks small enough to
+/// sweep are returned.
+pub fn sweep_networks(networks: &[Ipv4Net], failed: Option<Ipv4Addr>) -> Vec<Ipv4Net> {
+    let mut selected: Vec<Ipv4Net> = networks
         .iter()
-        .filter(|net| !net.addr().is_loopback() && net.contains(&near))
-        .find(|net| net.prefix_len() >= MAX_SWEEP_PREFIX_LEN)
+        .filter(|net| net.prefix_len() >= MAX_SWEEP_PREFIX_LEN)
+        .filter(|net| match failed {
+            Some(failed) => !net.addr().is_loopback() && net.contains(&failed),
+            None => net.addr().is_private(),
+        })
         .copied()
+        .collect();
+    selected.sort();
+    selected.dedup();
+    selected
 }
 
 /// The IP holding `mac`, ignoring `exclude`. After a lease change the ARP
@@ -109,42 +118,42 @@ pub fn sweep_network(networks: &[Ipv4Net], near: Ipv4Addr) -> Option<Ipv4Net> {
 pub fn lookup_mac(
     table: &[(Ipv4Addr, MacAddress)],
     mac: &MacAddress,
-    exclude: Ipv4Addr,
+    exclude: Option<Ipv4Addr>,
 ) -> Option<Ipv4Addr> {
     table
         .iter()
-        .find(|(ip, entry)| entry == mac && *ip != exclude)
+        .find(|(ip, entry)| entry == mac && Some(*ip) != exclude)
         .map(|(ip, _)| *ip)
 }
 
-/// Finds `mac` on the local network around `near`, the address that just
-/// failed. Returns another address if the MAC moved, `near` itself only if
-/// the sweep still shows the MAC nowhere else, and `Ok(None)` if it is not
-/// seen at all or `near` is not on a sweepable local network.
-pub async fn locate_mac_near(mac: &MacAddress, near: Ipv4Addr) -> Result<Option<Ipv4Addr>> {
-    if let Some(ip) = lookup_mac(&arp_table().await?, mac, near) {
+/// Finds `mac` on the LAN. `failed` is the address that just stopped
+/// answering, if any: it is skipped and only its subnet is swept. Returns
+/// `failed` itself only if the sweep still shows the MAC nowhere else, and
+/// `Ok(None)` if the MAC is not seen or there is nothing sweepable.
+pub async fn locate_mac(mac: &MacAddress, failed: Option<Ipv4Addr>) -> Result<Option<Ipv4Addr>> {
+    if let Some(ip) = lookup_mac(&arp_table().await?, mac, failed) {
         return Ok(Some(ip));
     }
 
     let networks = parse_ifconfig_networks(&run(IFCONFIG_PROGRAM, &[]).await?);
-    let Some(network) = sweep_network(&networks, near) else {
-        tracing::debug!("no sweepable local network contains {near}; skipping MAC sweep");
+    let networks = sweep_networks(&networks, failed);
+    if networks.is_empty() {
+        tracing::debug!("no sweepable local network for a MAC sweep (failed address {failed:?})");
         return Ok(None);
-    };
-    sweep(network).await?;
+    }
+    for network in networks {
+        sweep(network).await?;
+    }
 
     let mut table = Vec::new();
     for _ in 0..ARP_SETTLE_POLLS {
         time::sleep(ARP_SETTLE_INTERVAL).await;
         table = arp_table().await?;
-        if let Some(ip) = lookup_mac(&table, mac, near) {
+        if let Some(ip) = lookup_mac(&table, mac, failed) {
             return Ok(Some(ip));
         }
     }
-    Ok(table
-        .iter()
-        .any(|(ip, entry)| entry == mac && *ip == near)
-        .then_some(near))
+    Ok(failed.filter(|failed| table.iter().any(|(ip, entry)| entry == mac && ip == failed)))
 }
 
 async fn sweep(network: Ipv4Net) -> Result<()> {
@@ -227,11 +236,11 @@ mod tests {
         let failed = Ipv4Addr::new(192, 168, 4, 59);
         // The stale entry for the address that just failed is skipped.
         assert_eq!(
-            lookup_mac(&table, &ERV_MAC, failed),
+            lookup_mac(&table, &ERV_MAC, Some(failed)),
             Some(Ipv4Addr::new(192, 168, 4, 68))
         );
-        assert_eq!(lookup_mac(&table[..3], &ERV_MAC, failed), None);
-        assert_eq!(lookup_mac(&table, &[0; 6], failed), None);
+        assert_eq!(lookup_mac(&table[..3], &ERV_MAC, Some(failed)), None);
+        assert_eq!(lookup_mac(&table, &[0; 6], Some(failed)), None);
     }
 
     #[test]
@@ -246,11 +255,16 @@ en9: flags=8863<UP,BROADCAST> mtu 1500
 ";
         let networks = parse_ifconfig_networks(output);
         assert_eq!(networks.len(), 3);
-        let network = sweep_network(&networks, Ipv4Addr::new(192, 168, 4, 59)).expect("network");
-        assert_eq!(network.to_string(), "192.168.4.0/22");
-        assert_eq!(network.hosts().count(), 1022);
+        let around_failed = sweep_networks(&networks, Some(Ipv4Addr::new(192, 168, 4, 59)));
+        assert_eq!(around_failed.len(), 1);
+        assert_eq!(around_failed[0].to_string(), "192.168.4.0/22");
+        assert_eq!(around_failed[0].hosts().count(), 1022);
+        // With no failed address: every private network small enough to sweep.
+        // 10.0.0.0/8 is private but far too large; loopback is not private.
+        let all_private = sweep_networks(&networks, None);
+        assert_eq!(all_private, around_failed);
         // Too large to sweep, and not local at all.
-        assert_eq!(sweep_network(&networks, Ipv4Addr::new(10, 1, 2, 3)), None);
-        assert_eq!(sweep_network(&networks, Ipv4Addr::new(172, 16, 0, 5)), None);
+        assert!(sweep_networks(&networks, Some(Ipv4Addr::new(10, 1, 2, 3))).is_empty());
+        assert!(sweep_networks(&networks, Some(Ipv4Addr::new(172, 16, 0, 5))).is_empty());
     }
 }

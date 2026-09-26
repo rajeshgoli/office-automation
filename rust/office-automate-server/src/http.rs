@@ -545,6 +545,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     )));
     let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
     let erv_state = ErvState::new(config.runtime.database_path.clone());
+    crate::erv::persist_erv_addresses_in(config.runtime.database_path.clone());
     let hvac_state = HvacState::new(config.runtime.database_path.clone());
     // One writer for the whole process. A second instance carries its own
     // local-health state, so a failure seen by one would not gate the other.

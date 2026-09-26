@@ -47,11 +47,11 @@ erv:
   type: "tuya"  # or "shelly" for relay control
   device_id: "your_tuya_device_id"
   local_key: "your_tuya_local_key"
-  ip: "192.168.1.xxx"
-  # Optional. If `ip` stops answering (e.g. a new DHCP lease), the server finds
-  # the ERV on the LAN by this MAC and uses its current IP until restart.
-  # A DHCP reservation for this MAC is still the durable fix.
+  # Identify the ERV by MAC; the server finds its IP on the LAN and saves it,
+  # so DHCP lease changes need no config edit. `ip` is optional: set it only
+  # to pin an address (a MAC, if also set, still recovers a stale one).
   mac: "aa:bb:cc:dd:ee:ff"
+  # ip: "192.168.1.xxx"
 
   # Writes go out as Smart Life tap-to-run scenes; local Tuya is read-only.
   # Scenes are the only cloud mechanism that reaches fan speed, because the
