@@ -336,8 +336,12 @@ impl SmartLifeAuthCache {
                 tmp_path.display()
             )
         })?;
-        fs::rename(&tmp_path, path)
-            .with_context(|| format!("failed to finalize Smart Life auth cache {}", path.display()))
+        fs::rename(&tmp_path, path).with_context(|| {
+            format!(
+                "failed to finalize Smart Life auth cache {}",
+                path.display()
+            )
+        })
     }
 }
 
