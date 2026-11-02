@@ -1671,17 +1671,25 @@ async fn evaluate_and_apply_hvac_policy(state: &AppState) -> Result<()> {
         bands.cool_off_temp_f as f64,
     );
 
+    let restore_mode = suspended_restore_mode(
+        &hvac_snapshot,
+        temp_f,
+        bands,
+        state_status.is_present,
+        erv_snapshot.running,
+        within_occupancy_hours,
+    );
+    // A suspended mode comes back with its saved setpoints, so it wins over a
+    // fresh heat start from Off.
+    let action = match action {
+        Some(HvacBandAction::StartHeat) if restore_mode.is_some() => None,
+        action => action,
+    };
+
     let temp_label = temp_f.unwrap_or_default().round() as i64;
     match action {
         None => {
-            if let Some(restore_mode) = suspended_restore_mode(
-                &hvac_snapshot,
-                temp_f,
-                bands,
-                state_status.is_present,
-                erv_snapshot.running,
-                within_occupancy_hours,
-            ) {
+            if let Some(restore_mode) = restore_mode {
                 let command = match restore_mode {
                     HvacControlMode::Heat => HvacModeCommand::new(
                         HvacControlMode::Heat,
@@ -6241,6 +6249,85 @@ mod tests {
             vec![
                 (HvacControlMode::Off, None),
                 (HvacControlMode::Heat, Some(22.0)),
+            ]
+        );
+    }
+
+    async fn restore_after_safety_clears_in_cold_room(
+        suspended_status: HvacDeviceStatus,
+    ) -> Vec<HvacModeCommand> {
+        let config = configured_hvac_config(true);
+        let now = unix_timestamp_now();
+        let state_machine = Arc::new(RwLock::new(StateMachine::from_thresholds(
+            &config.thresholds,
+            now,
+        )));
+        {
+            let mut machine = state_machine.write().expect("state machine lock poisoned");
+            machine.set_manual_presence(true, now);
+            machine.update_window(true, now + 1.0);
+        }
+        let yolink = YoLinkState::new(state_machine.clone(), config.runtime.database_path.clone());
+        let erv_state = ErvState::new(config.runtime.database_path.clone());
+        let hvac_state = HvacState::new(config.runtime.database_path.clone());
+        hvac_state.record_status(suspended_status.clone());
+        let writer = Arc::new(FakeHvacWriter::new(
+            vec![
+                Ok(suspended_status.clone()),
+                Ok(hvac_status(HvacControlMode::Off, 22.0)),
+            ],
+            vec![
+                Ok(hvac_status(HvacControlMode::Off, 22.0)),
+                Ok(suspended_status),
+            ],
+        ));
+        // Below the heat band, so StartHeat would also apply.
+        let qingping = qingping_with_temp(fahrenheit_to_celsius(66.0));
+        let (_service, state) = try_app_with_erv_writer_and_coordinator(
+            config,
+            qingping,
+            state_machine.clone(),
+            yolink,
+            erv_state,
+            hvac_state,
+            Arc::new(FakeErvWriter::default()),
+            writer.clone(),
+        )
+        .expect("app");
+
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy applies safety off");
+        state_machine
+            .write()
+            .expect("state machine lock poisoned")
+            .update_window(false, now + 2.0);
+        evaluate_and_apply_hvac_policy(&state)
+            .await
+            .expect("HVAC policy restores suspended mode");
+        assert!(!state.hvac.snapshot().suspended);
+        writer.write_commands()
+    }
+
+    #[tokio::test]
+    async fn automated_hvac_policy_restores_suspended_auto_in_cold_room() {
+        assert_eq!(
+            restore_after_safety_clears_in_cold_room(hvac_auto_status(20.0, 26.0)).await,
+            vec![
+                HvacModeCommand::new(HvacControlMode::Off, None),
+                HvacModeCommand::auto(20.0, 26.0),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn automated_hvac_policy_restores_suspended_heat_setpoint_in_cold_room() {
+        assert_eq!(
+            restore_after_safety_clears_in_cold_room(hvac_status(HvacControlMode::Heat, 20.0))
+                .await,
+            vec![
+                HvacModeCommand::new(HvacControlMode::Off, None),
+                HvacModeCommand::new(HvacControlMode::Heat, Some(20.0)),
             ]
         );
     }
