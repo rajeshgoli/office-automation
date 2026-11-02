@@ -33,7 +33,7 @@ impl VentilationSpeed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HvacBandAction {
     PauseHeat,
-    ResumeHeat,
+    StartHeat,
     StartCool,
     StopCool,
 }
@@ -784,7 +784,6 @@ impl ErvPolicyState {
 pub fn get_hvac_band_action(
     temp_f: Option<f64>,
     hvac_mode: HvacMode,
-    temp_band_mode: Option<HvacMode>,
     state: OccupancyState,
     erv_running: bool,
     min_temp_f: f64,
@@ -808,7 +807,7 @@ pub fn get_hvac_band_action(
         return None;
     }
 
-    if temp_band_mode == Some(HvacMode::Heat) && temp_f <= heat_on_temp_f {
+    if temp_f <= heat_on_temp_f {
         if state == OccupancyState::Away {
             if erv_running && temp_f > min_temp_f {
                 return None;
@@ -818,7 +817,7 @@ pub fn get_hvac_band_action(
             }
         }
 
-        return Some(HvacBandAction::ResumeHeat);
+        return Some(HvacBandAction::StartHeat);
     }
 
     if state == OccupancyState::Present && temp_f > cool_on_temp_f {
@@ -1732,7 +1731,6 @@ mod tests {
             get_hvac_band_action(
                 Some(75.2),
                 HvacMode::Heat,
-                None,
                 OccupancyState::Present,
                 false,
                 68.0,
@@ -1748,7 +1746,6 @@ mod tests {
             get_hvac_band_action(
                 Some(70.0),
                 HvacMode::Off,
-                Some(HvacMode::Heat),
                 OccupancyState::Away,
                 true,
                 68.0,
@@ -1764,7 +1761,6 @@ mod tests {
             get_hvac_band_action(
                 Some(81.1),
                 HvacMode::Off,
-                None,
                 OccupancyState::Present,
                 false,
                 68.0,
@@ -1780,7 +1776,6 @@ mod tests {
             get_hvac_band_action(
                 Some(78.0),
                 HvacMode::Cool,
-                None,
                 OccupancyState::Present,
                 false,
                 68.0,
@@ -1791,6 +1786,43 @@ mod tests {
                 78.0,
             ),
             Some(HvacBandAction::StopCool)
+        );
+    }
+
+    #[test]
+    fn hvac_band_starts_heat_from_off_without_a_prior_heat_pause() {
+        let start = |temp_f, state, erv_running, within_occupancy_hours| {
+            get_hvac_band_action(
+                Some(temp_f),
+                HvacMode::Off,
+                state,
+                erv_running,
+                68.0,
+                within_occupancy_hours,
+                72.0,
+                68.0,
+                78.0,
+                75.0,
+            )
+        };
+
+        assert_eq!(
+            start(67.5, OccupancyState::Present, false, true),
+            Some(HvacBandAction::StartHeat)
+        );
+        assert_eq!(
+            start(68.0, OccupancyState::Present, false, false),
+            Some(HvacBandAction::StartHeat)
+        );
+        assert_eq!(start(68.1, OccupancyState::Present, false, true), None);
+        assert_eq!(
+            start(67.5, OccupancyState::Away, false, true),
+            Some(HvacBandAction::StartHeat)
+        );
+        assert_eq!(start(67.5, OccupancyState::Away, false, false), None);
+        assert_eq!(
+            start(67.5, OccupancyState::Away, true, true),
+            Some(HvacBandAction::StartHeat)
         );
     }
 }
